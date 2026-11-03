@@ -66,6 +66,12 @@ type Config struct {
 	LostAckRate float64
 	CrashRate   float64
 	MaxLatency  time.Duration
+	// OutageRate, MaxOutage, and OutageTimeout make the store unreachable for a stretch of
+	// virtual time, for every process or for one, while the processes keep running. See
+	// [s3fake.Faults].
+	OutageRate    float64
+	MaxOutage     time.Duration
+	OutageTimeout time.Duration
 	// GracePeriod for GC.
 	GracePeriod time.Duration
 	// Mutations to break the engine with.
@@ -92,7 +98,12 @@ func DefaultConfig(seed uint64) Config {
 		LostAckRate: 0.05,
 		CrashRate:   0.01,
 		MaxLatency:  20 * time.Millisecond,
-		GracePeriod: 2 * time.Second,
+		// Outages long enough that a commit sometimes runs out of retries in one, so its outcome
+		// is unknown in a process that keeps running.
+		OutageRate:    0.01,
+		MaxOutage:     time.Second,
+		OutageTimeout: 50 * time.Millisecond,
+		GracePeriod:   2 * time.Second,
 	}
 }
 
@@ -112,7 +123,29 @@ type Result struct {
 // Stats of a run.
 type Stats struct {
 	Commits, Conflicts, Unknown, Crashes, Compactions, GCs, Deleted int
-	Elapsed                                                         time.Duration
+	// Outages and partitions injected.
+	Outages int
+	// LiveUnknown counts the unknown commit outcomes in processes that did not crash, which only
+	// outages and lost acknowledgements cause.
+	LiveUnknown int
+	// Unavailable counts client operations that failed because the store was unreachable.
+	Unavailable int
+	Elapsed     time.Duration
+}
+
+// Add the counts of o, for totals over several runs.
+func (s *Stats) Add(o Stats) {
+	s.Commits += o.Commits
+	s.Conflicts += o.Conflicts
+	s.Unknown += o.Unknown
+	s.Crashes += o.Crashes
+	s.Compactions += o.Compactions
+	s.GCs += o.GCs
+	s.Deleted += o.Deleted
+	s.Outages += o.Outages
+	s.LiveUnknown += o.LiveUnknown
+	s.Unavailable += o.Unavailable
+	s.Elapsed += o.Elapsed
 }
 
 // Failed reports whether any anomaly was found.
@@ -123,8 +156,8 @@ func (r Result) Failed() bool {
 // Report of the run for test output.
 func (r Result) Report() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "seed %d (%v): %d tx, %d commits, %d conflicts, %d unknown, %d crashes, %d compactions, %d GCs (%d deleted), %v virtual time",
-		r.Config.Seed, r.Config.Name(), len(r.History), r.Stats.Commits, r.Stats.Conflicts, r.Stats.Unknown, r.Stats.Crashes, r.Stats.Compactions, r.Stats.GCs, r.Stats.Deleted, r.Stats.Elapsed)
+	fmt.Fprintf(&b, "seed %d (%v): %d tx, %d commits, %d conflicts, %d unknown (%d without a crash), %d crashes, %d outages (%d operations failed), %d compactions, %d GCs (%d deleted), %v virtual time",
+		r.Config.Seed, r.Config.Name(), len(r.History), r.Stats.Commits, r.Stats.Conflicts, r.Stats.Unknown, r.Stats.LiveUnknown, r.Stats.Crashes, r.Stats.Outages, r.Stats.Unavailable, r.Stats.Compactions, r.Stats.GCs, r.Stats.Deleted, r.Stats.Elapsed)
 	for _, a := range r.Anomalies {
 		fmt.Fprintf(&b, "\nANOMALY: %v", a)
 	}
@@ -166,11 +199,14 @@ func Run(cfg Config) Result {
 	r.sched = sched.New(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
 	r.rng = rand.New(rand.NewPCG(cfg.Seed, 0x5ca1ab1e))
 	r.fake = s3fake.New(s3fake.WithClock(r.sched), s3fake.WithFaults(s3fake.Faults{
-		Rand:        rand.New(rand.NewPCG(cfg.Seed, 0xfa17)),
-		ErrorRate:   cfg.ErrorRate,
-		LostAckRate: cfg.LostAckRate,
-		CrashRate:   cfg.CrashRate,
-		MaxLatency:  cfg.MaxLatency,
+		Rand:          rand.New(rand.NewPCG(cfg.Seed, 0xfa17)),
+		ErrorRate:     cfg.ErrorRate,
+		LostAckRate:   cfg.LostAckRate,
+		CrashRate:     cfg.CrashRate,
+		MaxLatency:    cfg.MaxLatency,
+		OutageRate:    cfg.OutageRate,
+		MaxOutage:     cfg.MaxOutage,
+		OutageTimeout: cfg.OutageTimeout,
 	}))
 	if cfg.Trace != nil {
 		r.fake.Log = func(line string) {
@@ -196,6 +232,7 @@ func Run(cfg Config) Result {
 	}
 	r.sched.Run()
 	r.stats.Elapsed = r.sched.Elapsed()
+	r.stats.Outages = r.fake.Outages()
 
 	res := Result{Config: cfg, History: r.txs, Audits: r.audits, Stats: r.stats}
 	var final map[string][]int64
@@ -480,12 +517,20 @@ func (c *client) record(tx history.Tx) {
 // outcome of a commit. Only [engine.ErrCommitUnknown] is ambiguous; every other error means
 // the transaction was not applied.
 func (c *client) outcome(err error) history.Outcome {
+	if errors.Is(err, s3fake.ErrUnavailable) {
+		c.run.stats.Unavailable++
+	}
 	switch {
 	case err == nil:
 		c.run.stats.Commits++
 		return history.OK
 	case errors.Is(err, engine.ErrCommitUnknown):
 		c.run.stats.Unknown++
+		crashed, _ := c.proc.Crashed()
+		if !crashed {
+			c.run.stats.LiveUnknown++
+		}
+		assert.Sometimes(!crashed, "a commit outcome is unknown in a process that keeps running", nil)
 		return history.Unknown
 	case errors.Is(err, engine.ErrConflict):
 		c.run.stats.Conflicts++

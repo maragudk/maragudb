@@ -175,9 +175,10 @@ func (c *client) listAppendSQL(ctx context.Context) {
 		plans = append(plans, p)
 	}
 
-	// A single append runs as two autocommit statements: a read, and an insert at the position
-	// the read found. The insert is its own transaction in the history.
-	if len(plans) == 1 && plans[0].append {
+	// A single append, and a third of all operations, run as two autocommit statements: a read,
+	// and an insert at the position the read found. The insert is its own transaction in the
+	// history. Autocommit statements are frequent so that their retries meet every fault.
+	if c.rng.IntN(3) == 0 || len(plans) == 1 && plans[0].append {
 		k := plans[0].key
 		h := history.Tx{Client: c.id, Invoke: c.run.stamp()}
 		list, err := readList(ctx, c.sql, k)

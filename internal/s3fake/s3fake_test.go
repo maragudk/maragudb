@@ -257,6 +257,99 @@ func TestClient_Faults(t *testing.T) {
 	})
 }
 
+func TestClient_Unavailable(t *testing.T) {
+	newClient := func(timeout time.Duration) (*s3fake.Client, *s3fake.VirtualClock) {
+		clock := s3fake.NewVirtualClock(time.Unix(0, 0))
+		return s3fake.New(s3fake.WithClock(clock), s3fake.WithFaults(s3fake.Faults{Rand: rand.New(rand.NewPCG(1, 2)), OutageTimeout: timeout})), clock
+	}
+
+	t.Run("an outage refuses every request until it ends, without crashing the process", func(t *testing.T) {
+		c, clock := newClient(0)
+		p := &s3fake.Process{Name: "p"}
+		ctx := s3fake.WithProcess(t.Context(), p)
+		c.Unavailable("", clock.Now().Add(time.Second))
+		_, err := c.Put(ctx, "k", []byte("v"), s3.PutOptions{})
+		is.Error(t, s3fake.ErrUnavailable, err)
+		_, err = c.Get(ctx, "k", s3.GetOptions{})
+		is.Error(t, s3fake.ErrUnavailable, err)
+		_, err = c.Put(t.Context(), "k", []byte("v"), s3.PutOptions{})
+		is.Error(t, s3fake.ErrUnavailable, err, "requests without a process too")
+		is.Error(t, s3fake.ErrUnavailable, c.Delete(ctx, "k"))
+		_, err = c.List(ctx, "")
+		is.Error(t, s3fake.ErrUnavailable, err)
+		is.Equal(t, 0, len(c.Keys()), "refused writes are not applied")
+		crashed, _ := p.Crashed()
+		is.True(t, !crashed, "the process keeps running")
+
+		clock.Sleep(t.Context(), time.Second)
+		_, err = c.Put(ctx, "k", []byte("v"), s3.PutOptions{})
+		is.NotError(t, err, "the outage is over")
+	})
+
+	t.Run("a partition only affects the named process", func(t *testing.T) {
+		c, clock := newClient(0)
+		pctx := s3fake.WithProcess(t.Context(), &s3fake.Process{Name: "p"})
+		qctx := s3fake.WithProcess(t.Context(), &s3fake.Process{Name: "q"})
+		c.Unavailable("p", clock.Now().Add(time.Second))
+		_, err := c.Put(pctx, "k", []byte("v"), s3.PutOptions{})
+		is.Error(t, s3fake.ErrUnavailable, err)
+		_, err = c.Put(qctx, "k", []byte("v"), s3.PutOptions{})
+		is.NotError(t, err)
+		_, err = c.Get(t.Context(), "k", s3.GetOptions{})
+		is.NotError(t, err, "requests without a process are not partitioned")
+		_, err = c.Get(s3fake.WithProcess(t.Context(), &s3fake.Process{Name: "p"}), "k", s3.GetOptions{})
+		is.Error(t, s3fake.ErrUnavailable, err, "a restarted process with the same name is still partitioned")
+	})
+
+	t.Run("a fault-free view ignores outages", func(t *testing.T) {
+		c, clock := newClient(0)
+		c.Unavailable("", clock.Now().Add(time.Second))
+		_, err := c.WithoutFaults().Put(t.Context(), "k", []byte("v"), s3.PutOptions{})
+		is.NotError(t, err)
+	})
+
+	t.Run("with a timeout, requests are refused or hang, and some timed-out writes are applied", func(t *testing.T) {
+		c, clock := newClient(100 * time.Millisecond)
+		c.Unavailable("", clock.Now().Add(time.Hour))
+		var refused, timedOut, applied int
+		for i := range 200 {
+			key := fmt.Sprint("k", i)
+			before := clock.Now()
+			_, err := c.Put(t.Context(), key, []byte("v"), s3.PutOptions{})
+			is.Error(t, s3fake.ErrUnavailable, err)
+			switch clock.Now().Sub(before) {
+			case 0:
+				refused++
+				_, ok := c.Body(key)
+				is.True(t, !ok, "a refused write is not applied")
+			case 100 * time.Millisecond:
+				timedOut++
+				if _, ok := c.Body(key); ok {
+					applied++
+				}
+			default:
+				t.Fatalf("request took %v", clock.Now().Sub(before))
+			}
+		}
+		is.True(t, refused > 50, fmt.Sprint("refused ", refused))
+		is.True(t, timedOut > 50, fmt.Sprint("timed out ", timedOut))
+		is.True(t, applied > 10 && applied < timedOut-10, fmt.Sprint("applied ", applied, " of ", timedOut))
+	})
+
+	t.Run("a timed-out write checks its condition when it lands", func(t *testing.T) {
+		c, clock := newClient(100 * time.Millisecond)
+		_, err := c.Put(t.Context(), "k", []byte("v1"), s3.PutOptions{})
+		is.NotError(t, err)
+		c.Unavailable("", clock.Now().Add(time.Hour))
+		for range 50 {
+			_, err := c.Put(t.Context(), "k", []byte("v2"), s3.PutOptions{IfNoneMatch: true})
+			is.Error(t, s3fake.ErrUnavailable, err)
+		}
+		body, _ := c.Body("k")
+		is.Equal(t, "v1", string(body))
+	})
+}
+
 // modelObject in the reference model.
 type modelObject struct {
 	body []byte

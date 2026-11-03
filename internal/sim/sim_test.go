@@ -89,19 +89,16 @@ func TestSimulator(t *testing.T) {
 			if res.Failed() {
 				failReport(t, res)
 			}
-			totals.Commits += res.Stats.Commits
-			totals.Conflicts += res.Stats.Conflicts
-			totals.Unknown += res.Stats.Unknown
-			totals.Crashes += res.Stats.Crashes
-			totals.Compactions += res.Stats.Compactions
-			totals.GCs += res.Stats.GCs
-			totals.Deleted += res.Stats.Deleted
+			totals.Add(res.Stats)
 		}
 		t.Logf("corpus of %d runs in %v: %+v", len(corpus()), time.Since(start).Round(time.Millisecond), totals)
 		// The corpus must exercise every interesting path, or passing means nothing.
 		is.True(t, totals.Commits > 1000, "commits")
 		is.True(t, totals.Conflicts > 100, "conflicts")
 		is.True(t, totals.Unknown > 50, "unknown outcomes")
+		is.True(t, totals.LiveUnknown > 50, "unknown outcomes in processes that keep running")
+		is.True(t, totals.Outages > 200, "outages and partitions")
+		is.True(t, totals.Unavailable > 100, "operations failed by an unreachable store")
 		is.True(t, totals.Crashes > 50, "crashes")
 		is.True(t, totals.Compactions > 50, "compactions")
 		is.True(t, totals.Deleted > 50, "deleted objects")
@@ -133,18 +130,14 @@ func TestSimulator(t *testing.T) {
 				continue
 			}
 			res := sim.Run(cfg)
-			totals.Commits += res.Stats.Commits
-			totals.Conflicts += res.Stats.Conflicts
-			totals.Unknown += res.Stats.Unknown
-			totals.Crashes += res.Stats.Crashes
-			totals.Compactions += res.Stats.Compactions
-			totals.GCs += res.Stats.GCs
-			totals.Deleted += res.Stats.Deleted
+			totals.Add(res.Stats)
 		}
 		t.Logf("SQL corpus: %+v", totals)
 		is.True(t, totals.Commits > 500, "commits")
 		is.True(t, totals.Conflicts > 100, "conflicts")
 		is.True(t, totals.Unknown > 10, "unknown outcomes")
+		is.True(t, totals.LiveUnknown > 10, "unknown outcomes in processes that keep running")
+		is.True(t, totals.Unavailable > 50, "operations failed by an unreachable store")
 		is.True(t, totals.Crashes > 20, "crashes")
 		is.True(t, totals.Compactions > 20, "compactions")
 		is.True(t, totals.Deleted > 20, "deleted objects")
@@ -221,6 +214,9 @@ func TestSimulator(t *testing.T) {
 			cfg.LostAckRate = rng.Float64() * 0.3
 			cfg.CrashRate = rng.Float64() * 0.05
 			cfg.MaxLatency = time.Duration(1+rng.IntN(50)) * time.Millisecond
+			cfg.OutageRate = rng.Float64() * 0.03
+			cfg.MaxOutage = time.Duration(1+rng.IntN(3000)) * time.Millisecond
+			cfg.OutageTimeout = time.Duration(rng.IntN(200)) * time.Millisecond
 			cfg.GracePeriod = time.Duration(50+rng.IntN(3000)) * time.Millisecond
 			res := sim.Run(cfg)
 			runs++
@@ -270,12 +266,15 @@ func TestMutants(t *testing.T) {
 		{name: "GC ignoring the grace period", mutations: engine.Mutations{GCIgnoreGrace: true}, workloads: []sim.Workload{sim.ListAppend, sim.Bank}, sql: true, maintainers: 2, detectedBy: "grace period"},
 		{name: "serving the cache without a freshness check", mutations: engine.Mutations{SkipFreshnessCheck: true}, workloads: []sim.Workload{sim.ListAppend}, sql: true, detectedBy: "cycle"},
 		{name: "acking before the write is confirmed", mutations: engine.Mutations{AckBeforeConfirm: true}, workloads: []sim.Workload{sim.ListAppend}, sql: true},
-		// The SQL layer's own mutant: a fresh snapshot per statement lets an audit straddle a
-		// transfer and lets a list reader see two different states. The other SQL mutant, retrying
-		// an autocommit statement after an unknown commit outcome, is invisible here: in the
-		// simulator an unknown outcome only comes from a crash, after which the process cannot
-		// retry anything. The scripted test in the exec package shows it applies a statement twice.
+		// The SQL layer's own mutants. A fresh snapshot per statement lets an audit straddle a
+		// transfer and lets a list reader see two different states.
 		{name: "a fresh snapshot per statement", sqlMutations: exec.Mutations{FreshSnapshotPerStatement: true}, workloads: []sim.Workload{sim.ListAppend, sim.Bank}, sql: true},
+		// Retrying an autocommit statement after an unknown commit outcome needs a process that
+		// keeps running after the outcome became unknown, which outages provide. When the first
+		// attempt landed, the retry fails, on the duplicate primary key or on the outage, and the
+		// statement reports a definite failure for a write that is in the database. Only the
+		// list-append workload has autocommit writes.
+		{name: "retrying an autocommit statement after an unknown commit outcome", sqlMutations: exec.Mutations{RetryAfterUnknownCommit: true}, workloads: []sim.Workload{sim.ListAppend}, sql: true, detectedBy: "failed"},
 	}
 	for _, m := range mutants {
 		for _, w := range m.workloads {

@@ -9,6 +9,8 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/antithesishq/antithesis-sdk-go/assert"
+
 	"maragu.dev/maragudb/internal/engine"
 	"maragu.dev/maragudb/internal/sql/ast"
 	"maragu.dev/maragudb/internal/sql/parser"
@@ -256,6 +258,8 @@ func (s *Session) Execute(ctx context.Context, st *Statement, params []value.Val
 			return rows, res, nil
 		}
 		retry := errors.Is(err, engine.ErrConflict)
+		assert.Sometimes(retry, "an autocommit statement retries after a conflict", nil)
+		assert.Sometimes(errors.Is(err, engine.ErrCommitUnknown), "an autocommit statement reports an unknown commit outcome instead of retrying", nil)
 		if s.opts.Mutations.RetryAfterUnknownCommit && errors.Is(err, engine.ErrCommitUnknown) {
 			retry = true
 		}

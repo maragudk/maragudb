@@ -2,7 +2,9 @@
 //
 // It implements conditional writes faithfully, counts requests by kind, and can inject faults
 // driven by a seeded random source: errors, latency in virtual time, lost acknowledgements
-// (the write is applied but the response is an error), and client crashes at any step.
+// (the write is applied but the response is an error), client crashes at any step, and outages
+// and partitions that make the store unreachable for a stretch of virtual time while the clients
+// keep running.
 package s3fake
 
 import (
@@ -25,6 +27,9 @@ var (
 	ErrInjected = errors.New("s3fake: injected error")
 	// ErrCrashed is returned to a process that has crashed. Nothing is applied after a crash.
 	ErrCrashed = errors.New("s3fake: process crashed")
+	// ErrUnavailable is returned during an outage or a partition. A write that timed out may or
+	// may not have been applied.
+	ErrUnavailable = errors.New("s3fake: store unavailable")
 )
 
 // Clock in which latency is simulated.
@@ -91,6 +96,16 @@ type Faults struct {
 	CrashRate float64
 	// MaxLatency bounds the uniformly drawn virtual latency added before and after a request.
 	MaxLatency time.Duration
+	// OutageRate is the probability that a request starts an outage at the moment it is made,
+	// which fails that request and the ones after it for up to MaxOutage of virtual time. Two in
+	// three are partitions of the calling [Process], and the rest, as well as those started by a
+	// request without a process, make the store unreachable for everyone. See [Client.Unavailable].
+	OutageRate float64
+	// MaxOutage bounds the uniformly drawn length of an outage started by OutageRate.
+	MaxOutage time.Duration
+	// OutageTimeout is how long a request that times out during an outage takes, in virtual
+	// time. Zero makes every request in an outage fail at once.
+	OutageTimeout time.Duration
 }
 
 // Process is a simulated client process that can crash.
@@ -147,6 +162,12 @@ type Client struct {
 	randMu  sync.Mutex
 	store   *store
 	counter s3.Counter
+
+	outageMu sync.Mutex
+	// outages by process name, where the empty name is every request, with their end times.
+	outages map[string]time.Time
+	// started counts the outages started by [Faults.OutageRate].
+	started int
 	// Log receives one line per request when non-nil.
 	Log func(string)
 }
@@ -177,10 +198,78 @@ func New(opts ...Option) *Client {
 	for _, opt := range opts {
 		opt(c)
 	}
-	if c.faults.Rand == nil && (c.faults.ErrorRate > 0 || c.faults.LostAckRate > 0 || c.faults.CrashRate > 0 || c.faults.MaxLatency > 0) {
+	if c.faults.Rand == nil && (c.faults.ErrorRate > 0 || c.faults.LostAckRate > 0 || c.faults.CrashRate > 0 || c.faults.MaxLatency > 0 || c.faults.OutageTimeout > 0 || c.faults.OutageRate > 0) {
 		panic("s3fake: faults require a Rand")
 	}
 	return c
+}
+
+// Unavailable makes the store unreachable until the given time on the fake's clock: for the
+// requests of the [Process] with the given name, which is a partition, or for every request when
+// the name is empty, which is an outage. A later call for the same name replaces the end time.
+//
+// A request during an outage fails with [ErrUnavailable] and the process keeps running. Without
+// [Faults.OutageTimeout] it fails at once and is not applied, like a refused connection. With
+// it, half of the requests instead hang for the timeout first, like a client timeout, and a
+// write among those reaches the store with probability one half before its answer is lost.
+func (c *Client) Unavailable(process string, until time.Time) {
+	c.outageMu.Lock()
+	defer c.outageMu.Unlock()
+	if c.outages == nil {
+		c.outages = map[string]time.Time{}
+	}
+	c.outages[process] = until
+}
+
+// Outages started by [Faults.OutageRate] so far.
+func (c *Client) Outages() int {
+	c.outageMu.Lock()
+	defer c.outageMu.Unlock()
+	return c.started
+}
+
+// startOutage draws whether a request of p starts an outage, and starts it.
+func (c *Client) startOutage(p *Process, step string) bool {
+	f := c.faults
+	if f.Rand == nil || f.OutageRate <= 0 || f.MaxOutage <= 0 {
+		return false
+	}
+	c.randMu.Lock()
+	start := f.Rand.Float64() < f.OutageRate
+	partition := p != nil && f.Rand.IntN(3) != 0
+	d := 1 + time.Duration(f.Rand.Int64N(int64(f.MaxOutage)))
+	c.randMu.Unlock()
+	if !start {
+		return false
+	}
+	name, who := "", "everyone"
+	if partition {
+		name, who = p.Name, p.Name
+	}
+	c.Unavailable(name, c.clock.Now().Add(d))
+	c.outageMu.Lock()
+	c.started++
+	c.outageMu.Unlock()
+	c.log("%s: store unreachable for %s for %v", step, who, d)
+	return true
+}
+
+// unavailable reports whether the store is unreachable for a request of p now.
+func (c *Client) unavailable(p *Process) bool {
+	c.outageMu.Lock()
+	defer c.outageMu.Unlock()
+	if len(c.outages) == 0 {
+		return false
+	}
+	now := c.clock.Now()
+	if until, ok := c.outages[""]; ok && now.Before(until) {
+		return true
+	}
+	if p == nil {
+		return false
+	}
+	until, ok := c.outages[p.Name]
+	return ok && now.Before(until)
 }
 
 // WithoutFaults returns a client over the same objects and clock that injects no faults.
@@ -245,6 +334,9 @@ func (c *Client) request(ctx context.Context, kind s3.Kind, key string, write bo
 	if f.Rand != nil && f.MaxLatency > 0 {
 		c.clock.Sleep(ctx, c.latency())
 	}
+	if c.unavailable(p) || c.startOutage(p, step) {
+		return c.outage(ctx, step, write, apply)
+	}
 	outcome := OutcomeNormal
 	switch {
 	case f.Decide != nil:
@@ -294,6 +386,29 @@ func (c *Client) request(ctx context.Context, kind s3.Kind, key string, write bo
 		c.log("%s: ok", step)
 	}
 	return err
+}
+
+// outage fails a request during an outage or partition, as described at [Client.Unavailable].
+func (c *Client) outage(ctx context.Context, step string, write bool, apply func() error) error {
+	timeout, applied := false, false
+	if c.faults.Rand != nil && c.faults.OutageTimeout > 0 {
+		c.randMu.Lock()
+		timeout = c.faults.Rand.IntN(2) == 0
+		applied = write && timeout && c.faults.Rand.IntN(2) == 0
+		c.randMu.Unlock()
+	}
+	if !timeout {
+		c.log("%s: unavailable, refused", step)
+		return fmt.Errorf("%w: %s refused", ErrUnavailable, step)
+	}
+	c.clock.Sleep(ctx, c.faults.OutageTimeout)
+	if applied {
+		err := apply()
+		c.log("%s: unavailable, timed out after apply (%v)", step, err)
+	} else {
+		c.log("%s: unavailable, timed out", step)
+	}
+	return fmt.Errorf("%w: %s timed out", ErrUnavailable, step)
 }
 
 // latency draws a virtual latency. The random source is guarded because clients may be used
