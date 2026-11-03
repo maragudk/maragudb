@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -93,7 +94,11 @@ func (v Value) String() string {
 	case Int:
 		return strconv.FormatInt(v.I, 10)
 	case Float:
-		return FormatFloat(v.F)
+		s := FormatFloat(v.F)
+		if !strings.ContainsAny(s, ".eIN") {
+			s += ".0"
+		}
+		return s
 	case Bool:
 		if v.B {
 			return "true"
