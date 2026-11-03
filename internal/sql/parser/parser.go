@@ -265,6 +265,9 @@ func (p *parser) createTable() (ast.Statement, error) {
 		}
 		break
 	}
+	if len(s.Columns) == 0 {
+		return nil, p.errorf("table %q needs at least one column", s.Name)
+	}
 	if s.PrimaryKey == nil {
 		return nil, p.errorf("table %q needs a PRIMARY KEY", s.Name)
 	}

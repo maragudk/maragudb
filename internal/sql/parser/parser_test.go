@@ -43,7 +43,8 @@ func TestParse(t *testing.T) {
 			{"end transaction", "COMMIT"},
 			{"rollback", "ROLLBACK"},
 			{"select a from t -- comment\n where b = 1 /* block */", "SELECT a FROM t WHERE b = 1"},
-			{`select "Quoted" from t`, "SELECT Quoted FROM t"},
+			{`select "Quoted", "select", "a b", "x""y" from "key"`, `SELECT "Quoted", "select", "a b", "x""y" FROM "key"`},
+			{`select "cast"(1)`, `SELECT "cast"(1)`},
 		}
 		for _, test := range tests {
 			t.Run(test.sql, func(t *testing.T) {
@@ -163,6 +164,9 @@ func TestParse(t *testing.T) {
 			{"begin read sometimes", "syntax error at position 12: expected ONLY or WRITE, got \"sometimes\""},
 			{"select /* unterminated", "syntax error at position 8: unterminated comment"},
 			{"select \"\"", "syntax error at position 8: empty quoted identifier"},
+			{"select \"a\x00b\"", "syntax error at position 8: quoted identifier must be valid UTF-8 without NUL bytes"},
+			{"select \"\xff\"", "syntax error at position 8: quoted identifier must be valid UTF-8 without NUL bytes"},
+			{"create table t (primary key (id))", "syntax error at position 33: table \"t\" needs at least one column"},
 			{"select 'a' from select", "syntax error at position 17: expected identifier, got SELECT"},
 		}
 		for _, test := range tests {
@@ -235,7 +239,8 @@ func TestParseTime(t *testing.T) {
 	})
 }
 
-var names = []string{"a", "b", "c", "id", "name", "t1", "x_y"}
+// names include keywords, mixed case, and characters that need quoting.
+var names = []string{"a", "b", "c", "id", "name", "t1", "x_y", "select", "key", "cast", "Foo", "a b", "x\"y", "héllo", "1a", "_"}
 
 func drawName(ht hegel.TestCase) string {
 	return hegel.Draw(ht, hegel.SampledFrom(names))

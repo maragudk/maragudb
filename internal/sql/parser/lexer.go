@@ -5,6 +5,8 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	"maragu.dev/maragudb/internal/sql/ast"
 )
 
 type tokenKind int
@@ -42,18 +44,6 @@ func (t token) String() string {
 		return strings.ToUpper(t.text)
 	}
 	return fmt.Sprintf("%q", t.text)
-}
-
-// keywords that cannot be used as identifiers.
-var keywords = map[string]bool{
-	"all": true, "and": true, "as": true, "asc": true, "begin": true, "between": true, "by": true,
-	"case": true, "cast": true, "commit": true, "create": true, "default": true, "delete": true, "desc": true,
-	"distinct": true, "drop": true, "else": true, "end": true, "exists": true, "false": true, "from": true,
-	"group": true, "having": true, "if": true, "in": true, "insert": true, "into": true, "is": true, "key": true,
-	"like": true, "limit": true, "not": true, "null": true, "nulls": true, "offset": true, "on": true,
-	"only": true, "or": true, "order": true, "primary": true, "rollback": true, "select": true, "set": true,
-	"start": true, "table": true, "then": true, "transaction": true, "true": true, "union": true,
-	"unique": true, "update": true, "using": true, "values": true, "when": true, "where": true, "with": true,
 }
 
 type lexer struct {
@@ -130,7 +120,7 @@ func (l *lexer) next() (token, error) {
 			l.pos++
 		}
 		text := strings.ToLower(l.src[start:l.pos])
-		if keywords[text] {
+		if ast.Keywords[text] {
 			return token{kind: tokKeyword, text: text, pos: start}, nil
 		}
 		return token{kind: tokIdent, text: text, pos: start}, nil
@@ -201,6 +191,9 @@ func (l *lexer) quotedIdent() (token, error) {
 	}
 	if b.Len() == 0 {
 		return token{}, l.errorf(start, "empty quoted identifier")
+	}
+	if !utf8.ValidString(b.String()) || strings.IndexByte(b.String(), 0) >= 0 {
+		return token{}, l.errorf(start, "quoted identifier must be valid UTF-8 without NUL bytes")
 	}
 	return token{kind: tokIdent, text: b.String(), pos: start}, nil
 }

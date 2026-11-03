@@ -151,7 +151,11 @@ func Compare(a, b Value) int {
 	case Bytes:
 		return bytes.Compare(a.Raw, b.Raw)
 	case Time:
-		return a.T.Compare(b.T)
+		// By Unix seconds and nanoseconds, like the key encoding, which never overflows.
+		if c := cmp(a.T.Unix(), b.T.Unix()); c != 0 {
+			return c
+		}
+		return cmp(int64(a.T.Nanosecond()), int64(b.T.Nanosecond()))
 	}
 	panic(fmt.Sprintf("value: comparing %v", a.Type))
 }

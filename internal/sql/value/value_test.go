@@ -33,7 +33,7 @@ func drawValue(ht hegel.TestCase, t value.Type, nullable bool) value.Value {
 	case value.Bytes:
 		return value.NewBytes(hegel.Draw(ht, hegel.Binary(0, 6)))
 	case value.Time:
-		sec := hegel.Draw(ht, hegel.Integers[int64](-62135596800, 253402300799))
+		sec := hegel.Draw(ht, hegel.OneOf(hegel.Integers[int64](-62135596800, 253402300799), hegel.Integers[int64](math.MinInt64, math.MaxInt64)))
 		nsec := hegel.Draw(ht, hegel.Integers[int64](0, 999999999))
 		return value.NewTime(time.Unix(sec, nsec))
 	}

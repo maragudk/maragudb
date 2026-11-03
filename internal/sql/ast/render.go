@@ -66,13 +66,13 @@ func (r *renderer) stmt(s Statement) {
 		if s.IfNotExists {
 			r.b.WriteString("IF NOT EXISTS ")
 		}
-		r.b.WriteString(s.Name)
+		r.ident(s.Name)
 		r.b.WriteString(" (")
 		for i, c := range s.Columns {
 			if i > 0 {
 				r.b.WriteString(", ")
 			}
-			r.b.WriteString(c.Name)
+			r.ident(c.Name)
 			r.b.WriteByte(' ')
 			r.b.WriteString(TypeName(c.Type, r.d))
 			if c.NotNull {
@@ -80,20 +80,20 @@ func (r *renderer) stmt(s Statement) {
 			}
 		}
 		r.b.WriteString(", PRIMARY KEY (")
-		r.b.WriteString(strings.Join(s.PrimaryKey, ", "))
+		r.idents(s.PrimaryKey)
 		r.b.WriteString("))")
 	case *DropTable:
 		r.b.WriteString("DROP TABLE ")
 		if s.IfExists {
 			r.b.WriteString("IF EXISTS ")
 		}
-		r.b.WriteString(s.Name)
+		r.ident(s.Name)
 	case *Insert:
 		r.b.WriteString("INSERT INTO ")
-		r.b.WriteString(s.Table)
+		r.ident(s.Table)
 		if len(s.Columns) > 0 {
 			r.b.WriteString(" (")
-			r.b.WriteString(strings.Join(s.Columns, ", "))
+			r.idents(s.Columns)
 			r.b.WriteByte(')')
 		}
 		r.b.WriteString(" VALUES ")
@@ -107,20 +107,20 @@ func (r *renderer) stmt(s Statement) {
 		}
 	case *Update:
 		r.b.WriteString("UPDATE ")
-		r.b.WriteString(s.Table)
+		r.ident(s.Table)
 		r.b.WriteString(" SET ")
 		for i, a := range s.Set {
 			if i > 0 {
 				r.b.WriteString(", ")
 			}
-			r.b.WriteString(a.Column)
+			r.ident(a.Column)
 			r.b.WriteString(" = ")
 			r.expr(a.Value, 0)
 		}
 		r.where(s.Where)
 	case *Delete:
 		r.b.WriteString("DELETE FROM ")
-		r.b.WriteString(s.Table)
+		r.ident(s.Table)
 		r.where(s.Where)
 	case *Select:
 		r.b.WriteString("SELECT ")
@@ -135,12 +135,12 @@ func (r *renderer) stmt(s Statement) {
 			r.expr(item.Expr, 0)
 			if item.Alias != "" {
 				r.b.WriteString(" AS ")
-				r.b.WriteString(item.Alias)
+				r.ident(item.Alias)
 			}
 		}
 		if s.From != "" {
 			r.b.WriteString(" FROM ")
-			r.b.WriteString(s.From)
+			r.ident(s.From)
 		}
 		r.where(s.Where)
 		if len(s.OrderBy) > 0 {
@@ -189,6 +189,43 @@ func (r *renderer) stmt(s Statement) {
 	default:
 		panic(fmt.Sprintf("ast: rendering %T", s))
 	}
+}
+
+// ident writes an identifier, quoted unless it is a plain lowercase name that is not a keyword.
+func (r *renderer) ident(name string) {
+	if IsPlainIdentifier(name) {
+		r.b.WriteString(name)
+		return
+	}
+	r.b.WriteByte('"')
+	r.b.WriteString(strings.ReplaceAll(name, `"`, `""`))
+	r.b.WriteByte('"')
+}
+
+func (r *renderer) idents(names []string) {
+	for i, n := range names {
+		if i > 0 {
+			r.b.WriteString(", ")
+		}
+		r.ident(n)
+	}
+}
+
+// IsPlainIdentifier reports whether name can be written without quotes: lowercase ASCII letters,
+// digits, and underscores, not starting with a digit, and not a keyword.
+func IsPlainIdentifier(name string) bool {
+	if name == "" || Keywords[name] {
+		return false
+	}
+	for i, c := range name {
+		switch {
+		case c == '_', c >= 'a' && c <= 'z':
+		case c >= '0' && c <= '9' && i > 0:
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 func (r *renderer) where(e Expr) {
@@ -263,7 +300,7 @@ func (r *renderer) expr(e Expr, minimum int) {
 	case *Param:
 		fmt.Fprintf(&r.b, "$%d", e.Index)
 	case *ColumnRef:
-		r.b.WriteString(e.Name)
+		r.ident(e.Name)
 	case *Unary:
 		if e.Op == Not {
 			r.b.WriteString("NOT ")
@@ -343,7 +380,7 @@ func (r *renderer) expr(e Expr, minimum int) {
 		}
 		r.b.WriteString(" END")
 	case *Call:
-		r.b.WriteString(e.Name)
+		r.ident(e.Name)
 		r.b.WriteByte('(')
 		r.exprs(e.Args)
 		r.b.WriteByte(')')

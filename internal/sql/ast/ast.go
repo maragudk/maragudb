@@ -4,6 +4,18 @@ package ast
 
 import "maragu.dev/maragudb/internal/sql/value"
 
+// Keywords of the dialect, which cannot be unquoted identifiers.
+var Keywords = map[string]bool{
+	"all": true, "and": true, "as": true, "asc": true, "begin": true, "between": true, "by": true,
+	"case": true, "cast": true, "commit": true, "create": true, "default": true, "delete": true, "desc": true,
+	"distinct": true, "drop": true, "else": true, "end": true, "exists": true, "false": true, "from": true,
+	"group": true, "having": true, "if": true, "in": true, "insert": true, "into": true, "is": true, "key": true,
+	"like": true, "limit": true, "not": true, "null": true, "nulls": true, "offset": true, "on": true,
+	"only": true, "or": true, "order": true, "primary": true, "rollback": true, "select": true, "set": true,
+	"start": true, "table": true, "then": true, "transaction": true, "true": true, "union": true,
+	"unique": true, "update": true, "using": true, "values": true, "when": true, "where": true, "with": true,
+}
+
 // Statement is any SQL statement.
 type Statement interface {
 	stmt()
