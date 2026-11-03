@@ -5,6 +5,7 @@ package sim
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"math/rand/v2"
@@ -19,6 +20,7 @@ import (
 	"maragu.dev/maragudb/internal/history"
 	"maragu.dev/maragudb/internal/s3fake"
 	"maragu.dev/maragudb/internal/sched"
+	"maragu.dev/maragudb/internal/sql/exec"
 )
 
 // Workload kind.
@@ -37,6 +39,14 @@ func (w Workload) String() string {
 		return "bank"
 	}
 	return "list-append"
+}
+
+// Name of the configuration's workload, with its API.
+func (c Config) Name() string {
+	if c.SQL {
+		return c.Workload.String() + " through SQL"
+	}
+	return c.Workload.String()
 }
 
 // Config of a simulation run.
@@ -60,6 +70,11 @@ type Config struct {
 	GracePeriod time.Duration
 	// Mutations to break the engine with.
 	Mutations engine.Mutations
+	// SQL runs the clients through the SQL layer and the database/sql driver instead of the
+	// engine's key-value API.
+	SQL bool
+	// SQLMutations to break the SQL layer with. Only used with SQL.
+	SQLMutations exec.Mutations
 	// Trace receives one line per event when non-nil.
 	Trace func(string)
 }
@@ -109,7 +124,7 @@ func (r Result) Failed() bool {
 func (r Result) Report() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "seed %d (%v): %d tx, %d commits, %d conflicts, %d unknown, %d crashes, %d compactions, %d GCs (%d deleted), %v virtual time",
-		r.Config.Seed, r.Config.Workload, len(r.History), r.Stats.Commits, r.Stats.Conflicts, r.Stats.Unknown, r.Stats.Crashes, r.Stats.Compactions, r.Stats.GCs, r.Stats.Deleted, r.Stats.Elapsed)
+		r.Config.Seed, r.Config.Name(), len(r.History), r.Stats.Commits, r.Stats.Conflicts, r.Stats.Unknown, r.Stats.Crashes, r.Stats.Compactions, r.Stats.GCs, r.Stats.Deleted, r.Stats.Elapsed)
 	for _, a := range r.Anomalies {
 		fmt.Fprintf(&b, "\nANOMALY: %v", a)
 	}
@@ -163,7 +178,10 @@ func Run(cfg Config) Result {
 		}
 	}
 
-	if cfg.Workload == Bank {
+	switch {
+	case cfg.SQL:
+		r.seedSQL()
+	case cfg.Workload == Bank:
 		r.seedBank()
 		r.sched.Run()
 	}
@@ -180,7 +198,14 @@ func Run(cfg Config) Result {
 	r.stats.Elapsed = r.sched.Elapsed()
 
 	res := Result{Config: cfg, History: r.txs, Audits: r.audits, Stats: r.stats}
-	final, balances, err := r.readFinal()
+	var final map[string][]int64
+	var balances map[string]int64
+	var err error
+	if cfg.SQL {
+		final, balances, err = r.readFinalSQL()
+	} else {
+		final, balances, err = r.readFinal()
+	}
 	if err != nil {
 		r.anoms = append(r.anoms, fmt.Errorf("reading final state: %w", err))
 	}
@@ -207,7 +232,7 @@ func Run(cfg Config) Result {
 		}
 	}
 	res.Anomalies = r.anoms
-	if cfg.Mutations == (engine.Mutations{}) {
+	if cfg.Mutations == (engine.Mutations{}) && cfg.SQLMutations == (exec.Mutations{}) {
 		assert.Always(len(r.anoms) == 0, "the simulated history has no anomalies", map[string]any{"seed": cfg.Seed})
 	}
 	res.Digest = r.digest(res)
@@ -239,10 +264,10 @@ func (r *run) anomaly(format string, args ...any) {
 	r.anoms = append(r.anoms, err)
 }
 
-// open an engine for a process. Clients vary in caching: every third one has no cache at all,
+// engineOptions for a process. Clients vary in caching: every third one has no cache at all,
 // so that its reads go to the store and exercise the garbage collection grace period, and every
 // third one has only a disk cache.
-func (r *run) open(ctx context.Context, id int, rng *rand.Rand, disk cache.Cache) (*engine.DB, error) {
+func (r *run) engineOptions(id int, rng *rand.Rand, disk cache.Cache) engine.Options {
 	grace := r.cfg.GracePeriod
 	opts := engine.Options{
 		Client:        r.fake,
@@ -260,7 +285,12 @@ func (r *run) open(ctx context.Context, id int, rng *rand.Rand, disk cache.Cache
 	case 2:
 		opts.MemoryCacheBytes = new(int64)
 	}
-	return engine.Open(ctx, opts)
+	return opts
+}
+
+// open an engine for a process.
+func (r *run) open(ctx context.Context, id int, rng *rand.Rand, disk cache.Cache) (*engine.DB, error) {
+	return engine.Open(ctx, r.engineOptions(id, rng, disk))
 }
 
 // seedBank writes the initial balances with a fault-free client before the clients start.
@@ -357,6 +387,8 @@ type client struct {
 	disk cache.Cache
 	proc *s3fake.Process
 	db   *engine.DB
+	// sql is the database/sql handle when the run goes through SQL.
+	sql  *sql.DB
 	next int64
 }
 
@@ -365,10 +397,15 @@ func (c *client) loop(ctx context.Context) {
 		c.run.activeClients--
 	}()
 	for i := 0; i < c.run.cfg.TxPerClient; i++ {
-		if c.db == nil {
+		if c.db == nil && c.sql == nil {
 			c.proc = &s3fake.Process{Name: fmt.Sprint("client", c.id)}
 			pctx := s3fake.WithProcess(ctx, c.proc)
-			db, err := c.run.open(pctx, c.id, c.rng, c.disk)
+			var err error
+			if c.run.cfg.SQL {
+				c.sql, err = c.run.openSQL(pctx, c.run.engineOptions(c.id, c.rng, c.disk))
+			} else {
+				c.db, err = c.run.open(pctx, c.id, c.rng, c.disk)
+			}
 			if err != nil {
 				c.run.trace("client %d: open: %v", c.id, err)
 				c.afterCrash()
@@ -376,13 +413,16 @@ func (c *client) loop(ctx context.Context) {
 				i--
 				continue
 			}
-			c.db = db
 		}
 		pctx := s3fake.WithProcess(ctx, c.proc)
-		switch c.run.cfg.Workload {
-		case ListAppend:
+		switch {
+		case c.run.cfg.SQL && c.run.cfg.Workload == ListAppend:
+			c.listAppendSQL(pctx)
+		case c.run.cfg.SQL:
+			c.bankSQL(pctx)
+		case c.run.cfg.Workload == ListAppend:
 			c.listAppendTx(pctx)
-		case Bank:
+		default:
 			c.bankTx(pctx)
 		}
 		c.afterCrash()
@@ -398,6 +438,10 @@ func (c *client) afterCrash() {
 		c.run.trace("client %d: crashed at %s, restarting", c.id, step)
 		c.run.stats.Crashes++
 		c.db = nil
+		if c.sql != nil {
+			_ = c.sql.Close()
+			c.sql = nil
+		}
 		c.proc = nil
 	}
 }

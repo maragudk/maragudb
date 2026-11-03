@@ -213,7 +213,7 @@ func (c *Conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, e
 	if err := c.session.Begin(ctx, opts.ReadOnly); err != nil {
 		return nil, err
 	}
-	return &Tx{conn: c}, nil
+	return &Tx{conn: c, ctx: ctx}, nil
 }
 
 // ExecContext runs a statement without preparing it separately.
@@ -378,15 +378,17 @@ func named(args []driver.Value) []driver.NamedValue {
 	return out
 }
 
-// Tx is an open transaction.
+// Tx is an open transaction. Its commit runs in the context the transaction began with, because
+// [driver.Tx] has no context of its own.
 type Tx struct {
 	conn *Conn
+	ctx  context.Context
 }
 
 // Commit the transaction. It returns [engine.ErrConflict] when the transaction lost to a
 // concurrent commit.
 func (t *Tx) Commit() error {
-	return t.conn.session.Commit(context.Background())
+	return t.conn.session.Commit(t.ctx)
 }
 
 // Rollback the transaction.

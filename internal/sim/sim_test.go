@@ -15,6 +15,7 @@ import (
 	"maragu.dev/maragudb/internal/engine"
 	"maragu.dev/maragudb/internal/history"
 	"maragu.dev/maragudb/internal/sim"
+	"maragu.dev/maragudb/internal/sql/exec"
 )
 
 // corpus of fixed seeds and configurations run in `make test`.
@@ -49,13 +50,34 @@ func corpus() []sim.Config {
 		cfg.Maintainers = 2
 		cfgs = append(cfgs, cfg)
 	}
+	// The same through the SQL layer and the database/sql driver.
+	for seed := uint64(300); seed < 330; seed++ {
+		for _, w := range []sim.Workload{sim.ListAppend, sim.Bank} {
+			cfg := sim.DefaultConfig(seed)
+			cfg.Workload = w
+			cfg.SQL = true
+			if seed%3 == 0 {
+				cfg.Clients = 10
+				cfg.ErrorRate = 0.15
+				cfg.LostAckRate = 0.15
+				cfg.CrashRate = 0.03
+				cfg.Maintainers = 2
+				cfg.GracePeriod = 500 * time.Millisecond
+			}
+			cfgs = append(cfgs, cfg)
+		}
+	}
 	return cfgs
 }
 
 func failReport(t *testing.T, res sim.Result) {
 	t.Helper()
-	t.Errorf("%s\n\nreplay with:\n  make replay SEED=%d WORKLOAD=%v\nor:\n  MARAGUDB_SEED=%d MARAGUDB_WORKLOAD=%v go test ./internal/sim -run TestSimulator/replay -v",
-		res.Report(), res.Config.Seed, res.Config.Workload, res.Config.Seed, res.Config.Workload)
+	api := ""
+	if res.Config.SQL {
+		api = " API=sql"
+	}
+	t.Errorf("%s\n\nreplay with:\n  make replay SEED=%d WORKLOAD=%v%s\nor:\n  MARAGUDB_SEED=%d MARAGUDB_WORKLOAD=%v MARAGUDB_API=%s go test ./internal/sim -run TestSimulator/replay -v",
+		res.Report(), res.Config.Seed, res.Config.Workload, api, res.Config.Seed, res.Config.Workload, strings.TrimPrefix(api, " API="))
 }
 
 func TestSimulator(t *testing.T) {
@@ -86,19 +108,46 @@ func TestSimulator(t *testing.T) {
 	})
 
 	t.Run("the same seed produces the same history", func(t *testing.T) {
-		for _, w := range []sim.Workload{sim.ListAppend, sim.Bank} {
-			cfg := sim.DefaultConfig(7)
-			cfg.Workload = w
-			cfg.Maintainers = 2
-			first := sim.Run(cfg)
-			for range 3 {
-				again := sim.Run(cfg)
-				if first.Digest != again.Digest {
-					t.Fatalf("%v: digests differ:\n%s", w, diff(first.Digest, again.Digest))
+		for _, useSQL := range []bool{false, true} {
+			for _, w := range []sim.Workload{sim.ListAppend, sim.Bank} {
+				cfg := sim.DefaultConfig(7)
+				cfg.Workload = w
+				cfg.SQL = useSQL
+				cfg.Maintainers = 2
+				first := sim.Run(cfg)
+				for range 3 {
+					again := sim.Run(cfg)
+					if first.Digest != again.Digest {
+						t.Fatalf("%v: digests differ:\n%s", cfg.Name(), diff(first.Digest, again.Digest))
+					}
 				}
+				is.True(t, len(first.History) > 0)
 			}
-			is.True(t, len(first.History) > 0)
 		}
+	})
+
+	t.Run("the SQL workloads exercise the same paths as the engine workloads", func(t *testing.T) {
+		var totals sim.Stats
+		for _, cfg := range corpus() {
+			if !cfg.SQL {
+				continue
+			}
+			res := sim.Run(cfg)
+			totals.Commits += res.Stats.Commits
+			totals.Conflicts += res.Stats.Conflicts
+			totals.Unknown += res.Stats.Unknown
+			totals.Crashes += res.Stats.Crashes
+			totals.Compactions += res.Stats.Compactions
+			totals.GCs += res.Stats.GCs
+			totals.Deleted += res.Stats.Deleted
+		}
+		t.Logf("SQL corpus: %+v", totals)
+		is.True(t, totals.Commits > 500, "commits")
+		is.True(t, totals.Conflicts > 100, "conflicts")
+		is.True(t, totals.Unknown > 10, "unknown outcomes")
+		is.True(t, totals.Crashes > 20, "crashes")
+		is.True(t, totals.Compactions > 20, "compactions")
+		is.True(t, totals.Deleted > 20, "deleted objects")
 	})
 
 	t.Run("different seeds produce different histories", func(t *testing.T) {
@@ -118,6 +167,7 @@ func TestSimulator(t *testing.T) {
 		if os.Getenv("MARAGUDB_WORKLOAD") == "bank" {
 			cfg.Workload = sim.Bank
 		}
+		cfg.SQL = os.Getenv("MARAGUDB_API") == "sql"
 		cfg.Maintainers = 2
 		switch os.Getenv("MARAGUDB_MUTATION") {
 		case "cas":
@@ -128,6 +178,12 @@ func TestSimulator(t *testing.T) {
 			cfg.Mutations.SkipFreshnessCheck = true
 		case "ack":
 			cfg.Mutations.AckBeforeConfirm = true
+		case "retry-unknown":
+			cfg.SQL = true
+			cfg.SQLMutations.RetryAfterUnknownCommit = true
+		case "fresh-snapshot":
+			cfg.SQL = true
+			cfg.SQLMutations.FreshSnapshotPerStatement = true
 		}
 		cfg.Trace = func(line string) {
 			t.Log(line)
@@ -156,6 +212,7 @@ func TestSimulator(t *testing.T) {
 			seed := rng.Uint64()
 			cfg := sim.DefaultConfig(seed)
 			cfg.Workload = sim.Workload(rng.IntN(2))
+			cfg.SQL = rng.IntN(2) == 0
 			cfg.Clients = 2 + rng.IntN(12)
 			cfg.TxPerClient = 10 + rng.IntN(60)
 			cfg.Keys = 1 + rng.IntN(6)
@@ -190,9 +247,12 @@ func diff(a, b string) string {
 
 func TestMutants(t *testing.T) {
 	mutants := []struct {
-		name      string
-		mutations engine.Mutations
-		workloads []sim.Workload
+		name         string
+		mutations    engine.Mutations
+		sqlMutations exec.Mutations
+		workloads    []sim.Workload
+		// sql runs the workloads through the SQL layer.
+		sql bool
 		// maintainers to run; the history checkers alone must catch the mutants that run without.
 		maintainers int
 		// detectedBy is a substring of the anomaly that must be among those found.
@@ -205,16 +265,33 @@ func TestMutants(t *testing.T) {
 		{name: "GC ignoring the grace period", mutations: engine.Mutations{GCIgnoreGrace: true}, workloads: []sim.Workload{sim.ListAppend, sim.Bank}, maintainers: 2, detectedBy: "grace period"},
 		{name: "serving the cache without a freshness check", mutations: engine.Mutations{SkipFreshnessCheck: true}, workloads: []sim.Workload{sim.ListAppend}, detectedBy: "cycle"},
 		{name: "acking before the write is confirmed", mutations: engine.Mutations{AckBeforeConfirm: true}, workloads: []sim.Workload{sim.ListAppend}},
+		// The engine mutants are also visible through SQL.
+		{name: "commit without CAS", mutations: engine.Mutations{CommitWithoutCAS: true}, workloads: []sim.Workload{sim.ListAppend}, sql: true},
+		{name: "GC ignoring the grace period", mutations: engine.Mutations{GCIgnoreGrace: true}, workloads: []sim.Workload{sim.ListAppend, sim.Bank}, sql: true, maintainers: 2, detectedBy: "grace period"},
+		{name: "serving the cache without a freshness check", mutations: engine.Mutations{SkipFreshnessCheck: true}, workloads: []sim.Workload{sim.ListAppend}, sql: true, detectedBy: "cycle"},
+		{name: "acking before the write is confirmed", mutations: engine.Mutations{AckBeforeConfirm: true}, workloads: []sim.Workload{sim.ListAppend}, sql: true},
+		// The SQL layer's own mutant: a fresh snapshot per statement lets an audit straddle a
+		// transfer and lets a list reader see two different states. The other SQL mutant, retrying
+		// an autocommit statement after an unknown commit outcome, is invisible here: in the
+		// simulator an unknown outcome only comes from a crash, after which the process cannot
+		// retry anything. The scripted test in the exec package shows it applies a statement twice.
+		{name: "a fresh snapshot per statement", sqlMutations: exec.Mutations{FreshSnapshotPerStatement: true}, workloads: []sim.Workload{sim.ListAppend, sim.Bank}, sql: true},
 	}
 	for _, m := range mutants {
 		for _, w := range m.workloads {
-			t.Run(fmt.Sprintf("%s is detected by the %v workload with %d maintainers", m.name, w, m.maintainers), func(t *testing.T) {
+			api := "engine"
+			if m.sql {
+				api = "SQL"
+			}
+			t.Run(fmt.Sprintf("%s is detected by the %v workload through %s with %d maintainers", m.name, w, api, m.maintainers), func(t *testing.T) {
 				start := time.Now()
 				const maxSeeds = 20
 				for seed := uint64(1); seed <= maxSeeds; seed++ {
 					cfg := sim.DefaultConfig(seed)
 					cfg.Workload = w
+					cfg.SQL = m.sql
 					cfg.Mutations = m.mutations
+					cfg.SQLMutations = m.sqlMutations
 					cfg.Maintainers = m.maintainers
 					res := sim.Run(cfg)
 					if !res.Failed() {
