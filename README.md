@@ -68,6 +68,21 @@ The SQL surface is `CREATE TABLE` and `DROP TABLE`; `INSERT`, `UPDATE`, and `DEL
 
 `maragudb.Options` has a `Logger` for debug and warning messages, `MemoryCacheBytes` for the in-memory block cache (default 64 MiB), `DiskCacheDir` for a disk cache that never evicts, and `GCGracePeriod` (default one hour). The grace period is the longest a transaction may live, and it is measured on the clocks of the processes that run transactions and garbage collection, so the clock skew between processes must be much smaller than it.
 
+To use another object store, or an S3 client configured in code, set `Options.Store` to any value with these four methods. The store then serves every DSN in place of the default AWS SDK client; the DSN's bucket is ignored, and its prefix still applies.
+
+```go
+type myStore struct{ /* ... */ }
+
+func (s *myStore) Get(ctx context.Context, key string, opts maragudb.GetOptions) ([]byte, string, error)
+func (s *myStore) Put(ctx context.Context, key string, body []byte, opts maragudb.PutOptions) (string, error)
+func (s *myStore) Delete(ctx context.Context, key string) error
+func (s *myStore) List(ctx context.Context, prefix string) ([]string, error)
+
+maragudb.RegisterDriver(maragudb.Options{Store: &myStore{}})
+```
+
+The store must support conditional writes (`PutOptions.IfNoneMatch` for `If-None-Match: *`, and `PutOptions.IfMatch`), conditional reads (`GetOptions.IfNoneMatch`), and byte ranges (`GetOptions.Offset` and `Length`, where a `Length` of zero reads the whole object), and it must return `maragudb.ErrObjectNotFound`, `maragudb.ErrPreconditionFailed`, and `maragudb.ErrNotModified`, possibly wrapped, for those outcomes. Any other error means the request failed, and a failed write may or may not have been applied. The ETag that `Put` returns must equal the one a later `Get` of that version returns, and a read with `GetOptions.Consistent` must see every write that completed before it started. The godoc of `Options.Store` has the whole contract, and the `ExampleOptions` example is a complete store in memory.
+
 There is no background maintenance; the application runs it, for example from a periodic job. `maragudb.Stats` returns request counts by kind, cache hits and misses, and the number of segments and garbage objects. `maragudb.Compact` merges every segment into one, so call it when the segment count grows. `maragudb.GC` deletes the objects that no transaction within the grace period can reference, so call it after compaction and whenever garbage accumulates. Both return `maragudb.ErrConflict` when a commit happens meanwhile, and can then be retried.
 
 ## Development
@@ -77,6 +92,8 @@ There is no background maintenance; the application runs it, for example from a 
 The Postgres harness needs Docker locally. It starts a `postgres:18` container named `maragudb-pgdiff` on an ephemeral port and leaves it running for later runs. Set `MARAGUDB_PGDIFF_URL` to a Postgres superuser URL to use another server instead. The harness fails rather than skips when neither is available.
 
 The Tigris suite reads `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT_URL_S3`, `AWS_REGION`, and `BUCKET` from the environment or from a gitignored `.env` file at the repository root. It fails when any but `AWS_REGION`, which defaults to `auto`, is missing.
+
+The Antithesis harness is in `antithesis`: a Dockerfile, `config/docker-compose.yaml`, the test template in `test/maragudb`, the workload command in `workload`, and notes in `scratchbook`. It runs two containers: versitygw v1.10.0 as the S3-compatible store, and the workload image, cross-compiled to linux/amd64 with cgo and instrumented with `antithesis-go-toolexec`. The test commands `parallel_driver_s3_bank_engine`, `parallel_driver_s3_bank_sql`, `parallel_driver_s3_list_append_engine`, and `parallel_driver_s3_list_append_sql` run the workloads against versitygw over the network, and `parallel_driver_sim` runs simulator seeds against the in-process fake. `make antithesis-build` builds the images. `make antithesis` brings the harness up locally with docker compose, runs every test command once, and tears it down. `make antithesis-validate` runs `snouty validate antithesis/config`, which needs snouty, the Antithesis CLI, on `PATH`. Running the harness locally needs no Antithesis account; launching a run does.
 
 Made with ✨sparkles✨ by [maragu](https://www.maragu.dev/): independent software consulting for cloud-native Go apps & AI engineering.
 
