@@ -772,6 +772,13 @@ func (b *binder) caseExpr(e *ast.Case) (*cexpr, error) {
 			elseExpr = unified[elseExpr]
 		}
 	}
+	if len(whens) == 0 {
+		// Every WHEN is known not to match, so the CASE is its ELSE, or a NULL constant.
+		if elseExpr != nil {
+			return elseExpr, nil
+		}
+		return constant(value.NewNull(t)), nil
+	}
 	return b.fold(&cexpr{typ: t, eval: func(row []value.Value) (value.Value, error) {
 		for _, w := range whens {
 			c, err := w.cond.value(row)

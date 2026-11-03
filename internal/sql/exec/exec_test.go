@@ -378,6 +378,8 @@ func TestSession_Select(t *testing.T) {
 		is.Equal(t, "NULL", query(t, s, "SELECT CAST(id AS string) LIKE NULL FROM e"))
 		is.Equal(t, "1", query(t, s, "SELECT CASE NULL WHEN id THEN -id ELSE 1 END FROM e"))
 		is.Equal(t, "1", query(t, s, "SELECT CASE id WHEN NULL THEN -id ELSE 1 END FROM e"))
+		is.Equal(t, "NULL", query(t, s, "SELECT CASE id WHEN NULL THEN id END = -id FROM e"), "a CASE with no live WHEN and no ELSE is a NULL constant")
+		is.Equal(t, "NULL", query(t, s, "SELECT CASE WHEN FALSE THEN id END + -id FROM e"))
 		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT NULL + 1 / 0 FROM e"), "but a constant operand is still folded first")
 		is.Equal(t, "NULL", query(t, s, "SELECT NULL BETWEEN NULL AND -id FROM e"), "a known NULL value folds BETWEEN")
 		is.Equal(t, "NULL", query(t, s, "SELECT NULL BETWEEN -id AND 1 FROM e"))
