@@ -335,9 +335,13 @@ func TestSession_Select(t *testing.T) {
 			{"SELECT 1 OFFSET 'a'", exec.ErrType},
 			{"SELECT 1 ORDER BY 2", exec.ErrInvalid},
 			{"SELECT 1 ORDER BY 0", exec.ErrInvalid},
-			{"SELECT 1 ORDER BY FALSE", exec.ErrInvalid},
-			{"SELECT 1 ORDER BY 'a'", exec.ErrInvalid},
-			{"SELECT 1 ORDER BY NULL", exec.ErrInvalid},
+			{"SELECT 1 ORDER BY FALSE", exec.ErrSyntax},
+			{"SELECT 1 ORDER BY 'a'", exec.ErrSyntax},
+			{"SELECT 1 ORDER BY NULL", exec.ErrSyntax},
+			{"SELECT 1 ORDER BY 2147483647", exec.ErrInvalid},
+			{"SELECT 1 ORDER BY -2147483647", exec.ErrInvalid},
+			{"SELECT 1 ORDER BY 2147483648", exec.ErrSyntax},
+			{"SELECT 1 ORDER BY -2147483648", exec.ErrSyntax},
 			{"SELECT 1 AS a, 2 AS a ORDER BY a", exec.ErrInvalid},
 		}
 		for _, test := range tests {
@@ -360,6 +364,7 @@ func TestSession_Select(t *testing.T) {
 		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT coalesce(id, 1 / 0) FROM e"))
 		is.Equal(t, "", query(t, s, "SELECT * FROM e WHERE FALSE AND 1 / 0 = 1"))
 		is.Equal(t, "", query(t, s, "SELECT * FROM e WHERE FALSE AND id = 1 / 0"), "the planner does not bind pruned key comparisons")
+		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT * FROM e WHERE NULL AND 1 / 0 = 1"), "but folding goes on after it")
 		is.Equal(t, int64(0), mustExec(t, s, "DELETE FROM e WHERE FALSE AND id = 1 / 0").RowsAffected)
 		is.Equal(t, "", query(t, s, "SELECT 1 WHERE FALSE AND 1 IN (1 / 0)"), "a pruned IN element never compares")
 		is.Equal(t, "true", query(t, s, "SELECT TRUE OR 1 IN (1 / 0)"))
@@ -373,6 +378,19 @@ func TestSession_Select(t *testing.T) {
 		is.Equal(t, "1", query(t, s, "SELECT coalesce(1, 1 / 0)"))
 		is.Equal(t, "true", query(t, s, "SELECT TRUE OR 1 / 0 = 1"))
 		mustExec(t, s, "INSERT INTO e VALUES (-9223372036854775808, TRUE)")
+		is.Error(t, exec.ErrOutOfRange, queryErr(t, s, "SELECT * FROM e WHERE -id > 0"))
+		is.Equal(t, int64(0), mustExec(t, s, "UPDATE e SET b = NULL WHERE -id > 0 AND NULL").RowsAffected, "a NULL conjunct reads no rows")
+		is.Equal(t, "", query(t, s, "SELECT * FROM e WHERE NULL AND -id > 0"))
+		is.Equal(t, "true", query(t, s, "SELECT -id > 0 OR TRUE FROM e"), "a deciding constant on the right drops the left side")
+		is.Equal(t, "false", query(t, s, "SELECT -id > 0 AND FALSE FROM e"))
+		is.Equal(t, "true", query(t, s, "SELECT (-id > 0 OR -id < 0) OR (NULL OR TRUE) FROM e"))
+		is.Error(t, exec.ErrOutOfRange, queryErr(t, s, "SELECT -id > 0 OR FALSE FROM e"))
+		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT 1 / 0 = 1 OR TRUE"), "but the left side is still folded")
+		is.Equal(t, "NULL", query(t, s, "SELECT -id IN (NULL) FROM e"), "a single NULL element is a comparison with NULL")
+		is.Equal(t, "NULL", query(t, s, "SELECT -id NOT IN (NULL) FROM e"))
+		is.Error(t, exec.ErrOutOfRange, queryErr(t, s, "SELECT -id IN (NULL, NULL) FROM e"), "two are an array")
+		is.Error(t, exec.ErrOutOfRange, queryErr(t, s, "SELECT -id IN (NULL, id) FROM e"))
+		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT 1 / 0 IN (NULL)"))
 		is.Equal(t, "NULL", query(t, s, "SELECT NULL + -id FROM e"), "a strict operator with a known NULL does not evaluate the other side")
 		is.Equal(t, "NULL", query(t, s, "SELECT -id * CAST(NULL AS int) FROM e"))
 		is.Equal(t, "NULL", query(t, s, "SELECT CAST(id AS string) LIKE NULL FROM e"))
@@ -393,7 +411,12 @@ func TestSession_Select(t *testing.T) {
 		is.Equal(t, "false", query(t, s, "SELECT id NOT IN (id, -id) FROM e"), "IN stops at the first matching column element")
 		is.Equal(t, "true", query(t, s, "SELECT id IN (1, id, -id) FROM e"))
 		is.Error(t, exec.ErrOutOfRange, queryErr(t, s, "SELECT id IN (1, -id, id) FROM e"))
-		is.Error(t, exec.ErrOutOfRange, queryErr(t, s, "SELECT NULL IN (id, -id) FROM e"), "a NULL left side still evaluates every element")
+		is.Equal(t, "NULL", query(t, s, "SELECT NULL IN (id, -id) FROM e"), "a NULL left side makes every comparison NULL without evaluating the elements")
+		is.Equal(t, "NULL", query(t, s, "SELECT NULL IN (id, -id, 1, 2) FROM e"), "also with an array")
+		is.Equal(t, "NULL", query(t, s, "SELECT NULL NOT IN (1, 2, -id) FROM e"))
+		is.Equal(t, "false", query(t, s, "SELECT 1 IN (1.5, id) FROM e"), "each comparison adapts its own literal")
+		is.Equal(t, "", query(t, s, "SELECT id FROM e WHERE id NOT IN (NULL, NULL, -id)"), "the array of constants is a conjunct of its own")
+		is.Error(t, exec.ErrOutOfRange, queryErr(t, s, "SELECT id NOT IN (NULL, NULL, -id) FROM e"), "but NULL does not stop AND inside an expression")
 		is.Equal(t, "NULL", query(t, s, "SELECT TRUE AND coalesce(CASE WHEN FALSE THEN FALSE END)"), "a pruned branch still types the CASE")
 		is.Equal(t, "false", query(t, s, "SELECT 0 BETWEEN 1 AND 1 / 0"))
 		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT 2 BETWEEN 1 AND 1 / 0"))
@@ -401,6 +424,44 @@ func TestSession_Select(t *testing.T) {
 		is.Equal(t, "false", query(t, s, "SELECT 'a' LIKE 'a\\'"), "the trailing escape is only an error when matching reaches it")
 		is.Equal(t, "false", query(t, s, "SELECT '' LIKE '\\'"))
 		is.Equal(t, "false", query(t, s, "SELECT '' LIKE '%\\'"))
+	})
+
+	t.Run("reports a mistake anywhere in the statement before a folding error, and folding errors in Postgres's order", func(t *testing.T) {
+		s := newSession(t)
+		mustExec(t, s, "CREATE TABLE e (id int PRIMARY KEY, j int)")
+		mustExec(t, s, "INSERT INTO e VALUES (1, 1)")
+		tests := []struct {
+			sql  string
+			want error
+		}{
+			// Checking the whole statement comes first.
+			{"SELECT 1 WHERE 1 / 0 = 1 ORDER BY 'a'", exec.ErrSyntax},
+			{"SELECT 1 / 0 ORDER BY 2", exec.ErrInvalid},
+			{"SELECT 1 / 0 FROM e WHERE nope = 1", exec.ErrInvalid},
+			{"SELECT 1 / 0 FROM e WHERE j = 'a'", exec.ErrType},
+			{"SELECT 1 / 0 LIMIT TRUE", exec.ErrType},
+			{"SELECT id FROM e LIMIT 1 / 0 OFFSET id", exec.ErrInvalid},
+			{"DELETE FROM e WHERE 1 / 0 = 1 AND j = 'a'", exec.ErrType},
+			{"UPDATE e SET j = 1 / 0 WHERE j = 'a'", exec.ErrType},
+			{"INSERT INTO e VALUES (3, 1 / 0), (4, 'a')", exec.ErrType},
+			// Then folding: output expressions, ORDER BY among them, then WHERE, OFFSET, and LIMIT.
+			{"SELECT 1 / 0 WHERE 9223372036854775807 + 1 = 1", exec.ErrDivisionByZero},
+			{"SELECT 9223372036854775807 + 1, 1 / 0", exec.ErrOutOfRange},
+			{"SELECT 1 WHERE 1 / 0 = 1 ORDER BY 9223372036854775807 + 1", exec.ErrOutOfRange},
+			{"SELECT 1 WHERE 9223372036854775807 + 1 = 1 AND 1 / 0 = 1", exec.ErrOutOfRange},
+			{"SELECT 1 LIMIT 1 / 0 OFFSET 9223372036854775807 + 1", exec.ErrOutOfRange},
+			{"UPDATE e SET j = 1 / 0 WHERE 9223372036854775807 + 1 = 1", exec.ErrDivisionByZero},
+			{"SELECT 1 / 0 + 1.5", exec.ErrDivisionByZero},
+			// Then running: a negative LIMIT, and constraints, only once every value is known.
+			{"SELECT 1 LIMIT -1 OFFSET 1 / 0", exec.ErrDivisionByZero},
+			{"INSERT INTO e VALUES (1, 1), (2, 1 / 0)", exec.ErrDivisionByZero},
+		}
+		for _, test := range tests {
+			t.Run(test.sql, func(t *testing.T) {
+				is.Error(t, test.want, queryErr(t, s, test.sql))
+			})
+		}
+		is.Equal(t, "1 1", query(t, s, "SELECT * FROM e"), "nothing was written")
 	})
 
 	t.Run("filters, orders, limits, and offsets", func(t *testing.T) {

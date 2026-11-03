@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -105,15 +106,14 @@ func (s *Session) insert(ctx context.Context, st *ast.Insert, params []value.Val
 			cols = append(cols, i)
 		}
 	}
+	// Every row is checked and evaluated before any is written, as in Postgres.
 	b := &binder{params: params}
+	var bound [][]*cexpr
 	for _, exprRow := range st.Rows {
 		if len(exprRow) != len(cols) {
 			return Result{}, fmt.Errorf("%w: INSERT has %d expressions but %d target columns", ErrInvalid, len(exprRow), len(cols))
 		}
-		row := make([]value.Value, len(t.Columns))
-		for i, c := range t.Columns {
-			row[i] = value.NewNull(c.Type)
-		}
+		var es []*cexpr
 		for i, e := range exprRow {
 			c, err := b.bind(e)
 			if err != nil {
@@ -122,10 +122,28 @@ func (s *Session) insert(ctx context.Context, st *ast.Insert, params []value.Val
 			if c, err = assignable(c, t, cols[i]); err != nil {
 				return Result{}, err
 			}
+			es = append(es, c)
+		}
+		bound = append(bound, es)
+	}
+	if err := b.folding(); err != nil {
+		return Result{}, err
+	}
+	rows := make([][]value.Value, len(bound))
+	for r, es := range bound {
+		row := make([]value.Value, len(t.Columns))
+		for i, c := range t.Columns {
+			row[i] = value.NewNull(c.Type)
+		}
+		for i, c := range es {
+			var err error
 			if row[cols[i]], err = c.value(nil); err != nil {
 				return Result{}, err
 			}
 		}
+		rows[r] = row
+	}
+	for _, row := range rows {
 		if err := s.writeRow(ctx, t, nil, row); err != nil {
 			return Result{}, err
 		}
@@ -181,6 +199,7 @@ func (b *binder) where(e ast.Expr) (filter, error) {
 	}
 	var f filter
 	pruned := false
+	var null *cexpr
 	for _, c := range conjuncts(e) {
 		var ce *cexpr
 		var err error
@@ -208,7 +227,17 @@ func (b *binder) where(e ast.Expr) (filter, error) {
 			f.conds = []*cexpr{ce}
 			continue
 		}
+		if ce.folded && null == nil {
+			null = ce
+		}
 		f.conds = append(f.conds, ce)
+	}
+	if null != nil && !f.never {
+		// A known NULL conjunct decides the clause too, because Postgres evaluates a conjunct
+		// without columns once before it reads any row. Unlike FALSE, it does not stop the
+		// folding of the conjuncts after it.
+		f.never = true
+		f.conds = []*cexpr{null}
 	}
 	return f, nil
 }
@@ -291,8 +320,13 @@ func (s *Session) update(ctx context.Context, st *ast.Update, params []value.Val
 		}
 		sets = append(sets, assignment{i, e})
 	}
+	b.phase = phaseWhere
 	f, err := b.where(st.Where)
 	if err != nil {
+		return Result{}, err
+	}
+	// The planner needs the folded constants.
+	if err := b.folding(); err != nil {
 		return Result{}, err
 	}
 	a, err := b.plan(t, st.Where, f)
@@ -354,9 +388,13 @@ func (s *Session) delete(ctx context.Context, st *ast.Delete, params []value.Val
 	if err != nil {
 		return Result{}, err
 	}
-	b := &binder{table: t, params: params}
+	b := &binder{table: t, params: params, phase: phaseWhere}
 	f, err := b.where(st.Where)
 	if err != nil {
+		return Result{}, err
+	}
+	// The planner needs the folded constants.
+	if err := b.folding(); err != nil {
 		return Result{}, err
 	}
 	a, err := b.plan(t, st.Where, f)
@@ -430,17 +468,15 @@ func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value
 		columns = append(columns, col)
 	}
 
+	b.phase = phaseWhere
 	f, err := b.where(st.Where)
 	if err != nil {
 		return nil, err
 	}
-	var a access
-	if t != nil {
-		if a, err = b.plan(t, st.Where, f); err != nil {
-			return nil, err
-		}
-	}
 
+	// ORDER BY is checked after WHERE, but its expressions are output expressions, which
+	// Postgres folds before WHERE.
+	b.phase = phaseOutput
 	var order []orderKey
 	for _, o := range st.OrderBy {
 		k := orderKey{output: -1, desc: o.Desc}
@@ -455,10 +491,12 @@ func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value
 		switch e := o.Expr.(type) {
 		case *ast.Literal:
 			// An int constant is an output position. Other untyped constants are an error, as in
-			// Postgres, while bytes and time literals are typed and sort as constants.
+			// Postgres, while bytes and time literals are typed and sort as constants. Postgres
+			// only takes a literal in its 32-bit integer range as a position.
 			switch {
-			case e.Value.Null, e.Value.Type == value.Float, e.Value.Type == value.String, e.Value.Type == value.Bool:
-				return nil, fmt.Errorf("%w: non-integer constant in ORDER BY", ErrInvalid)
+			case e.Value.Null, e.Value.Type == value.Float, e.Value.Type == value.String, e.Value.Type == value.Bool,
+				e.Value.Type == value.Int && (e.Value.I < -math.MaxInt32 || e.Value.I > math.MaxInt32):
+				return nil, fmt.Errorf("%w: non-integer constant in ORDER BY", ErrSyntax)
 			case e.Value.Type == value.Int:
 				if e.Value.I < 1 || e.Value.I > int64(len(columns)) {
 					return nil, fmt.Errorf("%w: ORDER BY position %d is not in the select list", ErrInvalid, e.Value.I)
@@ -489,11 +527,32 @@ func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value
 		order = append(order, k)
 	}
 
-	limit, err := s.limit(st.Limit, params, "LIMIT")
+	// OFFSET is checked and folded before LIMIT, as in Postgres.
+	b.phase = phaseOffset
+	offsetExpr, err := b.limit(st.Offset, "OFFSET")
 	if err != nil {
 		return nil, err
 	}
-	offset, err := s.limit(st.Offset, params, "OFFSET")
+	b.phase = phaseLimit
+	limitExpr, err := b.limit(st.Limit, "LIMIT")
+	if err != nil {
+		return nil, err
+	}
+	if err := b.folding(); err != nil {
+		return nil, err
+	}
+	// The planner needs the folded constants.
+	var a access
+	if t != nil {
+		if a, err = b.plan(t, st.Where, f); err != nil {
+			return nil, err
+		}
+	}
+	offset, err := limitValue(offsetExpr, "OFFSET")
+	if err != nil {
+		return nil, err
+	}
+	limit, err := limitValue(limitExpr, "LIMIT")
 	if err != nil {
 		return nil, err
 	}
@@ -575,20 +634,29 @@ func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value
 	return &Rows{Columns: columns, Rows: out}, nil
 }
 
-// limit evaluates a LIMIT or OFFSET expression. It returns -1 when absent or NULL.
-func (s *Session) limit(e ast.Expr, params []value.Value, what string) (int64, error) {
+// limit binds a LIMIT or OFFSET expression, which must be an int that reads no columns. It
+// returns nil when e is.
+func (b *binder) limit(e ast.Expr, what string) (*cexpr, error) {
 	if e == nil {
-		return -1, nil
+		return nil, nil
 	}
-	b := &binder{params: params}
 	c, err := b.bind(e)
 	if err != nil {
-		return 0, err
+		return nil, err
+	}
+	if c.refs {
+		return nil, fmt.Errorf("%w: argument of %s must not read columns", ErrInvalid, what)
 	}
 	if c.typ != value.Int && c.typ != value.Unknown {
-		return 0, fmt.Errorf("%w: argument of %s must be int, not %v", ErrType, what, c.typ)
+		return nil, fmt.Errorf("%w: argument of %s must be int, not %v", ErrType, what, c.typ)
 	}
-	if c.val.Null {
+	return c, nil
+}
+
+// limitValue of a bound LIMIT or OFFSET expression whose folding succeeded. It returns -1 when
+// the expression is absent or NULL.
+func limitValue(c *cexpr, what string) (int64, error) {
+	if c == nil || c.val.Null {
 		return -1, nil
 	}
 	if c.val.I < 0 {

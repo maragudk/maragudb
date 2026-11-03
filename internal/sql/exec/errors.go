@@ -12,7 +12,7 @@ var (
 	ErrSyntax = parser.ErrSyntax
 	// ErrInvalid is a statement that cannot run: an unknown column or function, wrong arity, a
 	// missing parameter, and the like.
-	ErrInvalid = errors.New("invalid statement")
+	ErrInvalid = parser.ErrInvalid
 	// ErrType is a type mismatch. There is no implicit coercion.
 	ErrType = errors.New("type mismatch")
 	// ErrNoTable is a reference to a table that does not exist.

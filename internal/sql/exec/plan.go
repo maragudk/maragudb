@@ -85,14 +85,11 @@ func (b *binder) plan(t *table, where ast.Expr, f filter) (access, error) {
 }
 
 func conjuncts(e ast.Expr) []ast.Expr {
+	if d, ok := desugar(e); ok {
+		e = d
+	}
 	if b, ok := e.(*ast.Binary); ok && b.Op == ast.And {
 		return append(conjuncts(b.Left), conjuncts(b.Right)...)
-	}
-	if bt, ok := e.(*ast.Between); ok && !bt.Not {
-		return []ast.Expr{
-			&ast.Binary{Op: ast.Ge, Left: bt.Expr, Right: bt.Low},
-			&ast.Binary{Op: ast.Le, Left: bt.Expr, Right: bt.High},
-		}
 	}
 	return []ast.Expr{e}
 }

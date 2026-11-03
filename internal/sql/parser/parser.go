@@ -13,8 +13,13 @@ import (
 	"maragu.dev/maragudb/internal/sql/value"
 )
 
-// ErrSyntax is wrapped by every parse error.
-var ErrSyntax = errors.New("syntax error")
+var (
+	// ErrSyntax is wrapped by every parse error, except those of [ErrInvalid].
+	ErrSyntax = errors.New("syntax error")
+	// ErrInvalid is wrapped by the errors of statements that parse but cannot run, such as a
+	// table with two primary keys.
+	ErrInvalid = errors.New("invalid statement")
+)
 
 // Parse one statement, with an optional trailing semicolon.
 func Parse(sql string) (ast.Statement, error) {
@@ -219,7 +224,7 @@ func (p *parser) createTable() (ast.Statement, error) {
 			return nil, err
 		} else if ok {
 			if s.PrimaryKey != nil {
-				return nil, p.errorf("multiple primary keys for table %q", s.Name)
+				return nil, fmt.Errorf("%w: multiple primary keys for table %q", ErrInvalid, s.Name)
 			}
 			if err := p.expectWord("key"); err != nil {
 				return nil, err
@@ -251,7 +256,7 @@ func (p *parser) createTable() (ast.Statement, error) {
 			}
 			if col.pk {
 				if s.PrimaryKey != nil {
-					return nil, p.errorf("multiple primary keys for table %q", s.Name)
+					return nil, fmt.Errorf("%w: multiple primary keys for table %q", ErrInvalid, s.Name)
 				}
 				s.PrimaryKey = []string{col.def.Name}
 			}

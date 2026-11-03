@@ -157,7 +157,6 @@ func TestParse(t *testing.T) {
 			{"select a < b >= c", "syntax error at position 14: comparisons do not chain, use parentheses"},
 			{"select a not 1", "syntax error at position 14: expected BETWEEN, IN, or LIKE after NOT, got \"1\""},
 			{"create table t (a int)", "syntax error at position 22: table \"t\" needs a PRIMARY KEY"},
-			{"create table t (a int primary key, b int primary key)", "syntax error at position 53: multiple primary keys for table \"t\""},
 			{"select time 'yesterday'", "syntax error at position 13: invalid time \"yesterday\", want RFC 3339 such as 2006-01-02T15:04:05Z"},
 			{"select @", "syntax error at position 8: unexpected character '@'"},
 			{"select a from t order by b nulls sometimes", "syntax error at position 34: expected FIRST or LAST, got \"sometimes\""},
@@ -175,6 +174,14 @@ func TestParse(t *testing.T) {
 				is.Error(t, parser.ErrSyntax, err)
 				is.Equal(t, test.want, err.Error())
 			})
+		}
+	})
+
+	t.Run("reports a table with two primary keys as invalid, not as a syntax error, as Postgres does", func(t *testing.T) {
+		for _, sql := range []string{"create table t (a int primary key, b int primary key)", "create table t (a int primary key, primary key (a))"} {
+			_, err := parser.Parse(sql)
+			is.Error(t, parser.ErrInvalid, err)
+			is.Equal(t, `invalid statement: multiple primary keys for table "t"`, err.Error())
 		}
 	})
 

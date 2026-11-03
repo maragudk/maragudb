@@ -50,6 +50,29 @@ type binder struct {
 	// CASE whose WHEN is known true. Such a branch is still type-checked, but an error in folding
 	// it is not reported, as in Postgres.
 	pruned int
+	// phase of the statement being bound, which orders folding errors. See [binder.folding].
+	phase int
+	// foldErr is the folding error to report, from the lowest phase, and the first in it.
+	foldErr   error
+	foldPhase int
+}
+
+// Phases of a statement, in the order in which Postgres folds their constants: the output
+// expressions, including those of ORDER BY, then WHERE, then OFFSET, then LIMIT.
+const (
+	phaseOutput = iota
+	phaseWhere
+	phaseOffset
+	phaseLimit
+)
+
+// folding returns the error that folding constants raised, if any. Postgres checks the whole
+// statement before it folds any constant, so a statement that is invalid, or mistyped anywhere,
+// reports that before a folding error such as division by zero. The binder therefore records
+// folding errors instead of returning them, and the statement reports one only once it has bound
+// everything.
+func (b *binder) folding() error {
+	return b.foldErr
 }
 
 // fold a node whose children are all constants by evaluating it now, which also reports errors
@@ -65,10 +88,13 @@ func (b *binder) fold(e *cexpr, children ...*cexpr) (*cexpr, error) {
 	}
 	v, err := e.eval(nil)
 	if err != nil {
-		if b.pruned > 0 {
-			return e, nil
+		if b.pruned == 0 && (b.foldErr == nil || b.phase < b.foldPhase) {
+			b.foldErr, b.foldPhase = err, b.phase
 		}
-		return nil, err
+		// The expression stays unfolded, but it is still built from literals, so it adapts its
+		// type like one and binding goes on as if it had folded.
+		e.literal = literal
+		return e, nil
 	}
 	c := constant(v)
 	c.literal = literal
@@ -173,8 +199,12 @@ func (b *binder) bind(e ast.Expr) (*cexpr, error) {
 			return value.NewBool(v.Null != not), nil
 		}}, x)
 	case *ast.Between:
-		return b.between(e)
+		d, _ := desugar(e)
+		return b.bind(d)
 	case *ast.In:
+		if d, ok := desugar(e); ok {
+			return b.bind(d)
+		}
 		return b.in(e)
 	case *ast.Like:
 		return b.like(e)
@@ -321,7 +351,10 @@ func (b *binder) logical(e *ast.Binary) (*cexpr, error) {
 	if r.typ != value.Bool && r.typ != value.Unknown {
 		return nil, fmt.Errorf("%w: argument of %s must be bool, not %v", ErrType, logicalName(e.Op), r.typ)
 	}
-	if decided {
+	// A constant that decides the result also decides it on the right, after a left side that is
+	// not constant, because Postgres drops the other arguments of an AND with a FALSE constant
+	// or an OR with a TRUE one wherever it is.
+	if decided || r.folded && !r.val.Null && r.val.B != and {
 		return constant(value.NewBool(!and)), nil
 	}
 	return b.fold(&cexpr{typ: value.Bool, eval: func(row []value.Value) (value.Value, error) {
@@ -469,70 +502,64 @@ func floatArithmetic(op ast.BinaryOp, x, y float64) (value.Value, error) {
 	return value.NewFloat(r), nil
 }
 
-func (b *binder) between(e *ast.Between) (*cexpr, error) {
-	x, err := b.bind(e.Expr)
-	if err != nil {
-		return nil, err
-	}
-	low, err := b.bind(e.Low)
-	if err != nil {
-		return nil, err
-	}
-	// Postgres rewrites x BETWEEN low AND high as x >= low AND x <= high, so when the first
-	// comparison is known false the high bound is only type-checked.
-	var high *cexpr
-	if xl, lowl, err := unify(x, low, "BETWEEN mixes"); err == nil && xl.folded && lowl.folded && !xl.val.Null && !lowl.val.Null && value.Compare(xl.val, lowl.val) < 0 {
-		high, err = b.bindPruned(e.High)
-		if err != nil {
-			return nil, err
+// desugar rewrites BETWEEN and IN as the comparisons that Postgres rewrites them to before it
+// folds constants, so that the same folding and pruning rules apply: x BETWEEN a AND b is
+// x >= a AND x <= b, NOT BETWEEN is x < a OR x > b, x IN (a, b) is x = a OR x = b, and NOT IN is
+// x <> a AND x <> b. When several elements read no columns, they stay together as one IN, which
+// is an array comparison in Postgres, and come first, followed by the other elements in order.
+// An IN of only such elements is not rewritten.
+func desugar(e ast.Expr) (ast.Expr, bool) {
+	switch e := e.(type) {
+	case *ast.Between:
+		if e.Not {
+			return &ast.Binary{Op: ast.Or, Left: &ast.Binary{Op: ast.Lt, Left: e.Expr, Right: e.Low}, Right: &ast.Binary{Op: ast.Gt, Left: e.Expr, Right: e.High}}, true
 		}
-	} else if high, err = b.bind(e.High); err != nil {
-		return nil, err
-	}
-	es, _, err := unifyAll([]*cexpr{x, low, high}, "BETWEEN mixes")
-	if err != nil {
-		return nil, err
-	}
-	x, low, high = es[0], es[1], es[2]
-	if x.folded && x.val.Null {
-		// Both comparisons are strict, so a known NULL value makes them NULL without the
-		// bounds being evaluated, as Postgres folds them.
-		return constant(value.NewNull(value.Bool)), nil
-	}
-	not := e.Not
-	// The high bound is only evaluated when the low comparison is not false.
-	return b.fold(&cexpr{typ: value.Bool, eval: func(row []value.Value) (value.Value, error) {
-		v, err := x.value(row)
-		if err != nil {
-			return value.Value{}, err
-		}
-		lo, err := low.value(row)
-		if err != nil {
-			return value.Value{}, err
-		}
-		var result value.Value
-		switch {
-		case !v.Null && !lo.Null && value.Compare(v, lo) < 0:
-			result = value.NewBool(false)
-		default:
-			hi, err := high.value(row)
-			if err != nil {
-				return value.Value{}, err
-			}
-			switch {
-			case !v.Null && !hi.Null && value.Compare(v, hi) > 0:
-				result = value.NewBool(false)
-			case v.Null || lo.Null || hi.Null:
-				result = value.NewNull(value.Bool)
-			default:
-				result = value.NewBool(true)
+		return &ast.Binary{Op: ast.And, Left: &ast.Binary{Op: ast.Ge, Left: e.Expr, Right: e.Low}, Right: &ast.Binary{Op: ast.Le, Left: e.Expr, Right: e.High}}, true
+	case *ast.In:
+		var constants, columns []ast.Expr
+		for _, item := range e.List {
+			if readsColumns(item) {
+				columns = append(columns, item)
+			} else {
+				constants = append(constants, item)
 			}
 		}
-		if not && !result.Null {
-			result.B = !result.B
+		items := e.List
+		var out ast.Expr
+		if len(constants) > 1 {
+			if len(columns) == 0 {
+				return nil, false
+			}
+			out = &ast.In{Expr: e.Expr, List: constants, Not: e.Not}
+			items = columns
 		}
-		return result, nil
-	}}, x, low, high)
+		cmp, join := ast.Eq, ast.Or
+		if e.Not {
+			cmp, join = ast.Ne, ast.And
+		}
+		for _, item := range items {
+			c := &ast.Binary{Op: cmp, Left: e.Expr, Right: item}
+			if out == nil {
+				out = c
+			} else {
+				out = &ast.Binary{Op: join, Left: out, Right: c}
+			}
+		}
+		return out, true
+	}
+	return nil, false
+}
+
+// readsColumns reports whether e references a column.
+func readsColumns(e ast.Expr) bool {
+	found := false
+	ast.Walk(e, func(x ast.Expr) bool {
+		if _, ok := x.(*ast.ColumnRef); ok {
+			found = true
+		}
+		return !found
+	})
+	return found
 }
 
 func (b *binder) in(e *ast.In) (*cexpr, error) {
@@ -553,6 +580,11 @@ func (b *binder) in(e *ast.In) (*cexpr, error) {
 		return nil, err
 	}
 	x, list := es[0], es[1:]
+	if x.folded && x.val.Null {
+		// The array comparison and the comparison with each element that reads columns are
+		// strict, so a known NULL makes them all NULL without evaluating the elements.
+		return constant(value.NewNull(value.Bool)), nil
+	}
 	not := e.Not
 	// Postgres puts the constant elements into an array that is evaluated as a whole, and
 	// compares each element that reads columns separately, left to right, stopping at the first
