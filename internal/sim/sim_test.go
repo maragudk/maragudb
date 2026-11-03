@@ -1,0 +1,247 @@
+package sim_test
+
+import (
+	"errors"
+	"fmt"
+	"math/rand/v2"
+	"os"
+	"strconv"
+	"strings"
+	"testing"
+	"time"
+
+	"maragu.dev/is"
+
+	"maragu.dev/maragudb/internal/engine"
+	"maragu.dev/maragudb/internal/history"
+	"maragu.dev/maragudb/internal/sim"
+)
+
+// corpus of fixed seeds and configurations run in `make test`.
+func corpus() []sim.Config {
+	var cfgs []sim.Config
+	for seed := uint64(1); seed <= 40; seed++ {
+		for _, w := range []sim.Workload{sim.ListAppend, sim.Bank} {
+			cfg := sim.DefaultConfig(seed)
+			cfg.Workload = w
+			cfgs = append(cfgs, cfg)
+		}
+	}
+	// Heavier faults and more contention.
+	for seed := uint64(100); seed < 120; seed++ {
+		for _, w := range []sim.Workload{sim.ListAppend, sim.Bank} {
+			cfg := sim.DefaultConfig(seed)
+			cfg.Workload = w
+			cfg.Clients = 10
+			cfg.ErrorRate = 0.15
+			cfg.LostAckRate = 0.15
+			cfg.CrashRate = 0.03
+			cfg.Maintainers = 2
+			cfg.GracePeriod = 500 * time.Millisecond
+			cfgs = append(cfgs, cfg)
+		}
+	}
+	// Long transactions relative to the grace period, so some readers legitimately expire.
+	for seed := uint64(200); seed < 210; seed++ {
+		cfg := sim.DefaultConfig(seed)
+		cfg.GracePeriod = 100 * time.Millisecond
+		cfg.MaxLatency = 40 * time.Millisecond
+		cfg.Maintainers = 2
+		cfgs = append(cfgs, cfg)
+	}
+	return cfgs
+}
+
+func failReport(t *testing.T, res sim.Result) {
+	t.Helper()
+	t.Errorf("%s\n\nreplay with:\n  make replay SEED=%d WORKLOAD=%v\nor:\n  MARAGUDB_SEED=%d MARAGUDB_WORKLOAD=%v go test ./internal/sim -run TestSimulator/replay -v",
+		res.Report(), res.Config.Seed, res.Config.Workload, res.Config.Seed, res.Config.Workload)
+}
+
+func TestSimulator(t *testing.T) {
+	t.Run("corpus finds no anomalies", func(t *testing.T) {
+		var totals sim.Stats
+		start := time.Now()
+		for _, cfg := range corpus() {
+			res := sim.Run(cfg)
+			if res.Failed() {
+				failReport(t, res)
+			}
+			totals.Commits += res.Stats.Commits
+			totals.Conflicts += res.Stats.Conflicts
+			totals.Unknown += res.Stats.Unknown
+			totals.Crashes += res.Stats.Crashes
+			totals.Compactions += res.Stats.Compactions
+			totals.GCs += res.Stats.GCs
+			totals.Deleted += res.Stats.Deleted
+		}
+		t.Logf("corpus of %d runs in %v: %+v", len(corpus()), time.Since(start).Round(time.Millisecond), totals)
+		// The corpus must exercise every interesting path, or passing means nothing.
+		is.True(t, totals.Commits > 1000, "commits")
+		is.True(t, totals.Conflicts > 100, "conflicts")
+		is.True(t, totals.Unknown > 50, "unknown outcomes")
+		is.True(t, totals.Crashes > 50, "crashes")
+		is.True(t, totals.Compactions > 50, "compactions")
+		is.True(t, totals.Deleted > 50, "deleted objects")
+	})
+
+	t.Run("the same seed produces the same history", func(t *testing.T) {
+		for _, w := range []sim.Workload{sim.ListAppend, sim.Bank} {
+			cfg := sim.DefaultConfig(7)
+			cfg.Workload = w
+			cfg.Maintainers = 2
+			first := sim.Run(cfg)
+			for range 3 {
+				again := sim.Run(cfg)
+				if first.Digest != again.Digest {
+					t.Fatalf("%v: digests differ:\n%s", w, diff(first.Digest, again.Digest))
+				}
+			}
+			is.True(t, len(first.History) > 0)
+		}
+	})
+
+	t.Run("different seeds produce different histories", func(t *testing.T) {
+		a := sim.Run(sim.DefaultConfig(1))
+		b := sim.Run(sim.DefaultConfig(2))
+		is.True(t, a.Digest != b.Digest)
+	})
+
+	t.Run("replay", func(t *testing.T) {
+		seedVar := os.Getenv("MARAGUDB_SEED")
+		if seedVar == "" {
+			t.Skip("set MARAGUDB_SEED to replay a seed")
+		}
+		seed, err := strconv.ParseUint(seedVar, 10, 64)
+		is.NotError(t, err)
+		cfg := sim.DefaultConfig(seed)
+		if os.Getenv("MARAGUDB_WORKLOAD") == "bank" {
+			cfg.Workload = sim.Bank
+		}
+		cfg.Maintainers = 2
+		switch os.Getenv("MARAGUDB_MUTATION") {
+		case "cas":
+			cfg.Mutations.CommitWithoutCAS = true
+		case "gc":
+			cfg.Mutations.GCIgnoreGrace = true
+		case "freshness":
+			cfg.Mutations.SkipFreshnessCheck = true
+		case "ack":
+			cfg.Mutations.AckBeforeConfirm = true
+		}
+		cfg.Trace = func(line string) {
+			t.Log(line)
+		}
+		res := sim.Run(cfg)
+		t.Log(res.Report())
+		if res.Failed() {
+			t.Fail()
+		}
+	})
+
+	t.Run("soak", func(t *testing.T) {
+		if os.Getenv("MARAGUDB_SOAK") == "" {
+			t.Skip("set MARAGUDB_SOAK to run the soak")
+		}
+		duration := 5 * time.Minute
+		if d := os.Getenv("MARAGUDB_SOAK_DURATION"); d != "" {
+			var err error
+			duration, err = time.ParseDuration(d)
+			is.NotError(t, err)
+		}
+		rng := rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), 0))
+		deadline := time.Now().Add(duration)
+		runs := 0
+		for time.Now().Before(deadline) {
+			seed := rng.Uint64()
+			cfg := sim.DefaultConfig(seed)
+			cfg.Workload = sim.Workload(rng.IntN(2))
+			cfg.Clients = 2 + rng.IntN(12)
+			cfg.TxPerClient = 10 + rng.IntN(60)
+			cfg.Keys = 1 + rng.IntN(6)
+			cfg.Maintainers = rng.IntN(3)
+			cfg.ErrorRate = rng.Float64() * 0.3
+			cfg.LostAckRate = rng.Float64() * 0.3
+			cfg.CrashRate = rng.Float64() * 0.05
+			cfg.MaxLatency = time.Duration(1+rng.IntN(50)) * time.Millisecond
+			cfg.GracePeriod = time.Duration(50+rng.IntN(3000)) * time.Millisecond
+			res := sim.Run(cfg)
+			runs++
+			if res.Failed() {
+				t.Errorf("config %+v", cfg)
+				failReport(t, res)
+				return
+			}
+		}
+		t.Logf("soak: %d runs in %v without anomalies", runs, duration)
+	})
+}
+
+func diff(a, b string) string {
+	al := strings.Split(a, "\n")
+	bl := strings.Split(b, "\n")
+	for i := range min(len(al), len(bl)) {
+		if al[i] != bl[i] {
+			return fmt.Sprintf("line %d:\n  %s\n  %s", i+1, al[i], bl[i])
+		}
+	}
+	return fmt.Sprintf("lengths %d and %d", len(al), len(bl))
+}
+
+func TestMutants(t *testing.T) {
+	mutants := []struct {
+		name      string
+		mutations engine.Mutations
+		workloads []sim.Workload
+		// maintainers to run; the history checkers alone must catch the mutants that run without.
+		maintainers int
+		// detectedBy is a substring of the anomaly that must be among those found.
+		detectedBy string
+	}{
+		// Without CAS a stale manifest write drops whole commits, which conserves money, so the bank
+		// checker alone cannot see it; the list-append checker and the GC invariant can.
+		{name: "commit without CAS", mutations: engine.Mutations{CommitWithoutCAS: true}, workloads: []sim.Workload{sim.ListAppend}},
+		{name: "commit without CAS", mutations: engine.Mutations{CommitWithoutCAS: true}, workloads: []sim.Workload{sim.ListAppend, sim.Bank}, maintainers: 2},
+		{name: "GC ignoring the grace period", mutations: engine.Mutations{GCIgnoreGrace: true}, workloads: []sim.Workload{sim.ListAppend, sim.Bank}, maintainers: 2, detectedBy: "grace period"},
+		{name: "serving the cache without a freshness check", mutations: engine.Mutations{SkipFreshnessCheck: true}, workloads: []sim.Workload{sim.ListAppend}, detectedBy: "cycle"},
+		{name: "acking before the write is confirmed", mutations: engine.Mutations{AckBeforeConfirm: true}, workloads: []sim.Workload{sim.ListAppend}},
+	}
+	for _, m := range mutants {
+		for _, w := range m.workloads {
+			t.Run(fmt.Sprintf("%s is detected by the %v workload with %d maintainers", m.name, w, m.maintainers), func(t *testing.T) {
+				start := time.Now()
+				const maxSeeds = 20
+				for seed := uint64(1); seed <= maxSeeds; seed++ {
+					cfg := sim.DefaultConfig(seed)
+					cfg.Workload = w
+					cfg.Mutations = m.mutations
+					cfg.Maintainers = m.maintainers
+					res := sim.Run(cfg)
+					if !res.Failed() {
+						continue
+					}
+					t.Logf("detected with seed %d after %v, %d anomalies:", seed, time.Since(start).Round(time.Millisecond), len(res.Anomalies))
+					var checker, named bool
+					for _, a := range res.Anomalies {
+						t.Logf("  %v", a)
+						var anomaly *history.Anomaly
+						if errors.As(a, &anomaly) {
+							checker = true
+						}
+						if m.detectedBy != "" && strings.Contains(a.Error(), m.detectedBy) {
+							named = true
+						}
+					}
+					if m.maintainers == 0 {
+						is.True(t, checker, "a history checker found the mutant")
+					}
+					if m.detectedBy != "" {
+						is.True(t, named, fmt.Sprintf("an anomaly mentions %q", m.detectedBy))
+					}
+					return
+				}
+				t.Fatalf("mutant %q not detected in %d seeds", m.name, maxSeeds)
+			})
+		}
+	}
+}

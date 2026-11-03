@@ -134,12 +134,17 @@ type object struct {
 	modified time.Time
 }
 
+// store holds the objects, shared between a client and its fault-free views.
+type store struct {
+	mu      sync.Mutex
+	objects map[string]object
+}
+
 // Client is a fake object store. It implements [s3.Client].
 type Client struct {
 	clock   Clock
 	faults  Faults
-	mu      sync.Mutex
-	objects map[string]object
+	store   *store
 	counter s3.Counter
 	// Log receives one line per request when non-nil.
 	Log func(string)
@@ -165,8 +170,8 @@ func WithFaults(faults Faults) Option {
 // New fake client.
 func New(opts ...Option) *Client {
 	c := &Client{
-		clock:   NewVirtualClock(time.Unix(0, 0).UTC()),
-		objects: map[string]object{},
+		clock: NewVirtualClock(time.Unix(0, 0).UTC()),
+		store: &store{objects: map[string]object{}},
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -177,6 +182,11 @@ func New(opts ...Option) *Client {
 	return c
 }
 
+// WithoutFaults returns a client over the same objects and clock that injects no faults.
+func (c *Client) WithoutFaults() *Client {
+	return &Client{clock: c.clock, store: c.store}
+}
+
 // Counts of requests by kind, including requests that failed or whose acknowledgement was lost.
 func (c *Client) Counts() s3.Counts {
 	return c.counter.Counts()
@@ -184,10 +194,10 @@ func (c *Client) Counts() s3.Counts {
 
 // Keys of all objects, sorted.
 func (c *Client) Keys() []string {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	keys := make([]string, 0, len(c.objects))
-	for k := range c.objects {
+	c.store.mu.Lock()
+	defer c.store.mu.Unlock()
+	keys := make([]string, 0, len(c.store.objects))
+	for k := range c.store.objects {
 		keys = append(keys, k)
 	}
 	sort.Strings(keys)
@@ -196,9 +206,9 @@ func (c *Client) Keys() []string {
 
 // Body of the object at key, if present.
 func (c *Client) Body(key string) ([]byte, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	o, ok := c.objects[key]
+	c.store.mu.Lock()
+	defer c.store.mu.Unlock()
+	o, ok := c.store.objects[key]
 	if !ok {
 		return nil, false
 	}
@@ -302,9 +312,9 @@ func (c *Client) log(format string, args ...any) {
 func (c *Client) Get(ctx context.Context, key string, opts s3.GetOptions) (s3.Object, error) {
 	var res s3.Object
 	err := c.request(ctx, s3.GetKind(opts), key, false, func() error {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		o, ok := c.objects[key]
+		c.store.mu.Lock()
+		defer c.store.mu.Unlock()
+		o, ok := c.store.objects[key]
 		if !ok {
 			return s3.ErrNotFound
 		}
@@ -332,16 +342,16 @@ func (c *Client) Get(ctx context.Context, key string, opts s3.GetOptions) (s3.Ob
 func (c *Client) Put(ctx context.Context, key string, body []byte, opts s3.PutOptions) (string, error) {
 	etag := etagOf(body)
 	err := c.request(ctx, s3.PutKind(opts), key, true, func() error {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		o, exists := c.objects[key]
+		c.store.mu.Lock()
+		defer c.store.mu.Unlock()
+		o, exists := c.store.objects[key]
 		if opts.IfNoneMatch && exists {
 			return s3.ErrPreconditionFailed
 		}
 		if opts.IfMatch != "" && (!exists || o.etag != opts.IfMatch) {
 			return s3.ErrPreconditionFailed
 		}
-		c.objects[key] = object{body: append([]byte(nil), body...), etag: etag, modified: c.clock.Now()}
+		c.store.objects[key] = object{body: append([]byte(nil), body...), etag: etag, modified: c.clock.Now()}
 		return nil
 	})
 	if err != nil {
@@ -352,9 +362,9 @@ func (c *Client) Put(ctx context.Context, key string, body []byte, opts s3.PutOp
 
 func (c *Client) Delete(ctx context.Context, key string) error {
 	return c.request(ctx, s3.KindDelete, key, true, func() error {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		delete(c.objects, key)
+		c.store.mu.Lock()
+		defer c.store.mu.Unlock()
+		delete(c.store.objects, key)
 		return nil
 	})
 }
@@ -362,9 +372,9 @@ func (c *Client) Delete(ctx context.Context, key string) error {
 func (c *Client) List(ctx context.Context, prefix string) ([]s3.ObjectInfo, error) {
 	var infos []s3.ObjectInfo
 	err := c.request(ctx, s3.KindList, prefix, false, func() error {
-		c.mu.Lock()
-		defer c.mu.Unlock()
-		for k, o := range c.objects {
+		c.store.mu.Lock()
+		defer c.store.mu.Unlock()
+		for k, o := range c.store.objects {
 			if strings.HasPrefix(k, prefix) {
 				infos = append(infos, s3.ObjectInfo{Key: k, Size: int64(len(o.body)), LastModified: o.modified})
 			}
