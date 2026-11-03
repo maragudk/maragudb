@@ -210,7 +210,7 @@ func (b *binder) unary(e *ast.Unary) (*cexpr, error) {
 			return value.NewBool(!v.B), nil
 		}}, x)
 	case ast.Neg:
-		if x.typ != value.Int && x.typ != value.Float && x.typ != value.Unknown {
+		if x.typ != value.Int && x.typ != value.Float {
 			return nil, fmt.Errorf("%w: operator - does not exist for %v", ErrType, x.typ)
 		}
 		return b.fold(&cexpr{typ: x.typ, eval: func(row []value.Value) (value.Value, error) {
@@ -458,8 +458,15 @@ func (b *binder) between(e *ast.Between) (*cexpr, error) {
 	if err != nil {
 		return nil, err
 	}
-	high, err := b.bind(e.High)
-	if err != nil {
+	// Postgres rewrites x BETWEEN low AND high as x >= low AND x <= high, so when the first
+	// comparison is known false the high bound is only type-checked.
+	var high *cexpr
+	if xl, lowl, err := unify(x, low, "BETWEEN mixes"); err == nil && xl.folded && lowl.folded && !xl.val.Null && !lowl.val.Null && value.Compare(xl.val, lowl.val) < 0 {
+		high, err = b.bindPruned(e.High)
+		if err != nil {
+			return nil, err
+		}
+	} else if high, err = b.bind(e.High); err != nil {
 		return nil, err
 	}
 	es, _, err := unifyAll([]*cexpr{x, low, high}, "BETWEEN mixes")
@@ -468,8 +475,7 @@ func (b *binder) between(e *ast.Between) (*cexpr, error) {
 	}
 	x, low, high = es[0], es[1], es[2]
 	not := e.Not
-	// Postgres rewrites x BETWEEN low AND high as x >= low AND x <= high, so the high bound is
-	// only evaluated when the low comparison is not false.
+	// The high bound is only evaluated when the low comparison is not false.
 	return b.fold(&cexpr{typ: value.Bool, eval: func(row []value.Value) (value.Value, error) {
 		v, err := x.value(row)
 		if err != nil {
@@ -856,52 +862,83 @@ func (b *binder) call(e *ast.Call) (*cexpr, error) {
 }
 
 // like matches s against a LIKE pattern, where _ matches one character, % matches any sequence,
-// and a backslash escapes the next character.
+// and a backslash escapes the next character. It is a port of the Postgres matcher, so that an
+// escape character at the end of the pattern is an error only when matching reaches it.
 func like(s, pattern string) (bool, error) {
-	p := []rune(pattern)
-	for i := 0; i < len(p); i++ {
-		if p[i] == '\\' {
-			if i == len(p)-1 {
-				return false, fmt.Errorf("%w: LIKE pattern must not end with escape character", ErrInvalid)
-			}
-			i++
-		}
-	}
-	return likeMatch([]rune(s), p), nil
+	m, err := likeMatch([]rune(s), []rune(pattern))
+	return m == likeTrue, err
 }
 
-func likeMatch(s, p []rune) bool {
-	for len(p) > 0 {
+const (
+	likeFalse = iota
+	likeTrue
+	// likeAbort means no later start position can match either.
+	likeAbort
+)
+
+func likeMatch(t, p []rune) (int, error) {
+	for len(t) > 0 && len(p) > 0 {
 		switch p[0] {
-		case '%':
-			for len(p) > 0 && p[0] == '%' {
-				p = p[1:]
-			}
+		case '\\':
+			p = p[1:]
 			if len(p) == 0 {
-				return true
+				return 0, fmt.Errorf("%w: LIKE pattern must not end with escape character", ErrInvalid)
 			}
-			for i := 0; i <= len(s); i++ {
-				if likeMatch(s[i:], p) {
-					return true
+			if p[0] != t[0] {
+				return likeFalse, nil
+			}
+		case '%':
+			p = p[1:]
+		skip:
+			for len(p) > 0 {
+				switch p[0] {
+				case '%':
+					p = p[1:]
+				case '_':
+					if len(t) == 0 {
+						return likeAbort, nil
+					}
+					t, p = t[1:], p[1:]
+				default:
+					break skip
 				}
 			}
-			return false
+			if len(p) == 0 {
+				return likeTrue, nil
+			}
+			first := p[0]
+			if first == '\\' {
+				if len(p) < 2 {
+					return 0, fmt.Errorf("%w: LIKE pattern must not end with escape character", ErrInvalid)
+				}
+				first = p[1]
+			}
+			for len(t) > 0 {
+				if t[0] == first {
+					m, err := likeMatch(t, p)
+					if err != nil || m != likeFalse {
+						return m, err
+					}
+				}
+				t = t[1:]
+			}
+			return likeAbort, nil
 		case '_':
-			if len(s) == 0 {
-				return false
-			}
-			s, p = s[1:], p[1:]
 		default:
-			c := p[0]
-			if c == '\\' {
-				p = p[1:]
-				c = p[0]
+			if p[0] != t[0] {
+				return likeFalse, nil
 			}
-			if len(s) == 0 || s[0] != c {
-				return false
-			}
-			s, p = s[1:], p[1:]
 		}
+		t, p = t[1:], p[1:]
 	}
-	return len(s) == 0
+	if len(t) > 0 {
+		return likeFalse, nil
+	}
+	for len(p) > 0 && p[0] == '%' {
+		p = p[1:]
+	}
+	if len(p) == 0 {
+		return likeTrue, nil
+	}
+	return likeAbort, nil
 }

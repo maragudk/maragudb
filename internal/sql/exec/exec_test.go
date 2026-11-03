@@ -299,6 +299,9 @@ func TestSession_Select(t *testing.T) {
 			{"SELECT 'a' || 1", exec.ErrType},
 			{"SELECT 1.5 % 1.0", exec.ErrType},
 			{"SELECT -'a'", exec.ErrType},
+			{"SELECT -NULL", exec.ErrType},
+			{"SELECT 'abc' LIKE 'a\\'", exec.ErrInvalid},
+			{"SELECT 'x' LIKE '%\\'", exec.ErrInvalid},
 			{"SELECT NOT 1", exec.ErrType},
 			{"SELECT 1 AND TRUE", exec.ErrType},
 			{"SELECT 1 BETWEEN 'a' AND 'b'", exec.ErrType},
@@ -347,6 +350,12 @@ func TestSession_Select(t *testing.T) {
 		is.Equal(t, "1", query(t, s, "SELECT CASE WHEN TRUE THEN 1 ELSE 1 / 0 END"))
 		is.Equal(t, "1", query(t, s, "SELECT coalesce(1, 1 / 0)"))
 		is.Equal(t, "true", query(t, s, "SELECT TRUE OR 1 / 0 = 1"))
+		is.Equal(t, "false", query(t, s, "SELECT 0 BETWEEN 1 AND 1 / 0"))
+		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT 2 BETWEEN 1 AND 1 / 0"))
+		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT NULL BETWEEN 1 AND 1 / 0"))
+		is.Equal(t, "false", query(t, s, "SELECT 'a' LIKE 'a\\'"), "the trailing escape is only an error when matching reaches it")
+		is.Equal(t, "false", query(t, s, "SELECT '' LIKE '\\'"))
+		is.Equal(t, "false", query(t, s, "SELECT '' LIKE '%\\'"))
 	})
 
 	t.Run("filters, orders, limits, and offsets", func(t *testing.T) {
