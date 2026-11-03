@@ -8,6 +8,7 @@ import (
 	"hegel.dev/go/hegel"
 
 	"maragu.dev/maragudb/internal/sql/ast"
+	"maragu.dev/maragudb/internal/sql/exec"
 	"maragu.dev/maragudb/internal/sql/value"
 )
 
@@ -459,7 +460,13 @@ func (g *gen) selectStmt() *ast.Select {
 		s.OrderBy = append(s.OrderBy, o)
 	}
 	if limited {
-		// The order must be fully determined, so every key column is a sort key.
+		// The order must be fully determined, so every key column is a sort key. An output
+		// column named like a key column would shadow it in ORDER BY, so then there is no LIMIT.
+		for _, k := range g.table.PrimaryKey {
+			if shadowed(s, k) {
+				return s
+			}
+		}
 		for _, k := range g.table.PrimaryKey {
 			s.OrderBy = append(s.OrderBy, ast.OrderItem{Expr: &ast.ColumnRef{Name: k}, Desc: g.bool()})
 		}
@@ -489,13 +496,35 @@ func (g *gen) outputs(s *ast.Select) int {
 	return n
 }
 
+// shadowed reports whether an expression item of s is output under the name of column k, so
+// that ORDER BY k would sort by that expression instead of the column.
+func shadowed(s *ast.Select, k string) bool {
+	for _, item := range s.Items {
+		if item.Star {
+			continue
+		}
+		name := item.Alias
+		if name == "" {
+			name = exec.OutputName(item.Expr)
+		}
+		if name == k {
+			return true
+		}
+	}
+	return false
+}
+
 // FullyOrdered reports whether the ORDER BY of s determines the row order completely, which
-// is when every primary key column is a sort key referenced by name.
+// is when every primary key column is a sort key referenced by name and not shadowed by an
+// output column of the same name.
 func FullyOrdered(s *ast.Select, pk []string) bool {
 	if len(s.OrderBy) == 0 {
 		return false
 	}
 	for _, k := range pk {
+		if shadowed(s, k) {
+			return false
+		}
 		found := false
 		for _, o := range s.OrderBy {
 			if ref, ok := o.Expr.(*ast.ColumnRef); ok && ref.Name == k {

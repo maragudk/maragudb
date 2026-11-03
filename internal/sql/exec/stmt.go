@@ -400,7 +400,7 @@ func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value
 		itemExprs = append(itemExprs, item.Expr)
 		col := Column{Name: item.Alias, Type: e.typ, Nullable: true}
 		if col.Name == "" {
-			col.Name = outputName(item.Expr)
+			col.Name = OutputName(item.Expr)
 		}
 		if ref, ok := item.Expr.(*ast.ColumnRef); ok {
 			i, _ := t.columnIndex(ref.Name)
@@ -607,10 +607,11 @@ func compareKeys(order []orderKey, a, b []value.Value) int {
 	return 0
 }
 
-// outputName of an expression without an alias, following Postgres: a column or function keeps
+// OutputName of a SELECT item without an alias, following Postgres: a column or function keeps
 // its name, a CASE takes the name of its ELSE when that is a column or function and is "case"
-// otherwise, and a cast keeps the name of what it casts or takes the type's name.
-func outputName(e ast.Expr) string {
+// otherwise, a cast keeps the name of what it casts or takes the type's name, and anything else
+// is "?column?".
+func OutputName(e ast.Expr) string {
 	name, _ := outputNameStrength(e)
 	return name
 }
