@@ -545,32 +545,46 @@ func (b *binder) in(e *ast.In) (*cexpr, error) {
 	}
 	x, list := es[0], es[1:]
 	not := e.Not
+	// Postgres puts the constant elements into an array that is evaluated as a whole, and
+	// compares each element that reads columns separately, left to right, stopping at the first
+	// match. Constants have been folded already, so only the column elements can fail, and
+	// they fail in order and only until a match.
+	var consts, columns []*cexpr
+	for _, item := range list {
+		if item.refs {
+			columns = append(columns, item)
+		} else {
+			consts = append(consts, item)
+		}
+	}
 	return b.fold(&cexpr{typ: value.Bool, eval: func(row []value.Value) (value.Value, error) {
 		v, err := x.value(row)
 		if err != nil {
 			return value.Value{}, err
 		}
-		// The whole list is evaluated first, as Postgres evaluates the array of = ANY.
-		items := make([]value.Value, len(list))
-		for i, item := range list {
-			if items[i], err = item.value(row); err != nil {
-				return value.Value{}, err
-			}
-		}
-		if v.Null {
-			return value.NewNull(value.Bool), nil
-		}
 		sawNull := false
-		for _, item := range items {
+		matches := func(item value.Value) bool {
 			if item.Null {
 				sawNull = true
-				continue
+				return false
 			}
-			if value.Compare(v, item) == 0 {
+			return !v.Null && value.Compare(v, item) == 0
+		}
+		for _, c := range consts {
+			if matches(c.val) {
 				return value.NewBool(!not), nil
 			}
 		}
-		if sawNull {
+		for _, c := range columns {
+			item, err := c.value(row)
+			if err != nil {
+				return value.Value{}, err
+			}
+			if matches(item) {
+				return value.NewBool(!not), nil
+			}
+		}
+		if v.Null || sawNull {
 			return value.NewNull(value.Bool), nil
 		}
 		return value.NewBool(not), nil
