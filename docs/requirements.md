@@ -98,7 +98,7 @@ These apply to every section, for the SQL surface that exists at that point.
 
    Latency against Tigris is measured and reported, but it does not gate.
 6. **Bounded storage.** After compaction, the object count grows with data size, not with commit count. GC never deletes an object that a snapshot within the configured grace period still references. A reader older than the grace period gets a clear error, never wrong data.
-7. **Real S3-compatible storage.** An integration suite passes against Tigris when Tigris credentials are in the environment, and it skips otherwise.
+7. **Real S3-compatible storage.** An integration suite passes against Tigris. If the Tigris credentials are not in the environment or in a gitignored `.env` file, the suite fails and does not skip. The failure message names the missing variables.
 8. **Antithesis-ready.** Antithesis Go SDK assertions (Always, Sometimes, and Reachable) mark the key invariants. A docker-compose harness runs the simulator workloads as an Antithesis workload. Go cross-compiles to amd64.
 
 ## Out of scope for now
