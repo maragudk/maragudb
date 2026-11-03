@@ -77,3 +77,23 @@ Context: the simulator must reproduce a history exactly from its seed, but Go sc
 Decision: simulated processes run as goroutines under `sched.Scheduler`, which hands a single baton to one task at a time. The only yield points are the fake store's requests, which sleep for a seeded virtual latency, and explicit pauses. Fault decisions, latencies, commit identifiers, and the engine's clock all derive from the seed, and the engine starts no goroutines of its own. The same seed therefore produces an identical history, and a failure is replayed from the seed alone.
 
 Alternative considered: `testing/synctest` with a fake clock. Rejected because the order in which goroutines wake at the same instant is still up to the Go scheduler, so histories would not be byte-identical across runs.
+
+## 2026-11-03: SQL layer: hand-written parser, rows keyed by primary key, statement-level atomicity, strict typing
+
+Context: section 1 needs a SQL surface over the key-value core, and the project's own dialect follows Postgres semantics without SQLite's quirks.
+
+Decisions:
+- The lexer, parser, binder, and executor are written by hand in `/internal/sql`. A parser dependency would bring a dialect that is not ours and far more syntax than the sections need, and a hand-written recursive-descent parser with the Postgres precedence table is small.
+- Every table has a primary key and there is no hidden row id. A row lives at `r/<table>\x00<key>`, where the key is the order-preserving encoding of the primary key columns, and the table definition at `c/<table>`. Point lookups and range scans on the primary key fall out of the key encoding, and the catalog is transactional because it is just more keys.
+- Statements are atomic on their own: a statement buffers its writes and applies them to the transaction only when it succeeds, so a failed statement leaves the transaction usable. Postgres aborts the whole transaction instead; this is recorded as an intentional deviation.
+- Types are strict: there is no implicit coercion, a parameter of the wrong Go type is an error, and the only adaptation is the one Postgres applies to literals, an integer literal next to a float. Everything else that Postgres coerces implicitly is a type error here, documented in `/docs/deviations.md`.
+
+Alternatives considered: a hidden row id, as SQLite has, which would make primary keys optional but puts every lookup through a secondary structure; and Postgres's transaction abort on error, which is safer for scripts but makes `database/sql` callers handle an aborted state they rarely expect.
+
+## 2026-11-03: Postgres is the oracle through a shared AST, with Postgres 18 in Docker and `COLLATE "C"`
+
+Context: acceptance criterion 4 asks for differential testing against Postgres, and the two dialects differ in syntax and type names.
+
+Decision: hegel generates a schema, rows, and statements as the `ast` package's syntax tree, which renders to both dialects; the harness in `/internal/pgdiff` runs each statement on both and compares results, exactly when `ORDER BY` determines the order and as multisets otherwise. Postgres 18 runs in a Docker container locally and as the shared workflow's service in CI, with a database created from `template0` with the `C` locale so that strings compare by byte order on both sides. The harness fails rather than skips when neither is available. `pgx` is the test dependency for the Postgres side. Every intentional difference is listed in `/docs/deviations.md` with its own test that asserts the difference on both databases, so the list cannot drift from the behavior.
+
+Alternative considered: comparing against SQLite, which the requirements interview rejected because the dialect must not inherit SQLite's quirks.
