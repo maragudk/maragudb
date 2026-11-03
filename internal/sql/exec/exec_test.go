@@ -241,6 +241,7 @@ func TestSession_Select(t *testing.T) {
 			{"SELECT CASE WHEN 1 > 2 THEN 'a' WHEN 2 > 1 THEN 'b' ELSE 'c' END, CASE WHEN NULL THEN 1 ELSE 2 END, CASE WHEN FALSE THEN 1 END", `"b" 2 NULL`},
 			{"SELECT CASE 2 WHEN 1 THEN 'one' WHEN 2 THEN 'two' END, CASE NULL WHEN NULL THEN 'null' ELSE 'other' END", `"two" "other"`},
 			{"SELECT coalesce(NULL, 1), coalesce(NULL, NULL), coalesce(1, 2), coalesce(NULL, 1.5, 2)", "1 NULL 1 1.5"},
+			{"SELECT -abs(NULL), abs(NULL) + 1, length(NULL) + 1, lower(NULL) || 'a'", "NULL NULL NULL NULL"},
 			{"SELECT CAST(1 AS float), CAST(2.5 AS int), CAST(3.5 AS int), CAST(-2.5 AS int), CAST(2.4 AS int)", "1.0 2 4 -2 2"},
 			{"SELECT CAST(42 AS string), CAST(TRUE AS string), CAST(1.5 AS string), CAST(X'6869' AS string), CAST(TIME '2024-01-01T00:00:00.25Z' AS string)", `"42" "true" "1.5" "hi" "2024-01-01T00:00:00.25Z"`},
 			{"SELECT CAST(' 42 ' AS int), CAST('1.5e3' AS float), CAST('t' AS bool), CAST('NO' AS bool), CAST('on' AS bool), CAST('hi' AS bytes), CAST('2024-01-01 00:00:00Z' AS time)", `42 1500.0 true false true X'6869' 2024-01-01T00:00:00Z`},
@@ -308,6 +309,10 @@ func TestSession_Select(t *testing.T) {
 			{"SELECT 1 IN ('a')", exec.ErrType},
 			{"SELECT 1 LIKE 'a'", exec.ErrType},
 			{"SELECT CASE WHEN 1 THEN 1 END", exec.ErrType},
+			{"SELECT TRUE AND CASE WHEN TRUE THEN NULL END", exec.ErrType},
+			{"SELECT TRUE AND coalesce(NULL, NULL)", exec.ErrType},
+			{"SELECT 1 + coalesce(CASE WHEN FALSE THEN FALSE END)", exec.ErrType},
+			{"SELECT 1 + CASE WHEN FALSE THEN NULL END", exec.ErrType},
 			{"SELECT CASE WHEN TRUE THEN 1 ELSE 'a' END", exec.ErrType},
 			{"SELECT CASE 1 WHEN 'a' THEN 1 END", exec.ErrType},
 			{"SELECT coalesce(1, 'a')", exec.ErrType},
@@ -325,6 +330,9 @@ func TestSession_Select(t *testing.T) {
 			{"SELECT 1 OFFSET 'a'", exec.ErrType},
 			{"SELECT 1 ORDER BY 2", exec.ErrInvalid},
 			{"SELECT 1 ORDER BY 0", exec.ErrInvalid},
+			{"SELECT 1 ORDER BY FALSE", exec.ErrInvalid},
+			{"SELECT 1 ORDER BY 'a'", exec.ErrInvalid},
+			{"SELECT 1 ORDER BY NULL", exec.ErrInvalid},
 			{"SELECT 1 AS a, 2 AS a ORDER BY a", exec.ErrInvalid},
 		}
 		for _, test := range tests {
@@ -348,8 +356,20 @@ func TestSession_Select(t *testing.T) {
 		is.Equal(t, "", query(t, s, "SELECT * FROM e WHERE FALSE AND 1 / 0 = 1"))
 		is.Equal(t, "1", query(t, s, "SELECT CASE WHEN FALSE THEN 1 / 0 ELSE 1 END"))
 		is.Equal(t, "1", query(t, s, "SELECT CASE WHEN TRUE THEN 1 ELSE 1 / 0 END"))
+		is.Equal(t, "1", query(t, s, "SELECT CASE WHEN TRUE THEN 1 WHEN 1 / 0 = 1 THEN 2 END"))
+		is.Equal(t, "1", query(t, s, "SELECT CASE 1 WHEN 1 THEN 1 WHEN 1 / 0 THEN 2 END"))
+		is.Error(t, exec.ErrType, queryErr(t, s, "SELECT CASE 1 WHEN 1 THEN 1 WHEN 'a' THEN 2 END"))
+		is.Error(t, exec.ErrType, queryErr(t, s, "SELECT CASE WHEN TRUE THEN 1 WHEN 1 THEN 2 END"))
 		is.Equal(t, "1", query(t, s, "SELECT coalesce(1, 1 / 0)"))
 		is.Equal(t, "true", query(t, s, "SELECT TRUE OR 1 / 0 = 1"))
+		mustExec(t, s, "INSERT INTO e VALUES (-9223372036854775808, TRUE)")
+		is.Equal(t, "NULL", query(t, s, "SELECT NULL + -id FROM e"), "a strict operator with a known NULL does not evaluate the other side")
+		is.Equal(t, "NULL", query(t, s, "SELECT -id * CAST(NULL AS int) FROM e"))
+		is.Equal(t, "NULL", query(t, s, "SELECT CAST(id AS string) LIKE NULL FROM e"))
+		is.Equal(t, "1", query(t, s, "SELECT CASE NULL WHEN id THEN -id ELSE 1 END FROM e"))
+		is.Equal(t, "1", query(t, s, "SELECT CASE id WHEN NULL THEN -id ELSE 1 END FROM e"))
+		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT NULL + 1 / 0 FROM e"), "but a constant operand is still folded first")
+		is.Equal(t, "NULL", query(t, s, "SELECT TRUE AND coalesce(CASE WHEN FALSE THEN FALSE END)"), "a pruned branch still types the CASE")
 		is.Equal(t, "false", query(t, s, "SELECT 0 BETWEEN 1 AND 1 / 0"))
 		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT 2 BETWEEN 1 AND 1 / 0"))
 		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT NULL BETWEEN 1 AND 1 / 0"))
@@ -397,9 +417,13 @@ func TestSession_Select(t *testing.T) {
 			{"SELECT id FROM t ORDER BY b, id DESC", "2\n1\n3"},
 			{"SELECT id FROM t ORDER BY b IS NULL, id", "1\n2\n3"},
 			{"SELECT id FROM t ORDER BY 1 DESC", "3\n2\n1"},
+			{"SELECT id FROM t ORDER BY TIME '2024-01-01T00:00:00Z', id DESC", "3\n2\n1"},
+			{"SELECT id FROM t ORDER BY X'01', id DESC", "3\n2\n1"},
 			{"SELECT id AS x FROM t ORDER BY x DESC", "3\n2\n1"},
 			{"SELECT -id AS id FROM t ORDER BY id", "-3\n-2\n-1"},
 			{"SELECT id FROM t ORDER BY -id", "3\n2\n1"},
+			{"SELECT id, id FROM t ORDER BY id DESC", "3 3\n2 2\n1 1"},
+			{"SELECT *, * FROM t ORDER BY id DESC LIMIT 1", `3 "carol" -2.5 NULL X'' 2024-06-01T12:30:00.5Z 3 "carol" -2.5 NULL X'' 2024-06-01T12:30:00.5Z`},
 			{"SELECT id FROM t ORDER BY id DESC LIMIT 2", "3\n2"},
 			{"SELECT id FROM t ORDER BY id LIMIT 1 OFFSET 1", "2"},
 			{"SELECT id FROM t LIMIT 2", "1\n2"},
@@ -422,6 +446,7 @@ func TestSession_Select(t *testing.T) {
 				is.Equal(t, test.want, query(t, s, test.sql, params...))
 			})
 		}
+		is.Error(t, exec.ErrInvalid, queryErr(t, s, "SELECT id AS a, name AS a FROM t ORDER BY a"))
 		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT 1 / (id - 1) FROM t LIMIT 1"))
 		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT 1 / (id - 1) FROM t LIMIT 1 OFFSET 1"), "OFFSET evaluates the skipped rows")
 		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT 1 / (id - 1) FROM t ORDER BY id DESC LIMIT 1"), "ORDER BY evaluates every row")
@@ -430,13 +455,15 @@ func TestSession_Select(t *testing.T) {
 	t.Run("names and types output columns", func(t *testing.T) {
 		s := newSession(t)
 		setup(t, s)
-		rows, _, err := run(t.Context(), s, "SELECT id, name AS n, f + 1, length(name), CASE WHEN TRUE THEN 1 END, CAST(f AS int), NULL, 1 FROM t")
+		rows, _, err := run(t.Context(), s, "SELECT id, name AS n, f + 1, length(name), CASE WHEN TRUE THEN 1 END, CAST(f AS int), NULL, 1, CASE WHEN FALSE THEN 1 ELSE id END, CASE WHEN FALSE THEN 1 ELSE CAST(2 AS int) END, CAST(1 AS float), CASE WHEN TRUE THEN 1 ELSE coalesce(id) END FROM t")
 		is.NotError(t, err)
 		is.Equal(t, fmt.Sprint([]exec.Column{
 			{Name: "id", Type: value.Int}, {Name: "n", Type: value.String}, {Name: "?column?", Type: value.Float, Nullable: true},
 			{Name: "length", Type: value.Int, Nullable: true}, {Name: "case", Type: value.Int, Nullable: true}, {Name: "f", Type: value.Int, Nullable: true},
 			{Name: "?column?", Type: value.Unknown, Nullable: true}, {Name: "?column?", Type: value.Int, Nullable: true},
+			{Name: "id", Type: value.Int, Nullable: true}, {Name: "case", Type: value.Int, Nullable: true}, {Name: "float", Type: value.Float, Nullable: true}, {Name: "coalesce", Type: value.Int, Nullable: true},
 		}), fmt.Sprint(rows.Columns))
+		is.Error(t, exec.ErrInvalid, queryErr(t, s, "SELECT *, CASE WHEN FALSE THEN id ELSE id END FROM t ORDER BY id"), "ambiguous, as in Postgres")
 	})
 
 	t.Run("uses composite primary keys for ranges", func(t *testing.T) {

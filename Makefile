@@ -29,6 +29,12 @@ SOAK_DURATION ?= 5m
 soak:
 	MARAGUDB_SOAK=1 MARAGUDB_SOAK_DURATION=$(SOAK_DURATION) go test ./internal/sim -run 'TestSimulator/soak' -count 1 -v -timeout 0
 
+# Run the Postgres differential harness with many more cases (default 3000).
+PGDIFF_CASES ?= 3000
+.PHONY: pgdiff
+pgdiff:
+	MARAGUDB_PGDIFF_CASES=$(PGDIFF_CASES) go test ./internal/pgdiff -run TestDifferential -count 1 -v -timeout 0
+
 # Run only the Tigris integration suite.
 .PHONY: tigris
 tigris:

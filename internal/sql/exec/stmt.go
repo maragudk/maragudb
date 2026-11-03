@@ -376,14 +376,18 @@ func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value
 
 	var columns []Column
 	var items []*cexpr
+	// itemExprs are the output expressions with stars expanded.
+	var itemExprs []ast.Expr
 	for _, item := range st.Items {
 		if item.Star {
 			if t == nil {
 				return nil, fmt.Errorf("%w: SELECT * needs a FROM clause", ErrInvalid)
 			}
 			for i, c := range t.Columns {
-				e, _ := b.bind(&ast.ColumnRef{Name: c.Name})
+				ref := &ast.ColumnRef{Name: c.Name}
+				e, _ := b.bind(ref)
 				items = append(items, e)
+				itemExprs = append(itemExprs, ref)
 				columns = append(columns, Column{Name: c.Name, Type: c.Type, Nullable: !t.Columns[i].NotNull})
 			}
 			continue
@@ -393,6 +397,7 @@ func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value
 			return nil, err
 		}
 		items = append(items, e)
+		itemExprs = append(itemExprs, item.Expr)
 		col := Column{Name: item.Alias, Type: e.typ, Nullable: true}
 		if col.Name == "" {
 			col.Name = outputName(item.Expr)
@@ -428,20 +433,29 @@ func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value
 		}
 		switch e := o.Expr.(type) {
 		case *ast.Literal:
-			if e.Value.Type == value.Int && !e.Value.Null {
+			// An int constant is an output position. Other untyped constants are an error, as in
+			// Postgres, while bytes and time literals are typed and sort as constants.
+			switch {
+			case e.Value.Null, e.Value.Type == value.Float, e.Value.Type == value.String, e.Value.Type == value.Bool:
+				return nil, fmt.Errorf("%w: non-integer constant in ORDER BY", ErrInvalid)
+			case e.Value.Type == value.Int:
 				if e.Value.I < 1 || e.Value.I > int64(len(columns)) {
 					return nil, fmt.Errorf("%w: ORDER BY position %d is not in the select list", ErrInvalid, e.Value.I)
 				}
 				k.output = int(e.Value.I) - 1
 			}
 		case *ast.ColumnRef:
+			// A name matches an output column first. Several output columns of that name are
+			// only ambiguous when they are different expressions, as in Postgres.
 			matches := -1
 			for i, c := range columns {
 				if c.Name == e.Name {
-					if matches >= 0 {
+					if matches >= 0 && ast.RenderExpr(itemExprs[matches], ast.Maragudb) != ast.RenderExpr(itemExprs[i], ast.Maragudb) {
 						return nil, fmt.Errorf("%w: ORDER BY %q is ambiguous", ErrInvalid, e.Name)
 					}
-					matches = i
+					if matches < 0 {
+						matches = i
+					}
 				}
 			}
 			k.output = matches
@@ -593,17 +607,34 @@ func compareKeys(order []orderKey, a, b []value.Value) int {
 	return 0
 }
 
-// outputName of an expression without an alias, following Postgres.
+// outputName of an expression without an alias, following Postgres: a column or function keeps
+// its name, a CASE takes the name of its ELSE when that is a column or function and is "case"
+// otherwise, and a cast keeps the name of what it casts or takes the type's name.
 func outputName(e ast.Expr) string {
+	name, _ := outputNameStrength(e)
+	return name
+}
+
+// outputNameStrength is the name and how good it is: 2 for a column or function name, 1 for a
+// generic name, and 0 for none.
+func outputNameStrength(e ast.Expr) (string, int) {
 	switch e := e.(type) {
 	case *ast.ColumnRef:
-		return e.Name
+		return e.Name, 2
 	case *ast.Call:
-		return e.Name
+		return e.Name, 2
 	case *ast.Case:
-		return "case"
+		if e.Else != nil {
+			if name, strength := outputNameStrength(e.Else); strength > 1 {
+				return name, strength
+			}
+		}
+		return "case", 1
 	case *ast.Cast:
-		return outputName(e.Expr)
+		if name, strength := outputNameStrength(e.Expr); strength > 1 {
+			return name, strength
+		}
+		return e.Type.String(), 1
 	}
-	return "?column?"
+	return "?column?", 0
 }

@@ -250,6 +250,11 @@ func (b *binder) binary(e *ast.Binary) (*cexpr, error) {
 		return nil, err
 	}
 	t := l.typ
+	if resultType, ok := binaryResultType(e.Op, t); ok && ((l.folded && l.val.Null) || (r.folded && r.val.Null)) {
+		// Operators are strict, so a known NULL operand makes the result NULL without evaluating
+		// the other operand, as Postgres folds it.
+		return constant(value.NewNull(resultType)), nil
+	}
 	var op func(a, c value.Value) (value.Value, error)
 	var resultType value.Type
 	switch e.Op {
@@ -340,6 +345,17 @@ func (b *binder) logical(e *ast.Binary) (*cexpr, error) {
 		}
 		return value.NewBool(and), nil
 	}}, l, r)
+}
+
+// binaryResultType of a non-logical operator on operands of type t, when the operator exists.
+func binaryResultType(op ast.BinaryOp, t value.Type) (value.Type, bool) {
+	switch op {
+	case ast.Add, ast.Sub, ast.Mul, ast.Div, ast.Mod:
+		return t, t == value.Int || t == value.Float || (t == value.Unknown && op != ast.Mod)
+	case ast.Concat:
+		return t, t == value.String || t == value.Bytes || t == value.Unknown
+	}
+	return value.Bool, true
 }
 
 func logicalName(op ast.BinaryOp) string {
@@ -575,6 +591,9 @@ func (b *binder) like(e *ast.Like) (*cexpr, error) {
 			return nil, fmt.Errorf("%w: LIKE needs strings, not %v", ErrType, c.typ)
 		}
 	}
+	if (x.folded && x.val.Null) || (p.folded && p.val.Null) {
+		return constant(value.NewNull(value.Bool)), nil
+	}
 	not := e.Not
 	return b.fold(&cexpr{typ: value.Bool, eval: func(row []value.Value) (value.Value, error) {
 		v, err := x.value(row)
@@ -618,6 +637,26 @@ func (b *binder) caseExpr(e *ast.Case) (*cexpr, error) {
 	// later results are never bound and folded, as in Postgres.
 	decided := false
 	for _, w := range e.Whens {
+		if decided {
+			// Everything after a WHEN known true is only type-checked.
+			cond, err := b.bindPruned(w.Cond)
+			if err != nil {
+				return nil, err
+			}
+			if operand != nil {
+				if _, _, err = unify(operand, cond, "CASE mixes"); err != nil {
+					return nil, err
+				}
+			} else if cond.typ != value.Bool && cond.typ != value.Unknown {
+				return nil, fmt.Errorf("%w: argument of CASE WHEN must be bool, not %v", ErrType, cond.typ)
+			}
+			result, err := b.bindPruned(w.Result)
+			if err != nil {
+				return nil, err
+			}
+			results = append(results, result)
+			continue
+		}
 		cond, err := b.bind(w.Cond)
 		if err != nil {
 			return nil, err
@@ -628,9 +667,11 @@ func (b *binder) caseExpr(e *ast.Case) (*cexpr, error) {
 			if o, cond, err = unify(operand, cond, "CASE mixes"); err != nil {
 				return nil, err
 			}
-			if o.folded && cond.folded {
+			// A NULL operand or value never matches, and the comparison is strict, so the WHEN
+			// is known not to match when either is a known NULL.
+			if (o.folded && cond.folded) || (o.folded && o.val.Null) || (cond.folded && cond.val.Null) {
 				known = true
-				matched = !o.val.Null && !cond.val.Null && value.Compare(o.val, cond.val) == 0
+				matched = o.folded && cond.folded && !o.val.Null && !cond.val.Null && value.Compare(o.val, cond.val) == 0
 			}
 		} else {
 			if cond.typ != value.Bool && cond.typ != value.Unknown {
@@ -641,7 +682,7 @@ func (b *binder) caseExpr(e *ast.Case) (*cexpr, error) {
 				matched = !cond.val.Null && cond.val.B
 			}
 		}
-		if decided || (known && !matched) {
+		if known && !matched {
 			// The branch is only type-checked.
 			result, err := b.bindPruned(w.Result)
 			if err != nil {
@@ -683,6 +724,13 @@ func (b *binder) caseExpr(e *ast.Case) (*cexpr, error) {
 	results, t, err := unifyAll(results, "CASE results mix")
 	if err != nil {
 		return nil, err
+	}
+	if t == value.Unknown {
+		// Results that are all untyped NULLs make a string, as Postgres resolves unknown to text.
+		t = value.String
+		for i := range results {
+			results[i] = retypeNull(results[i], t)
+		}
 	}
 	// The unified results are matched back to the live WHENs by identity, because pruned
 	// results are in the list too.
@@ -773,12 +821,16 @@ func (b *binder) call(e *ast.Call) (*cexpr, error) {
 				decided = true
 			}
 		}
-		if len(kept) == 0 {
-			return constant(value.NewNull(value.Unknown)), nil
-		}
 		unifiedAll, t, err := unifyAll(all, "coalesce mixes")
 		if err != nil {
 			return nil, err
+		}
+		if t == value.Unknown {
+			// Arguments that are all untyped NULLs make a string, as Postgres resolves unknown to text.
+			t = value.String
+		}
+		if len(kept) == 0 {
+			return constant(value.NewNull(t)), nil
 		}
 		unified := map[*cexpr]*cexpr{}
 		for i, a := range all {
@@ -840,6 +892,10 @@ func (b *binder) call(e *ast.Call) (*cexpr, error) {
 		x := args[0]
 		if x.typ != value.Int && x.typ != value.Float && x.typ != value.Unknown {
 			return nil, fmt.Errorf("%w: abs takes an int or float, not %v", ErrType, x.typ)
+		}
+		if x.typ == value.Unknown {
+			// Postgres resolves abs(NULL) to its preferred numeric type, double precision.
+			return constant(value.NewNull(value.Float)), nil
 		}
 		return b.fold(&cexpr{typ: x.typ, eval: func(row []value.Value) (value.Value, error) {
 			v, err := x.value(row)

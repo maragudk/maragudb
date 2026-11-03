@@ -149,7 +149,15 @@ func (r *renderer) stmt(s Statement) {
 				if i > 0 {
 					r.b.WriteString(", ")
 				}
-				r.expr(o.Expr, 0)
+				// A bare constant is an output position when it is an int and an error otherwise,
+				// in both dialects, so a literal is rendered untyped in Postgres too.
+				if lit, ok := o.Expr.(*Literal); ok && (lit.Value.Null || lit.Value.Type == value.Int || lit.Value.Type == value.String || lit.Value.Type == value.Bool || (lit.Value.Type == value.Float && !math.IsNaN(lit.Value.F) && !math.IsInf(lit.Value.F, 0))) {
+					bare := renderer{d: Maragudb}
+					bare.literal(lit.Value)
+					r.b.WriteString(bare.b.String())
+				} else {
+					r.expr(o.Expr, 0)
+				}
 				if o.Desc {
 					r.b.WriteString(" DESC")
 				}
@@ -372,14 +380,16 @@ func (r *renderer) literal(v value.Value) {
 			return
 		}
 		s := value.FormatFloat(v.F)
+		if r.d == Postgres {
+			// A quoted literal goes through float8in directly. A numeric literal would be
+			// parsed as numeric first, which has no negative zero.
+			fmt.Fprintf(&r.b, "'%s'::float8", s)
+			return
+		}
 		if !strings.ContainsAny(s, ".e") {
 			s += ".0"
 		}
-		if r.d == Postgres {
-			fmt.Fprintf(&r.b, "(%s)::float8", s)
-		} else {
-			r.b.WriteString(s)
-		}
+		r.b.WriteString(s)
 	case value.Bool:
 		if v.B {
 			r.b.WriteString("TRUE")
