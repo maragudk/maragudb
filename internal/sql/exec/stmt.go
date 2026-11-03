@@ -175,34 +175,61 @@ func joinStrings(parts []string, sep string) string {
 	return out
 }
 
-// filter is a bound WHERE clause.
+// filter is a bound WHERE clause: its top-level conjuncts, evaluated in order until one is not
+// true. Postgres evaluates the conjuncts of a WHERE clause the same way, stopping at the first
+// false or NULL, so a later conjunct that would fail is never evaluated for that row.
 type filter struct {
-	cond *cexpr
+	conds []*cexpr
 }
 
 func (b *binder) where(e ast.Expr) (filter, error) {
 	if e == nil {
 		return filter{}, nil
 	}
-	c, err := b.bind(e)
-	if err != nil {
-		return filter{}, err
+	var f filter
+	pruned := false
+	for _, c := range conjuncts(e) {
+		var ce *cexpr
+		var err error
+		if pruned {
+			ce, err = b.bindPruned(c)
+		} else {
+			ce, err = b.bind(c)
+		}
+		if err != nil {
+			return filter{}, err
+		}
+		if ce.typ != value.Bool && ce.typ != value.Unknown {
+			return filter{}, fmt.Errorf("%w: argument of WHERE must be bool, not %v", ErrType, ce.typ)
+		}
+		if pruned {
+			continue
+		}
+		if ce.folded && !ce.val.Null {
+			if ce.val.B {
+				continue
+			}
+			// A known false conjunct decides the clause; the rest is only type-checked.
+			pruned = true
+			f.conds = []*cexpr{ce}
+			continue
+		}
+		f.conds = append(f.conds, ce)
 	}
-	if c.typ != value.Bool && c.typ != value.Unknown {
-		return filter{}, fmt.Errorf("%w: argument of WHERE must be bool, not %v", ErrType, c.typ)
-	}
-	return filter{cond: c}, nil
+	return f, nil
 }
 
 func (f filter) matches(row []value.Value) (bool, error) {
-	if f.cond == nil {
-		return true, nil
+	for _, c := range f.conds {
+		v, err := c.value(row)
+		if err != nil {
+			return false, err
+		}
+		if v.Null || !v.B {
+			return false, nil
+		}
 	}
-	v, err := f.cond.value(row)
-	if err != nil {
-		return false, err
-	}
-	return !v.Null && v.B, nil
+	return true, nil
 }
 
 // scanRows calls fn with the key and decoded row of every row of t that the access path and
