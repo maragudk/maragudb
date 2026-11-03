@@ -1,0 +1,401 @@
+package history_test
+
+import (
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"hegel.dev/go/hegel"
+	"maragu.dev/is"
+
+	"maragu.dev/maragudb/internal/history"
+)
+
+func app(key string, v int64) history.Op {
+	return history.Op{Kind: history.Append, Key: key, Value: v}
+}
+
+func read(key string, list ...int64) history.Op {
+	if list == nil {
+		list = []int64{}
+	}
+	return history.Op{Kind: history.Read, Key: key, List: list}
+}
+
+func tx(id int, invoke, complete int, outcome history.Outcome, ops ...history.Op) history.Tx {
+	return history.Tx{ID: id, Client: id, Invoke: time.Duration(invoke), Complete: time.Duration(complete), Ops: ops, Outcome: outcome}
+}
+
+func anomalyKind(t *testing.T, err error) string {
+	t.Helper()
+	var a *history.Anomaly
+	if !errors.As(err, &a) {
+		return ""
+	}
+	return a.Kind
+}
+
+func TestCheckListAppend(t *testing.T) {
+	tests := []struct {
+		name  string
+		txs   []history.Tx
+		final map[string][]int64
+		want  string
+	}{
+		{
+			name: "accepts a serial history",
+			txs: []history.Tx{
+				tx(1, 0, 10, history.OK, app("k", 1)),
+				tx(2, 20, 30, history.OK, read("k", 1), app("k", 2)),
+				tx(3, 40, 50, history.OK, read("k", 1, 2)),
+			},
+			final: map[string][]int64{"k": {1, 2}},
+		},
+		{
+			name: "accepts concurrent transactions in either order",
+			txs: []history.Tx{
+				tx(1, 0, 30, history.OK, app("k", 1)),
+				tx(2, 10, 20, history.OK, read("k"), app("j", 2)),
+			},
+			final: map[string][]int64{"k": {1}, "j": {2}},
+		},
+		{
+			name: "rejects a stale read after a completed write",
+			txs: []history.Tx{
+				tx(1, 0, 10, history.OK, app("k", 1)),
+				tx(2, 20, 30, history.OK, read("k")),
+			},
+			final: map[string][]int64{"k": {1}},
+			want:  "cycle",
+		},
+		{
+			name: "rejects a read that misses an earlier element of a key read by a later transaction",
+			txs: []history.Tx{
+				tx(1, 0, 10, history.OK, app("k", 1)),
+				tx(2, 11, 20, history.OK, app("k", 2)),
+				tx(3, 30, 40, history.OK, read("k", 2)),
+			},
+			final: map[string][]int64{"k": {1, 2}},
+			want:  "incompatible orders",
+		},
+		{
+			name: "rejects write skew",
+			txs: []history.Tx{
+				tx(1, 0, 20, history.OK, read("a"), app("b", 1)),
+				tx(2, 0, 20, history.OK, read("b"), app("a", 2)),
+			},
+			final: map[string][]int64{"a": {2}, "b": {1}},
+			want:  "cycle",
+		},
+		{
+			name: "rejects a lost update seen as incompatible orders",
+			txs: []history.Tx{
+				tx(1, 0, 10, history.OK, app("k", 1)),
+				tx(2, 0, 10, history.OK, app("k", 2)),
+				tx(3, 20, 30, history.OK, read("k", 1)),
+				tx(4, 20, 30, history.OK, read("k", 2)),
+			},
+			final: map[string][]int64{"k": {2}},
+			want:  "incompatible orders",
+		},
+		{
+			name: "rejects a read of a failed transaction's write",
+			txs: []history.Tx{
+				tx(1, 0, 10, history.Failed, app("k", 1)),
+				tx(2, 20, 30, history.OK, read("k", 1)),
+			},
+			final: map[string][]int64{"k": {1}},
+			want:  "read of failed write",
+		},
+		{
+			name: "rejects a value nobody appended",
+			txs: []history.Tx{
+				tx(1, 0, 10, history.OK, read("k", 99)),
+			},
+			final: map[string][]int64{"k": {99}},
+			want:  "unknown value",
+		},
+		{
+			name: "treats an observed unknown transaction as committed",
+			txs: []history.Tx{
+				tx(1, 0, 10, history.Unknown, app("k", 1)),
+				tx(2, 20, 30, history.OK, read("k", 1)),
+			},
+			final: map[string][]int64{"k": {1}},
+		},
+		{
+			name: "an unknown transaction has no completion so it may be ordered late",
+			txs: []history.Tx{
+				tx(1, 0, 10, history.Unknown, app("k", 1)),
+				tx(2, 20, 30, history.OK, read("k")),
+			},
+			final: map[string][]int64{"k": {1}},
+		},
+		{
+			name: "ignores an unobserved unknown transaction",
+			txs: []history.Tx{
+				tx(1, 0, 10, history.Unknown, app("k", 1)),
+				tx(2, 20, 30, history.OK, read("k")),
+			},
+			final: map[string][]int64{},
+		},
+		{
+			name: "reads see own appends",
+			txs: []history.Tx{
+				tx(1, 0, 10, history.OK, app("k", 1), read("k", 1), app("k", 2), read("k", 1, 2)),
+				tx(2, 20, 30, history.OK, read("k", 1, 2)),
+			},
+			final: map[string][]int64{"k": {1, 2}},
+		},
+		{
+			name: "rejects a read that does not show own appends",
+			txs: []history.Tx{
+				tx(1, 0, 10, history.OK, app("k", 1), read("k")),
+			},
+			final: map[string][]int64{"k": {1}},
+			want:  "internal inconsistency",
+		},
+		{
+			name: "rejects a duplicated value",
+			txs: []history.Tx{
+				tx(1, 0, 10, history.OK, app("k", 1)),
+			},
+			final: map[string][]int64{"k": {1, 1}},
+			want:  "duplicate value",
+		},
+		{
+			name: "rejects a three-transaction cycle through write-read and real-time edges",
+			txs: []history.Tx{
+				tx(1, 0, 10, history.OK, read("k"), app("j", 1)),
+				tx(2, 20, 30, history.OK, read("j", 1), app("k", 2)),
+				tx(3, 40, 50, history.OK, read("k", 2), read("j")),
+			},
+			final: map[string][]int64{"k": {2}, "j": {1}},
+			want:  "cycle",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := history.CheckListAppend(test.txs, test.final)
+			if test.want == "" {
+				is.NotError(t, err)
+				return
+			}
+			is.Equal(t, test.want, anomalyKind(t, err), fmt.Sprint(err))
+		})
+	}
+}
+
+func TestCheckDurability(t *testing.T) {
+	tests := []struct {
+		name  string
+		txs   []history.Tx
+		final map[string][]int64
+		want  string
+	}{
+		{
+			name:  "accepts acknowledged writes in the final state",
+			txs:   []history.Tx{tx(1, 0, 10, history.OK, app("k", 1), app("j", 2))},
+			final: map[string][]int64{"k": {1}, "j": {2}},
+		},
+		{
+			name:  "rejects a missing acknowledged write",
+			txs:   []history.Tx{tx(1, 0, 10, history.OK, app("k", 1), app("j", 2))},
+			final: map[string][]int64{"k": {1}},
+			want:  "lost acknowledged write",
+		},
+		{
+			name:  "rejects a failed write that was applied",
+			txs:   []history.Tx{tx(1, 0, 10, history.Failed, app("k", 1))},
+			final: map[string][]int64{"k": {1}},
+			want:  "failed write applied",
+		},
+		{
+			name:  "rejects a partially applied unknown transaction",
+			txs:   []history.Tx{tx(1, 0, 10, history.Unknown, app("k", 1), app("j", 2))},
+			final: map[string][]int64{"k": {1}},
+			want:  "partial write",
+		},
+		{
+			name:  "accepts an unknown transaction that was fully applied or not at all",
+			txs:   []history.Tx{tx(1, 0, 10, history.Unknown, app("k", 1), app("j", 2)), tx(2, 0, 10, history.Unknown, app("k", 3))},
+			final: map[string][]int64{"k": {1}, "j": {2}},
+		},
+		{
+			name:  "rejects a value in the wrong key",
+			txs:   []history.Tx{tx(1, 0, 10, history.OK, app("k", 1))},
+			final: map[string][]int64{"j": {1}},
+			want:  "misplaced value",
+		},
+		{
+			name:  "rejects a value nobody wrote",
+			txs:   []history.Tx{tx(1, 0, 10, history.OK, app("k", 1))},
+			final: map[string][]int64{"k": {1, 7}},
+			want:  "unknown value",
+		},
+		{
+			name:  "rejects a read of a failed write even when it is gone from the final state",
+			txs:   []history.Tx{tx(1, 0, 10, history.Failed, app("k", 1)), tx(2, 0, 10, history.OK, read("k", 1))},
+			final: map[string][]int64{},
+			want:  "read of failed write",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := history.CheckDurability(test.txs, test.final)
+			if test.want == "" {
+				is.NotError(t, err)
+				return
+			}
+			is.Equal(t, test.want, anomalyKind(t, err), fmt.Sprint(err))
+		})
+	}
+}
+
+func TestCheckBank(t *testing.T) {
+	t.Run("accepts audits that sum to the total", func(t *testing.T) {
+		is.NotError(t, history.CheckBank([]history.BankAudit{{TxID: 1, Balances: map[string]int64{"a": 60, "b": 40}}}, 100))
+	})
+
+	t.Run("rejects a wrong total", func(t *testing.T) {
+		err := history.CheckBank([]history.BankAudit{{TxID: 1, Balances: map[string]int64{"a": 60, "b": 50}}}, 100)
+		is.Equal(t, "money not conserved", anomalyKind(t, err))
+	})
+
+	t.Run("rejects a negative balance", func(t *testing.T) {
+		err := history.CheckBank([]history.BankAudit{{TxID: 1, Balances: map[string]int64{"a": 110, "b": -10}}}, 100)
+		is.Equal(t, "negative balance", anomalyKind(t, err))
+	})
+}
+
+// serialHistory generates transactions that ran one after another over a model, so the
+// history is strictly serializable by construction.
+func serialHistory(ht *hegel.T) ([]history.Tx, map[string][]int64) {
+	keys := []string{"a", "b", "c"}
+	state := map[string][]int64{}
+	var txs []history.Tx
+	now := 0
+	next := int64(1)
+	n := hegel.Draw(ht, hegel.Integers(1, 12))
+	for id := 1; id <= n; id++ {
+		outcome := hegel.Draw(ht, hegel.SampledFrom([]history.Outcome{history.OK, history.OK, history.OK, history.Failed, history.Unknown}))
+		pending := map[string][]int64{}
+		for k, v := range state {
+			pending[k] = append([]int64(nil), v...)
+		}
+		var ops []history.Op
+		for range hegel.Draw(ht, hegel.Integers(1, 4)) {
+			key := hegel.Draw(ht, hegel.SampledFrom(keys))
+			if hegel.Draw(ht, hegel.Booleans()) {
+				ops = append(ops, app(key, next))
+				pending[key] = append(pending[key], next)
+				next++
+			} else {
+				ops = append(ops, read(key, pending[key]...))
+			}
+		}
+		invoke := now
+		now += hegel.Draw(ht, hegel.Integers(1, 5))
+		txs = append(txs, tx(id, invoke, now, outcome, ops...))
+		now++
+		applied := outcome == history.OK || (outcome == history.Unknown && hegel.Draw(ht, hegel.Booleans()))
+		if applied {
+			state = pending
+		}
+	}
+	return txs, state
+}
+
+func TestChecks_Properties(t *testing.T) {
+	t.Run("accept every serial history", func(t *testing.T) {
+		hegel.Test(t, func(ht *hegel.T) {
+			txs, final := serialHistory(ht)
+			if err := history.CheckListAppend(txs, final); err != nil {
+				ht.Fatalf("list-append: %v", err)
+			}
+			if err := history.CheckDurability(txs, final); err != nil {
+				ht.Fatalf("durability: %v", err)
+			}
+		}, hegel.WithTestCases(1000))
+	})
+
+	t.Run("reject a serial history whose acknowledged read was truncated by one value", func(t *testing.T) {
+		hegel.Test(t, func(ht *hegel.T) {
+			txs, final := serialHistory(ht)
+			// Dropping a value written by an unknown transaction is consistent, because that
+			// transaction has no completion and may be ordered after the read.
+			acked := map[int64]bool{}
+			for _, tx := range txs {
+				if tx.Outcome != history.OK {
+					continue
+				}
+				for _, op := range tx.Ops {
+					if op.Kind == history.Append {
+						acked[op.Value] = true
+					}
+				}
+			}
+			var candidates []int
+			for i, tx := range txs {
+				if tx.Outcome != history.OK {
+					continue
+				}
+				for j, op := range tx.Ops {
+					if op.Kind == history.Read && len(op.List) > 0 && acked[op.List[len(op.List)-1]] {
+						candidates = append(candidates, i*100+j)
+					}
+				}
+			}
+			ht.Assume(len(candidates) > 0)
+			c := hegel.Draw(ht, hegel.SampledFrom(candidates))
+			op := &txs[c/100].Ops[c%100]
+			op.List = op.List[:len(op.List)-1]
+			err := history.CheckListAppend(txs, final)
+			if err == nil {
+				ht.Fatalf("accepted truncated read in %v", txs[c/100])
+			}
+		}, hegel.WithTestCases(1000))
+	})
+
+	t.Run("reject a serial history where an acknowledged append was dropped from the final state", func(t *testing.T) {
+		hegel.Test(t, func(ht *hegel.T) {
+			txs, final := serialHistory(ht)
+			var candidates []int64
+			for _, tx := range txs {
+				if tx.Outcome != history.OK {
+					continue
+				}
+				for _, op := range tx.Ops {
+					if op.Kind == history.Append {
+						candidates = append(candidates, op.Value)
+					}
+				}
+			}
+			ht.Assume(len(candidates) > 0)
+			victim := hegel.Draw(ht, hegel.SampledFrom(candidates))
+			for key, list := range final {
+				var kept []int64
+				for _, v := range list {
+					if v != victim {
+						kept = append(kept, v)
+					}
+				}
+				final[key] = kept
+			}
+			if err := history.CheckDurability(txs, final); err == nil {
+				ht.Fatalf("accepted dropped value %d", victim)
+			}
+		}, hegel.WithTestCases(1000))
+	})
+}
+
+func TestAnomaly(t *testing.T) {
+	t.Run("prints the kind, message, and transactions", func(t *testing.T) {
+		a := &history.Anomaly{Kind: "cycle", Message: "x", Txs: []history.Tx{tx(1, 0, 1, history.OK, app("k", 1))}}
+		s := a.Error()
+		is.True(t, strings.HasPrefix(s, "cycle: x"))
+		is.True(t, strings.Contains(s, "append(k, 1)"))
+	})
+}
