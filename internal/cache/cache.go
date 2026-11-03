@@ -5,7 +5,6 @@ import (
 	"container/list"
 	"crypto/sha256"
 	"encoding/hex"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -13,7 +12,7 @@ import (
 )
 
 // Cache of byte values by key. Implementations must be safe for concurrent use.
-// A cache may drop or fail to store any entry at any time; correctness must never depend on it.
+// A cache may drop or fail to store any entry at any time, so it only ever speeds things up.
 type Cache interface {
 	Get(key string) ([]byte, bool)
 	Put(key string, value []byte)
@@ -128,7 +127,5 @@ func (d *Disk) Put(key string, value []byte) {
 	if err := tmp.Close(); err != nil {
 		return
 	}
-	if err := os.Rename(tmp.Name(), path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return
-	}
+	_ = os.Rename(tmp.Name(), path)
 }

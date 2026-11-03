@@ -13,6 +13,7 @@ import (
 // segments become garbage for [DB.GC]. It returns [ErrConflict] when a commit happened meanwhile.
 // It is safe to run concurrently with transactions in any process.
 func (db *DB) Compact(ctx context.Context) error {
+	startedAt := db.now()
 	m, etag, err := db.refreshManifest(ctx)
 	if err != nil {
 		return fmt.Errorf("engine: compacting: %w", err)
@@ -20,8 +21,9 @@ func (db *DB) Compact(ctx context.Context) error {
 	if len(m.Segments) < 2 {
 		return nil
 	}
-	startedAt := db.now()
 
+	// Merging every segment is what makes dropping tombstones safe: no older segment remains
+	// whose values a tombstone would have to keep hiding.
 	it := &Iterator{}
 	for i := len(m.Segments) - 1; i >= 0; i-- {
 		seg := m.Segments[i]
@@ -48,7 +50,6 @@ func (db *DB) Compact(ctx context.Context) error {
 			return err
 		}
 		meta.Key = db.key(segmentKey(m.Seq, id))
-		meta.Seq = next.Seq
 		if err := db.putObject(ctx, meta.Key, body); err != nil {
 			return err
 		}

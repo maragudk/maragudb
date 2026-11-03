@@ -201,6 +201,23 @@ func TestCheckListAppend(t *testing.T) {
 			want:  "invalid history",
 		},
 		{
+			name: "rejects a stale read by a transaction that later failed",
+			txs: []history.Tx{
+				tx(1, 0, 10, history.OK, app("k", 1)),
+				tx(2, 20, 30, history.Failed, read("k"), app("j", 2)),
+			},
+			final: map[string][]int64{"k": {1}},
+			want:  "cycle",
+		},
+		{
+			name: "accepts a failed transaction whose read was current",
+			txs: []history.Tx{
+				tx(1, 0, 10, history.OK, app("k", 1)),
+				tx(2, 20, 30, history.Failed, read("k", 1), app("k", 2)),
+			},
+			final: map[string][]int64{"k": {1}},
+		},
+		{
 			name: "rejects a three-transaction cycle through write-read and real-time edges",
 			txs: []history.Tx{
 				tx(1, 0, 10, history.OK, read("k"), app("j", 1)),

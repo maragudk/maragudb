@@ -195,15 +195,15 @@ func TestSegment(t *testing.T) {
 		is.True(t, it.Err() != nil)
 	})
 
-	t.Run("decoding arbitrary bytes fails cleanly or round-trips", func(t *testing.T) {
+	t.Run("decoding arbitrary bytes never panics or allocates beyond the input", func(t *testing.T) {
 		hegel.Test(t, func(ht *hegel.T) {
 			b := hegel.Draw(ht, hegel.Binary(0, 64))
 			d, err := decodeBlock(b)
 			if err != nil {
 				return
 			}
-			if d.kind != blockKindData && d.kind != blockKindIndex {
-				ht.Fatalf("decoded unknown kind %d", d.kind)
+			if len(d.entries)+len(d.index) > len(b) {
+				ht.Fatalf("decoded %d entries from %d bytes", len(d.entries)+len(d.index), len(b))
 			}
 		}, hegel.WithTestCases(2000))
 	})

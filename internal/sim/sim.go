@@ -207,7 +207,9 @@ func Run(cfg Config) Result {
 		}
 	}
 	res.Anomalies = r.anoms
-	assert.Always(len(r.anoms) == 0, "the simulated history has no anomalies", map[string]any{"seed": cfg.Seed})
+	if cfg.Mutations == (engine.Mutations{}) {
+		assert.Always(len(r.anoms) == 0, "the simulated history has no anomalies", map[string]any{"seed": cfg.Seed})
+	}
 	res.Digest = r.digest(res)
 	return res
 }
@@ -265,38 +267,21 @@ func (r *run) open(ctx context.Context, id int, rng *rand.Rand, disk cache.Cache
 func (r *run) seedBank() {
 	r.total = int64(r.cfg.Keys) * initialBalance
 	r.sched.Go("seed", func(ctx context.Context) {
-		for {
-			db, err := r.open(ctx, 0, r.rng, nil)
-			if err != nil {
-				continue
-			}
-			tx, err := db.Begin(ctx)
-			if err != nil {
-				continue
-			}
-			for i := range r.cfg.Keys {
-				_ = tx.Put([]byte(keyName(i)), []byte(strconv.Itoa(initialBalance)))
-			}
-			if err := tx.Commit(ctx); err == nil {
-				return
-			}
-			if _, ok := checkExists(ctx, db, keyName(0)); ok {
-				return
-			}
+		db, err := engine.Open(ctx, engine.Options{Client: r.fake.WithoutFaults(), Prefix: "db", Now: r.sched.Now, Rand: rand.New(rand.NewPCG(r.cfg.Seed, 0x5eed))})
+		if err != nil {
+			panic(err)
+		}
+		tx, err := db.Begin(ctx)
+		if err != nil {
+			panic(err)
+		}
+		for i := range r.cfg.Keys {
+			_ = tx.Put([]byte(keyName(i)), []byte(strconv.Itoa(initialBalance)))
+		}
+		if err := tx.Commit(ctx); err != nil {
+			panic(err)
 		}
 	})
-}
-
-func checkExists(ctx context.Context, db *engine.DB, key string) ([]byte, bool) {
-	tx, err := db.BeginReadOnly(ctx)
-	if err != nil {
-		return nil, false
-	}
-	v, ok, err := tx.Get(ctx, []byte(key))
-	if err != nil {
-		return nil, false
-	}
-	return v, ok
 }
 
 // readFinal reads every key with a fresh, fault-free, cache-free process.
@@ -306,7 +291,7 @@ func (r *run) readFinal() (map[string][]int64, map[string]int64, error) {
 	var err error
 	r.sched.Go("final", func(ctx context.Context) {
 		var db *engine.DB
-		db, err = engine.Open(ctx, engine.Options{Client: r.fakeWithoutFaults(), Prefix: "db", Now: r.sched.Now, MemoryCacheBytes: new(int64)})
+		db, err = engine.Open(ctx, engine.Options{Client: r.fake.WithoutFaults(), Prefix: "db", Now: r.sched.Now, MemoryCacheBytes: new(int64), Rand: rand.New(rand.NewPCG(r.cfg.Seed, 0xf1a1))})
 		if err != nil {
 			return
 		}
@@ -334,11 +319,6 @@ func (r *run) readFinal() (map[string][]int64, map[string]int64, error) {
 	})
 	r.sched.Run()
 	return lists, balances, err
-}
-
-// fakeWithoutFaults is the same store with faults disabled, for the final read.
-func (r *run) fakeWithoutFaults() *s3fake.Client {
-	return r.fake.WithoutFaults()
 }
 
 func keyName(i int) string {
@@ -453,17 +433,21 @@ func (c *client) record(tx history.Tx) {
 	c.run.trace("%v", tx)
 }
 
+// outcome of a commit. Only [engine.ErrCommitUnknown] is ambiguous; every other error means
+// the transaction was not applied.
 func (c *client) outcome(err error) history.Outcome {
 	switch {
 	case err == nil:
 		c.run.stats.Commits++
 		return history.OK
+	case errors.Is(err, engine.ErrCommitUnknown):
+		c.run.stats.Unknown++
+		return history.Unknown
 	case errors.Is(err, engine.ErrConflict):
 		c.run.stats.Conflicts++
 		return history.Failed
 	default:
-		c.run.stats.Unknown++
-		return history.Unknown
+		return history.Failed
 	}
 }
 
@@ -501,6 +485,13 @@ func (c *client) listAppendTx(ctx context.Context) {
 		if err != nil {
 			c.readError(tx, err)
 			c.run.trace("client %d: read: %v", c.id, err)
+			// The reads that completed are real observations; the transaction was never committed.
+			if len(h.Ops) > 0 {
+				h.Complete = c.run.stamp()
+				h.Outcome = history.Failed
+				h.Err = err.Error()
+				c.record(h)
+			}
 			return
 		}
 		list := decodeList(v)

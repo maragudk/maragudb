@@ -11,9 +11,6 @@ import (
 // manifestVersion of the encoding.
 const manifestVersion = 1
 
-// commitWindow is how many recent commit records a manifest keeps for resolving ambiguous writes.
-const commitWindow = 128
-
 // manifest is the root of the database: the current commit sequence and the live segments.
 // It is replaced atomically with a conditional write on every commit.
 type manifest struct {
@@ -35,8 +32,6 @@ type segmentMeta struct {
 	MinKey []byte   `json:"minKey"`
 	MaxKey []byte   `json:"maxKey"`
 	Count  int      `json:"count"`
-	// Seq of the manifest write that added the segment.
-	Seq uint64 `json:"seq"`
 }
 
 // garbageEntry is an object no longer referenced by the current manifest, kept until the grace
@@ -85,9 +80,11 @@ func (m *manifest) next(commitID string, now time.Time) *manifest {
 	n := m.clone()
 	n.Seq = m.Seq + 1
 	n.CommitID = commitID
+	// The last 128 commit records are enough to resolve a write whose answer was lost unless
+	// that many other commits happen during its retries.
 	n.Commits = append(n.Commits, commitRecord{Seq: n.Seq, ID: commitID})
-	if len(n.Commits) > commitWindow {
-		n.Commits = n.Commits[len(n.Commits)-commitWindow:]
+	if len(n.Commits) > 128 {
+		n.Commits = n.Commits[len(n.Commits)-128:]
 	}
 	n.UpdatedAt = now
 	return n

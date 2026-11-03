@@ -3,8 +3,7 @@
 // Tasks run as goroutines, but only one runs at a time: a task holds the baton until it calls
 // [Scheduler.Sleep], which parks it until its virtual wake-up time. The scheduler then resumes
 // the task with the earliest wake-up time (ties broken in creation order). Given the same
-// sequence of calls, the interleaving is identical on every run, which makes a simulation
-// reproducible from its seed alone.
+// sequence of calls, the interleaving is identical on every run.
 package sched
 
 import (
@@ -24,7 +23,6 @@ type Scheduler struct {
 	seq    uint64
 	queue  waiters
 	parked chan struct{}
-	live   int
 }
 
 type task struct {
@@ -66,7 +64,6 @@ func New(epoch time.Time) *Scheduler {
 func (s *Scheduler) Go(name string, f func(ctx context.Context)) {
 	t := &task{name: name, wake: make(chan struct{})}
 	s.mu.Lock()
-	s.live++
 	s.enqueueLocked(t, s.now)
 	s.mu.Unlock()
 
@@ -74,9 +71,6 @@ func (s *Scheduler) Go(name string, f func(ctx context.Context)) {
 	go func() {
 		<-t.wake
 		f(ctx)
-		s.mu.Lock()
-		s.live--
-		s.mu.Unlock()
 		s.parked <- struct{}{}
 	}()
 }

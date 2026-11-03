@@ -19,28 +19,42 @@ func blockCacheKey(objectKey string, ref blockRef) string {
 // A missing object means the snapshot's objects were garbage collected.
 func (db *DB) readBlock(ctx context.Context, snapshotAt time.Time, objectKey string, ref blockRef) (*decodedBlock, error) {
 	ck := blockCacheKey(objectKey, ref)
+	// A corrupt cache entry is ignored and replaced from the store.
 	if db.mem != nil {
 		if b, ok := db.mem.Get(ck); ok {
-			db.memHits.Add(1)
-			return decodeBlock(b)
+			if d, err := decodeBlock(b); err == nil {
+				db.memHits.Add(1)
+				return d, nil
+			}
+			db.log.Warn("corrupt block in memory cache", "key", ck)
 		}
 		db.memMisses.Add(1)
 	}
 	if db.disk != nil {
 		if b, ok := db.disk.Get(ck); ok {
-			db.diskHits.Add(1)
-			if db.mem != nil {
-				db.mem.Put(ck, b)
+			if d, err := decodeBlock(b); err == nil {
+				db.diskHits.Add(1)
+				if db.mem != nil {
+					db.mem.Put(ck, b)
+				}
+				return d, nil
 			}
-			return decodeBlock(b)
+			db.log.Warn("corrupt block in disk cache", "key", ck)
 		}
 		db.diskMisses.Add(1)
 	}
-	res, err := db.client.Get(ctx, objectKey, s3.GetOptions{Range: &s3.ByteRange{Offset: ref.Offset, Length: ref.Length}})
+	byteRange := &s3.ByteRange{Offset: ref.Offset, Length: ref.Length}
+	res, err := db.client.Get(ctx, objectKey, s3.GetOptions{Range: byteRange})
+	if errors.Is(err, s3.ErrNotFound) {
+		// A store with eventually consistent reads may not show a fresh object yet, so ask again consistently.
+		res, err = db.client.Get(ctx, objectKey, s3.GetOptions{Range: byteRange, Consistent: true})
+	}
 	if err != nil {
 		if errors.Is(err, s3.ErrNotFound) {
 			age := db.now().Sub(snapshotAt)
-			assert.Always(age >= db.grace, "a reader younger than the GC grace period never loses its objects", map[string]any{"age": age.String(), "grace": db.grace.String()})
+			if !db.mutations.GCIgnoreGrace {
+				assert.Always(age >= db.grace, "a reader younger than the GC grace period never loses its objects", map[string]any{"age": age.String(), "grace": db.grace.String()})
+			}
 			return nil, fmt.Errorf("%w: object %q is gone after %v (grace period %v)", ErrSnapshotExpired, objectKey, age, db.grace)
 		}
 		return nil, fmt.Errorf("engine: reading block of %q: %w", objectKey, err)

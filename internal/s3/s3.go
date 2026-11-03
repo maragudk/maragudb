@@ -42,7 +42,7 @@ type GetOptions struct {
 	IfNoneMatch string
 	// Range limits the read to a byte range. Nil reads the whole object.
 	Range *ByteRange
-	// Consistent requests a strongly consistent read where the store distinguishes (Tigris).
+	// Consistent requests a strongly consistent read where the store distinguishes.
 	Consistent bool
 }
 

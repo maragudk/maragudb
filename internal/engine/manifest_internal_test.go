@@ -28,7 +28,6 @@ func TestManifest(t *testing.T) {
 					MinKey: hegel.Draw(ht, hegel.Binary(0, 8)),
 					MaxKey: hegel.Draw(ht, hegel.Binary(0, 8)),
 					Count:  hegel.Draw(ht, hegel.Integers(0, 1<<30)),
-					Seq:    hegel.Draw(ht, hegel.Integers[uint64](0, 1<<62)),
 				})
 			}
 			n = hegel.Draw(ht, hegel.Integers(0, 5))
@@ -55,7 +54,7 @@ func TestManifest(t *testing.T) {
 			}
 			for i := range m.Segments {
 				a, b := got.Segments[i], m.Segments[i]
-				if a.Key != b.Key || a.Size != b.Size || a.Root != b.Root || !bytes.Equal(a.MinKey, b.MinKey) || !bytes.Equal(a.MaxKey, b.MaxKey) || a.Count != b.Count || a.Seq != b.Seq {
+				if a.Key != b.Key || a.Size != b.Size || a.Root != b.Root || !bytes.Equal(a.MinKey, b.MinKey) || !bytes.Equal(a.MaxKey, b.MaxKey) || a.Count != b.Count {
 					ht.Fatalf("segment %d: got %+v, want %+v", i, a, b)
 				}
 			}
@@ -85,14 +84,14 @@ func TestManifest(t *testing.T) {
 
 	t.Run("next bumps the sequence, records the commit, and keeps the window bounded", func(t *testing.T) {
 		m := &manifest{Version: manifestVersion}
-		for i := range commitWindow + 10 {
+		for i := range 128 + 10 {
 			m = m.next(fmt.Sprint("c", i), time.Unix(int64(i), 0))
 			is.Equal(t, uint64(i+1), m.Seq)
 			c, ok := m.commitAt(m.Seq)
 			is.True(t, ok)
 			is.Equal(t, fmt.Sprint("c", i), c.ID)
 		}
-		is.Equal(t, commitWindow, len(m.Commits))
+		is.Equal(t, 128, len(m.Commits))
 		_, ok := m.commitAt(1)
 		is.True(t, !ok, "oldest commit fell out of the window")
 	})

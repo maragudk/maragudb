@@ -69,7 +69,8 @@ func (o Op) String() string {
 type Tx struct {
 	ID     int
 	Client int
-	// Invoke and Complete are when the client started the transaction and when it learned the outcome, in virtual time.
+	// Invoke and Complete are when the client started the transaction and when it learned the
+	// outcome, as monotonic timestamps in any unit.
 	Invoke   time.Duration
 	Complete time.Duration
 	Ops      []Op
@@ -342,15 +343,42 @@ func CheckListAppend(txs []Tx, final map[string][]int64) error {
 		}
 	}
 
+	// A failed transaction's reads are still real observations of a snapshot, so it joins the
+	// graph as a reader: it has no write edges and no completion, but it was invoked.
+	participates := map[int]bool{}
+	for _, tx := range txs {
+		if committed[tx.ID] {
+			participates[tx.ID] = true
+			continue
+		}
+		if tx.Outcome != Failed {
+			continue
+		}
+		for _, op := range tx.Ops {
+			if op.Kind == Read {
+				participates[tx.ID] = true
+			}
+		}
+	}
+
+	// Nodes and edges are added in a fixed order so that the reported cycle is the same on every run.
 	g := newGraph()
 	txNode := map[string]int{}
-	for id := range committed {
-		g.node(fmt.Sprint("tx", id))
-		txNode[fmt.Sprint("tx", id)] = id
+	for _, tx := range txs {
+		if participates[tx.ID] {
+			g.node(fmt.Sprint("tx", tx.ID))
+			txNode[fmt.Sprint("tx", tx.ID)] = tx.ID
+		}
 	}
+	keys := make([]string, 0, len(order))
+	for key := range order {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
 	// Write-write edges along each key's version order.
 	position := map[string]map[int64]int{}
-	for key, list := range order {
+	for _, key := range keys {
+		list := order[key]
 		position[key] = map[int64]int{}
 		for i, v := range list {
 			position[key][v] = i
@@ -364,7 +392,7 @@ func CheckListAppend(txs []Tx, final map[string][]int64) error {
 	}
 	// Write-read and read-write edges from each read.
 	for _, tx := range txs {
-		if tx.Outcome == Failed {
+		if !participates[tx.ID] {
 			continue
 		}
 		own := map[string][]int64{}
@@ -378,13 +406,13 @@ func CheckListAppend(txs []Tx, final map[string][]int64) error {
 				next := 0
 				if len(external) > 0 {
 					last := external[len(external)-1]
-					if w := writer[last]; w != tx.ID && committed[w] && committed[tx.ID] {
+					if w := writer[last]; w != tx.ID && committed[w] {
 						g.edge(fmt.Sprint("tx", w), fmt.Sprint("tx", tx.ID), fmt.Sprintf("wr on %s: read %d", op.Key, last))
 					}
 					next = position[op.Key][last] + 1
 				}
 				if next < len(list) {
-					if w := writer[list[next]]; w != tx.ID && committed[w] && committed[tx.ID] {
+					if w := writer[list[next]]; w != tx.ID && committed[w] {
 						g.edge(fmt.Sprint("tx", tx.ID), fmt.Sprint("tx", w), fmt.Sprintf("rw on %s: read before %d", op.Key, list[next]))
 					}
 				}
@@ -396,7 +424,7 @@ func CheckListAppend(txs []Tx, final map[string][]int64) error {
 	var invokes []time.Duration
 	seenInvoke := map[time.Duration]bool{}
 	for _, tx := range txs {
-		if committed[tx.ID] && !seenInvoke[tx.Invoke] {
+		if participates[tx.ID] && !seenInvoke[tx.Invoke] {
 			seenInvoke[tx.Invoke] = true
 			invokes = append(invokes, tx.Invoke)
 		}
@@ -410,7 +438,7 @@ func CheckListAppend(txs []Tx, final map[string][]int64) error {
 		}
 	}
 	for _, tx := range txs {
-		if !committed[tx.ID] {
+		if !participates[tx.ID] {
 			continue
 		}
 		g.edge(barrier(tx.Invoke), fmt.Sprint("tx", tx.ID), fmt.Sprintf("invoked at %v", tx.Invoke))

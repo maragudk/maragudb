@@ -164,7 +164,7 @@ func TestEngine_MatchesModel(t *testing.T) {
 			}
 			// Objects are bounded: at most the manifest, the live segments, and the garbage.
 			stats := fresh.Stats()
-			if n := len(fake.Keys()); n > 1+stats.Segments+stats.Garbage+1 {
+			if n := len(fake.Keys()); n > 1+stats.Segments+stats.Garbage {
 				ht.Fatalf("%d objects for %d segments and %d garbage", n, stats.Segments, stats.Garbage)
 			}
 		}, hegel.WithTestCases(300))

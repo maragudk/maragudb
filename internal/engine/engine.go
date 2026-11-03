@@ -49,12 +49,15 @@ type Options struct {
 	Logger *slog.Logger
 	// MemoryCacheBytes bounds the in-memory block cache. Defaults to 64 MiB. Zero disables it.
 	MemoryCacheBytes *int64
-	// DiskCache is an optional second cache tier that survives restarts.
+	// DiskCache is an optional second cache tier. It must be dedicated to this one database,
+	// because entries are keyed by object key under Prefix only.
 	DiskCache cache.Cache
-	// BlockSize of segment blocks in bytes. Defaults to 16 KiB.
+	// BlockSize of segment blocks in bytes. Defaults to 16 KiB and must be positive.
 	BlockSize *int
 	// GCGracePeriod is how long an unreferenced object is kept so that readers with older snapshots
 	// can still read it. Defaults to one hour. Transactions older than this may fail with [ErrSnapshotExpired].
+	// The period is measured on the clocks of the processes that start transactions and that run GC,
+	// so it must exceed the clock skew between processes by a comfortable margin.
 	GCGracePeriod *time.Duration
 	// Now is the clock. Defaults to [time.Now].
 	Now func() time.Time
@@ -64,8 +67,8 @@ type Options struct {
 	Mutations Mutations
 }
 
-// Mutations are switches that break the engine on purpose, so that tests can prove the checkers
-// detect each kind of bug. All of them are off in correct operation.
+// Mutations are switches that break the engine on purpose, so that a test can prove it would
+// notice each kind of bug. All of them are off in correct operation.
 type Mutations struct {
 	// CommitWithoutCAS writes the manifest unconditionally.
 	CommitWithoutCAS bool
@@ -144,6 +147,9 @@ func Open(ctx context.Context, opts Options) (*DB, error) {
 		db.mem = cache.NewMemory(memBytes)
 	}
 	if opts.BlockSize != nil {
+		if *opts.BlockSize <= 0 {
+			return nil, fmt.Errorf("engine: BlockSize must be positive, got %d", *opts.BlockSize)
+		}
 		db.blockSize = *opts.BlockSize
 	}
 	if opts.GCGracePeriod != nil {
@@ -197,11 +203,6 @@ func (db *DB) Stats() Stats {
 	return s
 }
 
-// GCGracePeriod in effect.
-func (db *DB) GCGracePeriod() time.Duration {
-	return db.grace
-}
-
 func (db *DB) key(name string) string {
 	return db.prefix + name
 }
@@ -225,15 +226,18 @@ func (db *DB) cachedManifest() (*manifest, string) {
 	return db.manifest, db.etag
 }
 
-// setManifest as the cached one, unless the cached one is newer.
-func (db *DB) setManifest(m *manifest, etag string) {
+// setManifest as the cached one. A manifest the store answered with always wins, because the
+// store is the truth and a cached one may belong to a database that no longer exists. One that
+// a local write produced only wins when it is newer than the cached one.
+func (db *DB) setManifest(m *manifest, etag string, fromStore bool) {
 	db.manifestMu.Lock()
-	defer db.manifestMu.Unlock()
-	if db.manifest != nil && db.manifest.Seq > m.Seq {
+	if !fromStore && db.manifest != nil && db.manifest.Seq > m.Seq {
+		db.manifestMu.Unlock()
 		return
 	}
 	db.manifest = m
 	db.etag = etag
+	db.manifestMu.Unlock()
 	if db.disk != nil {
 		if b, err := encodeManifest(m); err == nil {
 			cached, _ := json.Marshal(diskManifest{ETag: etag, Body: b})
@@ -285,7 +289,7 @@ func (db *DB) refreshManifest(ctx context.Context) (*manifest, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	db.setManifest(m, res.ETag)
+	db.setManifest(m, res.ETag, true)
 	return m, res.ETag, nil
 }
 
@@ -315,7 +319,7 @@ func (db *DB) createManifest(ctx context.Context) error {
 	}
 	assert.Reachable("a database is created", nil)
 	db.log.Info("created database", "prefix", db.prefix)
-	db.setManifest(m, etag)
+	db.setManifest(m, etag, true)
 	return nil
 }
 
@@ -334,21 +338,23 @@ func (db *DB) casManifest(ctx context.Context, baseEtag string, next *manifest) 
 	if db.mutations.CommitWithoutCAS {
 		opts = s3.PutOptions{}
 	}
-	assert.Always(opts.IfMatch != "" || db.mutations.CommitWithoutCAS, "manifest writes are conditional", nil)
 
 	const maxAttempts = 8
 	var lastErr error
 	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return "", fmt.Errorf("%w: %w", ErrCommitUnknown, err)
+		}
 		etag, err := db.client.Put(ctx, db.manifestKey(), body, opts)
 		if db.mutations.AckBeforeConfirm {
 			if err != nil {
 				etag = `"unconfirmed"`
 			}
-			db.setManifest(next, etag)
+			db.setManifest(next, etag, false)
 			return etag, nil
 		}
 		if err == nil {
-			db.setManifest(next, etag)
+			db.setManifest(next, etag, false)
 			return etag, nil
 		}
 		lastErr = err
@@ -364,7 +370,7 @@ func (db *DB) casManifest(ctx context.Context, baseEtag string, next *manifest) 
 		switch {
 		case cur.Seq == next.Seq && cur.CommitID == next.CommitID:
 			assert.Sometimes(true, "a lost manifest write is found to have landed", nil)
-			db.setManifest(cur, curEtag)
+			db.setManifest(cur, curEtag, true)
 			return curEtag, nil
 		case curEtag == baseEtag && !definite:
 			continue
@@ -374,17 +380,17 @@ func (db *DB) casManifest(ctx context.Context, baseEtag string, next *manifest) 
 				return "", fmt.Errorf("%w: %d commits happened meanwhile", ErrCommitUnknown, cur.Seq-next.Seq)
 			}
 			if rec.ID == next.CommitID {
-				db.setManifest(cur, curEtag)
+				db.setManifest(cur, curEtag, true)
 				return curEtag, nil
 			}
-			db.setManifest(cur, curEtag)
+			db.setManifest(cur, curEtag, true)
 			assert.Sometimes(true, "a commit loses to a concurrent commit", nil)
 			return "", fmt.Errorf("%w: commit %d was taken by %s", ErrConflict, next.Seq, rec.ID)
 		default:
 			return "", fmt.Errorf("%w: manifest at %d after writing %d", ErrCommitUnknown, cur.Seq, next.Seq)
 		}
 	}
-	return "", fmt.Errorf("%w: %v", ErrCommitUnknown, lastErr)
+	return "", fmt.Errorf("%w: %w", ErrCommitUnknown, lastErr)
 }
 
 // readManifest unconditionally and consistently.
@@ -405,6 +411,9 @@ func (db *DB) readManifest(ctx context.Context) (*manifest, string, error) {
 func (db *DB) putObject(ctx context.Context, key string, body []byte) error {
 	var err error
 	for range 4 {
+		if err := ctx.Err(); err != nil {
+			return fmt.Errorf("engine: writing %q: %w", key, err)
+		}
 		_, err = db.client.Put(ctx, key, body, s3.PutOptions{})
 		if err == nil {
 			return nil

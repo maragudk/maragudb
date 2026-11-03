@@ -156,7 +156,8 @@ func (tx *Tx) Rollback() error {
 
 // Commit the transaction. It returns nil only after the store has confirmed the write.
 // It returns [ErrConflict] when another commit happened since the transaction began, and
-// [ErrCommitUnknown] when the outcome could not be determined.
+// [ErrCommitUnknown] when the outcome could not be determined. Any other error means the
+// transaction was not applied.
 func (tx *Tx) Commit(ctx context.Context) error {
 	if err := tx.check(); err != nil {
 		return err
@@ -186,12 +187,15 @@ func (tx *Tx) Commit(ctx context.Context) error {
 	db := tx.db
 	id := db.newID()
 	meta.Key = db.key(segmentKey(tx.m.Seq, id))
-	meta.Seq = tx.m.Seq + 1
 	if err := db.putObject(ctx, meta.Key, body); err != nil {
 		return err
 	}
+	root := bytes.Clone(body[meta.Root.Offset : meta.Root.Offset+meta.Root.Length])
 	if db.mem != nil {
-		db.mem.Put(blockCacheKey(meta.Key, meta.Root), bytes.Clone(body[meta.Root.Offset:meta.Root.Offset+meta.Root.Length]))
+		db.mem.Put(blockCacheKey(meta.Key, meta.Root), root)
+	}
+	if db.disk != nil {
+		db.disk.Put(blockCacheKey(meta.Key, meta.Root), root)
 	}
 
 	next := tx.m.next(id, db.now())

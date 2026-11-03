@@ -1,11 +1,14 @@
 package engine_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand/v2"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -109,12 +112,64 @@ func TestOpen(t *testing.T) {
 		v, ok := get(t, db2, "a")
 		is.True(t, ok)
 		is.Equal(t, "1", v)
-		is.EqualSlice(t, []string{"db/manifest", w.fake.Keys()[1]}, w.fake.Keys())
+		keys := w.fake.Keys()
+		is.Equal(t, 2, len(keys))
+		is.Equal(t, "db/manifest", keys[0])
+		is.True(t, strings.HasPrefix(keys[1], "db/seg/"), keys[1])
 	})
 
 	t.Run("requires a client", func(t *testing.T) {
 		_, err := engine.Open(t.Context(), engine.Options{})
 		is.True(t, err != nil)
+	})
+
+	t.Run("rejects a non-positive block size", func(t *testing.T) {
+		w := newWorld(t)
+		_, err := engine.Open(t.Context(), engine.Options{Client: w.fake, BlockSize: new(int)})
+		is.True(t, err != nil)
+	})
+
+	t.Run("defaults to a memory cache and a one hour grace period", func(t *testing.T) {
+		w := newWorld(t)
+		db := w.open(1, engine.Options{})
+		put(t, db, "a", "1")
+		tx, err := db.BeginReadOnly(t.Context())
+		is.NotError(t, err)
+		get(t, db, "a")
+		is.True(t, db.Stats().MemoryCacheHits > 0, "memory cache on by default")
+		w.clock.Sleep(t.Context(), time.Hour)
+		_, _, err = tx.Get(t.Context(), []byte("a"))
+		is.Error(t, engine.ErrSnapshotExpired, err)
+	})
+
+	t.Run("logs creation and commits to the given logger", func(t *testing.T) {
+		w := newWorld(t)
+		var buf bytes.Buffer
+		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		db := w.open(1, engine.Options{Logger: logger})
+		put(t, db, "a", "1")
+		is.True(t, strings.Contains(buf.String(), "created database"), buf.String())
+		is.True(t, strings.Contains(buf.String(), "committed"), buf.String())
+	})
+
+	t.Run("serves blocks and the manifest from a disk cache directory across restarts", func(t *testing.T) {
+		w := newWorld(t)
+		dir := t.TempDir()
+		disk, err := cache.NewDisk(dir)
+		is.NotError(t, err)
+		db := w.open(1, engine.Options{DiskCache: disk})
+		put(t, db, "a", "1")
+
+		disk2, err := cache.NewDisk(dir)
+		is.NotError(t, err)
+		db2 := w.open(2, engine.Options{DiskCache: disk2, MemoryCacheBytes: new(int64)})
+		before := db2.Stats().S3
+		v, ok := get(t, db2, "a")
+		is.True(t, ok)
+		is.Equal(t, "1", v)
+		s := db2.Stats()
+		is.Equal(t, int64(1), s.DiskCacheHits)
+		is.Equal(t, s3.Counts{GetConditional: 1}, s.S3.Sub(before), "only the freshness check went to the store")
 	})
 }
 
@@ -557,16 +612,19 @@ func TestDB_Stats(t *testing.T) {
 		get(t, db2, "a")
 		s = db2.Stats()
 		is.Equal(t, int64(1), s.MemoryCacheMisses)
-		is.Equal(t, int64(1), s.DiskCacheMisses)
+		is.Equal(t, int64(1), s.DiskCacheHits, "the committed block was written to the disk tier too")
+		is.Equal(t, int64(0), s.S3.Get, "served from disk")
 		get(t, db2, "a")
 		s = db2.Stats()
-		is.Equal(t, int64(1), s.MemoryCacheHits)
+		is.Equal(t, int64(1), s.MemoryCacheHits, "promoted to memory")
 
-		db3 := w.open(3, engine.Options{DiskCache: disk})
+		db3 := w.open(3, engine.Options{DiskCache: cache.NewMemory(0)})
+		before := db3.Stats().S3
 		get(t, db3, "a")
 		s = db3.Stats()
-		is.Equal(t, int64(1), s.DiskCacheHits)
-		is.Equal(t, int64(0), s.S3.Get, "served from disk")
+		is.Equal(t, int64(1), s.MemoryCacheMisses)
+		is.Equal(t, int64(1), s.DiskCacheMisses)
+		is.Equal(t, int64(1), s.S3.Sub(before).Get, "fetched from the store")
 	})
 
 	t.Run("a stale disk-cached manifest is refreshed on open", func(t *testing.T) {
@@ -709,16 +767,20 @@ func TestContext(t *testing.T) {
 
 func TestDB_Tigris(t *testing.T) {
 	client, cfg := tigristest.NewClient(t)
-	open := func(t *testing.T, seed uint64) *engine.DB {
+	// Each subtest gets its own database under the run's prefix, so they do not depend on each other.
+	open := func(t *testing.T, seed uint64, opts engine.Options) *engine.DB {
 		t.Helper()
-		db, err := engine.Open(t.Context(), engine.Options{Client: client, Prefix: cfg.Prefix, Rand: rand.New(rand.NewPCG(seed, seed))})
+		opts.Client = client
+		opts.Prefix = cfg.Prefix + "/" + strings.ReplaceAll(t.Name(), "/", "-")
+		opts.Rand = rand.New(rand.NewPCG(seed, seed))
+		db, err := engine.Open(t.Context(), opts)
 		is.NotError(t, err)
 		return db
 	}
 
 	t.Run("commits are visible across processes and latencies are reported", func(t *testing.T) {
-		db1 := open(t, 1)
-		db2 := open(t, 2)
+		db1 := open(t, 1, engine.Options{})
+		db2 := open(t, 2, engine.Options{})
 		var commitLatency, readLatency []time.Duration
 		for i := range 5 {
 			tx, err := db1.Begin(t.Context())
@@ -745,7 +807,7 @@ func TestDB_Tigris(t *testing.T) {
 		var wg sync.WaitGroup
 		conflicts := make([]int, writers)
 		for w := range writers {
-			db := open(t, uint64(10+w))
+			db := open(t, uint64(10+w), engine.Options{})
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
@@ -780,7 +842,7 @@ func TestDB_Tigris(t *testing.T) {
 		}
 		wg.Wait()
 		t.Logf("conflicts per writer: %v", conflicts)
-		db := open(t, 99)
+		db := open(t, 99, engine.Options{})
 		v, ok := get(t, db, "counter")
 		is.True(t, ok)
 		is.Equal(t, strconv.Itoa(writers*perWriter), v, "every increment landed exactly once")
@@ -788,8 +850,10 @@ func TestDB_Tigris(t *testing.T) {
 
 	t.Run("compaction and GC keep the data and bound the objects", func(t *testing.T) {
 		grace := time.Second
-		db, err := engine.Open(t.Context(), engine.Options{Client: client, Prefix: cfg.Prefix, GCGracePeriod: &grace})
-		is.NotError(t, err)
+		db := open(t, 50, engine.Options{GCGracePeriod: &grace})
+		for i := range 3 {
+			put(t, db, fmt.Sprint("k", i), fmt.Sprint("v", i))
+		}
 		start := time.Now()
 		for {
 			err := db.Compact(t.Context())
@@ -800,17 +864,17 @@ func TestDB_Tigris(t *testing.T) {
 		}
 		t.Logf("compaction: %v", time.Since(start).Round(time.Millisecond))
 		is.Equal(t, 1, db.Stats().Segments)
-		_, err = db.GC(t.Context())
+		_, err := db.GC(t.Context())
 		is.NotError(t, err)
 		time.Sleep(grace)
 		n, err := db.GC(t.Context())
 		is.NotError(t, err)
-		is.True(t, n > 0, "expired segments were deleted")
-		infos, err := client.List(t.Context(), cfg.Prefix)
+		is.Equal(t, 3, n, "expired segments were deleted")
+		infos, err := client.List(t.Context(), cfg.Prefix+"/"+strings.ReplaceAll(t.Name(), "/", "-"))
 		is.NotError(t, err)
 		is.Equal(t, 2, len(infos), "manifest and one segment")
-		v, ok := get(t, db, "counter")
-		is.True(t, ok)
-		is.Equal(t, "12", v)
+		tx, err := db.BeginReadOnly(t.Context())
+		is.NotError(t, err)
+		equalMap(t, map[string]string{"k0": "v0", "k1": "v1", "k2": "v2"}, scan(t, tx, "", ""))
 	})
 }

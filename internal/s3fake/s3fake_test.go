@@ -41,7 +41,7 @@ func TestClient_Put(t *testing.T) {
 	t.Run("fails with ErrPreconditionFailed when IfMatch does not match", func(t *testing.T) {
 		c := s3fake.New()
 		_, err := c.Put(t.Context(), "k", []byte("v2"), s3.PutOptions{IfMatch: `"nope"`})
-		is.Error(t, s3.ErrPreconditionFailed, err, "missing object")
+		is.Error(t, s3.ErrNotFound, err, "missing object, as S3 answers")
 
 		etag, err := c.Put(t.Context(), "k", []byte("v1"), s3.PutOptions{})
 		is.NotError(t, err)
@@ -292,7 +292,13 @@ func TestClient_MatchesModel(t *testing.T) {
 					}
 					etag, err := c.Put(t.Context(), key, body, opts)
 					cur, exists := model[key]
-					wantFail := (opts.IfNoneMatch && exists) || (opts.IfMatch != "" && (!exists || cur.etag != opts.IfMatch))
+					if opts.IfMatch != "" && !exists {
+						if !errors.Is(err, s3.ErrNotFound) {
+							ht.Fatalf("put %q %+v: want not found, got %v", key, opts, err)
+						}
+						continue
+					}
+					wantFail := (opts.IfNoneMatch && exists) || (opts.IfMatch != "" && cur.etag != opts.IfMatch)
 					if wantFail {
 						if !errors.Is(err, s3.ErrPreconditionFailed) {
 							ht.Fatalf("put %q %+v: want precondition failure, got %v", key, opts, err)

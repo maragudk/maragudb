@@ -103,7 +103,7 @@ func (b *segmentBuilder) writeBlock(kind byte, n int, body []byte) blockRef {
 	return blockRef{Offset: offset, Length: int64(b.buf.Len()) - offset}
 }
 
-// finish the segment and return its bytes and metadata. The key is left for the caller to fill in.
+// finish the segment and return its bytes and metadata. The metadata has no key yet.
 func (b *segmentBuilder) finish() ([]byte, segmentMeta, error) {
 	if b.count == 0 {
 		return nil, segmentMeta{}, errors.New("engine: empty segment")

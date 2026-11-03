@@ -2,7 +2,7 @@
 //
 // It implements conditional writes faithfully, counts requests by kind, and can inject faults
 // driven by a seeded random source: errors, latency in virtual time, lost acknowledgements
-// (the write is applied but the caller sees an error), and client crashes at any step.
+// (the write is applied but the response is an error), and client crashes at any step.
 package s3fake
 
 import (
@@ -83,7 +83,7 @@ type Faults struct {
 	Decide func(kind s3.Kind, key string) Outcome
 	// ErrorRate is the probability that a request fails before it is applied.
 	ErrorRate float64
-	// LostAckRate is the probability that a write is applied but the caller sees an error.
+	// LostAckRate is the probability that a write is applied but the response is an error.
 	LostAckRate float64
 	// CrashRate is the probability that the calling process crashes at a request,
 	// before or after the request is applied with equal probability.
@@ -371,7 +371,10 @@ func (c *Client) Put(ctx context.Context, key string, body []byte, opts s3.PutOp
 		if opts.IfNoneMatch && exists {
 			return s3.ErrPreconditionFailed
 		}
-		if opts.IfMatch != "" && (!exists || o.etag != opts.IfMatch) {
+		if opts.IfMatch != "" && !exists {
+			return s3.ErrNotFound
+		}
+		if opts.IfMatch != "" && o.etag != opts.IfMatch {
 			return s3.ErrPreconditionFailed
 		}
 		c.store.objects[key] = object{body: append([]byte(nil), body...), etag: etag, modified: c.clock.Now()}
