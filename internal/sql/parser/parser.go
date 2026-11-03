@@ -643,6 +643,9 @@ func (p *parser) expr(minBp int) (ast.Expr, error) {
 				return nil, err
 			}
 			left = &ast.Binary{Op: op.op, Left: left, Right: right}
+			if next, ok := binaryOps[p.tok.text]; op.bp == bpCmp && p.tok.kind == tokOp && ok && next.bp == bpCmp {
+				return nil, p.errorf("comparisons do not chain, use parentheses")
+			}
 		case p.isKeyword("is"):
 			if bpIs < minBp {
 				return left, nil

@@ -152,6 +152,8 @@ func TestParse(t *testing.T) {
 			{"select cast(a as integer)", "syntax error at position 18: unknown type \"integer\", want int, float, bool, string, bytes, or time"},
 			{"select case end", "syntax error at position 13: expected an expression, got END"},
 			{"select case 1 end", "syntax error at position 15: expected WHEN, got END"},
+			{"select a = b = c", "syntax error at position 14: comparisons do not chain, use parentheses"},
+			{"select a < b >= c", "syntax error at position 14: comparisons do not chain, use parentheses"},
 			{"select a not 1", "syntax error at position 14: expected BETWEEN, IN, or LIKE after NOT, got \"1\""},
 			{"create table t (a int)", "syntax error at position 22: table \"t\" needs a PRIMARY KEY"},
 			{"create table t (a int primary key, b int primary key)", "syntax error at position 53: multiple primary keys for table \"t\""},
