@@ -13,13 +13,14 @@ import (
 	"maragu.dev/maragudb"
 	"maragu.dev/maragudb/internal/pgdiff"
 	"maragu.dev/maragudb/internal/s3fake"
+	"maragu.dev/maragudb/internal/s3test"
 	"maragu.dev/maragudb/internal/sql/ast"
 )
 
 func newRunner(t *testing.T) *pgdiff.Runner {
 	t.Helper()
 	return &pgdiff.Runner{PG: pgdiff.Postgres(t), New: func() (*sql.DB, error) {
-		c, err := maragudb.NewConnector(maragudb.Options{Client: s3fake.New()}, "s3://bucket/diff")
+		c, err := maragudb.NewConnector(maragudb.Options{Store: s3test.NewStore(s3fake.New())}, "s3://bucket/diff")
 		if err != nil {
 			return nil, err
 		}

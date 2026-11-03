@@ -8,6 +8,22 @@
 // Credentials and the endpoint come from the standard AWS environment and configuration chain,
 // including AWS_ENDPOINT_URL_S3 for S3-compatible stores.
 //
+// To use another object store, or an S3 client configured in code, set [Options.Store] to any
+// value with these four methods, which only use types from this package and the standard library:
+//
+//	type myStore struct{ /* ... */ }
+//
+//	func (s *myStore) Get(ctx context.Context, key string, opts maragudb.GetOptions) ([]byte, string, error)
+//	func (s *myStore) Put(ctx context.Context, key string, body []byte, opts maragudb.PutOptions) (string, error)
+//	func (s *myStore) Delete(ctx context.Context, key string) error
+//	func (s *myStore) List(ctx context.Context, prefix string) ([]string, error)
+//
+//	maragudb.RegisterDriver(maragudb.Options{Store: &myStore{}})
+//
+// The store must support conditional writes and return [ErrObjectNotFound],
+// [ErrPreconditionFailed], and [ErrNotModified] for those outcomes. [Options.Store] documents the
+// whole contract, and the example for [Options] is a complete store in memory.
+//
 // Placeholders are $1, $2, and so on. Parameters are int64 and int, float64, bool, string,
 // []byte, time.Time, and nil. A nil []byte is NULL. A parameter of the wrong type for its column
 // is an error and is never converted.
@@ -70,10 +86,6 @@ var (
 	ErrDSN = sqldriver.ErrDSN
 )
 
-// Client for an S3-compatible object store. The default client uses the AWS SDK with the
-// standard credential chain, and [Options.Client] overrides it.
-type Client = s3.Client
-
 // Options for [RegisterDriver] and [NewConnector]. Every field has a default.
 type Options struct {
 	// Name of the driver for sql.Open. Defaults to "maragudb".
@@ -91,8 +103,27 @@ type Options struct {
 	// measured on the clocks of the processes that run transactions and garbage collection, so
 	// the clock skew between processes must be much smaller than it.
 	GCGracePeriod *time.Duration
-	// Client for the object store. Defaults to an AWS SDK client for the DSN's bucket.
-	Client Client
+	// Store is the object store for every DSN, in place of the default AWS SDK client for the
+	// DSN's bucket. The DSN's bucket is then ignored and its prefix still applies. Any value with
+	// these methods can be set:
+	//
+	//	// Get an object, or the byte range [opts.Offset, opts.Offset+opts.Length) of it when
+	//	// opts.Length is positive, and its ETag.
+	//	Get(ctx context.Context, key string, opts maragudb.GetOptions) (body []byte, etag string, err error)
+	//	// Put an object and return its new ETag.
+	//	Put(ctx context.Context, key string, body []byte, opts maragudb.PutOptions) (etag string, err error)
+	//	// Delete an object. Deleting a missing object is not an error.
+	//	Delete(ctx context.Context, key string) error
+	//	// List the keys of the objects whose keys start with prefix, in any order.
+	//	List(ctx context.Context, prefix string) ([]string, error)
+	//
+	// The store must be safe for concurrent use and return [ErrObjectNotFound],
+	// [ErrPreconditionFailed], and [ErrNotModified], possibly wrapped, for those outcomes. Any
+	// other error means the request failed, and a failed write may or may not have been applied.
+	// An ETag identifies the content of one version of an object: Put returns the ETag that a
+	// later Get of that version returns. A read with [GetOptions.Consistent] must see every
+	// write that completed before it started. Correctness depends on all of this.
+	Store objectStore
 }
 
 func (o Options) withDefaults() Options {
@@ -110,9 +141,13 @@ func (o Options) withDefaults() Options {
 
 func newDriver(opts Options) *sqldriver.Driver {
 	opts = opts.withDefaults()
+	var client s3.Client
+	if opts.Store != nil {
+		client = storeClient{store: opts.Store}
+	}
 	return sqldriver.New(sqldriver.Options{
 		Engine: engine.Options{
-			Client:           opts.Client,
+			Client:           client,
 			Logger:           opts.Logger,
 			MemoryCacheBytes: opts.MemoryCacheBytes,
 			GCGracePeriod:    opts.GCGracePeriod,

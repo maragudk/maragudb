@@ -16,6 +16,7 @@ import (
 	"maragu.dev/maragudb"
 	"maragu.dev/maragudb/internal/s3"
 	"maragu.dev/maragudb/internal/s3fake"
+	"maragu.dev/maragudb/internal/s3test"
 )
 
 // world is a fake store shared by several databases, like several processes.
@@ -40,7 +41,7 @@ func newWorld(t *testing.T) *world {
 // open a database over the fake with sql.OpenDB.
 func (w *world) open(opts maragudb.Options) *sql.DB {
 	w.t.Helper()
-	opts.Client = w.fake
+	opts.Store = s3test.NewStore(w.fake)
 	c, err := maragudb.NewConnector(opts, "s3://bucket/app")
 	is.NotError(w.t, err)
 	db := sql.OpenDB(c)
@@ -104,7 +105,7 @@ func queryRows(t *testing.T, db interface {
 func TestRegisterDriver(t *testing.T) {
 	t.Run("registers under the given name and opens with sql.Open", func(t *testing.T) {
 		w := newWorld(t)
-		maragudb.RegisterDriver(maragudb.Options{Name: new("maragudb-test-register"), Client: w.fake})
+		maragudb.RegisterDriver(maragudb.Options{Name: new("maragudb-test-register"), Store: s3test.NewStore(w.fake)})
 		db, err := sql.Open("maragudb-test-register", "s3://bucket/app")
 		is.NotError(t, err)
 		defer func() { _ = db.Close() }()
@@ -117,10 +118,10 @@ func TestRegisterDriver(t *testing.T) {
 	t.Run("rejects a bad DSN when connecting", func(t *testing.T) {
 		w := newWorld(t)
 		for _, dsn := range []string{"bucket/app", "s3:///app", "http://bucket/app", "s3://bucket/app?x=1", "s3://user@bucket/app"} {
-			_, err := maragudb.NewConnector(maragudb.Options{Client: w.fake}, dsn)
+			_, err := maragudb.NewConnector(maragudb.Options{Store: s3test.NewStore(w.fake)}, dsn)
 			is.Error(t, maragudb.ErrDSN, err, dsn)
 		}
-		c, err := maragudb.NewConnector(maragudb.Options{Client: w.fake}, "s3://bucket")
+		c, err := maragudb.NewConnector(maragudb.Options{Store: s3test.NewStore(w.fake)}, "s3://bucket")
 		is.NotError(t, err, "an empty prefix is fine")
 		db := sql.OpenDB(c)
 		defer func() { _ = db.Close() }()
@@ -404,7 +405,7 @@ func TestStats(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			w := newWorld(t)
 			grace := time.Minute
-			c, err := maragudb.NewConnector(maragudb.Options{Client: w.fake, GCGracePeriod: &grace}, "s3://bucket/app")
+			c, err := maragudb.NewConnector(maragudb.Options{Store: s3test.NewStore(w.fake), GCGracePeriod: &grace}, "s3://bucket/app")
 			is.NotError(t, err)
 			db := sql.OpenDB(c)
 			defer func() { _ = db.Close() }()
