@@ -313,6 +313,7 @@ func (db *DB) createManifest(ctx context.Context) error {
 		}
 		return fmt.Errorf("engine: creating manifest: %w", err)
 	}
+	assert.Reachable("a database is created", nil)
 	db.log.Info("created database", "prefix", db.prefix)
 	db.setManifest(m, etag)
 	return nil
@@ -377,6 +378,7 @@ func (db *DB) casManifest(ctx context.Context, baseEtag string, next *manifest) 
 				return curEtag, nil
 			}
 			db.setManifest(cur, curEtag)
+			assert.Sometimes(true, "a commit loses to a concurrent commit", nil)
 			return "", fmt.Errorf("%w: commit %d was taken by %s", ErrConflict, next.Seq, rec.ID)
 		default:
 			return "", fmt.Errorf("%w: manifest at %d after writing %d", ErrCommitUnknown, cur.Seq, next.Seq)

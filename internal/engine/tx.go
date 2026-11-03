@@ -55,6 +55,7 @@ func (tx *Tx) check() error {
 		return ErrTxDone
 	}
 	if age := tx.db.now().Sub(tx.startedAt); age >= tx.db.grace {
+		assert.Sometimes(true, "a transaction outlives the GC grace period", nil)
 		return fmt.Errorf("%w: transaction is %v old", ErrSnapshotExpired, age)
 	}
 	return nil
