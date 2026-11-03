@@ -99,7 +99,7 @@ func (tx *Tx) Put(key, value []byte) error {
 	if tx.readOnly {
 		return ErrReadOnly
 	}
-	tx.writes[string(key)] = entry{key: append([]byte(nil), key...), value: append([]byte(nil), value...)}
+	tx.writes[string(key)] = entry{key: append([]byte{}, key...), value: append([]byte{}, value...)}
 	return nil
 }
 
@@ -111,7 +111,7 @@ func (tx *Tx) Delete(key []byte) error {
 	if tx.readOnly {
 		return ErrReadOnly
 	}
-	tx.writes[string(key)] = entry{key: append([]byte(nil), key...), tombstone: true}
+	tx.writes[string(key)] = entry{key: append([]byte{}, key...), tombstone: true}
 	return nil
 }
 
@@ -191,7 +191,7 @@ func (tx *Tx) Commit(ctx context.Context) error {
 		return err
 	}
 	if db.mem != nil {
-		db.mem.Put(blockCacheKey(meta.Key, meta.Root), body[meta.Root.Offset:meta.Root.Offset+meta.Root.Length])
+		db.mem.Put(blockCacheKey(meta.Key, meta.Root), bytes.Clone(body[meta.Root.Offset:meta.Root.Offset+meta.Root.Length]))
 	}
 
 	next := tx.m.next(id, db.now())

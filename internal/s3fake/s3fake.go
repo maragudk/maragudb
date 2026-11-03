@@ -144,6 +144,7 @@ type store struct {
 type Client struct {
 	clock   Clock
 	faults  Faults
+	randMu  sync.Mutex
 	store   *store
 	counter s3.Counter
 	// Log receives one line per request when non-nil.
@@ -242,23 +243,14 @@ func (c *Client) request(ctx context.Context, kind s3.Kind, key string, write bo
 
 	f := c.faults
 	if f.Rand != nil && f.MaxLatency > 0 {
-		c.clock.Sleep(ctx, time.Duration(f.Rand.Int64N(int64(f.MaxLatency))))
+		c.clock.Sleep(ctx, c.latency())
 	}
 	outcome := OutcomeNormal
 	switch {
 	case f.Decide != nil:
 		outcome = f.Decide(kind, key)
 	case f.Rand != nil:
-		if f.ErrorRate > 0 && f.Rand.Float64() < f.ErrorRate {
-			outcome = OutcomeError
-		} else if p != nil && f.CrashRate > 0 && f.Rand.Float64() < f.CrashRate {
-			outcome = OutcomeCrashBefore
-			if f.Rand.IntN(2) == 0 {
-				outcome = OutcomeCrashAfter
-			}
-		} else if write && f.LostAckRate > 0 && f.Rand.Float64() < f.LostAckRate {
-			outcome = OutcomeLostAck
-		}
+		outcome = c.decide(p != nil, write)
 	}
 	if p == nil && (outcome == OutcomeCrashBefore || outcome == OutcomeCrashAfter) {
 		outcome = OutcomeNormal
@@ -289,10 +281,11 @@ func (c *Client) request(ctx context.Context, kind s3.Kind, key string, write bo
 	err := apply()
 
 	if f.Rand != nil && f.MaxLatency > 0 {
-		c.clock.Sleep(ctx, time.Duration(f.Rand.Int64N(int64(f.MaxLatency))))
+		c.clock.Sleep(ctx, c.latency())
 	}
-	if outcome == OutcomeLostAck && err == nil {
-		c.log("%s: lost ack", step)
+	if outcome == OutcomeLostAck {
+		// The answer is lost whether the request was applied or failed its precondition.
+		c.log("%s: lost ack (%v)", step, err)
 		return fmt.Errorf("%w after %s (lost ack)", ErrInjected, step)
 	}
 	if err != nil {
@@ -301,6 +294,33 @@ func (c *Client) request(ctx context.Context, kind s3.Kind, key string, write bo
 		c.log("%s: ok", step)
 	}
 	return err
+}
+
+// latency draws a virtual latency. The random source is guarded because clients may be used
+// from several goroutines.
+func (c *Client) latency() time.Duration {
+	c.randMu.Lock()
+	defer c.randMu.Unlock()
+	return time.Duration(c.faults.Rand.Int64N(int64(c.faults.MaxLatency)))
+}
+
+// decide an outcome from the fault rates.
+func (c *Client) decide(hasProcess, write bool) Outcome {
+	c.randMu.Lock()
+	defer c.randMu.Unlock()
+	f := c.faults
+	switch {
+	case f.ErrorRate > 0 && f.Rand.Float64() < f.ErrorRate:
+		return OutcomeError
+	case hasProcess && f.CrashRate > 0 && f.Rand.Float64() < f.CrashRate:
+		if f.Rand.IntN(2) == 0 {
+			return OutcomeCrashAfter
+		}
+		return OutcomeCrashBefore
+	case write && f.LostAckRate > 0 && f.Rand.Float64() < f.LostAckRate:
+		return OutcomeLostAck
+	}
+	return OutcomeNormal
 }
 
 func (c *Client) log(format string, args ...any) {
@@ -327,7 +347,10 @@ func (c *Client) Get(ctx context.Context, key string, opts s3.GetOptions) (s3.Ob
 			if r.Offset < 0 || r.Length <= 0 || r.Offset >= int64(len(body)) {
 				return fmt.Errorf("s3fake: invalid range %d+%d for object of size %d", r.Offset, r.Length, len(body))
 			}
-			end := min(r.Offset+r.Length, int64(len(body)))
+			end := int64(len(body))
+			if r.Length < end-r.Offset {
+				end = r.Offset + r.Length
+			}
 			body = body[r.Offset:end]
 		}
 		res = s3.Object{Body: append([]byte(nil), body...), ETag: o.etag}

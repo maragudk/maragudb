@@ -116,7 +116,7 @@ func TestSegmentKey(t *testing.T) {
 	})
 
 	t.Run("rejects other keys", func(t *testing.T) {
-		for _, k := range []string{"", "manifest", "seg/", "seg/zz-1", "other/0000000000000001-x"} {
+		for _, k := range []string{"", "manifest", "seg/", "seg/zz-1", "other/0000000000000001-x", "seg/1-x", "seg/000000000000000F-x", "seg/00000000000000001-x"} {
 			_, ok := segmentBaseSeq(k)
 			is.True(t, !ok, k)
 		}

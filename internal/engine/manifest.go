@@ -119,7 +119,7 @@ func segmentBaseSeq(key string) (uint64, bool) {
 		return 0, false
 	}
 	hexSeq, _, ok := strings.Cut(rest, "-")
-	if !ok {
+	if !ok || len(hexSeq) != 16 || strings.ToLower(hexSeq) != hexSeq {
 		return 0, false
 	}
 	seq, err := strconv.ParseUint(hexSeq, 16, 64)

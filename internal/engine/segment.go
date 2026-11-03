@@ -256,10 +256,16 @@ func (d *decodedBlock) find(key []byte) (entry, bool) {
 // blockFetcher reads a block of a segment.
 type blockFetcher func(ref blockRef) (*decodedBlock, error)
 
+// maxTreeDepth bounds walks through a segment, so that a corrupt index cannot loop forever.
+const maxTreeDepth = 64
+
 // segmentLookup finds key in a segment by walking from the root.
 func segmentLookup(root blockRef, key []byte, fetch blockFetcher) (entry, bool, error) {
 	ref := root
-	for {
+	for depth := 0; ; depth++ {
+		if depth >= maxTreeDepth {
+			return entry{}, false, errors.New("engine: segment index deeper than allowed")
+		}
 		d, err := fetch(ref)
 		if err != nil {
 			return entry{}, false, err
@@ -299,6 +305,10 @@ func newSegmentIterator(root blockRef, start []byte, fetch blockFetcher) *segmen
 func (it *segmentIterator) seek(root blockRef, start []byte) {
 	ref := root
 	for {
+		if len(it.stack) >= maxTreeDepth {
+			it.err = errors.New("engine: segment index deeper than allowed")
+			return
+		}
 		d, err := it.fetch(ref)
 		if err != nil {
 			it.err = err
@@ -343,6 +353,11 @@ func (it *segmentIterator) settle() {
 			continue
 		}
 		if top.pos < len(top.block.index) {
+			if len(it.stack) >= maxTreeDepth {
+				it.err = errors.New("engine: segment index deeper than allowed")
+				it.valid = false
+				return
+			}
 			d, err := it.fetch(top.block.index[top.pos].ref)
 			if err != nil {
 				it.err = err

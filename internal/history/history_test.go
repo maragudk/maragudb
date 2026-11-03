@@ -166,6 +166,41 @@ func TestCheckListAppend(t *testing.T) {
 			want:  "duplicate value",
 		},
 		{
+			name: "rejects an observed value that is missing from the final state",
+			txs: []history.Tx{
+				tx(1, 0, 10, history.Unknown, app("k", 1)),
+				tx(2, 20, 30, history.OK, read("k", 1)),
+			},
+			final: map[string][]int64{"k": {}},
+			want:  "observed value missing from final state",
+		},
+		{
+			name: "rejects a transaction that completed before it was invoked",
+			txs: []history.Tx{
+				tx(1, 10, 5, history.OK, app("k", 1)),
+			},
+			final: map[string][]int64{"k": {1}},
+			want:  "invalid history",
+		},
+		{
+			name: "rejects a value appended by two transactions",
+			txs: []history.Tx{
+				tx(1, 0, 10, history.OK, app("k", 1)),
+				tx(2, 20, 30, history.Failed, app("k", 1)),
+			},
+			final: map[string][]int64{"k": {1}},
+			want:  "invalid history",
+		},
+		{
+			name: "rejects a reused transaction ID",
+			txs: []history.Tx{
+				tx(1, 0, 10, history.OK, app("k", 1)),
+				tx(1, 20, 30, history.OK, app("k", 2)),
+			},
+			final: map[string][]int64{"k": {1, 2}},
+			want:  "invalid history",
+		},
+		{
 			name: "rejects a three-transaction cycle through write-read and real-time edges",
 			txs: []history.Tx{
 				tx(1, 0, 10, history.OK, read("k"), app("j", 1)),

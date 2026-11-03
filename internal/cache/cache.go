@@ -33,7 +33,8 @@ type memoryEntry struct {
 	value []byte
 }
 
-// NewMemory cache holding at most maxBytes of values. A non-positive maxBytes means unbounded.
+// NewMemory cache holding at most maxBytes of values, except that the newest entry is always
+// kept even when it alone exceeds the budget. A non-positive maxBytes means unbounded.
 func NewMemory(maxBytes int64) *Memory {
 	return &Memory{maxBytes: maxBytes, order: list.New(), entries: map[string]*list.Element{}}
 }

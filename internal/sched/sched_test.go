@@ -76,14 +76,4 @@ func TestScheduler(t *testing.T) {
 		}()
 		s.Sleep(t.Context(), time.Second)
 	})
-
-	t.Run("reports task identity from context", func(t *testing.T) {
-		s := sched.New(time.Unix(0, 0))
-		is.True(t, !sched.InTask(t.Context()))
-		s.Go("worker", func(ctx context.Context) {
-			is.True(t, sched.InTask(ctx))
-			is.Equal(t, "worker", sched.TaskName(ctx))
-		})
-		s.Run()
-	})
 }

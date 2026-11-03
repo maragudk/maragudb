@@ -3,7 +3,9 @@ package s3fake_test
 import (
 	"errors"
 	"fmt"
+	"math"
 	"math/rand/v2"
+	"sync"
 	"testing"
 	"time"
 
@@ -84,6 +86,9 @@ func TestClient_Get(t *testing.T) {
 		is.Equal(t, "89", string(o.Body))
 		_, err = c.Get(t.Context(), "k", s3.GetOptions{Range: &s3.ByteRange{Offset: 10, Length: 1}})
 		is.True(t, err != nil)
+		o, err = c.Get(t.Context(), "k", s3.GetOptions{Range: &s3.ByteRange{Offset: 1, Length: math.MaxInt64}})
+		is.NotError(t, err, "a length that overflows is clipped")
+		is.Equal(t, "123456789", string(o.Body))
 	})
 }
 
@@ -146,6 +151,35 @@ func TestClient_Faults(t *testing.T) {
 		body, ok := c.Body("k")
 		is.True(t, ok)
 		is.Equal(t, "v", string(body))
+	})
+
+	t.Run("a lost ack hides a precondition failure too", func(t *testing.T) {
+		c := s3fake.New(s3fake.WithFaults(s3fake.Faults{Decide: func(kind s3.Kind, key string) s3fake.Outcome {
+			return s3fake.OutcomeLostAck
+		}}))
+		_, err := c.Put(t.Context(), "k", []byte("v"), s3.PutOptions{})
+		is.Error(t, s3fake.ErrInjected, err)
+		_, err = c.Put(t.Context(), "k", []byte("v2"), s3.PutOptions{IfNoneMatch: true})
+		is.Error(t, s3fake.ErrInjected, err)
+		is.True(t, !errors.Is(err, s3.ErrPreconditionFailed))
+		body, _ := c.Body("k")
+		is.Equal(t, "v", string(body))
+	})
+
+	t.Run("rates are safe to use from several goroutines", func(t *testing.T) {
+		c := s3fake.New(s3fake.WithFaults(s3fake.Faults{Rand: rand.New(rand.NewPCG(1, 2)), ErrorRate: 0.5, LostAckRate: 0.5, MaxLatency: time.Millisecond}))
+		var wg sync.WaitGroup
+		for i := range 8 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for j := range 50 {
+					_, _ = c.Put(t.Context(), fmt.Sprint(i, j), []byte("v"), s3.PutOptions{})
+				}
+			}()
+		}
+		wg.Wait()
+		is.Equal(t, int64(400), c.Counts().Put)
 	})
 
 	t.Run("lost acks never affect reads", func(t *testing.T) {

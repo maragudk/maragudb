@@ -135,18 +135,3 @@ func (s *Scheduler) Sleep(ctx context.Context, d time.Duration) {
 	s.parked <- struct{}{}
 	<-t.wake
 }
-
-// InTask reports whether ctx belongs to a scheduled task.
-func InTask(ctx context.Context) bool {
-	_, ok := ctx.Value(ctxKey{}).(*task)
-	return ok
-}
-
-// TaskName of the task owning ctx, or empty.
-func TaskName(ctx context.Context) string {
-	t, ok := ctx.Value(ctxKey{}).(*task)
-	if !ok {
-		return ""
-	}
-	return t.name
-}

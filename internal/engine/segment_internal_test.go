@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bytes"
+	"encoding/binary"
 	"fmt"
 	"sort"
 	"testing"
@@ -176,6 +177,22 @@ func TestSegment(t *testing.T) {
 	t.Run("rejects an empty segment", func(t *testing.T) {
 		_, _, err := newSegmentBuilder(64).finish()
 		is.True(t, err != nil)
+	})
+
+	t.Run("a corrupt index that points at itself fails instead of looping", func(t *testing.T) {
+		var b bytes.Buffer
+		b.WriteByte(blockKindIndex)
+		b.Write(binary.AppendUvarint(nil, 1))
+		b.Write(binary.AppendUvarint(nil, 0))
+		b.Write(binary.AppendUvarint(nil, 0))
+		b.Write(binary.AppendUvarint(nil, 0))
+		body := b.Bytes()
+		root := blockRef{Offset: 0, Length: int64(len(body))}
+		_, _, err := segmentLookup(root, []byte("k"), memoryFetcher(body, nil))
+		is.True(t, err != nil)
+		it := newSegmentIterator(root, nil, memoryFetcher(body, nil))
+		is.True(t, !it.Valid())
+		is.True(t, it.Err() != nil)
 	})
 
 	t.Run("decoding arbitrary bytes fails cleanly or round-trips", func(t *testing.T) {

@@ -128,6 +128,19 @@ type run struct {
 	total  int64
 	// activeClients counts clients still running, so maintainers know when to stop.
 	activeClients int
+	// lastStamp makes history timestamps strictly increasing in event order, even when virtual
+	// time did not advance between two events.
+	lastStamp time.Duration
+}
+
+// stamp returns a timestamp for a history event that is at least the virtual time and later than every earlier stamp.
+func (r *run) stamp() time.Duration {
+	t := r.sched.Elapsed()
+	if t <= r.lastStamp {
+		t = r.lastStamp + 1
+	}
+	r.lastStamp = t
+	return t
 }
 
 const initialBalance = 100
@@ -455,7 +468,7 @@ func (c *client) outcome(err error) history.Outcome {
 }
 
 func (c *client) listAppendTx(ctx context.Context) {
-	h := history.Tx{Client: c.id, Invoke: c.run.sched.Elapsed()}
+	h := history.Tx{Client: c.id, Invoke: c.run.stamp()}
 	nOps := 1 + c.rng.IntN(4)
 	type plan struct {
 		append bool
@@ -501,7 +514,7 @@ func (c *client) listAppendTx(ctx context.Context) {
 		}
 	}
 	err = tx.Commit(ctx)
-	h.Complete = c.run.sched.Elapsed()
+	h.Complete = c.run.stamp()
 	h.Outcome = c.outcome(err)
 	if err != nil {
 		h.Err = err.Error()
@@ -514,7 +527,7 @@ func (c *client) listAppendTx(ctx context.Context) {
 }
 
 func (c *client) bankTx(ctx context.Context) {
-	h := history.Tx{Client: c.id, Invoke: c.run.sched.Elapsed()}
+	h := history.Tx{Client: c.id, Invoke: c.run.stamp()}
 	if c.rng.IntN(3) == 0 {
 		tx, err := c.db.BeginReadOnly(ctx)
 		if err != nil {
@@ -537,7 +550,7 @@ func (c *client) bankTx(ctx context.Context) {
 				return
 			}
 		}
-		h.Complete = c.run.sched.Elapsed()
+		h.Complete = c.run.stamp()
 		h.Outcome = history.OK
 		c.record(h)
 		c.run.audits = append(c.run.audits, history.BankAudit{TxID: h.ID, Balances: balances})
@@ -584,7 +597,7 @@ func (c *client) bankTx(ctx context.Context) {
 	_ = tx.Put([]byte(from), []byte(strconv.FormatInt(a-amount, 10)))
 	_ = tx.Put([]byte(to), []byte(strconv.FormatInt(b+amount, 10)))
 	err = tx.Commit(ctx)
-	h.Complete = c.run.sched.Elapsed()
+	h.Complete = c.run.stamp()
 	h.Outcome = c.outcome(err)
 	h.Ops = []history.Op{{Kind: history.Append, Key: from, Value: -amount}, {Kind: history.Append, Key: to, Value: amount}}
 	if err != nil {

@@ -129,6 +129,9 @@ func CheckBank(audits []BankAudit, total int64) error {
 // activity: every acknowledged append is present, no failed append is present anywhere, and
 // an unknown transaction's appends are either all present or all absent.
 func CheckDurability(txs []Tx, final map[string][]int64) error {
+	if err := validate(txs); err != nil {
+		return err
+	}
 	present := map[int64]string{}
 	writers := map[int64]Tx{}
 	for key, list := range final {
@@ -209,9 +212,38 @@ func CheckDurability(txs []Tx, final map[string][]int64) error {
 	return nil
 }
 
+// validate the preconditions of a history: unique transaction IDs, unique appended values, and
+// invocation before completion.
+func validate(txs []Tx) error {
+	byID := map[int]bool{}
+	writer := map[int64]int{}
+	for _, tx := range txs {
+		if byID[tx.ID] {
+			return &Anomaly{Kind: "invalid history", Message: fmt.Sprintf("transaction ID %d is used twice", tx.ID), Txs: []Tx{tx}}
+		}
+		byID[tx.ID] = true
+		if tx.Complete < tx.Invoke {
+			return &Anomaly{Kind: "invalid history", Message: "completed before invoked", Txs: []Tx{tx}}
+		}
+		for _, op := range tx.Ops {
+			if op.Kind != Append {
+				continue
+			}
+			if other, ok := writer[op.Value]; ok {
+				return &Anomaly{Kind: "invalid history", Message: fmt.Sprintf("value %d appended by both tx %d and tx %d", op.Value, other, tx.ID), Txs: []Tx{tx}}
+			}
+			writer[op.Value] = tx.ID
+		}
+	}
+	return nil
+}
+
 // CheckListAppend verifies strict serializability of a list-append history. final is the
-// state read after all activity, by key; it serves as the longest read of every key.
+// state read after all activity, by key; when non-nil it must be the longest read of every key.
 func CheckListAppend(txs []Tx, final map[string][]int64) error {
+	if err := validate(txs); err != nil {
+		return err
+	}
 	writer := map[int64]int{}
 	byID := map[int]Tx{}
 	for _, tx := range txs {
@@ -304,6 +336,9 @@ func CheckListAppend(txs []Tx, final map[string][]int64) error {
 				return &Anomaly{Kind: "duplicate value", Message: fmt.Sprintf("key %s holds value %d twice: %v", key, v, list)}
 			}
 			seen[v] = true
+		}
+		if final != nil && len(list) > len(final[key]) {
+			return &Anomaly{Kind: "observed value missing from final state", Message: fmt.Sprintf("key %s was read as %v but ends as %v", key, list, final[key]), Txs: []Tx{byID[writer[list[len(list)-1]]]}}
 		}
 	}
 
