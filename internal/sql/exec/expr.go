@@ -243,8 +243,7 @@ func (b *binder) binary(e *ast.Binary) (*cexpr, error) {
 	if err != nil {
 		return nil, err
 	}
-	sym := ast.RenderExpr(&ast.Binary{Op: e.Op, Left: &ast.ColumnRef{Name: ""}, Right: &ast.ColumnRef{Name: ""}}, ast.Maragudb)
-	sym = strings.TrimSpace(sym)
+	sym := operatorSymbols[e.Op]
 	l, r, err = unify(l, r, "operator "+sym+" does not exist for")
 	if err != nil {
 		return nil, err
@@ -345,6 +344,11 @@ func (b *binder) logical(e *ast.Binary) (*cexpr, error) {
 		}
 		return value.NewBool(and), nil
 	}}, l, r)
+}
+
+var operatorSymbols = map[ast.BinaryOp]string{
+	ast.Add: "+", ast.Sub: "-", ast.Mul: "*", ast.Div: "/", ast.Mod: "%", ast.Concat: "||",
+	ast.Eq: "=", ast.Ne: "<>", ast.Lt: "<", ast.Le: "<=", ast.Gt: ">", ast.Ge: ">=",
 }
 
 // binaryResultType of a non-logical operator on operands of type t, when the operator exists.
@@ -552,14 +556,15 @@ func (b *binder) in(e *ast.In) (*cexpr, error) {
 	not := e.Not
 	// Postgres puts the constant elements into an array that is evaluated as a whole, and
 	// compares each element that reads columns separately, left to right, stopping at the first
-	// match. Constants have been folded already, so only the column elements can fail, and
-	// they fail in order and only until a match.
+	// match. Constants have been folded already, so only the other elements can fail, and they
+	// fail in order and only until a match. An element that is neither folded nor reads columns
+	// is a constant whose folding failed in a pruned branch; it is evaluated like a column.
 	var consts, columns []*cexpr
 	for _, item := range list {
-		if item.refs {
-			columns = append(columns, item)
-		} else {
+		if item.folded {
 			consts = append(consts, item)
+		} else {
+			columns = append(columns, item)
 		}
 	}
 	return b.fold(&cexpr{typ: value.Bool, eval: func(row []value.Value) (value.Value, error) {

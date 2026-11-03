@@ -172,6 +172,10 @@ func TestDeviations(t *testing.T) {
 			_, err = scan[int64](t.Context(), b.m, "SELECT CAST($1 AS int)", s)
 			is.Error(t, maragudb.ErrCast, err, "maragudb rejects "+s)
 		}
+		_, err := scan[float64](t.Context(), b.pg, "SELECT CAST('0x10' AS double precision)")
+		is.NotError(t, err, "postgres accepts hexadecimal floats")
+		_, err = scan[float64](t.Context(), b.m, "SELECT CAST('0x10' AS float)")
+		is.Error(t, maragudb.ErrCast, err)
 		got, err := scan[int64](t.Context(), b.m, "SELECT CAST(' 42 ' AS int)")
 		is.NotError(t, err)
 		is.Equal(t, int64(42), got)

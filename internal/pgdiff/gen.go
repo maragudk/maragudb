@@ -385,7 +385,7 @@ func (g *gen) where(s scope) ast.Expr {
 		return nil
 	}
 	if g.draw(0, 2) == 0 && len(g.table.PrimaryKey) > 0 {
-		// A comparison on a key column, which maragudb plans as a point lookup or range.
+		// A comparison on a key column, so that key access paths are exercised.
 		name := hegel.Draw(g.ht, hegel.SampledFrom(g.table.PrimaryKey))
 		op := hegel.Draw(g.ht, hegel.SampledFrom([]ast.BinaryOp{ast.Eq, ast.Eq, ast.Lt, ast.Le, ast.Gt, ast.Ge}))
 		var e ast.Expr = &ast.Binary{Op: op, Left: &ast.ColumnRef{Name: name}, Right: g.literal(g.column(name).Type)}

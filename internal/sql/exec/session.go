@@ -37,7 +37,7 @@ type Mutations struct {
 	UpdateSeesOwnWrites bool
 }
 
-// Session runs statements for one connection. It is not safe for concurrent use.
+// Session runs statements for one client, serially. It is not safe for concurrent use.
 type Session struct {
 	db   *engine.DB
 	opts Options
@@ -64,7 +64,6 @@ func NewSession(db *engine.DB, opts Options) *Session {
 
 // Statement is a parsed statement.
 type Statement struct {
-	SQL     string
 	ast     ast.Statement
 	nparams int
 }
@@ -80,7 +79,7 @@ func Prepare(sql string) (*Statement, error) {
 	if err != nil {
 		return nil, err
 	}
-	st := &Statement{SQL: sql, ast: s}
+	st := &Statement{ast: s}
 	for _, e := range exprs(s) {
 		ast.Walk(e, func(x ast.Expr) bool {
 			if p, ok := x.(*ast.Param); ok && p.Index > st.nparams {
@@ -281,12 +280,11 @@ func (s *Session) run(ctx context.Context, st *Statement, params []value.Value) 
 		}
 		return nil, Result{}, err
 	}
-	if len(s.kv.pending) > 0 {
-		s.wrote = true
-	}
+	wrote := len(s.kv.pending) > 0
 	if err := s.kv.apply(); err != nil {
 		return nil, Result{}, err
 	}
+	s.wrote = s.wrote || wrote
 	if ddl {
 		s.tables = map[string]*table{}
 	}
@@ -385,7 +383,11 @@ func (k *kvstore) set(key []byte, e pendingEntry) {
 	k.pending[string(key)] = e
 }
 
+// apply the pending writes to the transaction. The pending writes are dropped either way, so a
+// failure, which only happens when the transaction is done or read-only, cannot leak them into
+// a later statement.
 func (k *kvstore) apply() error {
+	defer k.discard()
 	for _, key := range k.keys {
 		e := k.pending[key]
 		var err error
@@ -398,7 +400,6 @@ func (k *kvstore) apply() error {
 			return err
 		}
 	}
-	k.discard()
 	return nil
 }
 

@@ -35,7 +35,7 @@ func (b *binder) cast(x *cexpr, t value.Type) (*cexpr, error) {
 		}
 	case t == value.String:
 		f = func(v value.Value) (value.Value, error) {
-			if v.Type == value.Bytes && !validString(v.Raw) {
+			if v.Type == value.Bytes && !utf8.Valid(v.Raw) {
 				return value.Value{}, fmt.Errorf("%w: bytes are not valid UTF-8", ErrCast)
 			}
 			return value.NewString(formatValue(v)), nil
@@ -122,7 +122,11 @@ func parseValue(s string, t value.Type) (value.Value, error) {
 		case "-infinity", "-inf":
 			return value.NewFloat(math.Inf(-1)), nil
 		}
+		// Only decimal notation: Go also reads hex floats and underscores.
 		f, err := strconv.ParseFloat(trimmed, 64)
+		if strings.ContainsAny(trimmed, "_xXpP") {
+			err = strconv.ErrSyntax
+		}
 		if err != nil {
 			if ne, ok := err.(*strconv.NumError); ok && ne.Err == strconv.ErrRange {
 				return value.Value{}, fmt.Errorf("%w: %q is out of range for float", ErrOutOfRange, s)
@@ -166,9 +170,4 @@ func parseBool(s string) (bool, bool) {
 		}
 	}
 	return false, false
-}
-
-// validString reports whether b is valid UTF-8, which every string value must be.
-func validString(b []byte) bool {
-	return utf8.Valid(b)
 }

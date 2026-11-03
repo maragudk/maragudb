@@ -157,7 +157,9 @@ func (c *Connector) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.db != nil {
-		return c.db.Close()
+		err := c.db.Close()
+		c.db = nil
+		return err
 	}
 	return nil
 }
@@ -235,7 +237,7 @@ func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 }
 
 func (c *Conn) exec(ctx context.Context, st *exec.Statement, args []driver.NamedValue) (driver.Result, error) {
-	params, err := toValues(args)
+	params, err := toValues(st, args)
 	if err != nil {
 		return nil, err
 	}
@@ -247,7 +249,7 @@ func (c *Conn) exec(ctx context.Context, st *exec.Statement, args []driver.Named
 }
 
 func (c *Conn) query(ctx context.Context, st *exec.Statement, args []driver.NamedValue) (driver.Rows, error) {
-	params, err := toValues(args)
+	params, err := toValues(st, args)
 	if err != nil {
 		return nil, err
 	}
@@ -268,9 +270,16 @@ func (c *Conn) CheckNamedValue(nv *driver.NamedValue) error {
 	}
 	v := nv.Value
 	if valuer, ok := v.(driver.Valuer); ok {
-		var err error
-		if v, err = valuer.Value(); err != nil {
-			return err
+		// A nil pointer whose Value method has a value receiver is NULL, as database/sql
+		// treats it, instead of a panic.
+		rv := reflect.ValueOf(v)
+		if rv.Kind() == reflect.Pointer && rv.IsNil() && rv.Type().Elem().Implements(reflect.TypeFor[driver.Valuer]()) {
+			v = nil
+		} else {
+			var err error
+			if v, err = valuer.Value(); err != nil {
+				return err
+			}
 		}
 	}
 	switch v.(type) {
@@ -304,7 +313,10 @@ func (c *Conn) IsValid() bool {
 	return true
 }
 
-func toValues(args []driver.NamedValue) ([]value.Value, error) {
+func toValues(st *exec.Statement, args []driver.NamedValue) ([]value.Value, error) {
+	if len(args) != st.NumParams() {
+		return nil, fmt.Errorf("sqldriver: statement has %d parameters, %d given", st.NumParams(), len(args))
+	}
 	params := make([]value.Value, len(args))
 	for i, a := range args {
 		if a.Ordinal != i+1 {
@@ -324,6 +336,11 @@ func toValues(args []driver.NamedValue) ([]value.Value, error) {
 		case string:
 			params[i] = value.NewString(v)
 		case []byte:
+			if v == nil {
+				// A nil slice is NULL, as in the common Postgres drivers.
+				params[i] = value.NewNull(value.Unknown)
+				continue
+			}
 			params[i] = value.NewBytes(append([]byte{}, v...))
 		case time.Time:
 			params[i] = value.NewTime(v)

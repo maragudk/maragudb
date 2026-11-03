@@ -130,8 +130,8 @@ func FormatFloat(f float64) string {
 
 // Compare two non-null values of the same type and return -1, 0 or 1. Strings and bytes compare
 // by byte order. Floats compare in a total order where NaN equals NaN and is greater than
-// everything else, and negative zero equals zero. It panics on a NULL or on mismatched types,
-// which is a programming error, because the binder checks types.
+// everything else, and negative zero equals zero. Both values must be non-NULL and of one type;
+// anything else is a programming error and panics.
 func Compare(a, b Value) int {
 	if a.Null || b.Null {
 		panic("value: comparing NULL")
@@ -194,20 +194,15 @@ func btoi(b bool) int {
 	return 0
 }
 
-// Key encoding tags. NULL sorts before every value.
-const (
-	keyNull  = 0x00
-	keyValue = 0x01
-)
-
 // EncodeKey appends the order-preserving encoding of v to dst and returns the result. For any two
 // values of the same type, the byte order of their encodings equals their [Compare] order, with
 // NULL before everything. Encodings are self-delimiting, so composite keys are concatenations.
 func EncodeKey(dst []byte, v Value) []byte {
+	// The first byte is 0x00 for NULL and 0x01 for a value, so NULL sorts first.
 	if v.Null {
-		return append(dst, keyNull)
+		return append(dst, 0x00)
 	}
-	dst = append(dst, keyValue)
+	dst = append(dst, 0x01)
 	switch v.Type {
 	case Int:
 		return binary.BigEndian.AppendUint64(dst, uint64(v.I)^(1<<63))

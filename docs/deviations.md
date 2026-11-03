@@ -18,7 +18,7 @@ The type mapping the harness uses is `int` → `bigint`, `float` → `double pre
 
 8. **`CAST(time AS string)` renders RFC 3339 with nanoseconds**, such as `2024-01-02T03:04:05.5Z`, and **`CAST(string AS time)` accepts only RFC 3339**, with a `T` or a space between date and time. Postgres renders `2024-01-02 03:04:05.5+00` and accepts many date formats.
 9. **`CAST(bytes AS string)` decodes UTF-8 and `CAST(string AS bytes)` encodes it.** Postgres renders bytes as the hex escape `\x6869` and parses that form back. In maragudb, bytes that are not valid UTF-8 cannot be cast to a string.
-10. **`CAST(string AS int)` and `CAST(string AS float)` accept decimal notation only**, with surrounding whitespace, and for floats exponents, `NaN`, and `Infinity`. Postgres 16 and later also accept `0x10`, `0o17`, `0b101`, and `1_000`.
+10. **`CAST(string AS int)` and `CAST(string AS float)` accept decimal notation only**, with surrounding whitespace, and for floats exponents, `NaN`, and `Infinity`. Postgres 16 and later also accept `0x10`, `0o17`, `0b101`, and `1_000` for integers, and hexadecimal such as `0x10` for floats.
 
 ## Functions
 

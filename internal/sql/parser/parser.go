@@ -614,15 +614,39 @@ const (
 	bpUnary
 )
 
-var binaryOps = map[string]struct {
-	op ast.BinaryOp
-	bp int
-}{
-	"or": {ast.Or, bpOr}, "and": {ast.And, bpAnd},
-	"=": {ast.Eq, bpCmp}, "<>": {ast.Ne, bpCmp}, "<": {ast.Lt, bpCmp}, "<=": {ast.Le, bpCmp}, ">": {ast.Gt, bpCmp}, ">=": {ast.Ge, bpCmp},
-	"||": {ast.Concat, bpConcat},
-	"+":  {ast.Add, bpAdd}, "-": {ast.Sub, bpAdd},
-	"*": {ast.Mul, bpMul}, "/": {ast.Div, bpMul}, "%": {ast.Mod, bpMul},
+// binaryOp and its binding power for an operator token, if it is one.
+func binaryOp(text string) (ast.BinaryOp, int, bool) {
+	switch text {
+	case "or":
+		return ast.Or, bpOr, true
+	case "and":
+		return ast.And, bpAnd, true
+	case "=":
+		return ast.Eq, bpCmp, true
+	case "<>":
+		return ast.Ne, bpCmp, true
+	case "<":
+		return ast.Lt, bpCmp, true
+	case "<=":
+		return ast.Le, bpCmp, true
+	case ">":
+		return ast.Gt, bpCmp, true
+	case ">=":
+		return ast.Ge, bpCmp, true
+	case "||":
+		return ast.Concat, bpConcat, true
+	case "+":
+		return ast.Add, bpAdd, true
+	case "-":
+		return ast.Sub, bpAdd, true
+	case "*":
+		return ast.Mul, bpMul, true
+	case "/":
+		return ast.Div, bpMul, true
+	case "%":
+		return ast.Mod, bpMul, true
+	}
+	return 0, 0, false
 }
 
 // expr parses an expression whose operators all bind at least as tightly as minBp.
@@ -634,19 +658,19 @@ func (p *parser) expr(minBp int) (ast.Expr, error) {
 	for {
 		switch {
 		case p.tok.kind == tokOp || p.isKeyword("and") || p.isKeyword("or"):
-			op, ok := binaryOps[p.tok.text]
-			if !ok || op.bp < minBp {
+			op, bp, ok := binaryOp(p.tok.text)
+			if !ok || bp < minBp {
 				return left, nil
 			}
 			if err := p.advance(); err != nil {
 				return nil, err
 			}
-			right, err := p.expr(op.bp + 1)
+			right, err := p.expr(bp + 1)
 			if err != nil {
 				return nil, err
 			}
-			left = &ast.Binary{Op: op.op, Left: left, Right: right}
-			if next, ok := binaryOps[p.tok.text]; op.bp == bpCmp && p.tok.kind == tokOp && ok && next.bp == bpCmp {
+			left = &ast.Binary{Op: op, Left: left, Right: right}
+			if _, nextBp, ok := binaryOp(p.tok.text); bp == bpCmp && p.tok.kind == tokOp && ok && nextBp == bpCmp {
 				return nil, p.errorf("comparisons do not chain, use parentheses")
 			}
 		case p.isKeyword("is"):

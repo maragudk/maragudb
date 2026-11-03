@@ -9,8 +9,8 @@
 // including AWS_ENDPOINT_URL_S3 for S3-compatible stores.
 //
 // Placeholders are $1, $2, and so on. Parameters are int64 and int, float64, bool, string,
-// []byte, time.Time, and nil. A parameter of the wrong type for its column is an error and is
-// never converted.
+// []byte, time.Time, and nil. A nil []byte is NULL. A parameter of the wrong type for its column
+// is an error and is never converted.
 //
 // Transactions are strict serializable. A statement outside a transaction retries on conflict by
 // itself. An explicit transaction whose commit loses to a concurrent commit fails with
@@ -71,7 +71,7 @@ var (
 )
 
 // Client for an S3-compatible object store. The default client uses the AWS SDK with the
-// standard credential chain; tests inject a fake through [Options.Client].
+// standard credential chain, and [Options.Client] overrides it.
 type Client = s3.Client
 
 // Options for [RegisterDriver] and [NewConnector]. Every field has a default.

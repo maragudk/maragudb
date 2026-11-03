@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
+	"unicode/utf8"
 
 	"maragu.dev/maragudb/internal/sql/ast"
 	"maragu.dev/maragudb/internal/sql/value"
@@ -137,7 +139,7 @@ func (s *Session) writeRow(ctx context.Context, t *table, oldKey []byte, row []v
 		if c.NotNull && row[i].Null {
 			return fmt.Errorf("%w: column %q of table %q", ErrNotNull, c.Name, t.Name)
 		}
-		if row[i].Type == value.String && !validString([]byte(row[i].S)) {
+		if row[i].Type == value.String && !utf8.ValidString(row[i].S) {
 			return fmt.Errorf("%w: column %q is not valid UTF-8", ErrInvalid, c.Name)
 		}
 	}
@@ -161,18 +163,7 @@ func keyDescription(t *table, row []value.Value) string {
 	for _, i := range t.PrimaryKey {
 		parts = append(parts, fmt.Sprintf("%s=%v", t.Columns[i].Name, row[i]))
 	}
-	return fmt.Sprintf("(%s)", joinStrings(parts, ", "))
-}
-
-func joinStrings(parts []string, sep string) string {
-	out := ""
-	for i, p := range parts {
-		if i > 0 {
-			out += sep
-		}
-		out += p
-	}
-	return out
+	return fmt.Sprintf("(%s)", strings.Join(parts, ", "))
 }
 
 // filter is a bound WHERE clause: its top-level conjuncts, evaluated in order until one is not
@@ -180,6 +171,8 @@ func joinStrings(parts []string, sep string) string {
 // false or NULL, so a later conjunct that would fail is never evaluated for that row.
 type filter struct {
 	conds []*cexpr
+	// never is set when a conjunct is known false, so no row can match.
+	never bool
 }
 
 func (b *binder) where(e ast.Expr) (filter, error) {
@@ -211,6 +204,7 @@ func (b *binder) where(e ast.Expr) (filter, error) {
 			}
 			// A known false conjunct decides the clause; the rest is only type-checked.
 			pruned = true
+			f.never = true
 			f.conds = []*cexpr{ce}
 			continue
 		}
@@ -301,7 +295,7 @@ func (s *Session) update(ctx context.Context, st *ast.Update, params []value.Val
 	if err != nil {
 		return Result{}, err
 	}
-	a, err := b.plan(t, st.Where)
+	a, err := b.plan(t, st.Where, f)
 	if err != nil {
 		return Result{}, err
 	}
@@ -365,7 +359,7 @@ func (s *Session) delete(ctx context.Context, st *ast.Delete, params []value.Val
 	if err != nil {
 		return Result{}, err
 	}
-	a, err := b.plan(t, st.Where)
+	a, err := b.plan(t, st.Where, f)
 	if err != nil {
 		return Result{}, err
 	}
@@ -442,7 +436,7 @@ func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value
 	}
 	var a access
 	if t != nil {
-		if a, err = b.plan(t, st.Where); err != nil {
+		if a, err = b.plan(t, st.Where, f); err != nil {
 			return nil, err
 		}
 	}

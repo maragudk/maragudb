@@ -135,6 +135,9 @@ func TestDB(t *testing.T) {
 		at := time.Date(2024, 5, 6, 7, 8, 9, 123456789, time.FixedZone("plus2", 2*3600))
 		mustExec(t, db, "INSERT INTO t VALUES ($1, $2, $3, $4, $5, $6, $7)", int64(1), 1.5, true, "héllo", []byte{0, 1, 2}, at, nil)
 		mustExec(t, db, "INSERT INTO t (id) VALUES ($1)", 2)
+		var nilBytes []byte
+		mustExec(t, db, "INSERT INTO t (id, bs) VALUES ($1, $2), ($3, $4)", 3, nilBytes, 4, []byte{})
+		is.Equal(t, "NULL\nX''", queryRows(t, db, "SELECT bs FROM t WHERE id >= 3 ORDER BY id"), "a nil slice is NULL and an empty one is empty bytes")
 
 		var id, n sql.NullInt64
 		var f float64
@@ -172,10 +175,15 @@ func TestDB(t *testing.T) {
 		_, err = db.ExecContext(t.Context(), "INSERT INTO t VALUES ($1, $2, $3)", int32(1), 1.5, "x")
 		is.True(t, err != nil && strings.Contains(err.Error(), "unsupported parameter type int32"), fmt.Sprint(err))
 		_, err = db.ExecContext(t.Context(), "INSERT INTO t VALUES ($1, $2, $3)", 1, 1.5)
-		is.Error(t, maragudb.ErrInvalid, err, "a missing parameter")
+		is.True(t, err != nil && strings.Contains(err.Error(), "3 parameters, 2 given"), fmt.Sprint(err))
 		is.Equal(t, "", queryRows(t, db, "SELECT * FROM t"))
 		mustExec(t, db, "INSERT INTO t VALUES ($1, $2, $3)", sql.NullInt64{Int64: 7, Valid: true}, sql.NullFloat64{}, sql.NullString{String: "v", Valid: true})
 		is.Equal(t, `7 NULL "v"`, queryRows(t, db, "SELECT * FROM t"), "driver.Valuer parameters are unwrapped")
+		var nilValuer *nullableValuer
+		mustExec(t, db, "INSERT INTO t VALUES ($1, $2, $3)", 8, nilValuer, nil)
+		is.Equal(t, `7 NULL "v"`+"\n"+`8 NULL NULL`, queryRows(t, db, "SELECT * FROM t"), "a nil pointer Valuer is NULL")
+		_, err = db.ExecContext(t.Context(), "INSERT INTO t VALUES ($1, $2, $3)", 9, 1.5, "x", "extra")
+		is.True(t, err != nil && strings.Contains(err.Error(), "3 parameters, 4 given"), fmt.Sprint(err))
 	})
 
 	t.Run("prepares statements and reports parameter count mismatches", func(t *testing.T) {
@@ -525,6 +533,11 @@ func TestRequestBudgets(t *testing.T) {
 		}
 	})
 }
+
+// nullableValuer is a Valuer with a value receiver, so a nil pointer to it must be NULL.
+type nullableValuer struct{}
+
+func (nullableValuer) Value() (driver.Value, error) { return "never", nil }
 
 // otherConnector is a connector of some other driver.
 type otherConnector struct{}

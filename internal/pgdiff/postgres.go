@@ -17,15 +17,12 @@ import (
 	_ "github.com/jackc/pgx/v5/stdlib" // Postgres driver for database/sql.
 )
 
-// Image of the Postgres version the harness runs against. The CI service runs the same major.
-const Image = "postgres:18"
-
 // container name of the local Postgres.
 const container = "maragudb-pgdiff"
 
 // Postgres returns a connection to a database collated with "C" for the harness. It uses
-// MARAGUDB_PGDIFF_URL when set, the CI service when CI is set, and otherwise starts the
-// Postgres Docker container, which stays running for later runs. It fails the test, never
+// MARAGUDB_PGDIFF_URL when set, the CI service when CI is set, and otherwise starts a
+// postgres:18 Docker container, which stays running for later runs. It fails the test, never
 // skips, when Postgres is unavailable.
 func Postgres(t *testing.T) *sql.DB {
 	t.Helper()
@@ -61,7 +58,7 @@ func Postgres(t *testing.T) *sql.DB {
 	}
 	// Plans are not cached across statements, because every case recreates the table with a
 	// different row type.
-	dbURL := replaceDatabase(url, name) + "?default_query_exec_mode=describe_exec"
+	dbURL := replaceDatabase(url, name)
 	db, err := sql.Open("pgx", dbURL)
 	if err != nil {
 		t.Fatalf("pgdiff: opening %s: %v", dbURL, err)
@@ -77,12 +74,14 @@ func Postgres(t *testing.T) *sql.DB {
 	return db
 }
 
+// replaceDatabase in a Postgres URL, keeping its query and adding the pgx mode that describes
+// every statement instead of caching plans.
 func replaceDatabase(url, name string) string {
 	i := strings.LastIndex(url, "/")
 	if j := strings.Index(url[i:], "?"); j >= 0 {
-		return url[:i+1] + name
+		return url[:i+1] + name + url[i+j:] + "&default_query_exec_mode=describe_exec"
 	}
-	return url[:i+1] + name
+	return url[:i+1] + name + "?default_query_exec_mode=describe_exec"
 }
 
 func waitReady(ctx context.Context, db *sql.DB) error {
@@ -108,9 +107,9 @@ func startContainer(ctx context.Context) (string, error) {
 		_ = exec.CommandContext(ctx, "docker", "rm", "-f", container).Run()
 		out, err := exec.CommandContext(ctx, "docker", "run", "-d", "--name", container,
 			"-e", "POSTGRES_USER=test", "-e", "POSTGRES_PASSWORD=test", "-e", "POSTGRES_DB=template1",
-			"-p", "127.0.0.1:0:5432", Image).CombinedOutput()
+			"-p", "127.0.0.1:0:5432", "postgres:18").CombinedOutput()
 		if err != nil {
-			return "", fmt.Errorf("docker run %s: %v: %s", Image, err, strings.TrimSpace(string(out)))
+			return "", fmt.Errorf("docker run postgres:18: %v: %s", err, strings.TrimSpace(string(out)))
 		}
 		if port, err = containerPort(ctx); err != nil {
 			return "", err

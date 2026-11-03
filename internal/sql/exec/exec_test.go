@@ -144,6 +144,7 @@ func TestSession_DDL(t *testing.T) {
 		is.Error(t, exec.ErrInvalid, queryErr(t, s, "CREATE TABLE t (id int, PRIMARY KEY (nope))"))
 		is.Error(t, exec.ErrInvalid, queryErr(t, s, "CREATE TABLE t (id int, id string, PRIMARY KEY (id))"))
 		is.Error(t, exec.ErrInvalid, queryErr(t, s, "CREATE TABLE t (id int, PRIMARY KEY (id, id))"))
+		is.True(t, strings.Contains(queryErr(t, s, "SELECT 1 + 'a'").Error(), "operator + does not exist for int and string"))
 	})
 
 	t.Run("primary key columns are not null", func(t *testing.T) {
@@ -288,6 +289,10 @@ func TestSession_Select(t *testing.T) {
 			{"SELECT CAST('x' AS int)", exec.ErrCast},
 			{"SELECT CAST('1.5' AS int)", exec.ErrCast},
 			{"SELECT CAST('x' AS float)", exec.ErrCast},
+			{"SELECT CAST('1_000' AS float)", exec.ErrCast},
+			{"SELECT CAST('0x1p-2' AS float)", exec.ErrCast},
+			{"SELECT CAST('0x10' AS int)", exec.ErrCast},
+			{"SELECT CAST('1_000' AS int)", exec.ErrCast},
 			{"SELECT CAST('o' AS bool)", exec.ErrCast},
 			{"SELECT CAST('' AS bool)", exec.ErrCast},
 			{"SELECT CAST('yesterday' AS time)", exec.ErrCast},
@@ -354,6 +359,11 @@ func TestSession_Select(t *testing.T) {
 		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT CASE WHEN b THEN 1 / 0 ELSE 0 END FROM e"))
 		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT coalesce(id, 1 / 0) FROM e"))
 		is.Equal(t, "", query(t, s, "SELECT * FROM e WHERE FALSE AND 1 / 0 = 1"))
+		is.Equal(t, "", query(t, s, "SELECT * FROM e WHERE FALSE AND id = 1 / 0"), "the planner does not bind pruned key comparisons")
+		is.Equal(t, int64(0), mustExec(t, s, "DELETE FROM e WHERE FALSE AND id = 1 / 0").RowsAffected)
+		is.Equal(t, "", query(t, s, "SELECT 1 WHERE FALSE AND 1 IN (1 / 0)"), "a pruned IN element never compares")
+		is.Equal(t, "true", query(t, s, "SELECT TRUE OR 1 IN (1 / 0)"))
+		is.Equal(t, "true", query(t, s, "SELECT coalesce(TRUE, 1 IN (1 / 0))"))
 		is.Equal(t, "1", query(t, s, "SELECT CASE WHEN FALSE THEN 1 / 0 ELSE 1 END"))
 		is.Equal(t, "1", query(t, s, "SELECT CASE WHEN TRUE THEN 1 ELSE 1 / 0 END"))
 		is.Equal(t, "1", query(t, s, "SELECT CASE WHEN TRUE THEN 1 WHEN 1 / 0 = 1 THEN 2 END"))
@@ -671,7 +681,7 @@ func TestMutations(t *testing.T) {
 		mustExec(t, s, "CREATE TABLE h (id int PRIMARY KEY)")
 		mustExec(t, s, "INSERT INTO h VALUES (1), (2), (3)")
 		mustExec(t, s, "UPDATE h SET id = id + 10 WHERE id < 100")
-		is.True(t, query(t, s, "SELECT id FROM h") != "11\n12\n13", "the mutant moves rows more than once")
+		is.Equal(t, "101\n102\n103", query(t, s, "SELECT id FROM h"), "the mutant moves every row until it leaves the range")
 	})
 
 	t.Run("FreshSnapshotPerStatement lets a transaction see a commit made after it began", func(t *testing.T) {

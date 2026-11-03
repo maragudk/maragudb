@@ -4,18 +4,16 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"maragu.dev/maragudb/internal/sql/ast"
 	"maragu.dev/maragudb/internal/sql/value"
 )
 
 // Key layout. A table's definition lives at `c/<name>`, and its rows at `r/<name>\x00<key>`,
-// where <key> is the order-preserving encoding of the primary key columns. Identifiers never
-// contain a NUL byte, so the row prefix of one table never covers rows of another.
-const (
-	catalogPrefix = "c/"
-	rowPrefix     = "r/"
-)
+// where <key> is the order-preserving encoding of the primary key columns. The layout requires
+// that a table name never contains a NUL byte, so that the row prefix of one table never covers
+// rows of another; [newTable] enforces it.
 
 // table definition as stored in the catalog.
 type table struct {
@@ -32,13 +30,13 @@ type column struct {
 }
 
 func catalogKey(name string) []byte {
-	return []byte(catalogPrefix + name)
+	return []byte("c/" + name)
 }
 
 // rowRange is the key range [start, end) that holds every row of the table.
 func (t *table) rowRange() ([]byte, []byte) {
-	start := []byte(rowPrefix + t.Name + "\x00")
-	end := []byte(rowPrefix + t.Name + "\x01")
+	start := []byte("r/" + t.Name + "\x00")
+	end := []byte("r/" + t.Name + "\x01")
 	return start, end
 }
 
@@ -84,6 +82,9 @@ func (t *table) isPrimaryKey(i int) bool {
 
 // newTable validates a CREATE TABLE statement.
 func newTable(s *ast.CreateTable) (*table, error) {
+	if strings.IndexByte(s.Name, 0) >= 0 {
+		return nil, fmt.Errorf("%w: table name must not contain a NUL byte", ErrInvalid)
+	}
 	t := &table{Name: s.Name}
 	seen := map[string]bool{}
 	for _, c := range s.Columns {

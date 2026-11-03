@@ -16,15 +16,18 @@ type access struct {
 	empty bool
 }
 
-// plan the access path for a WHERE clause over t. The conjuncts of the WHERE clause that compare
-// a primary key column with a constant narrow the scan: equalities on a prefix of the key
-// columns, and a range on the column after them. Every row read is still filtered by the whole
-// WHERE clause, so the plan only has to be sound, never exact.
-func (b *binder) plan(t *table, where ast.Expr) (access, error) {
+// plan the access path for a WHERE clause over t, bound already as f. The conjuncts of the WHERE
+// clause that compare a primary key column with a constant narrow the scan: equalities on a prefix
+// of the key columns, and a range on the column after them. Every row read is still filtered by
+// the whole WHERE clause, so the plan only has to be sound, never exact.
+func (b *binder) plan(t *table, where ast.Expr, f filter) (access, error) {
 	start, end := t.rowRange()
 	a := access{start: start, end: end}
 	if where == nil {
 		return a, nil
+	}
+	if f.never {
+		return access{empty: true}, nil
 	}
 	type bound struct {
 		v         value.Value
@@ -94,8 +97,6 @@ func conjuncts(e ast.Expr) []ast.Expr {
 	return []ast.Expr{e}
 }
 
-var flipped = map[ast.BinaryOp]ast.BinaryOp{ast.Eq: ast.Eq, ast.Lt: ast.Gt, ast.Le: ast.Ge, ast.Gt: ast.Lt, ast.Ge: ast.Le}
-
 // keyComparison recognizes `column op constant` or `constant op column` on a primary key column
 // and returns the column index, the operator as seen from the column, and the constant in the
 // column's type.
@@ -104,6 +105,8 @@ func (b *binder) keyComparison(t *table, e ast.Expr) (int, ast.BinaryOp, value.V
 	if !ok {
 		return 0, 0, value.Value{}, false, nil
 	}
+	// The operator as seen from the column when the column is on the right.
+	flipped := map[ast.BinaryOp]ast.BinaryOp{ast.Eq: ast.Eq, ast.Lt: ast.Gt, ast.Le: ast.Ge, ast.Gt: ast.Lt, ast.Ge: ast.Le}
 	op, ok := flipped[bin.Op]
 	if !ok {
 		return 0, 0, value.Value{}, false, nil
