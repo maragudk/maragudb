@@ -490,6 +490,11 @@ func (b *binder) between(e *ast.Between) (*cexpr, error) {
 		return nil, err
 	}
 	x, low, high = es[0], es[1], es[2]
+	if x.folded && x.val.Null {
+		// Both comparisons are strict, so a known NULL value makes them NULL without the
+		// bounds being evaluated, as Postgres folds them.
+		return constant(value.NewNull(value.Bool)), nil
+	}
 	not := e.Not
 	// The high bound is only evaluated when the low comparison is not false.
 	return b.fold(&cexpr{typ: value.Bool, eval: func(row []value.Value) (value.Value, error) {
