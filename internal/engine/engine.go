@@ -1,0 +1,412 @@
+// Package engine is the storage and transaction core: an ordered key space of immutable segment
+// objects in S3, a manifest committed by compare-and-swap, snapshot transactions with optimistic
+// multi-writer commits, optional caches, compaction, and garbage collection.
+package engine
+
+import (
+	"context"
+	"crypto/rand"
+	"encoding/binary"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	mathrand "math/rand/v2"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/antithesishq/antithesis-sdk-go/assert"
+
+	"maragu.dev/maragudb/internal/cache"
+	"maragu.dev/maragudb/internal/s3"
+)
+
+var (
+	// ErrConflict is returned by a commit that lost to a concurrent commit. The transaction can be retried.
+	ErrConflict = errors.New("engine: transaction conflict, retry the transaction")
+	// ErrCommitUnknown is returned when the outcome of a commit could not be determined after the
+	// store stopped answering. The commit may or may not have been applied.
+	ErrCommitUnknown = errors.New("engine: commit outcome unknown")
+	// ErrSnapshotExpired is returned when a transaction's snapshot is older than the GC grace period
+	// and an object it references is gone.
+	ErrSnapshotExpired = errors.New("engine: snapshot expired, the transaction is older than the GC grace period")
+	// ErrTxDone is returned when using a transaction after commit or rollback.
+	ErrTxDone = errors.New("engine: transaction already committed or rolled back")
+	// ErrReadOnly is returned when writing in a read-only transaction.
+	ErrReadOnly = errors.New("engine: read-only transaction")
+)
+
+// Options for [Open].
+type Options struct {
+	// Client for the object store. Required.
+	Client s3.Client
+	// Prefix under which all objects live. A trailing slash is added when missing.
+	Prefix string
+	// Logger for debug and warning messages. Discarded when nil.
+	Logger *slog.Logger
+	// MemoryCacheBytes bounds the in-memory block cache. Defaults to 64 MiB. Zero disables it.
+	MemoryCacheBytes *int64
+	// DiskCache is an optional second cache tier that survives restarts.
+	DiskCache cache.Cache
+	// BlockSize of segment blocks in bytes. Defaults to 16 KiB.
+	BlockSize *int
+	// GCGracePeriod is how long an unreferenced object is kept so that readers with older snapshots
+	// can still read it. Defaults to one hour. Transactions older than this may fail with [ErrSnapshotExpired].
+	GCGracePeriod *time.Duration
+	// Now is the clock. Defaults to [time.Now].
+	Now func() time.Time
+	// Rand is the source of commit and segment identifiers. Defaults to a cryptographically seeded source.
+	Rand *mathrand.Rand
+	// Mutations deliberately break the engine. For tests only.
+	Mutations Mutations
+}
+
+// Mutations are switches that break the engine on purpose, so that tests can prove the checkers
+// detect each kind of bug. All of them are off in correct operation.
+type Mutations struct {
+	// CommitWithoutCAS writes the manifest unconditionally.
+	CommitWithoutCAS bool
+	// GCIgnoreGrace deletes unreferenced objects immediately.
+	GCIgnoreGrace bool
+	// SkipFreshnessCheck starts transactions from the cached manifest without asking the store.
+	SkipFreshnessCheck bool
+	// AckBeforeConfirm reports a commit as successful without waiting for the store's answer.
+	AckBeforeConfirm bool
+}
+
+// Stats about store requests and cache effectiveness.
+type Stats struct {
+	S3                s3.Counts
+	MemoryCacheHits   int64
+	MemoryCacheMisses int64
+	DiskCacheHits     int64
+	DiskCacheMisses   int64
+	// Seq is the latest known commit sequence number.
+	Seq uint64
+	// Segments currently referenced by the latest known manifest.
+	Segments int
+	// Garbage objects awaiting their grace period.
+	Garbage int
+}
+
+// DB is an open database. It is safe for concurrent use.
+type DB struct {
+	client    *s3.CountingClient
+	prefix    string
+	log       *slog.Logger
+	mem       *cache.Memory
+	disk      cache.Cache
+	blockSize int
+	grace     time.Duration
+	now       func() time.Time
+	mutations Mutations
+
+	randMu sync.Mutex
+	rand   *mathrand.Rand
+
+	manifestMu sync.Mutex
+	manifest   *manifest
+	etag       string
+
+	memHits, memMisses, diskHits, diskMisses atomic.Int64
+}
+
+// Open a database, creating it when no manifest exists.
+func Open(ctx context.Context, opts Options) (*DB, error) {
+	if opts.Client == nil {
+		return nil, errors.New("engine: Client is required")
+	}
+	db := &DB{
+		client:    s3.NewCountingClient(opts.Client),
+		prefix:    opts.Prefix,
+		log:       opts.Logger,
+		disk:      opts.DiskCache,
+		blockSize: 16 << 10,
+		grace:     time.Hour,
+		now:       opts.Now,
+		rand:      opts.Rand,
+		mutations: opts.Mutations,
+	}
+	if db.prefix != "" && !strings.HasSuffix(db.prefix, "/") {
+		db.prefix += "/"
+	}
+	if db.log == nil {
+		db.log = slog.New(slog.DiscardHandler)
+	}
+	memBytes := int64(64 << 20)
+	if opts.MemoryCacheBytes != nil {
+		memBytes = *opts.MemoryCacheBytes
+	}
+	if memBytes > 0 {
+		db.mem = cache.NewMemory(memBytes)
+	}
+	if opts.BlockSize != nil {
+		db.blockSize = *opts.BlockSize
+	}
+	if opts.GCGracePeriod != nil {
+		db.grace = *opts.GCGracePeriod
+	}
+	if db.now == nil {
+		db.now = time.Now
+	}
+	if db.rand == nil {
+		var seed [16]byte
+		if _, err := rand.Read(seed[:]); err != nil {
+			return nil, fmt.Errorf("engine: seeding: %w", err)
+		}
+		db.rand = mathrand.New(mathrand.NewPCG(binary.LittleEndian.Uint64(seed[:8]), binary.LittleEndian.Uint64(seed[8:])))
+	}
+
+	db.loadManifestFromDisk()
+	if _, _, err := db.refreshManifest(ctx); err != nil {
+		if !errors.Is(err, s3.ErrNotFound) {
+			return nil, err
+		}
+		if err := db.createManifest(ctx); err != nil {
+			return nil, err
+		}
+	}
+	return db, nil
+}
+
+// Close the database. It does not affect the store.
+func (db *DB) Close() error {
+	return nil
+}
+
+// Stats so far.
+func (db *DB) Stats() Stats {
+	db.manifestMu.Lock()
+	m := db.manifest
+	db.manifestMu.Unlock()
+	s := Stats{
+		S3:                db.client.Counter.Counts(),
+		MemoryCacheHits:   db.memHits.Load(),
+		MemoryCacheMisses: db.memMisses.Load(),
+		DiskCacheHits:     db.diskHits.Load(),
+		DiskCacheMisses:   db.diskMisses.Load(),
+	}
+	if m != nil {
+		s.Seq = m.Seq
+		s.Segments = len(m.Segments)
+		s.Garbage = len(m.Garbage)
+	}
+	return s
+}
+
+// GCGracePeriod in effect.
+func (db *DB) GCGracePeriod() time.Duration {
+	return db.grace
+}
+
+func (db *DB) key(name string) string {
+	return db.prefix + name
+}
+
+func (db *DB) manifestKey() string {
+	return db.key("manifest")
+}
+
+func (db *DB) newID() string {
+	db.randMu.Lock()
+	defer db.randMu.Unlock()
+	var b [8]byte
+	binary.LittleEndian.PutUint64(b[:], db.rand.Uint64())
+	return hex.EncodeToString(b[:])
+}
+
+// cachedManifest and its ETag, if any.
+func (db *DB) cachedManifest() (*manifest, string) {
+	db.manifestMu.Lock()
+	defer db.manifestMu.Unlock()
+	return db.manifest, db.etag
+}
+
+// setManifest as the cached one, unless the cached one is newer.
+func (db *DB) setManifest(m *manifest, etag string) {
+	db.manifestMu.Lock()
+	defer db.manifestMu.Unlock()
+	if db.manifest != nil && db.manifest.Seq > m.Seq {
+		return
+	}
+	db.manifest = m
+	db.etag = etag
+	if db.disk != nil {
+		if b, err := encodeManifest(m); err == nil {
+			cached, _ := json.Marshal(diskManifest{ETag: etag, Body: b})
+			db.disk.Put(db.manifestKey(), cached)
+		}
+	}
+}
+
+// diskManifest is the disk cache's record of the last seen manifest.
+type diskManifest struct {
+	ETag string          `json:"etag"`
+	Body json.RawMessage `json:"body"`
+}
+
+func (db *DB) loadManifestFromDisk() {
+	if db.disk == nil {
+		return
+	}
+	b, ok := db.disk.Get(db.manifestKey())
+	if !ok {
+		return
+	}
+	var dm diskManifest
+	if err := json.Unmarshal(b, &dm); err != nil {
+		return
+	}
+	m, err := decodeManifest(dm.Body)
+	if err != nil {
+		return
+	}
+	db.manifestMu.Lock()
+	db.manifest = m
+	db.etag = dm.ETag
+	db.manifestMu.Unlock()
+}
+
+// refreshManifest asks the store whether the cached manifest is still current, with a conditional
+// read when one is cached, and returns the current manifest.
+func (db *DB) refreshManifest(ctx context.Context) (*manifest, string, error) {
+	cached, etag := db.cachedManifest()
+	res, err := db.client.Get(ctx, db.manifestKey(), s3.GetOptions{IfNoneMatch: etag, Consistent: true})
+	if err != nil {
+		if errors.Is(err, s3.ErrNotModified) && cached != nil {
+			return cached, etag, nil
+		}
+		return nil, "", err
+	}
+	m, err := decodeManifest(res.Body)
+	if err != nil {
+		return nil, "", err
+	}
+	db.setManifest(m, res.ETag)
+	return m, res.ETag, nil
+}
+
+// currentManifest for a new transaction: the cached one when fresh, or the store's.
+func (db *DB) currentManifest(ctx context.Context) (*manifest, string, error) {
+	if db.mutations.SkipFreshnessCheck {
+		if m, etag := db.cachedManifest(); m != nil {
+			return m, etag, nil
+		}
+	}
+	return db.refreshManifest(ctx)
+}
+
+func (db *DB) createManifest(ctx context.Context) error {
+	m := &manifest{Version: manifestVersion, UpdatedAt: db.now()}
+	b, err := encodeManifest(m)
+	if err != nil {
+		return err
+	}
+	etag, err := db.client.Put(ctx, db.manifestKey(), b, s3.PutOptions{IfNoneMatch: true})
+	if err != nil {
+		if errors.Is(err, s3.ErrPreconditionFailed) {
+			_, _, err = db.refreshManifest(ctx)
+			return err
+		}
+		return fmt.Errorf("engine: creating manifest: %w", err)
+	}
+	db.log.Info("created database", "prefix", db.prefix)
+	db.setManifest(m, etag)
+	return nil
+}
+
+// casManifest replaces the manifest at base with next by a conditional write and returns the new ETag.
+//
+// A write whose answer is lost is resolved by reading the manifest back: the write landed when
+// the record at next.Seq carries next.CommitID, it lost when another commit took that sequence
+// number, and it is retried with the same body while the manifest is unchanged. The same
+// commit ID is reused on every attempt, so a commit can never be applied twice.
+func (db *DB) casManifest(ctx context.Context, baseEtag string, next *manifest) (string, error) {
+	body, err := encodeManifest(next)
+	if err != nil {
+		return "", err
+	}
+	opts := s3.PutOptions{IfMatch: baseEtag}
+	if db.mutations.CommitWithoutCAS {
+		opts = s3.PutOptions{}
+	}
+	assert.Always(opts.IfMatch != "" || db.mutations.CommitWithoutCAS, "manifest writes are conditional", nil)
+
+	const maxAttempts = 8
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		etag, err := db.client.Put(ctx, db.manifestKey(), body, opts)
+		if db.mutations.AckBeforeConfirm {
+			if err != nil {
+				etag = `"unconfirmed"`
+			}
+			db.setManifest(next, etag)
+			return etag, nil
+		}
+		if err == nil {
+			db.setManifest(next, etag)
+			return etag, nil
+		}
+		lastErr = err
+		definite := errors.Is(err, s3.ErrPreconditionFailed)
+		assert.Sometimes(definite, "a manifest write fails its precondition", nil)
+		assert.Sometimes(!definite, "a manifest write has an unknown outcome", nil)
+
+		cur, curEtag, rerr := db.readManifest(ctx)
+		if rerr != nil {
+			lastErr = rerr
+			continue
+		}
+		switch {
+		case cur.Seq == next.Seq && cur.CommitID == next.CommitID:
+			assert.Sometimes(true, "a lost manifest write is found to have landed", nil)
+			db.setManifest(cur, curEtag)
+			return curEtag, nil
+		case curEtag == baseEtag && !definite:
+			continue
+		case cur.Seq >= next.Seq:
+			rec, covered := cur.commitAt(next.Seq)
+			if !covered {
+				return "", fmt.Errorf("%w: %d commits happened meanwhile", ErrCommitUnknown, cur.Seq-next.Seq)
+			}
+			if rec.ID == next.CommitID {
+				db.setManifest(cur, curEtag)
+				return curEtag, nil
+			}
+			db.setManifest(cur, curEtag)
+			return "", fmt.Errorf("%w: commit %d was taken by %s", ErrConflict, next.Seq, rec.ID)
+		default:
+			return "", fmt.Errorf("%w: manifest at %d after writing %d", ErrCommitUnknown, cur.Seq, next.Seq)
+		}
+	}
+	return "", fmt.Errorf("%w: %v", ErrCommitUnknown, lastErr)
+}
+
+// readManifest unconditionally and consistently.
+func (db *DB) readManifest(ctx context.Context) (*manifest, string, error) {
+	res, err := db.client.Get(ctx, db.manifestKey(), s3.GetOptions{Consistent: true})
+	if err != nil {
+		return nil, "", err
+	}
+	m, err := decodeManifest(res.Body)
+	if err != nil {
+		return nil, "", err
+	}
+	return m, res.ETag, nil
+}
+
+// putObject writes an immutable object, retrying on errors. The body is identical on every
+// attempt, so a lost acknowledgement is harmless.
+func (db *DB) putObject(ctx context.Context, key string, body []byte) error {
+	var err error
+	for range 4 {
+		_, err = db.client.Put(ctx, key, body, s3.PutOptions{})
+		if err == nil {
+			return nil
+		}
+	}
+	return fmt.Errorf("engine: writing %q: %w", key, err)
+}

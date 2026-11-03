@@ -57,10 +57,30 @@ func (c *VirtualClock) Sleep(_ context.Context, d time.Duration) {
 	c.now = c.now.Add(d)
 }
 
+// Outcome of a request chosen by a [Faults.Decide] script.
+type Outcome int
+
+// Outcomes of a request.
+const (
+	// OutcomeNormal applies the request and returns its result.
+	OutcomeNormal Outcome = iota
+	// OutcomeError fails the request before it is applied.
+	OutcomeError
+	// OutcomeLostAck applies the request but fails the response.
+	OutcomeLostAck
+	// OutcomeCrashBefore crashes the process before the request is applied.
+	OutcomeCrashBefore
+	// OutcomeCrashAfter crashes the process after the request is applied.
+	OutcomeCrashAfter
+)
+
 // Faults to inject. Rates are probabilities in [0, 1] per request.
 type Faults struct {
-	// Rand drives all fault decisions. Required when any rate is non-zero.
+	// Rand drives all random fault decisions. Required when any rate is non-zero.
 	Rand *rand.Rand
+	// Decide scripts the outcome of each request instead of the rates when non-nil.
+	// Latency still follows MaxLatency.
+	Decide func(kind s3.Kind, key string) Outcome
 	// ErrorRate is the probability that a request fails before it is applied.
 	ErrorRate float64
 	// LostAckRate is the probability that a write is applied but the caller sees an error.
@@ -211,41 +231,59 @@ func (c *Client) request(ctx context.Context, kind s3.Kind, key string, write bo
 	}
 
 	f := c.faults
-	if f.Rand != nil {
-		if f.MaxLatency > 0 {
-			c.clock.Sleep(ctx, time.Duration(f.Rand.Int64N(int64(f.MaxLatency))))
-		}
+	if f.Rand != nil && f.MaxLatency > 0 {
+		c.clock.Sleep(ctx, time.Duration(f.Rand.Int64N(int64(f.MaxLatency))))
+	}
+	outcome := OutcomeNormal
+	switch {
+	case f.Decide != nil:
+		outcome = f.Decide(kind, key)
+	case f.Rand != nil:
 		if f.ErrorRate > 0 && f.Rand.Float64() < f.ErrorRate {
-			c.log("%s: injected error before apply", step)
-			return fmt.Errorf("%w before %s", ErrInjected, step)
-		}
-		if p != nil && f.CrashRate > 0 && f.Rand.Float64() < f.CrashRate {
+			outcome = OutcomeError
+		} else if p != nil && f.CrashRate > 0 && f.Rand.Float64() < f.CrashRate {
+			outcome = OutcomeCrashBefore
 			if f.Rand.IntN(2) == 0 {
-				c.log("%s: crash before apply", step)
-				p.Crash("before " + step)
-				return ErrCrashed
+				outcome = OutcomeCrashAfter
 			}
-			if err := apply(); err != nil {
-				c.log("%s: crash after failed apply: %v", step, err)
-				p.Crash("after failed " + step)
-				return ErrCrashed
-			}
-			c.log("%s: crash after apply", step)
-			p.Crash("after " + step)
+		} else if write && f.LostAckRate > 0 && f.Rand.Float64() < f.LostAckRate {
+			outcome = OutcomeLostAck
+		}
+	}
+	if p == nil && (outcome == OutcomeCrashBefore || outcome == OutcomeCrashAfter) {
+		outcome = OutcomeNormal
+	}
+	if !write && outcome == OutcomeLostAck {
+		outcome = OutcomeNormal
+	}
+
+	switch outcome {
+	case OutcomeError:
+		c.log("%s: injected error before apply", step)
+		return fmt.Errorf("%w before %s", ErrInjected, step)
+	case OutcomeCrashBefore:
+		c.log("%s: crash before apply", step)
+		p.Crash("before " + step)
+		return ErrCrashed
+	case OutcomeCrashAfter:
+		if err := apply(); err != nil {
+			c.log("%s: crash after failed apply: %v", step, err)
+			p.Crash("after failed " + step)
 			return ErrCrashed
 		}
+		c.log("%s: crash after apply", step)
+		p.Crash("after " + step)
+		return ErrCrashed
 	}
 
 	err := apply()
 
-	if f.Rand != nil {
-		if f.MaxLatency > 0 {
-			c.clock.Sleep(ctx, time.Duration(f.Rand.Int64N(int64(f.MaxLatency))))
-		}
-		if write && err == nil && f.LostAckRate > 0 && f.Rand.Float64() < f.LostAckRate {
-			c.log("%s: lost ack", step)
-			return fmt.Errorf("%w after %s (lost ack)", ErrInjected, step)
-		}
+	if f.Rand != nil && f.MaxLatency > 0 {
+		c.clock.Sleep(ctx, time.Duration(f.Rand.Int64N(int64(f.MaxLatency))))
+	}
+	if outcome == OutcomeLostAck && err == nil {
+		c.log("%s: lost ack", step)
+		return fmt.Errorf("%w after %s (lost ack)", ErrInjected, step)
 	}
 	if err != nil {
 		c.log("%s: %v", step, err)
