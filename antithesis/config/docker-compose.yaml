@@ -1,0 +1,45 @@
+# The maragudb harness for Antithesis: the workload container runs the test commands, and an
+# S3-compatible store (versitygw on a POSIX directory) holds the databases. Antithesis injects
+# faults between and into the two. Build with `make antithesis-build`, and run locally with
+# `make antithesis`.
+name: maragudb
+
+services:
+  s3:
+    container_name: maragudb-s3
+    hostname: maragudb-s3
+    platform: linux/amd64
+    image: docker.io/versity/versitygw:v1.10.0
+    init: true
+    environment:
+      NO_COLOR: "1"
+      ROOT_ACCESS_KEY: maragudb
+      ROOT_SECRET_KEY: maragudb-secret
+    # The bucket is a directory of the POSIX backend.
+    entrypoint: ["sh", "-c", "mkdir -p /data/maragudb && exec versitygw posix /data"]
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "7070"]
+      interval: 1s
+      timeout: 2s
+      retries: 60
+
+  workload:
+    container_name: maragudb-workload
+    hostname: maragudb-workload
+    platform: linux/amd64
+    build:
+      context: ../..
+      dockerfile: antithesis/Dockerfile
+      target: workload
+    image: maragudb-workload:latest
+    init: true
+    environment:
+      NO_COLOR: "1"
+      AWS_ENDPOINT_URL_S3: http://maragudb-s3:7070
+      AWS_ACCESS_KEY_ID: maragudb
+      AWS_SECRET_ACCESS_KEY: maragudb-secret
+      AWS_REGION: us-east-1
+      BUCKET: maragudb
+    depends_on:
+      s3:
+        condition: service_healthy

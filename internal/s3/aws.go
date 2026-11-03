@@ -28,6 +28,9 @@ type AWSOptions struct {
 	// Tigris sends the X-Tigris-Consistent header on conditional operations and consistent reads.
 	// Detected from the endpoint host when nil.
 	Tigris *bool
+	// PathStyle addresses the bucket in the URL path instead of the host name, which stores
+	// reached by a plain host name, such as a container, need.
+	PathStyle bool
 }
 
 // AWSClient implements [Client] with aws-sdk-go-v2.
@@ -58,7 +61,7 @@ func NewAWSClient(ctx context.Context, opts AWSOptions) (*AWSClient, error) {
 		if opts.Endpoint != "" {
 			o.BaseEndpoint = aws.String(opts.Endpoint)
 		}
-		o.UsePathStyle = false
+		o.UsePathStyle = opts.PathStyle
 		// S3-compatible stores do not all support the SDK's default checksums.
 		o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
 		o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired

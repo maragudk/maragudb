@@ -40,3 +40,29 @@ pgdiff:
 .PHONY: tigris
 tigris:
 	go test ./internal/s3 ./internal/engine -run Tigris -count 1 -v
+
+ANTITHESIS_COMPOSE = docker compose -f antithesis/config/docker-compose.yaml
+
+# Build the Antithesis harness images in /antithesis for linux/amd64.
+.PHONY: antithesis-build
+antithesis-build:
+	$(ANTITHESIS_COMPOSE) build
+
+# Run the Antithesis harness locally without Antithesis: bring it up, run every test command
+# once, check that setup completed, and tear it down.
+.PHONY: antithesis
+antithesis: antithesis-build
+	$(ANTITHESIS_COMPOSE) up -d --wait
+	status=0; \
+	for c in $$($(ANTITHESIS_COMPOSE) exec -T workload ls /opt/antithesis/test/v1/maragudb); do \
+		echo "== $$c"; \
+		$(ANTITHESIS_COMPOSE) exec -T workload /opt/antithesis/test/v1/maragudb/$$c || status=1; \
+	done; \
+	$(ANTITHESIS_COMPOSE) logs workload | grep -q "setup complete" || { echo "the workload never signaled setup complete"; status=1; }; \
+	$(ANTITHESIS_COMPOSE) down -v; \
+	exit $$status
+
+# Validate the harness with snouty, the Antithesis CLI, which must be on PATH.
+.PHONY: antithesis-validate
+antithesis-validate: antithesis-build
+	SNOUTY_CONTAINER_ENGINE=docker snouty validate antithesis/config

@@ -1,0 +1,793 @@
+// Package workload runs the bank and list-append workloads against a real object store, through
+// the engine or through SQL, with concurrent clients that each have their own engine, as separate
+// processes would. It records the history in wall-clock time and checks it with the same checkers
+// as the simulator. Unlike the simulator it is not deterministic: faults come from the network and
+// the store, such as the ones Antithesis injects.
+package workload
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"math/rand/v2"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/antithesishq/antithesis-sdk-go/assert"
+
+	"maragu.dev/maragudb/internal/engine"
+	"maragu.dev/maragudb/internal/history"
+	"maragu.dev/maragudb/internal/s3"
+	"maragu.dev/maragudb/internal/sim"
+	"maragu.dev/maragudb/internal/sql/exec"
+	"maragu.dev/maragudb/internal/sqldriver"
+)
+
+// Config of a run.
+type Config struct {
+	// Client for the object store. Required.
+	Client s3.Client
+	// Prefix of the database, which must be empty. Required.
+	Prefix   string
+	Workload sim.Workload
+	// SQL runs the clients through the SQL layer and the database/sql driver.
+	SQL bool
+	// Clients is the number of concurrent clients.
+	Clients int
+	// TxPerClient is how many transactions each client runs.
+	TxPerClient int
+	// Keys for the list-append workload, or accounts for the bank workload.
+	Keys int
+	// MaxTimeout bounds the drawn timeout of each transaction. A transaction cut off by its
+	// timeout is like a client that crashed mid-request, and the client then restarts its engine.
+	MaxTimeout time.Duration
+	// Rand drives every decision. Required.
+	Rand *rand.Rand
+	// Log receives progress lines when non-nil.
+	Log func(string)
+	// Mutations to break the engine with, for tests.
+	Mutations engine.Mutations
+}
+
+// Result of a run.
+type Result struct {
+	History   []history.Tx
+	Audits    []history.BankAudit
+	Anomalies []error
+	Stats     Stats
+}
+
+// Stats of a run.
+type Stats struct {
+	Commits, Conflicts, Unknown, Failed, Restarts, Compactions int
+}
+
+// Report of the run, for logs.
+func (r Result) Report() string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "%d tx, %d commits, %d conflicts, %d unknown, %d other failures, %d restarts, %d compactions",
+		len(r.History), r.Stats.Commits, r.Stats.Conflicts, r.Stats.Unknown, r.Stats.Failed, r.Stats.Restarts, r.Stats.Compactions)
+	for _, a := range r.Anomalies {
+		fmt.Fprintf(&b, "\nANOMALY: %v", a)
+	}
+	return b.String()
+}
+
+const initialBalance = 100
+
+type run struct {
+	cfg   Config
+	start time.Time
+
+	mu     sync.Mutex
+	rng    *rand.Rand
+	txs    []history.Tx
+	audits []history.BankAudit
+	stats  Stats
+	anoms  []error
+	last   time.Duration
+	total  int64
+	next   int64
+}
+
+// Run the workload. It returns an error only when the store cannot be set up or read back at
+// all before ctx ends; anomalies are in the result.
+func Run(ctx context.Context, cfg Config) (Result, error) {
+	r := &run{cfg: cfg, start: time.Now(), rng: cfg.Rand}
+	if err := r.seed(ctx); err != nil {
+		return Result{}, fmt.Errorf("workload: seeding: %w", err)
+	}
+
+	clientsCtx, stopMaintainer := context.WithCancel(ctx)
+	var maintainer sync.WaitGroup
+	maintainer.Go(func() { r.maintain(clientsCtx) })
+	var clients sync.WaitGroup
+	for i := range cfg.Clients {
+		clients.Go(func() { r.client(ctx, i) })
+	}
+	clients.Wait()
+	stopMaintainer()
+	maintainer.Wait()
+
+	final, balances, err := r.readFinal(ctx)
+	if err != nil {
+		return Result{}, fmt.Errorf("workload: reading the final state: %w", err)
+	}
+	switch cfg.Workload {
+	case sim.ListAppend:
+		if err := history.CheckDurability(r.txs, final); err != nil {
+			r.anoms = append(r.anoms, err)
+		}
+		if err := history.CheckListAppend(r.txs, final); err != nil {
+			r.anoms = append(r.anoms, err)
+		}
+	case sim.Bank:
+		r.audits = append(r.audits, history.BankAudit{TxID: -1, Balances: balances})
+		if err := history.CheckBank(r.audits, r.total); err != nil {
+			r.anoms = append(r.anoms, err)
+		}
+	}
+	if cfg.Mutations == (engine.Mutations{}) {
+		assert.Always(len(r.anoms) == 0, "the history against a real object store has no anomalies", map[string]any{"workload": cfg.Workload.String(), "sql": cfg.SQL})
+	}
+	assert.Sometimes(r.stats.Unknown > 0, "a commit against a real object store has an unknown outcome", nil)
+	assert.Sometimes(r.stats.Conflicts > 0, "a commit against a real object store conflicts", nil)
+	return Result{History: r.txs, Audits: r.audits, Anomalies: r.anoms, Stats: r.stats}, nil
+}
+
+func (r *run) log(format string, args ...any) {
+	if r.cfg.Log != nil {
+		r.cfg.Log(fmt.Sprintf(format, args...))
+	}
+}
+
+// intN draws from the shared random source.
+func (r *run) intN(n int) int {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.rng.IntN(n)
+}
+
+// stamp returns a history timestamp that is later than every earlier one.
+func (r *run) stamp() time.Duration {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	t := time.Since(r.start)
+	if t <= r.last {
+		t = r.last + 1
+	}
+	r.last = t
+	return t
+}
+
+func (r *run) value(client int) int64 {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.next++
+	return int64(client)<<32 | r.next
+}
+
+func (r *run) record(tx history.Tx) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	tx.ID = len(r.txs) + 1
+	r.txs = append(r.txs, tx)
+}
+
+func (r *run) audit(tx history.Tx, balances map[string]int64) {
+	r.mu.Lock()
+	tx.ID = len(r.txs) + 1
+	r.txs = append(r.txs, tx)
+	r.audits = append(r.audits, history.BankAudit{TxID: tx.ID, Balances: balances})
+	r.mu.Unlock()
+}
+
+func (r *run) anomaly(format string, args ...any) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.anoms = append(r.anoms, fmt.Errorf(format, args...))
+}
+
+// outcome of a commit. Only [engine.ErrCommitUnknown] is ambiguous; every other error means the
+// transaction was not applied.
+func (r *run) outcome(err error) history.Outcome {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	switch {
+	case err == nil:
+		r.stats.Commits++
+		return history.OK
+	case errors.Is(err, engine.ErrCommitUnknown):
+		r.stats.Unknown++
+		return history.Unknown
+	case errors.Is(err, engine.ErrConflict):
+		r.stats.Conflicts++
+	default:
+		r.stats.Failed++
+	}
+	return history.Failed
+}
+
+func keyName(i int) string {
+	return fmt.Sprintf("k%02d", i)
+}
+
+func (r *run) engineOptions(cache bool) engine.Options {
+	opts := engine.Options{Client: r.cfg.Client, Prefix: r.cfg.Prefix, Mutations: r.cfg.Mutations}
+	if !cache {
+		opts.MemoryCacheBytes = new(int64)
+	}
+	return opts
+}
+
+// process is one client's connection to the database: an engine, or a database/sql handle.
+type process struct {
+	db  *engine.DB
+	sql *sql.DB
+}
+
+func (p *process) close() {
+	if p.sql != nil {
+		_ = p.sql.Close()
+	}
+}
+
+func (r *run) open(ctx context.Context, cache bool) (*process, error) {
+	if !r.cfg.SQL {
+		db, err := engine.Open(ctx, r.engineOptions(cache))
+		if err != nil {
+			return nil, err
+		}
+		return &process{db: db}, nil
+	}
+	d := sqldriver.New(sqldriver.Options{Engine: r.engineOptions(cache), Exec: exec.Options{}})
+	c, err := sqldriver.NewConnector(d, "s3://workload/"+r.cfg.Prefix)
+	if err != nil {
+		return nil, err
+	}
+	db := sql.OpenDB(c)
+	db.SetMaxOpenConns(2)
+	if err := db.PingContext(ctx); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return &process{sql: db}, nil
+}
+
+// retry fn until it succeeds or ctx ends, backing off between attempts.
+func retry(ctx context.Context, fn func() error) error {
+	wait := 10 * time.Millisecond
+	for {
+		err := fn()
+		if err == nil {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%w: last error: %w", ctx.Err(), err)
+		case <-time.After(wait):
+		}
+		wait = min(2*wait, time.Second)
+	}
+}
+
+// seed creates the schema and the accounts. A seed whose commit outcome is unknown is checked
+// by reading it back.
+func (r *run) seed(ctx context.Context) error {
+	r.total = int64(r.cfg.Keys) * initialBalance
+	return retry(ctx, func() error {
+		p, err := r.open(ctx, false)
+		if err != nil {
+			return err
+		}
+		defer p.close()
+		if seeded, err := r.seeded(ctx, p); err != nil || seeded {
+			return err
+		}
+		if p.db != nil {
+			if r.cfg.Workload == sim.ListAppend {
+				return nil
+			}
+			tx, err := p.db.Begin(ctx)
+			if err != nil {
+				return err
+			}
+			for i := range r.cfg.Keys {
+				_ = tx.Put([]byte(keyName(i)), []byte(strconv.Itoa(initialBalance)))
+			}
+			return tx.Commit(ctx)
+		}
+		tx, err := p.sql.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+		stmts := []string{"CREATE TABLE lists (k int, pos int, v int, PRIMARY KEY (k, pos))"}
+		if r.cfg.Workload == sim.Bank {
+			stmts = []string{"CREATE TABLE accounts (id int PRIMARY KEY, balance int NOT NULL)"}
+			for i := range r.cfg.Keys {
+				stmts = append(stmts, fmt.Sprintf("INSERT INTO accounts VALUES (%d, %d)", i, initialBalance))
+			}
+		}
+		for _, s := range stmts {
+			if _, err := tx.ExecContext(ctx, s); err != nil {
+				return err
+			}
+		}
+		return tx.Commit()
+	})
+}
+
+// seeded reports whether the seed transaction has been applied.
+func (r *run) seeded(ctx context.Context, p *process) (bool, error) {
+	if p.db != nil {
+		if r.cfg.Workload == sim.ListAppend {
+			return true, nil
+		}
+		tx, err := p.db.BeginReadOnly(ctx)
+		if err != nil {
+			return false, err
+		}
+		_, ok, err := tx.Get(ctx, []byte(keyName(0)))
+		return ok, err
+	}
+	table := "lists"
+	if r.cfg.Workload == sim.Bank {
+		table = "accounts"
+	}
+	_, err := p.sql.ExecContext(ctx, "SELECT 1 FROM "+table+" LIMIT 1")
+	switch {
+	case err == nil:
+		return true, nil
+	case errors.Is(err, exec.ErrNoTable):
+		return false, nil
+	}
+	return false, err
+}
+
+// client runs transactions. A transaction that runs out of time is like a crash in the middle
+// of it, after which the client starts over with a new engine and cold caches.
+func (r *run) client(ctx context.Context, id int) {
+	var p *process
+	defer func() {
+		if p != nil {
+			p.close()
+		}
+	}()
+	for i := 0; i < r.cfg.TxPerClient && ctx.Err() == nil; i++ {
+		if p == nil {
+			var err error
+			if p, err = r.open(ctx, r.intN(2) == 0); err != nil {
+				r.log("client %d: open: %v", id, err)
+				time.Sleep(10 * time.Millisecond)
+				i--
+				continue
+			}
+		}
+		timeout := time.Duration(1 + r.intN(int(r.cfg.MaxTimeout)))
+		txCtx, cancel := context.WithTimeout(ctx, timeout)
+		switch {
+		case r.cfg.SQL && r.cfg.Workload == sim.ListAppend:
+			r.listAppendSQL(txCtx, p, id)
+		case r.cfg.SQL:
+			r.bankSQL(txCtx, p, id)
+		case r.cfg.Workload == sim.ListAppend:
+			r.listAppendTx(txCtx, p, id)
+		default:
+			r.bankTx(txCtx, p, id)
+		}
+		expired := txCtx.Err() != nil
+		cancel()
+		if expired {
+			r.mu.Lock()
+			r.stats.Restarts++
+			r.mu.Unlock()
+			p.close()
+			p = nil
+		}
+	}
+}
+
+// maintain compacts and garbage collects now and then until ctx ends.
+func (r *run) maintain(ctx context.Context) {
+	db, err := engine.Open(ctx, r.engineOptions(false))
+	if err != nil {
+		return
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(time.Duration(50+r.intN(450)) * time.Millisecond):
+		}
+		if err := db.Compact(ctx); err == nil {
+			r.mu.Lock()
+			r.stats.Compactions++
+			r.mu.Unlock()
+		}
+		_, _ = db.GC(ctx)
+	}
+}
+
+type plan struct {
+	append bool
+	key    int
+}
+
+func (r *run) plans() ([]plan, bool) {
+	var plans []plan
+	readOnly := true
+	for range 1 + r.intN(4) {
+		p := plan{append: r.intN(2) == 0, key: r.intN(r.cfg.Keys)}
+		readOnly = readOnly && !p.append
+		plans = append(plans, p)
+	}
+	return plans, readOnly
+}
+
+func decodeList(b []byte) []int64 {
+	list := []int64{}
+	if len(b) == 0 {
+		return list
+	}
+	for _, s := range strings.Split(string(b), ",") {
+		v, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			panic(fmt.Sprintf("workload: corrupt list %q", b))
+		}
+		list = append(list, v)
+	}
+	return list
+}
+
+func encodeList(list []int64) []byte {
+	parts := make([]string, len(list))
+	for i, v := range list {
+		parts[i] = strconv.FormatInt(v, 10)
+	}
+	return []byte(strings.Join(parts, ","))
+}
+
+func (r *run) listAppendTx(ctx context.Context, p *process, id int) {
+	plans, readOnly := r.plans()
+	h := history.Tx{Client: id, Invoke: r.stamp()}
+	begin := p.db.Begin
+	if readOnly {
+		begin = p.db.BeginReadOnly
+	}
+	tx, err := begin(ctx)
+	if err != nil {
+		return
+	}
+	for _, pl := range plans {
+		v, _, err := tx.Get(ctx, []byte(keyName(pl.key)))
+		if err != nil {
+			// The reads that completed are real observations of a transaction that never committed.
+			if len(h.Ops) > 0 {
+				h.Complete, h.Outcome, h.Err = r.stamp(), history.Failed, err.Error()
+				r.record(h)
+			}
+			return
+		}
+		list := decodeList(v)
+		h.Ops = append(h.Ops, history.Op{Kind: history.Read, Key: keyName(pl.key), List: list})
+		if pl.append {
+			value := r.value(id)
+			_ = tx.Put([]byte(keyName(pl.key)), encodeList(append(list, value)))
+			h.Ops = append(h.Ops, history.Op{Kind: history.Append, Key: keyName(pl.key), Value: value})
+		}
+	}
+	err = tx.Commit(ctx)
+	h.Complete = r.stamp()
+	h.Outcome = r.outcome(err)
+	if err != nil {
+		h.Err = err.Error()
+		if readOnly {
+			h.Outcome = history.Failed
+		}
+	}
+	r.record(h)
+}
+
+func (r *run) bankTx(ctx context.Context, p *process, id int) {
+	h := history.Tx{Client: id, Invoke: r.stamp()}
+	if r.intN(3) == 0 {
+		tx, err := p.db.BeginReadOnly(ctx)
+		if err != nil {
+			return
+		}
+		balances := map[string]int64{}
+		for i := range r.cfg.Keys {
+			v, ok, err := tx.Get(ctx, []byte(keyName(i)))
+			if err != nil {
+				return
+			}
+			if !ok {
+				r.anomaly("client %d: account %s is missing", id, keyName(i))
+				return
+			}
+			if balances[keyName(i)], err = strconv.ParseInt(string(v), 10, 64); err != nil {
+				r.anomaly("client %d: corrupt balance %q", id, v)
+				return
+			}
+		}
+		h.Complete, h.Outcome = r.stamp(), history.OK
+		r.audit(h, balances)
+		return
+	}
+	from, to := keyName(r.intN(r.cfg.Keys)), keyName(r.intN(r.cfg.Keys))
+	amount := int64(1 + r.intN(initialBalance/2))
+	tx, err := p.db.Begin(ctx)
+	if err != nil {
+		return
+	}
+	read := func(key string) (int64, bool) {
+		v, ok, err := tx.Get(ctx, []byte(key))
+		if err != nil {
+			return 0, false
+		}
+		if !ok {
+			r.anomaly("client %d: account %s is missing", id, key)
+			return 0, false
+		}
+		n, err := strconv.ParseInt(string(v), 10, 64)
+		if err != nil {
+			r.anomaly("client %d: corrupt balance %q", id, v)
+			return 0, false
+		}
+		return n, true
+	}
+	a, ok := read(from)
+	if !ok {
+		return
+	}
+	b, ok := read(to)
+	if !ok || a < amount || from == to {
+		_ = tx.Rollback()
+		return
+	}
+	_ = tx.Put([]byte(from), []byte(strconv.FormatInt(a-amount, 10)))
+	_ = tx.Put([]byte(to), []byte(strconv.FormatInt(b+amount, 10)))
+	err = tx.Commit(ctx)
+	h.Complete = r.stamp()
+	h.Outcome = r.outcome(err)
+	h.Ops = []history.Op{{Kind: history.Append, Key: from, Value: -amount}, {Kind: history.Append, Key: to, Value: amount}}
+	if err != nil {
+		h.Err = err.Error()
+	}
+	r.record(h)
+}
+
+// readList reads a list in a transaction or on the database.
+func readList(ctx context.Context, q interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}, k int) ([]int64, error) {
+	rows, err := q.QueryContext(ctx, "SELECT pos, v FROM lists WHERE k = $1 ORDER BY pos", k)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	list := []int64{}
+	for rows.Next() {
+		var pos, v int64
+		if err := rows.Scan(&pos, &v); err != nil {
+			return nil, err
+		}
+		if pos != int64(len(list)) {
+			return nil, fmt.Errorf("list %d has position %d at index %d", k, pos, len(list))
+		}
+		list = append(list, v)
+	}
+	return list, rows.Err()
+}
+
+func (r *run) listAppendSQL(ctx context.Context, p *process, id int) {
+	plans, readOnly := r.plans()
+	// A third of the operations, and every lone append, run as two autocommit statements: a read,
+	// and an insert at the position it found, which is its own transaction in the history.
+	if r.intN(3) == 0 || len(plans) == 1 && plans[0].append {
+		k := plans[0].key
+		h := history.Tx{Client: id, Invoke: r.stamp()}
+		list, err := readList(ctx, p.sql, k)
+		if err != nil {
+			return
+		}
+		h.Ops = []history.Op{{Kind: history.Read, Key: keyName(k), List: list}}
+		h.Complete, h.Outcome = r.stamp(), history.OK
+		r.record(h)
+
+		h = history.Tx{Client: id, Invoke: r.stamp()}
+		value := r.value(id)
+		_, err = p.sql.ExecContext(ctx, "INSERT INTO lists VALUES ($1, $2, $3)", k, len(list), value)
+		h.Complete = r.stamp()
+		h.Ops = []history.Op{{Kind: history.Append, Key: keyName(k), Value: value}}
+		h.Outcome = r.outcome(err)
+		if err != nil {
+			h.Err = err.Error()
+		}
+		r.record(h)
+		return
+	}
+
+	h := history.Tx{Client: id, Invoke: r.stamp()}
+	tx, err := p.sql.BeginTx(ctx, &sql.TxOptions{ReadOnly: readOnly})
+	if err != nil {
+		return
+	}
+	defer func() { _ = tx.Rollback() }()
+	fail := func(err error) {
+		if len(h.Ops) > 0 {
+			h.Complete, h.Outcome, h.Err = r.stamp(), history.Failed, err.Error()
+			r.record(h)
+		}
+	}
+	for _, pl := range plans {
+		list, err := readList(ctx, tx, pl.key)
+		if err != nil {
+			fail(err)
+			return
+		}
+		h.Ops = append(h.Ops, history.Op{Kind: history.Read, Key: keyName(pl.key), List: list})
+		if pl.append {
+			value := r.value(id)
+			if _, err := tx.ExecContext(ctx, "INSERT INTO lists VALUES ($1, $2, $3)", pl.key, len(list), value); err != nil {
+				fail(err)
+				return
+			}
+			h.Ops = append(h.Ops, history.Op{Kind: history.Append, Key: keyName(pl.key), Value: value})
+		}
+	}
+	err = tx.Commit()
+	h.Complete = r.stamp()
+	h.Outcome = r.outcome(err)
+	if err != nil {
+		h.Err = err.Error()
+		if readOnly {
+			h.Outcome = history.Failed
+		}
+	}
+	r.record(h)
+}
+
+func (r *run) bankSQL(ctx context.Context, p *process, id int) {
+	h := history.Tx{Client: id, Invoke: r.stamp()}
+	if r.intN(3) == 0 {
+		tx, err := p.sql.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+		if err != nil {
+			return
+		}
+		defer func() { _ = tx.Rollback() }()
+		rows, err := tx.QueryContext(ctx, "SELECT id, balance FROM accounts ORDER BY id")
+		if err != nil {
+			return
+		}
+		balances := map[string]int64{}
+		for rows.Next() {
+			var id, balance int64
+			if err := rows.Scan(&id, &balance); err != nil {
+				_ = rows.Close()
+				return
+			}
+			balances[keyName(int(id))] = balance
+		}
+		_ = rows.Close()
+		if rows.Err() != nil {
+			return
+		}
+		if len(balances) != r.cfg.Keys {
+			r.anomaly("client %d: read %d accounts, want %d", id, len(balances), r.cfg.Keys)
+			return
+		}
+		h.Complete, h.Outcome = r.stamp(), history.OK
+		r.audit(h, balances)
+		return
+	}
+	from, to := r.intN(r.cfg.Keys), r.intN(r.cfg.Keys)
+	amount := int64(1 + r.intN(initialBalance/2))
+	if from == to {
+		return
+	}
+	tx, err := p.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return
+	}
+	defer func() { _ = tx.Rollback() }()
+	var balance int64
+	if err := tx.QueryRowContext(ctx, "SELECT balance FROM accounts WHERE id = $1", from).Scan(&balance); err != nil || balance < amount {
+		return
+	}
+	for _, step := range []struct {
+		id    int
+		delta int64
+	}{{from, -amount}, {to, amount}} {
+		res, err := tx.ExecContext(ctx, "UPDATE accounts SET balance = balance + $1 WHERE id = $2", step.delta, step.id)
+		if err != nil {
+			return
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			r.anomaly("client %d: update of account %s affected %d rows", id, keyName(step.id), n)
+			return
+		}
+	}
+	err = tx.Commit()
+	h.Complete = r.stamp()
+	h.Outcome = r.outcome(err)
+	h.Ops = []history.Op{{Kind: history.Append, Key: keyName(from), Value: -amount}, {Kind: history.Append, Key: keyName(to), Value: amount}}
+	if err != nil {
+		h.Err = err.Error()
+	}
+	r.record(h)
+}
+
+// readFinal compacts, then reads every list or account with a new engine without caches,
+// retrying until the store answers.
+func (r *run) readFinal(ctx context.Context) (map[string][]int64, map[string]int64, error) {
+	// Merge the segments first, now that no commit competes, so that the read touches few objects.
+	_ = retry(ctx, func() error {
+		db, err := engine.Open(ctx, r.engineOptions(false))
+		if err != nil {
+			return err
+		}
+		return db.Compact(ctx)
+	})
+	var lists map[string][]int64
+	var balances map[string]int64
+	err := retry(ctx, func() error {
+		p, err := r.open(ctx, false)
+		if err != nil {
+			return err
+		}
+		defer p.close()
+		lists, balances = map[string][]int64{}, map[string]int64{}
+		if p.db != nil {
+			tx, err := p.db.BeginReadOnly(ctx)
+			if err != nil {
+				return err
+			}
+			it := tx.Scan(ctx, nil, nil)
+			for it.Next() {
+				key := string(it.Key())
+				if r.cfg.Workload == sim.ListAppend {
+					lists[key] = decodeList(it.Value())
+					continue
+				}
+				if balances[key], err = strconv.ParseInt(string(it.Value()), 10, 64); err != nil {
+					return err
+				}
+			}
+			return it.Err()
+		}
+		if r.cfg.Workload == sim.ListAppend {
+			rows, err := p.sql.QueryContext(ctx, "SELECT k, v FROM lists ORDER BY k, pos")
+			if err != nil {
+				return err
+			}
+			defer func() { _ = rows.Close() }()
+			for rows.Next() {
+				var k, v int64
+				if err := rows.Scan(&k, &v); err != nil {
+					return err
+				}
+				lists[keyName(int(k))] = append(lists[keyName(int(k))], v)
+			}
+			return rows.Err()
+		}
+		rows, err := p.sql.QueryContext(ctx, "SELECT id, balance FROM accounts")
+		if err != nil {
+			return err
+		}
+		defer func() { _ = rows.Close() }()
+		for rows.Next() {
+			var id, balance int64
+			if err := rows.Scan(&id, &balance); err != nil {
+				return err
+			}
+			balances[keyName(int(id))] = balance
+		}
+		return rows.Err()
+	})
+	return lists, balances, err
+}

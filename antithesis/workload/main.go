@@ -1,0 +1,191 @@
+// Command workload is the maragudb workload for Antithesis. It runs as the test commands of the
+// harness in /antithesis, chosen by the name it is invoked under, and as the entrypoint that
+// waits for the object store and signals that setup is complete.
+//
+//	ready                          wait for the object store, signal setup complete, and idle
+//	parallel_driver_sim            run simulator seeds against the in-process fake
+//	parallel_driver_s3_<w>_<api>   run workload w (bank, list_append) through api (engine, sql)
+//	                               against the object store
+//
+// The object store comes from AWS_ENDPOINT_URL_S3, BUCKET, and the standard AWS credentials.
+package main
+
+import (
+	"context"
+	"encoding/hex"
+	"fmt"
+	mathrand "math/rand"
+	"math/rand/v2"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/antithesishq/antithesis-sdk-go/assert"
+	"github.com/antithesishq/antithesis-sdk-go/lifecycle"
+	"github.com/antithesishq/antithesis-sdk-go/random"
+
+	"maragu.dev/maragudb/internal/s3"
+	"maragu.dev/maragudb/internal/sim"
+	"maragu.dev/maragudb/internal/workload"
+)
+
+func main() {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	command := filepath.Base(os.Args[0])
+	if len(os.Args) > 1 {
+		command = os.Args[1]
+	}
+	for _, prefix := range []string{"parallel_driver_", "singleton_driver_", "anytime_"} {
+		command = strings.TrimPrefix(command, prefix)
+	}
+	if err := run(ctx, command); err != nil {
+		fmt.Println("workload:", err)
+		os.Exit(1)
+	}
+}
+
+func run(ctx context.Context, command string) error {
+	switch command {
+	case "ready":
+		return ready(ctx)
+	case "sim":
+		return simulate()
+	case "s3_bank_engine":
+		return store(ctx, sim.Bank, false)
+	case "s3_bank_sql":
+		return store(ctx, sim.Bank, true)
+	case "s3_list_append_engine":
+		return store(ctx, sim.ListAppend, false)
+	case "s3_list_append_sql":
+		return store(ctx, sim.ListAppend, true)
+	}
+	return fmt.Errorf("unknown command %q", command)
+}
+
+func newClient(ctx context.Context) (*s3.AWSClient, error) {
+	bucket := os.Getenv("BUCKET")
+	if bucket == "" {
+		return nil, fmt.Errorf("BUCKET is not set")
+	}
+	return s3.NewAWSClient(ctx, s3.AWSOptions{Bucket: bucket, PathStyle: true})
+}
+
+// ready waits until the object store answers, signals that setup is complete, and idles, so that
+// the container stays up for the test commands.
+func ready(ctx context.Context) error {
+	client, err := newClient(ctx)
+	if err != nil {
+		return err
+	}
+	for {
+		_, err := client.List(ctx, "ready/")
+		if err == nil {
+			break
+		}
+		fmt.Println("waiting for the object store:", err)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Second):
+		}
+	}
+	assert.Reachable("the workload reaches the object store at startup", nil)
+	lifecycle.SetupComplete(map[string]any{"bucket": os.Getenv("BUCKET")})
+	fmt.Println("setup complete")
+	<-ctx.Done()
+	return nil
+}
+
+// simulate runs simulator seeds with random configurations, through the engine and through SQL.
+// A seed makes a whole run deterministic, so Antithesis steers the runs by choosing seeds.
+func simulate() error {
+	seeds := newSDKSource()
+	failed := 0
+	for range 8 {
+		cfg := sim.DefaultConfig(seeds.Uint64())
+		rng := rand.New(rand.NewPCG(cfg.Seed, 0x5ea))
+		cfg.Workload = sim.Workload(rng.IntN(2))
+		cfg.SQL = rng.IntN(2) == 0
+		cfg.Clients = 2 + rng.IntN(10)
+		cfg.TxPerClient = 10 + rng.IntN(40)
+		cfg.Keys = 1 + rng.IntN(6)
+		cfg.Maintainers = rng.IntN(3)
+		cfg.ErrorRate = rng.Float64() * 0.3
+		cfg.LostAckRate = rng.Float64() * 0.3
+		cfg.CrashRate = rng.Float64() * 0.05
+		cfg.OutageRate = rng.Float64() * 0.03
+		cfg.MaxOutage = time.Duration(1+rng.IntN(3000)) * time.Millisecond
+		cfg.OutageTimeout = time.Duration(rng.IntN(200)) * time.Millisecond
+		cfg.MaxLatency = time.Duration(1+rng.IntN(50)) * time.Millisecond
+		cfg.GracePeriod = time.Duration(50+rng.IntN(3000)) * time.Millisecond
+		res := sim.Run(cfg)
+		fmt.Println(res.Report())
+		if res.Failed() {
+			failed++
+			fmt.Printf("replay with: make replay SEED=%d (configuration %+v)\n", cfg.Seed, cfg)
+		}
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d simulator runs found anomalies", failed)
+	}
+	return nil
+}
+
+// sdkSource draws every number from the Antithesis SDK at the moment it is needed, so that
+// Antithesis controls each decision of the workload. It adapts the SDK's [mathrand.Source64] to
+// [rand.Source].
+type sdkSource struct {
+	src mathrand.Source64
+}
+
+func newSDKSource() sdkSource {
+	return sdkSource{src: random.Source().(mathrand.Source64)}
+}
+
+func (s sdkSource) Uint64() uint64 {
+	return s.src.Uint64()
+}
+
+// store runs a workload against the object store, in a database of its own.
+func store(ctx context.Context, w sim.Workload, useSQL bool) error {
+	client, err := newClient(ctx)
+	if err != nil {
+		return err
+	}
+	rng := rand.New(newSDKSource())
+	var id [8]byte
+	for i := range id {
+		id[i] = byte(rng.Uint32())
+	}
+	cfg := workload.Config{
+		Client:      client,
+		Prefix:      "workload/" + hex.EncodeToString(id[:]),
+		Workload:    w,
+		SQL:         useSQL,
+		Clients:     2 + rng.IntN(6),
+		TxPerClient: 10 + rng.IntN(30),
+		Keys:        1 + rng.IntN(5),
+		MaxTimeout:  time.Duration(100+rng.IntN(5000)) * time.Millisecond,
+		Rand:        rng,
+		Log:         func(line string) { fmt.Println(line) },
+	}
+	fmt.Printf("running %v (SQL %v) in %s with %d clients of %d transactions on %d keys\n", w, useSQL, cfg.Prefix, cfg.Clients, cfg.TxPerClient, cfg.Keys)
+	// The run gets a few minutes; a store that stays unreachable longer is not a finding.
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	defer cancel()
+	res, err := workload.Run(ctx, cfg)
+	if err != nil {
+		fmt.Println("the store was unreachable:", err)
+		return nil
+	}
+	fmt.Println(res.Report())
+	if len(res.Anomalies) > 0 {
+		return fmt.Errorf("%d anomalies", len(res.Anomalies))
+	}
+	return nil
+}
