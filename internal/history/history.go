@@ -308,8 +308,10 @@ func CheckListAppend(txs []Tx, final map[string][]int64) error {
 	}
 
 	g := newGraph()
+	txNode := map[string]int{}
 	for id := range committed {
 		g.node(fmt.Sprint("tx", id))
+		txNode[fmt.Sprint("tx", id)] = id
 	}
 	// Write-write edges along each key's version order.
 	position := map[string]map[int64]int{}
@@ -390,9 +392,7 @@ func CheckListAppend(txs []Tx, final map[string][]int64) error {
 		var cycleTxs []Tx
 		var steps []string
 		for _, e := range cycle {
-			if strings.HasPrefix(e.from, "tx") {
-				var id int
-				fmt.Sscanf(e.from, "tx%d", &id)
+			if id, ok := txNode[e.from]; ok {
 				cycleTxs = append(cycleTxs, byID[id])
 			}
 			if e.label != "" {

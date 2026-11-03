@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -14,6 +16,7 @@ import (
 	"maragu.dev/maragudb/internal/engine"
 	"maragu.dev/maragudb/internal/s3"
 	"maragu.dev/maragudb/internal/s3fake"
+	"maragu.dev/maragudb/internal/tigristest"
 )
 
 // world is a fake store with a clock shared by several database instances, like several processes.
@@ -701,5 +704,113 @@ func TestContext(t *testing.T) {
 		cancel()
 		_, err := db.Begin(ctx)
 		is.True(t, err != nil)
+	})
+}
+
+func TestDB_Tigris(t *testing.T) {
+	client, cfg := tigristest.NewClient(t)
+	open := func(t *testing.T, seed uint64) *engine.DB {
+		t.Helper()
+		db, err := engine.Open(t.Context(), engine.Options{Client: client, Prefix: cfg.Prefix, Rand: rand.New(rand.NewPCG(seed, seed))})
+		is.NotError(t, err)
+		return db
+	}
+
+	t.Run("commits are visible across processes and latencies are reported", func(t *testing.T) {
+		db1 := open(t, 1)
+		db2 := open(t, 2)
+		var commitLatency, readLatency []time.Duration
+		for i := range 5 {
+			tx, err := db1.Begin(t.Context())
+			is.NotError(t, err)
+			is.NotError(t, tx.Put(fmt.Appendf(nil, "key-%d", i), fmt.Appendf(nil, "value-%d", i)))
+			start := time.Now()
+			is.NotError(t, tx.Commit(t.Context()))
+			commitLatency = append(commitLatency, time.Since(start))
+
+			start = time.Now()
+			v, ok := get(t, db2, fmt.Sprint("key-", i))
+			readLatency = append(readLatency, time.Since(start))
+			is.True(t, ok)
+			is.Equal(t, fmt.Sprint("value-", i), v)
+		}
+		t.Logf("commit latency: %v", commitLatency)
+		t.Logf("read latency (begin + point lookup, cold then warm): %v", readLatency)
+		t.Logf("db1 stats: %+v", db1.Stats())
+	})
+
+	t.Run("concurrent writers conflict and retry until every write lands", func(t *testing.T) {
+		const writers = 3
+		const perWriter = 4
+		var wg sync.WaitGroup
+		conflicts := make([]int, writers)
+		for w := range writers {
+			db := open(t, uint64(10+w))
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := range perWriter {
+					for {
+						tx, err := db.Begin(t.Context())
+						if err != nil {
+							t.Errorf("writer %d: begin: %v", w, err)
+							return
+						}
+						v, _, err := tx.Get(t.Context(), []byte("counter"))
+						if err != nil {
+							t.Errorf("writer %d: get: %v", w, err)
+							return
+						}
+						n, _ := strconv.Atoi(string(v))
+						_ = tx.Put([]byte("counter"), []byte(strconv.Itoa(n+1)))
+						_ = tx.Put(fmt.Appendf(nil, "writer-%d-%d", w, i), []byte("done"))
+						err = tx.Commit(t.Context())
+						if err == nil {
+							break
+						}
+						if errors.Is(err, engine.ErrConflict) {
+							conflicts[w]++
+							continue
+						}
+						t.Errorf("writer %d: commit: %v", w, err)
+						return
+					}
+				}
+			}()
+		}
+		wg.Wait()
+		t.Logf("conflicts per writer: %v", conflicts)
+		db := open(t, 99)
+		v, ok := get(t, db, "counter")
+		is.True(t, ok)
+		is.Equal(t, strconv.Itoa(writers*perWriter), v, "every increment landed exactly once")
+	})
+
+	t.Run("compaction and GC keep the data and bound the objects", func(t *testing.T) {
+		grace := time.Second
+		db, err := engine.Open(t.Context(), engine.Options{Client: client, Prefix: cfg.Prefix, GCGracePeriod: &grace})
+		is.NotError(t, err)
+		start := time.Now()
+		for {
+			err := db.Compact(t.Context())
+			if !errors.Is(err, engine.ErrConflict) {
+				is.NotError(t, err)
+				break
+			}
+		}
+		t.Logf("compaction: %v", time.Since(start).Round(time.Millisecond))
+		is.Equal(t, 1, db.Stats().Segments)
+		_, err = db.GC(t.Context())
+		is.NotError(t, err)
+		time.Sleep(grace)
+		n, err := db.GC(t.Context())
+		is.NotError(t, err)
+		is.True(t, n > 0, "expired segments were deleted")
+		infos, err := client.List(t.Context(), cfg.Prefix)
+		is.NotError(t, err)
+		is.Equal(t, 2, len(infos), "manifest and one segment")
+		v, ok := get(t, db, "counter")
+		is.True(t, ok)
+		is.Equal(t, "12", v)
 	})
 }

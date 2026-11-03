@@ -59,6 +59,9 @@ func NewAWSClient(ctx context.Context, opts AWSOptions) (*AWSClient, error) {
 			o.BaseEndpoint = aws.String(opts.Endpoint)
 		}
 		o.UsePathStyle = false
+		// S3-compatible stores do not all support the SDK's default checksums.
+		o.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+		o.ResponseChecksumValidation = aws.ResponseChecksumValidationWhenRequired
 	})
 
 	tigris := false
