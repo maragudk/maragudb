@@ -10,6 +10,7 @@ import (
 	"maragu.dev/is"
 
 	"maragu.dev/maragudb"
+	"maragu.dev/maragudb/internal/pgdiff"
 )
 
 // Each test here is one numbered deviation in /docs/deviations.md. It runs the statement on both
@@ -213,6 +214,18 @@ func TestDeviations(t *testing.T) {
 		}
 	})
 
+	t.Run("13 statements visit rows in key order, so the first failing row can differ", func(t *testing.T) {
+		b := newBoth(t, "CREATE TABLE dev (i int PRIMARY KEY)")
+		for _, db := range []*sql.DB{b.m, b.pg} {
+			_, err := db.ExecContext(t.Context(), "INSERT INTO dev VALUES (0), (-9223372036854775808)")
+			is.NotError(t, err)
+		}
+		_, err := b.pg.ExecContext(t.Context(), "SELECT i / i, abs(i) FROM dev")
+		is.Equal(t, "22012", pgdiff.SQLState(err), "postgres visits 0 first")
+		_, err = b.m.ExecContext(t.Context(), "SELECT i / i, abs(i) FROM dev")
+		is.Error(t, maragudb.ErrOutOfRange, err, "maragudb visits the smallest int first")
+	})
+
 	t.Run("13 UPDATE of key columns visits rows in key order", func(t *testing.T) {
 		b := newBoth(t, "CREATE TABLE dev (i int PRIMARY KEY)")
 		for _, db := range []*sql.DB{b.m, b.pg} {
@@ -259,5 +272,47 @@ func TestDeviations(t *testing.T) {
 		is.Equal(t, "case", name(b.pg, "SELECT CASE WHEN TRUE THEN 1 END"))
 		is.Equal(t, "?column?", name(b.m, "SELECT 1 + 1"))
 		is.Equal(t, "?column?", name(b.pg, "SELECT 1 + 1"))
+	})
+
+	t.Run("17 a string literal where another type is expected is a type error", func(t *testing.T) {
+		b := newBoth(t, "CREATE TABLE dev (i int PRIMARY KEY)")
+		_, pgErr := b.pg.ExecContext(t.Context(), "INSERT INTO dev VALUES ('a')")
+		is.Equal(t, "22P02", pgdiff.SQLState(pgErr), "postgres reads the literal as bigint")
+		_, mErr := b.m.ExecContext(t.Context(), "INSERT INTO dev VALUES ('a')")
+		is.Error(t, maragudb.ErrType, mErr)
+		is.True(t, !pgdiff.SameClass(mErr, pgErr))
+		_, err := b.pg.ExecContext(t.Context(), "INSERT INTO dev VALUES ('1')")
+		is.NotError(t, err)
+		_, err = b.m.ExecContext(t.Context(), "INSERT INTO dev VALUES ('1')")
+		is.Error(t, maragudb.ErrType, err)
+	})
+
+	t.Run("18 LIKE on a primary key column runs on every row", func(t *testing.T) {
+		b := newBoth(t, "CREATE TABLE dev (s string PRIMARY KEY)")
+		for _, db := range []*sql.DB{b.m, b.pg} {
+			_, err := db.ExecContext(t.Context(), "INSERT INTO dev VALUES ('0')")
+			is.NotError(t, err)
+		}
+		res, err := b.pg.ExecContext(t.Context(), `UPDATE dev SET s = 'x' WHERE s LIKE '\'`)
+		is.NotError(t, err, "postgres only evaluates the LIKE on the rows where s = ''")
+		n, err := res.RowsAffected()
+		is.NotError(t, err)
+		is.Equal(t, int64(0), n)
+		_, err = b.pg.ExecContext(t.Context(), `UPDATE dev SET s = 'x' WHERE s || '' LIKE '\'`)
+		is.Equal(t, "22025", pgdiff.SQLState(err), "but fails without the index")
+		_, err = b.m.ExecContext(t.Context(), `UPDATE dev SET s = 'x' WHERE s LIKE '\'`)
+		is.Error(t, maragudb.ErrInvalid, err)
+	})
+
+	t.Run("19 WHERE conjuncts are evaluated in the order they are written", func(t *testing.T) {
+		b := newBoth(t, "CREATE TABLE dev (i int PRIMARY KEY, s string, n int)")
+		for _, db := range []*sql.DB{b.m, b.pg} {
+			_, err := db.ExecContext(t.Context(), "INSERT INTO dev VALUES (1, '0', 1)")
+			is.NotError(t, err)
+		}
+		_, err := scan[int64](t.Context(), b.pg, `SELECT i FROM dev WHERE n = 2 AND s LIKE '\'`)
+		is.Equal(t, "22025", pgdiff.SQLState(err), "postgres evaluates the LIKE first")
+		_, err = scan[int64](t.Context(), b.m, `SELECT i FROM dev WHERE n = 2 AND s LIKE '\'`)
+		is.Error(t, sql.ErrNoRows, err, "maragudb stops at the false equality")
 	})
 }

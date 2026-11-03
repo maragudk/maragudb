@@ -3,6 +3,7 @@ package pgdiff
 import (
 	"fmt"
 	"math"
+	"strings"
 	"time"
 
 	"hegel.dev/go/hegel"
@@ -241,6 +242,10 @@ func (g *gen) expr(t value.Type, s scope, depth int) ast.Expr {
 		case 2:
 			return &ast.Cast{Expr: g.expr(value.Int, s.withNull(true), depth), Type: value.Float}
 		case 3:
+			if s.safe {
+				// A subnormal float does not read back.
+				return g.literal(t)
+			}
 			return &ast.Cast{Expr: &ast.Cast{Expr: g.expr(value.Float, s.withNull(true), depth), Type: value.String}, Type: value.Float}
 		case 4:
 			// An integer literal adapts to a float.
@@ -276,7 +281,14 @@ func (g *gen) expr(t value.Type, s scope, depth int) ast.Expr {
 			if g.bool() {
 				pattern = hegel.Draw(g.ht, hegel.Text().Alphabet("aA%_\\").MaxSize(5))
 			}
-			return &ast.Like{Expr: g.expr(value.String, s.withNull(true), depth), Pattern: &ast.Literal{Value: value.NewString(pattern)}, Not: g.bool()}
+			x := g.expr(value.String, s.withNull(true), depth)
+			if ref, ok := x.(*ast.ColumnRef); s.safe || ok && g.isKey(ref.Name) {
+				// Postgres turns a LIKE on an indexed column into an index condition and only
+				// evaluates it on the rows the index finds, so whether a trailing escape is an
+				// error depends on its plan. See deviation 17.
+				pattern = strings.TrimRight(pattern, "\\")
+			}
+			return &ast.Like{Expr: x, Pattern: &ast.Literal{Value: value.NewString(pattern)}, Not: g.bool()}
 		default:
 			ot := g.anyType()
 			op := hegel.Draw(g.ht, hegel.SampledFrom([]ast.BinaryOp{ast.Eq, ast.Ne, ast.Lt, ast.Le, ast.Gt, ast.Ge}))
@@ -390,11 +402,31 @@ func (g *gen) where(s scope) ast.Expr {
 		op := hegel.Draw(g.ht, hegel.SampledFrom([]ast.BinaryOp{ast.Eq, ast.Eq, ast.Lt, ast.Le, ast.Gt, ast.Ge}))
 		var e ast.Expr = &ast.Binary{Op: op, Left: &ast.ColumnRef{Name: name}, Right: g.literal(g.column(name).Type)}
 		if g.bool() {
+			s.safe = true
 			e = &ast.Binary{Op: ast.And, Left: e, Right: g.expr(value.Bool, s, 1)}
 		}
 		return e
 	}
-	return g.expr(value.Bool, s, 0)
+	e := g.expr(value.Bool, s, 0)
+	if len(conjuncts(e)) > 1 && !s.safe {
+		s.safe = true
+		e = g.expr(value.Bool, s, 0)
+	}
+	return e
+}
+
+// conjuncts of the top level of a WHERE clause. When there are several, Postgres evaluates them
+// in an order its planner picks, cheapest first and equalities with a constant last, so only
+// conjuncts that cannot fail are combined. See deviation 19.
+func conjuncts(e ast.Expr) []ast.Expr {
+	if b, ok := e.(*ast.Binary); ok && b.Op == ast.And {
+		return append(conjuncts(b.Left), conjuncts(b.Right)...)
+	}
+	if b, ok := e.(*ast.Between); ok && !b.Not {
+		// BETWEEN is two conjuncts in Postgres.
+		return []ast.Expr{e, e}
+	}
+	return []ast.Expr{e}
 }
 
 func (g *gen) statement() ast.Statement {

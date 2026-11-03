@@ -35,8 +35,11 @@ type Report struct {
 	Rows int
 	// Ordered counts SELECTs compared in order, as opposed to as multisets.
 	Ordered int
-	// ErrorClasses counts the maragudb error messages of statements that failed on both sides,
-	// by their first words.
+	// Reordered counts statements that failed on both sides for reasons that only agree when
+	// Postgres visits the rows in key order, as maragudb does.
+	Reordered int
+	// ErrorClasses counts the statements that failed on both sides, by maragudb error class and
+	// SQLSTATE.
 	ErrorClasses map[string]int
 }
 
@@ -48,6 +51,7 @@ func (r *Report) Add(o Report) {
 	r.Checks += o.Checks
 	r.Rows += o.Rows
 	r.Ordered += o.Ordered
+	r.Reordered += o.Reordered
 	if r.ErrorClasses == nil {
 		r.ErrorClasses = map[string]int{}
 	}
@@ -62,8 +66,8 @@ func (r Report) String() string {
 		classes = append(classes, fmt.Sprintf("%s=%d", k, v))
 	}
 	sort.Strings(classes)
-	return fmt.Sprintf("%d statements: %d ok on both, %d errors on both, %d state checks, %d rows, %d ordered comparisons; errors: %s",
-		r.Statements, r.OK, r.Errors, r.Checks, r.Rows, r.Ordered, strings.Join(classes, " "))
+	return fmt.Sprintf("%d statements: %d ok on both, %d errors on both (%d agreeing in key order), %d state checks, %d rows, %d ordered comparisons; errors: %s",
+		r.Statements, r.OK, r.Errors, r.Reordered, r.Checks, r.Rows, r.Ordered, strings.Join(classes, " "))
 }
 
 // Mismatch between the two databases.
@@ -138,11 +142,21 @@ func (r *Runner) compare(ctx context.Context, m *sql.DB, st ast.Statement, pk []
 	}
 	if pg.err != nil {
 		rep.Errors++
-		words := strings.Fields(mg.err.Error())
-		if len(words) > 2 {
-			words = words[:2]
+		if !SameClass(mg.err, pg.err) {
+			// Different rows can fail for different reasons, and maragudb visits rows in key order
+			// where Postgres visits them in the order they are stored. Postgres gets the same
+			// chance in key order before this counts as a mismatch. See deviation 13.
+			ordered, err := r.inKeyOrder(ctx, pgSQL, pk)
+			if err != nil {
+				return err
+			}
+			if !SameClass(mg.err, ordered) {
+				return mismatch(fmt.Sprintf("both failed, for different reasons: postgres SQLSTATE %s, maragudb %s", SQLState(pg.err), className(mg.err)))
+			}
+			rep.Reordered++
+			pg.err = ordered
 		}
-		rep.ErrorClasses[strings.Join(words, " ")]++
+		rep.ErrorClasses[ClassOf(mg.err).Name+"/"+SQLState(pg.err)]++
 		return nil
 	}
 	rep.OK++
@@ -175,6 +189,31 @@ func (r *Runner) compare(ctx context.Context, m *sql.DB, st ast.Statement, pk []
 	return nil
 }
 
+// inKeyOrder runs a statement that failed on Postgres again, with the table's rows stored in
+// primary key order so that a scan visits them in that order, and returns the statement's error,
+// which is nil if it succeeded. Nothing it does is kept.
+func (r *Runner) inKeyOrder(ctx context.Context, pgSQL string, pk []string) (error, error) {
+	tx, err := r.PG.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	var keys []string
+	for _, k := range pk {
+		keys = append(keys, ast.RenderExpr(&ast.ColumnRef{Name: k}, ast.Postgres))
+	}
+	for _, q := range []string{
+		"CREATE TEMP TABLE sorted ON COMMIT DROP AS SELECT * FROM " + tableName,
+		"DELETE FROM " + tableName,
+		"INSERT INTO " + tableName + " SELECT * FROM sorted ORDER BY " + strings.Join(keys, ", "),
+	} {
+		if _, err := tx.ExecContext(ctx, q); err != nil {
+			return nil, fmt.Errorf("postgres: %s: %w", q, err)
+		}
+	}
+	return run(ctx, tx, pgSQL).err, nil
+}
+
 func describe(r result) string {
 	if r.err != nil {
 		return "\n    error: " + r.err.Error()
@@ -185,7 +224,13 @@ func describe(r result) string {
 	return fmt.Sprintf("\n    %d rows: %s", len(r.rows), strings.Join(canonical(r.rows), "; "))
 }
 
-func run(ctx context.Context, db *sql.DB, sqlText string) result {
+// querier is a database or a transaction.
+type querier interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
+}
+
+func run(ctx context.Context, db querier, sqlText string) result {
 	if !strings.HasPrefix(sqlText, "SELECT") {
 		res, err := db.ExecContext(ctx, sqlText)
 		if err != nil {
@@ -250,6 +295,13 @@ func canonical(rows [][]any) []string {
 		out[i] = strings.Join(parts, " ")
 	}
 	return out
+}
+
+func className(err error) string {
+	if c := ClassOf(err); c != nil {
+		return c.Name
+	}
+	return "unclassified error"
 }
 
 // IsMismatch reports whether err is a mismatch, as opposed to an infrastructure failure.

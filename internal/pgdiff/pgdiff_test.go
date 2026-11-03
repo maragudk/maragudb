@@ -66,6 +66,7 @@ func TestDifferential(t *testing.T) {
 		is.True(t, total.Statements >= cases, "statements")
 		is.True(t, total.OK > total.Statements/2, "most statements succeed on both sides")
 		is.True(t, total.Errors > 0, "some statements fail on both sides")
+		is.True(t, len(total.ErrorClasses) >= 3, "failures on both sides are compared by class, for several classes")
 		is.True(t, total.Rows > 0, "rows are returned")
 		is.True(t, total.Ordered > 0, "some comparisons are ordered")
 	})

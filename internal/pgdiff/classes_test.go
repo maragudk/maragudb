@@ -1,0 +1,98 @@
+package pgdiff_test
+
+import (
+	"database/sql"
+	"fmt"
+	"slices"
+	"testing"
+
+	"maragu.dev/is"
+
+	"maragu.dev/maragudb"
+	"maragu.dev/maragudb/internal/pgdiff"
+)
+
+func TestErrorClasses(t *testing.T) {
+	// Each case fails on both databases. Postgres is the Postgres spelling when it differs.
+	tests := []struct {
+		maragudb, postgres string
+		want               error
+		code               string
+	}{
+		{maragudb: "SELECT 1 / 0", want: maragudb.ErrDivisionByZero, code: "22012"},
+		{maragudb: "SELECT 9223372036854775807 + 1", want: maragudb.ErrOutOfRange, code: "22003"},
+		{maragudb: "SELECT CAST(1e300 AS int)", postgres: "SELECT CAST(1e300::float8 AS bigint)", want: maragudb.ErrOutOfRange, code: "22003"},
+		{maragudb: "INSERT INTO dev VALUES (2, NULL)", want: maragudb.ErrNotNull, code: "23502"},
+		{maragudb: "INSERT INTO dev VALUES (1, 1)", want: maragudb.ErrDuplicateKey, code: "23505"},
+		{maragudb: "SELEC 1", want: maragudb.ErrSyntax, code: "42601"},
+		{maragudb: "SELECT 1 ORDER BY 'a'", want: maragudb.ErrSyntax, code: "42601"},
+		{maragudb: "SELECT * FROM nope", want: maragudb.ErrNoTable, code: "42P01"},
+		{maragudb: "CREATE TABLE dev (i int PRIMARY KEY)", postgres: "CREATE TABLE dev (i bigint PRIMARY KEY)", want: maragudb.ErrTableExists, code: "42P07"},
+		{maragudb: "SELECT 1 WHERE 1", want: maragudb.ErrType, code: "42804"},
+		{maragudb: "SELECT 1 + TRUE", want: maragudb.ErrType, code: "42883"},
+		{maragudb: "SELECT CAST('a' AS int)", postgres: "SELECT CAST('a' AS bigint)", want: maragudb.ErrCast, code: "22P02"},
+		{maragudb: "SELECT CAST('x' AS time)", postgres: "SELECT CAST('x' AS timestamptz)", want: maragudb.ErrCast, code: "22007"},
+		{maragudb: "SELECT CAST(TRUE AS bytes)", postgres: "SELECT CAST(TRUE AS bytea)", want: maragudb.ErrCast, code: "42846"},
+		{maragudb: "SELECT nope FROM dev", want: maragudb.ErrInvalid, code: "42703"},
+		{maragudb: "SELECT nope(1)", want: maragudb.ErrInvalid, code: "42883"},
+		{maragudb: "SELECT 1 ORDER BY 2", want: maragudb.ErrInvalid, code: "42P10"},
+		{maragudb: "SELECT i FROM dev LIMIT i", want: maragudb.ErrInvalid, code: "42P10"},
+		{maragudb: "CREATE TABLE dev2 (a int PRIMARY KEY, a int)", postgres: "CREATE TABLE dev2 (a bigint PRIMARY KEY, a bigint)", want: maragudb.ErrInvalid, code: "42701"},
+		{maragudb: "SELECT i AS a, j AS a FROM dev ORDER BY a", want: maragudb.ErrInvalid, code: "42702"},
+		{maragudb: "CREATE TABLE dev2 (a int PRIMARY KEY, b int PRIMARY KEY)", postgres: "CREATE TABLE dev2 (a bigint PRIMARY KEY, b bigint PRIMARY KEY)", want: maragudb.ErrInvalid, code: "42P16"},
+		{maragudb: "SELECT 'ab' LIKE 'a\\'", want: maragudb.ErrInvalid, code: "22025"},
+		{maragudb: "SELECT 1 LIMIT -1", want: maragudb.ErrInvalid, code: "2201W"},
+		{maragudb: "SELECT 1 OFFSET -1", want: maragudb.ErrInvalid, code: "2201X"},
+	}
+
+	seen := map[string]bool{}
+	for _, test := range tests {
+		t.Run(fmt.Sprintf("%s fails with the class of SQLSTATE %s on both", test.maragudb, test.code), func(t *testing.T) {
+			b := newBoth(t, "CREATE TABLE dev (i int PRIMARY KEY, j int NOT NULL)")
+			for _, db := range []*sql.DB{b.m, b.pg} {
+				_, err := db.ExecContext(t.Context(), "INSERT INTO dev VALUES (1, 1)")
+				is.NotError(t, err)
+			}
+			pgSQL := test.postgres
+			if pgSQL == "" {
+				pgSQL = test.maragudb
+			}
+			_, mErr := b.m.ExecContext(t.Context(), test.maragudb)
+			_, pgErr := b.pg.ExecContext(t.Context(), pgSQL)
+			is.Error(t, test.want, mErr)
+			is.True(t, pgErr != nil, "postgres fails too")
+			is.Equal(t, test.code, pgdiff.SQLState(pgErr))
+			is.True(t, pgdiff.SameClass(mErr, pgErr), fmt.Sprintf("maragudb %v and postgres %v are the same class", mErr, pgErr))
+			seen[pgdiff.ClassOf(mErr).Name+"/"+pgdiff.SQLState(pgErr)] = true
+		})
+	}
+
+	t.Run("a write in a read-only transaction fails with the class of SQLSTATE 25006 on both", func(t *testing.T) {
+		b := newBoth(t, "CREATE TABLE dev (i int PRIMARY KEY)")
+		var errs []error
+		for _, db := range []*sql.DB{b.m, b.pg} {
+			tx, err := db.BeginTx(t.Context(), &sql.TxOptions{ReadOnly: true})
+			is.NotError(t, err)
+			_, err = tx.ExecContext(t.Context(), "INSERT INTO dev VALUES (1)")
+			errs = append(errs, err)
+			is.NotError(t, tx.Rollback())
+		}
+		is.Error(t, maragudb.ErrReadOnlyTx, errs[0])
+		is.Equal(t, "25006", pgdiff.SQLState(errs[1]))
+		is.True(t, pgdiff.SameClass(errs[0], errs[1]))
+		seen["read-only transaction/25006"] = true
+	})
+
+	// The code lists are no wider than what the cases show.
+	for _, c := range pgdiff.ErrorClasses {
+		for _, code := range c.Codes {
+			is.True(t, seen[c.Name+"/"+code], fmt.Sprintf("class %s with SQLSTATE %s has a case", c.Name, code))
+		}
+	}
+
+	t.Run("errors outside the classes match nothing", func(t *testing.T) {
+		is.True(t, pgdiff.ClassOf(maragudb.ErrConflict) == nil)
+		is.True(t, !pgdiff.SameClass(maragudb.ErrConflict, nil))
+		is.True(t, !slices.Contains(pgdiff.ErrorClasses[0].Codes, ""))
+	})
+}
