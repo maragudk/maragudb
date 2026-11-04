@@ -736,6 +736,102 @@ func TestDB_GC(t *testing.T) {
 	})
 }
 
+func TestDB_ReadRetries(t *testing.T) {
+	// Each database here reads without caches, so every block read goes to the store.
+	cold := func(t *testing.T, w *world, seed uint64) *engine.DB {
+		t.Helper()
+		return w.open(seed, engine.Options{MemoryCacheBytes: new(int64), Sleep: w.clock.Sleep})
+	}
+	isSegmentGet := func(kind s3.Kind, key string) bool {
+		return kind == s3.KindGet && strings.HasPrefix(key, "db/seg/")
+	}
+
+	t.Run("retries a block read that fails transiently, backing off on the clock", func(t *testing.T) {
+		w := newWorld(t)
+		db := cold(t, w, 1)
+		put(t, db, "a", "1")
+		failures := 0
+		w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
+			if isSegmentGet(kind, key) && failures < 3 {
+				failures++
+				return s3fake.OutcomeError
+			}
+			return s3fake.OutcomeNormal
+		}
+		before := db.Stats().S3
+		start := w.clock.Now()
+		v, ok := get(t, db, "a")
+		is.True(t, ok)
+		is.Equal(t, "1", v)
+		is.Equal(t, 3, failures)
+		is.Equal(t, int64(4), db.Stats().S3.Sub(before).Get, "three failures and a success")
+		is.True(t, w.clock.Now().Sub(start) >= 70*time.Millisecond, "backed off between attempts")
+	})
+
+	t.Run("gives up after a bounded number of attempts", func(t *testing.T) {
+		w := newWorld(t)
+		db := cold(t, w, 1)
+		put(t, db, "a", "1")
+		w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
+			if isSegmentGet(kind, key) {
+				return s3fake.OutcomeError
+			}
+			return s3fake.OutcomeNormal
+		}
+		tx, err := db.BeginReadOnly(t.Context())
+		is.NotError(t, err)
+		before := db.Stats().S3
+		_, _, err = tx.Get(t.Context(), []byte("a"))
+		is.Error(t, s3fake.ErrInjected, err)
+		is.Equal(t, int64(4), db.Stats().S3.Sub(before).Get)
+	})
+
+	t.Run("does not retry a missing object beyond the one consistent read", func(t *testing.T) {
+		grace := 10 * time.Minute
+		w := newWorld(t)
+		// The reader runs with the mutation that lets GC delete too early, so that the engine's
+		// own invariant assertion stays out of a test that deletes objects behind its back.
+		db := w.open(1, engine.Options{MemoryCacheBytes: new(int64), Sleep: w.clock.Sleep, GCGracePeriod: &grace, Mutations: engine.Mutations{GCIgnoreGrace: true}})
+		put(t, db, "a", "1")
+		put(t, db, "b", "2")
+		tx, err := db.BeginReadOnly(t.Context())
+		is.NotError(t, err)
+		is.NotError(t, db.Compact(t.Context()))
+		// Delete the old segments behind the reader's back. Keys sort by base sequence number,
+		// so the compacted segment is the last one.
+		keys := w.fake.Keys()
+		for _, key := range keys[:len(keys)-1] {
+			if strings.HasPrefix(key, "db/seg/") {
+				is.NotError(t, w.fake.Delete(t.Context(), key))
+			}
+		}
+		before := db.Stats().S3
+		_, _, err = tx.Get(t.Context(), []byte("a"))
+		is.Error(t, engine.ErrSnapshotExpired, err)
+		is.Equal(t, int64(2), db.Stats().S3.Sub(before).Get, "one eventually consistent read and one consistent read")
+	})
+
+	t.Run("does not retry once the context is cancelled", func(t *testing.T) {
+		w := newWorld(t)
+		db := cold(t, w, 1)
+		put(t, db, "a", "1")
+		ctx, cancel := context.WithCancel(t.Context())
+		w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
+			if isSegmentGet(kind, key) {
+				cancel()
+				return s3fake.OutcomeError
+			}
+			return s3fake.OutcomeNormal
+		}
+		tx, err := db.BeginReadOnly(t.Context())
+		is.NotError(t, err)
+		before := db.Stats().S3
+		_, _, err = tx.Get(ctx, []byte("a"))
+		is.True(t, err != nil)
+		is.Equal(t, int64(1), db.Stats().S3.Sub(before).Get)
+	})
+}
+
 func TestDB_Stats(t *testing.T) {
 	t.Run("counts cache hits and misses per tier", func(t *testing.T) {
 		w := newWorld(t)

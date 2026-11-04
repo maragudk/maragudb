@@ -798,17 +798,9 @@ func (r *run) bankSQL(ctx context.Context, p *process, id int) {
 	r.record(h)
 }
 
-// readFinal compacts, then reads every list or account with a new engine without caches,
-// retrying until the store answers.
+// readFinal reads every list or account with a new engine without caches, retrying until the
+// store answers.
 func (r *run) readFinal(ctx context.Context) (map[string][]int64, map[string]int64, error) {
-	// Merge the segments first, now that no commit competes, so that the read touches few objects.
-	_ = retry(ctx, func() error {
-		db, err := engine.Open(ctx, r.engineOptions(false))
-		if err != nil {
-			return err
-		}
-		return db.Compact(ctx)
-	})
 	var lists map[string][]int64
 	var balances map[string]int64
 	err := retry(ctx, func() error {

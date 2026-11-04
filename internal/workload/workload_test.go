@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -14,7 +13,6 @@ import (
 
 	"maragu.dev/maragudb/internal/engine"
 	"maragu.dev/maragudb/internal/history"
-	"maragu.dev/maragudb/internal/s3"
 	"maragu.dev/maragudb/internal/s3fake"
 	"maragu.dev/maragudb/internal/sim"
 	"maragu.dev/maragudb/internal/workload"
@@ -22,27 +20,6 @@ import (
 
 func config(seed uint64, w sim.Workload, useSQL bool, faults s3fake.Faults) workload.Config {
 	faults.Rand = rand.New(rand.NewPCG(seed, 1))
-	if faults.ErrorRate < 1 && (faults.ErrorRate > 0 || faults.LostAckRate > 0) {
-		// The engine does not retry failed reads, and the final read touches every segment, so
-		// reads fail less often than writes, as on a network that is up.
-		rng := rand.New(rand.NewPCG(seed, 3))
-		var mu sync.Mutex
-		errorRate, lostAckRate := faults.ErrorRate, faults.LostAckRate
-		faults.Decide = func(kind s3.Kind, _ string) s3fake.Outcome {
-			mu.Lock()
-			defer mu.Unlock()
-			read := kind == s3.KindGet || kind == s3.KindGetConditional || kind == s3.KindList
-			switch {
-			case read && rng.Float64() < errorRate/10:
-				return s3fake.OutcomeError
-			case !read && rng.Float64() < errorRate:
-				return s3fake.OutcomeError
-			case !read && rng.Float64() < lostAckRate:
-				return s3fake.OutcomeLostAck
-			}
-			return s3fake.OutcomeNormal
-		}
-	}
 	return workload.Config{
 		Client:      s3fake.New(s3fake.WithFaults(faults)),
 		Prefix:      "db",

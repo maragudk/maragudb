@@ -136,6 +136,8 @@ type Stats struct {
 	LiveUnknown int
 	// Unavailable counts client operations that failed because the store was unreachable.
 	Unavailable int
+	// FailedReads counts reads in client transactions that failed for any reason.
+	FailedReads int
 	Elapsed     time.Duration
 }
 
@@ -154,6 +156,7 @@ func (s *Stats) Add(o Stats) {
 	s.Outages += o.Outages
 	s.LiveUnknown += o.LiveUnknown
 	s.Unavailable += o.Unavailable
+	s.FailedReads += o.FailedReads
 	s.Elapsed += o.Elapsed
 }
 
@@ -321,6 +324,7 @@ func (r *run) engineOptions(id int, rng *rand.Rand, disk cache.Cache) engine.Opt
 		DiskCache:     disk,
 		GCGracePeriod: &grace,
 		Now:           r.sched.Now,
+		Sleep:         r.sched.Sleep,
 		Rand:          rand.New(rand.NewPCG(rng.Uint64(), rng.Uint64())),
 		Mutations:     r.cfg.Mutations,
 	}
@@ -343,7 +347,7 @@ func (r *run) open(ctx context.Context, id int, rng *rand.Rand, disk cache.Cache
 func (r *run) seedBank() {
 	r.total = int64(r.cfg.Keys) * initialBalance
 	r.sched.Go("seed", func(ctx context.Context) {
-		db, err := engine.Open(ctx, engine.Options{Client: r.fake.WithoutFaults(), Prefix: "db", Now: r.sched.Now, Rand: rand.New(rand.NewPCG(r.cfg.Seed, 0x5eed))})
+		db, err := engine.Open(ctx, engine.Options{Client: r.fake.WithoutFaults(), Prefix: "db", Now: r.sched.Now, Sleep: r.sched.Sleep, Rand: rand.New(rand.NewPCG(r.cfg.Seed, 0x5eed))})
 		if err != nil {
 			panic(err)
 		}
@@ -367,7 +371,7 @@ func (r *run) readFinal() (map[string][]int64, map[string]int64, error) {
 	var err error
 	r.sched.Go("final", func(ctx context.Context) {
 		var db *engine.DB
-		db, err = engine.Open(ctx, engine.Options{Client: r.fake.WithoutFaults(), Prefix: "db", Now: r.sched.Now, MemoryCacheBytes: new(int64), Rand: rand.New(rand.NewPCG(r.cfg.Seed, 0xf1a1))})
+		db, err = engine.Open(ctx, engine.Options{Client: r.fake.WithoutFaults(), Prefix: "db", Now: r.sched.Now, Sleep: r.sched.Sleep, MemoryCacheBytes: new(int64), Rand: rand.New(rand.NewPCG(r.cfg.Seed, 0xf1a1))})
 		if err != nil {
 			return
 		}
@@ -508,6 +512,7 @@ func (c *client) value() int64 {
 // readError handles an error from a read: it classifies snapshot expiry as an anomaly when the
 // transaction is younger than the grace period.
 func (c *client) readError(tx *engine.Tx, err error) {
+	c.run.stats.FailedReads++
 	if errors.Is(err, engine.ErrSnapshotExpired) {
 		age := c.run.sched.Now().Sub(tx.StartedAt())
 		assert.Sometimes(age >= c.run.cfg.GracePeriod, "a reader older than the grace period is told so", nil)

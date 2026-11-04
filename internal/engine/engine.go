@@ -61,6 +61,9 @@ type Options struct {
 	GCGracePeriod *time.Duration
 	// Now is the clock. Defaults to [time.Now].
 	Now func() time.Time
+	// Sleep waits for d or until ctx ends, between retries of a failed read. Defaults to a real
+	// sleep. It must be consistent with Now.
+	Sleep func(ctx context.Context, d time.Duration)
 	// Rand is the source of commit and segment identifiers. Defaults to a cryptographically seeded source.
 	Rand *mathrand.Rand
 	// Mutations deliberately break the engine. For tests only.
@@ -111,6 +114,7 @@ type DB struct {
 	blockSize int
 	grace     time.Duration
 	now       func() time.Time
+	sleep     func(ctx context.Context, d time.Duration)
 	mutations Mutations
 
 	randMu sync.Mutex
@@ -137,6 +141,7 @@ func Open(ctx context.Context, opts Options) (*DB, error) {
 		blockSize: 16 << 10,
 		grace:     time.Hour,
 		now:       opts.Now,
+		sleep:     opts.Sleep,
 		rand:      opts.Rand,
 		mutations: opts.Mutations,
 	}
@@ -164,6 +169,14 @@ func Open(ctx context.Context, opts Options) (*DB, error) {
 	}
 	if db.now == nil {
 		db.now = time.Now
+	}
+	if db.sleep == nil {
+		db.sleep = func(ctx context.Context, d time.Duration) {
+			select {
+			case <-ctx.Done():
+			case <-time.After(d):
+			}
+		}
 	}
 	if db.rand == nil {
 		var seed [16]byte

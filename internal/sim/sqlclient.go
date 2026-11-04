@@ -38,7 +38,7 @@ func (r *run) openSQL(ctx context.Context, opts engine.Options) (*sql.DB, error)
 // seedSQL creates the tables, and the accounts, with a fault-free client before the clients start.
 func (r *run) seedSQL() {
 	r.sched.Go("seed", func(ctx context.Context) {
-		db, err := r.openSQL(ctx, engine.Options{Client: r.fake.WithoutFaults(), Now: r.sched.Now, Rand: rand.New(rand.NewPCG(r.cfg.Seed, 0x5eed))})
+		db, err := r.openSQL(ctx, engine.Options{Client: r.fake.WithoutFaults(), Now: r.sched.Now, Sleep: r.sched.Sleep, Rand: rand.New(rand.NewPCG(r.cfg.Seed, 0x5eed))})
 		if err != nil {
 			panic(err)
 		}
@@ -70,7 +70,7 @@ func (r *run) readFinalSQL() (map[string][]int64, map[string]int64, error) {
 	var err error
 	r.sched.Go("final", func(ctx context.Context) {
 		var db *sql.DB
-		db, err = r.openSQL(ctx, engine.Options{Client: r.fake.WithoutFaults(), Now: r.sched.Now, MemoryCacheBytes: new(int64), Rand: rand.New(rand.NewPCG(r.cfg.Seed, 0xf1a1))})
+		db, err = r.openSQL(ctx, engine.Options{Client: r.fake.WithoutFaults(), Now: r.sched.Now, Sleep: r.sched.Sleep, MemoryCacheBytes: new(int64), Rand: rand.New(rand.NewPCG(r.cfg.Seed, 0xf1a1))})
 		if err != nil {
 			return
 		}
@@ -128,6 +128,7 @@ func (c *client) outcomeSQL(err error) history.Outcome {
 
 // readErrorSQL is like [client.readError] for a transaction begun at startedAt.
 func (c *client) readErrorSQL(startedAt time.Time, err error) {
+	c.run.stats.FailedReads++
 	if errors.Is(err, engine.ErrSnapshotExpired) {
 		age := c.run.sched.Now().Sub(startedAt)
 		if age < c.run.cfg.GracePeriod {
