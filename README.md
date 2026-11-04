@@ -89,11 +89,21 @@ Compaction and garbage collection together bound the objects in the store: an ob
 
 `maragudb.Compact` and `maragudb.GC` remain for manual use, for example from a periodic job with `Maintenance` off. `Compact` merges every segment into one, keeps the commits that happen meanwhile ahead of the merged segment, and returns `maragudb.ErrConflict` only when another compaction won. `GC` deletes the objects that no transaction within the grace period can reference and reapplies its pass on top of commits that land meanwhile. Both can be retried on `maragudb.ErrConflict`.
 
+## How do we know it works?
+
+Nobody reads this code, so the tests have to show their work. They do so in two places: [docs/verification.md](docs/verification.md), generated from the tests themselves, and a verification report on the summary page of every [CI run](https://github.com/maragudk/maragudb/actions/workflows/ci.yml) with the numbers of that run.
+
+**Every requirement maps to tests.** Each acceptance criterion and invariant in [docs/requirements.md](docs/requirements.md) has an ID, such as `AC-1.5` or `INV-STRICT-SERIALIZABLE`, and so does each deviation from Postgres. Tests declare which IDs they verify and, in one line, what they assert. docs/verification.md lists the tests behind every ID. A test fails if an ID has no test, if a test names an ID that does not exist, or if the document is stale. So a reader can check that every promise has a test without opening one.
+
+**Mutants prove the checkers bite.** A passing checker might be one that never fires. So eight deliberate bugs, such as committing without compare-and-swap or acknowledging a commit before the store confirms it, run through the simulator in up to eight configurations until a checker catches them. The one bug that no workload can trigger, an UPDATE that revisits rows it moved, is caught by a targeted test instead. The kill matrix records the first seed that did and the checkers that caught it. Where a configuration cannot catch a mutant, it states why, and a wrong reason fails the test.
+
+**Reached states prove the hard cases happen.** Zero anomalies mean nothing if the simulator never lost an acknowledgement or crashed mid-commit. Thirteen such states are declared, and the fixed corpus must reach each at least once. The CI report shows how often.
+
 ## Development
 
-`make test` runs everything, including the simulator corpus, the Postgres differential harness, and the Tigris suite. `make lint` runs golangci-lint. `make soak` runs the simulator with random seeds for a while, and `make replay SEED=<n>` replays one seed with a full trace; add `MAINTENANCE=lease|none|overlap` to replay it with the clients' background maintenance in that mode. `make pgdiff` runs a longer differential run, and `make tigris` runs only the Tigris suite.
+`make test` runs everything, including the simulator corpus, the Postgres differential harness, and the Tigris suite, and records the verification facts in `.verify/`; `make report` renders them as the report CI shows. `make verification` regenerates the kill matrix and docs/verification.md. `make lint` runs golangci-lint. `make soak` runs the simulator with random seeds for a while, and `make replay SEED=<n>` replays one seed with a full trace; add `WORKLOAD=bank`, `API=sql`, `CORPUS=1` for the corpus configuration of that seed, `MAINTAINERS=<n>` (default 2), `MAINTENANCE=lease|none|overlap` for the clients' background maintenance, or `MUTATION=<name>` with a name from the kill matrix to replay that configuration. `make pgdiff` runs a longer differential run, and `make tigris` runs only the Tigris suite.
 
-The Postgres harness needs Docker locally. It starts a `postgres:18` container named `maragudb-pgdiff` on an ephemeral port and leaves it running for later runs. Set `MARAGUDB_PGDIFF_URL` to a Postgres superuser URL to use another server instead. The harness fails rather than skips when neither is available.
+The Postgres harness needs Docker locally. It starts a `postgres:18` container named `maragudb-pgdiff` on an ephemeral port and leaves it running for later runs. Set `MARAGUDB_PGDIFF_URL` to a Postgres superuser URL to use another server instead. The harness fails rather than skips when neither is available. Each test process creates a database of its own on the server, from `template0` with the C locale, and drops it at the end, so concurrent runs on one server do not collide; databases left behind for over a day are dropped too.
 
 The Tigris suite reads `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ENDPOINT_URL_S3`, `AWS_REGION`, and `BUCKET` from the environment or from a gitignored `.env` file at the repository root. It fails when any but `AWS_REGION`, which defaults to `auto`, is missing.
 
