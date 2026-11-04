@@ -11,6 +11,7 @@ import (
 	"maragu.dev/maragudb/internal/pgdiff"
 	"maragu.dev/maragudb/internal/sql/ast"
 	"maragu.dev/maragudb/internal/sql/value"
+	"maragu.dev/maragudb/internal/verify"
 )
 
 func TestRunner_Run(t *testing.T) {
@@ -34,6 +35,7 @@ func TestRunner_Run(t *testing.T) {
 	})
 
 	t.Run("reports errors of different classes as a mismatch", func(t *testing.T) {
+		verify.Covers(t, "a statement that fails on both sides for different reasons is a mismatch", "AC-4.3")
 		r := newRunner(t)
 		// maragudb rejects a string literal for an int column as a type error, where Postgres
 		// reports invalid input. See deviation 17.

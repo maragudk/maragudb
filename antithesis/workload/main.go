@@ -38,35 +38,48 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	command := filepath.Base(os.Args[0])
+	name := filepath.Base(os.Args[0])
 	if len(os.Args) > 1 {
-		command = os.Args[1]
+		name = os.Args[1]
 	}
-	for _, prefix := range []string{"parallel_driver_", "singleton_driver_", "anytime_"} {
-		command = strings.TrimPrefix(command, prefix)
-	}
-	if err := run(ctx, command); err != nil {
+	if err := run(ctx, commandOf(name)); err != nil {
 		fmt.Println("workload:", err)
 		os.Exit(1)
 	}
 }
 
-func run(ctx context.Context, command string) error {
-	switch command {
-	case "ready":
-		return ready(ctx)
-	case "sim":
-		return simulate()
-	case "s3_bank_engine":
-		return store(ctx, sim.Bank, false)
-	case "s3_bank_sql":
-		return store(ctx, sim.Bank, true)
-	case "s3_list_append_engine":
-		return store(ctx, sim.ListAppend, false)
-	case "s3_list_append_sql":
-		return store(ctx, sim.ListAppend, true)
+// commandOf the name the workload is invoked under: the name without its test command prefix.
+func commandOf(name string) string {
+	for _, prefix := range []string{"parallel_driver_", "singleton_driver_", "anytime_"} {
+		name = strings.TrimPrefix(name, prefix)
 	}
-	return fmt.Errorf("unknown command %q", command)
+	return name
+}
+
+// commands of the workload, by name.
+var commands = map[string]func(ctx context.Context) error{
+	"ready": ready,
+	"sim":   func(context.Context) error { return simulate(newSDKSource()) },
+	"s3_bank_engine": func(ctx context.Context) error {
+		return store(ctx, sim.Bank, false)
+	},
+	"s3_bank_sql": func(ctx context.Context) error {
+		return store(ctx, sim.Bank, true)
+	},
+	"s3_list_append_engine": func(ctx context.Context) error {
+		return store(ctx, sim.ListAppend, false)
+	},
+	"s3_list_append_sql": func(ctx context.Context) error {
+		return store(ctx, sim.ListAppend, true)
+	},
+}
+
+func run(ctx context.Context, command string) error {
+	f, ok := commands[command]
+	if !ok {
+		return fmt.Errorf("unknown command %q", command)
+	}
+	return f(ctx)
 }
 
 func newClient(ctx context.Context) (*s3.AWSClient, error) {
@@ -105,8 +118,7 @@ func ready(ctx context.Context) error {
 
 // simulate runs simulator seeds with random configurations, through the engine and through SQL.
 // A seed makes a whole run deterministic, so Antithesis steers the runs by choosing seeds.
-func simulate() error {
-	seeds := newSDKSource()
+func simulate(seeds rand.Source) error {
 	failed := 0
 	for range 8 {
 		cfg := sim.DefaultConfig(seeds.Uint64())
@@ -130,7 +142,7 @@ func simulate() error {
 		fmt.Println(res.Report())
 		if res.Failed() {
 			failed++
-			fmt.Printf("replay with: make replay SEED=%d (configuration %+v)\n", cfg.Seed, cfg)
+			fmt.Printf("seed %d failed with the configuration %+v\n", cfg.Seed, cfg)
 		}
 	}
 	if failed > 0 {

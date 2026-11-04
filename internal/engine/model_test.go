@@ -13,6 +13,7 @@ import (
 
 	"maragu.dev/maragudb/internal/engine"
 	"maragu.dev/maragudb/internal/s3fake"
+	"maragu.dev/maragudb/internal/verify"
 )
 
 // model of the committed key space.
@@ -39,6 +40,7 @@ func (m model) clone() model {
 
 func TestEngine_MatchesModel(t *testing.T) {
 	t.Run("transactions over several processes with compaction and GC behave like a map", func(t *testing.T) {
+		verify.Covers(t, "random transactions over several processes, with compaction and GC, behave like a map", "INV-MULTI-WRITER")
 		hegel.Test(t, func(ht *hegel.T) {
 			clock := s3fake.NewVirtualClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
 			fake := s3fake.New(s3fake.WithClock(clock))
@@ -171,6 +173,7 @@ func TestEngine_MatchesModel(t *testing.T) {
 	})
 
 	t.Run("conflicting commits from two processes leave exactly one winner", func(t *testing.T) {
+		verify.Covers(t, "of two random conflicting commits from two processes, exactly one wins", "INV-CAS-COMMIT", "INV-DB-CONFLICTS")
 		hegel.Test(t, func(ht *hegel.T) {
 			clock := s3fake.NewVirtualClock(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
 			fake := s3fake.New(s3fake.WithClock(clock))

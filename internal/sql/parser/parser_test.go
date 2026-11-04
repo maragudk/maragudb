@@ -14,7 +14,12 @@ import (
 	"maragu.dev/maragudb/internal/sql/ast"
 	"maragu.dev/maragudb/internal/sql/parser"
 	"maragu.dev/maragudb/internal/sql/value"
+	"maragu.dev/maragudb/internal/verify"
 )
+
+func TestMain(m *testing.M) {
+	verify.Main(m)
+}
 
 func TestParse(t *testing.T) {
 	t.Run("parses statements and renders them back canonically", func(t *testing.T) {
@@ -186,6 +191,7 @@ func TestParse(t *testing.T) {
 	})
 
 	t.Run("round trips every statement through the renderer", func(t *testing.T) {
+		verify.Covers(t, "every generated statement AST renders to SQL that parses back to the same AST", "AC-4.1")
 		hegel.Test(t, func(ht *hegel.T) {
 			s := drawStatement(ht)
 			sql := ast.Render(s, ast.Maragudb)

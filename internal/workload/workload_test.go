@@ -15,8 +15,13 @@ import (
 	"maragu.dev/maragudb/internal/history"
 	"maragu.dev/maragudb/internal/s3fake"
 	"maragu.dev/maragudb/internal/sim"
+	"maragu.dev/maragudb/internal/verify"
 	"maragu.dev/maragudb/internal/workload"
 )
+
+func TestMain(m *testing.M) {
+	verify.Main(m)
+}
 
 func config(seed uint64, w sim.Workload, useSQL bool, faults s3fake.Faults) workload.Config {
 	faults.Rand = rand.New(rand.NewPCG(seed, 1))
@@ -37,6 +42,7 @@ func TestRun(t *testing.T) {
 	for _, useSQL := range []bool{false, true} {
 		for _, w := range []sim.Workload{sim.ListAppend, sim.Bank} {
 			t.Run(fmt.Sprintf("the %v workload through SQL %v finds no anomalies under errors and lost acknowledgements", w, useSQL), func(t *testing.T) {
+				verify.Covers(t, "the real-store workload that the Antithesis harness runs finds no anomalies under errors and lost acknowledgements, with commits, conflicts, and background compactions", "AC-8.2")
 				var total workload.Stats
 				for seed := range uint64(4) {
 					res, err := workload.Run(t.Context(), config(seed, w, useSQL, s3fake.Faults{ErrorRate: 0.05, LostAckRate: 0.05}))
@@ -61,6 +67,7 @@ func TestRun(t *testing.T) {
 	}
 
 	t.Run("finds the lost writes of a commit without CAS", func(t *testing.T) {
+		verify.Covers(t, "the real-store workload's checkers find the lost writes of the mutant", "MUT-COMMIT-WITHOUT-CAS")
 		for seed := range uint64(10) {
 			cfg := config(seed, sim.ListAppend, false, s3fake.Faults{})
 			cfg.Mutations = engine.Mutations{CommitWithoutCAS: true}
@@ -78,6 +85,7 @@ func TestRun(t *testing.T) {
 	})
 
 	t.Run("finds snapshots lost before the grace period ends, when GC ignores it", func(t *testing.T) {
+		verify.Covers(t, "the real-store workload finds snapshots lost early with the mutant", "MUT-GC-IGNORE-GRACE")
 		// The run is in wall-clock time, so the seed does not decide it, and detection varies.
 		for seed := range uint64(60) {
 			cfg := config(seed, sim.ListAppend, seed%2 == 0, s3fake.Faults{})

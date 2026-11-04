@@ -13,9 +13,15 @@ import (
 	"maragu.dev/maragudb/internal/engine"
 	"maragu.dev/maragudb/internal/s3fake"
 	"maragu.dev/maragudb/internal/sqldriver"
+	"maragu.dev/maragudb/internal/verify"
 )
 
+func TestMain(m *testing.M) {
+	verify.Main(m)
+}
+
 func TestParseDSN(t *testing.T) {
+	verify.Covers(t, "s3://bucket/prefix DSNs parse into a bucket and a prefix, and malformed DSNs are rejected", "INV-DSN")
 	tests := []struct {
 		dsn            string
 		bucket, prefix string

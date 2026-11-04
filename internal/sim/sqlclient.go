@@ -186,7 +186,7 @@ func (c *client) readErrorSQL(ctx context.Context, startedAt time.Time, err erro
 			reach.Hit(ctx, reach.SnapshotExpiredRefused)
 		}
 		if age < c.run.cfg.GracePeriod {
-			c.run.anomaly("client %d: snapshot expired after %v, grace period is %v: %v", c.id, age, c.run.cfg.GracePeriod, err)
+			c.run.anomaly(CheckerGracePeriod, "client %d: snapshot expired after %v, grace period is %v: %v", c.id, age, c.run.cfg.GracePeriod, err)
 		}
 	}
 }
@@ -200,6 +200,9 @@ func packed(k int) bool {
 // transaction ever does.
 var errMissingList = errors.New("sim: the row of a packed list is missing")
 
+// errCorruptList is returned by [decodePacked] for values that no transaction ever writes.
+var errCorruptList = errors.New("sim: corrupt packed list")
+
 // decodePacked decodes the comma-prefixed values of a packed list.
 func decodePacked(vals string) ([]int64, error) {
 	list := []int64{}
@@ -207,12 +210,12 @@ func decodePacked(vals string) ([]int64, error) {
 		return list, nil
 	}
 	if vals[0] != ',' {
-		return nil, fmt.Errorf("sim: corrupt packed list %q", vals)
+		return nil, fmt.Errorf("%w: %q", errCorruptList, vals)
 	}
 	for _, s := range strings.Split(vals[1:], ",") {
 		v, err := strconv.ParseInt(s, 10, 64)
 		if err != nil {
-			return nil, fmt.Errorf("sim: corrupt packed list %q", vals)
+			return nil, fmt.Errorf("%w: %q", errCorruptList, vals)
 		}
 		list = append(list, v)
 	}
@@ -308,7 +311,7 @@ func (c *client) listAppendSQL(ctx context.Context) {
 		}
 		if err == nil {
 			if n, _ := res.RowsAffected(); n != 1 {
-				c.run.anomaly("client %d: append to %s affected %d rows", c.id, keyName(k), n)
+				c.run.anomaly(CheckerWorkload, "client %d: append to %s affected %d rows", c.id, keyName(k), n)
 			}
 		}
 		h.Complete = c.run.stamp()
@@ -362,7 +365,7 @@ func (c *client) listAppendSQL(ctx context.Context) {
 				return
 			}
 			if n, _ := res.RowsAffected(); n != 1 {
-				c.run.anomaly("client %d: append to %s affected %d rows", c.id, keyName(p.key), n)
+				c.run.anomaly(CheckerWorkload, "client %d: append to %s affected %d rows", c.id, keyName(p.key), n)
 			}
 			h.Ops = append(h.Ops, history.Op{Kind: history.Append, Key: keyName(p.key), Value: value})
 		}
@@ -400,7 +403,7 @@ func (c *client) bankSQL(ctx context.Context) {
 			for rows.Next() {
 				var id, balance int64
 				if err := rows.Scan(&id, &balance); err != nil {
-					c.run.anomaly("client %d: scan: %v", c.id, err)
+					c.run.anomaly(CheckerWorkload, "client %d: scan: %v", c.id, err)
 					_ = rows.Close()
 					return
 				}
@@ -418,7 +421,7 @@ func (c *client) bankSQL(ctx context.Context) {
 				var balance int64
 				err := tx.QueryRowContext(ctx, "SELECT balance FROM accounts WHERE id = $1", i).Scan(&balance)
 				if errors.Is(err, sql.ErrNoRows) {
-					c.run.anomaly("client %d: account %s is missing", c.id, keyName(i))
+					c.run.anomaly(CheckerWorkload, "client %d: account %s is missing", c.id, keyName(i))
 					return
 				}
 				if err != nil {
@@ -429,7 +432,7 @@ func (c *client) bankSQL(ctx context.Context) {
 			}
 		}
 		if len(balances) != c.run.cfg.Keys {
-			c.run.anomaly("client %d: read %d accounts, want %d", c.id, len(balances), c.run.cfg.Keys)
+			c.run.anomaly(CheckerWorkload, "client %d: read %d accounts, want %d", c.id, len(balances), c.run.cfg.Keys)
 			return
 		}
 		h.Complete = c.run.stamp()
@@ -452,7 +455,7 @@ func (c *client) bankSQL(ctx context.Context) {
 		var balance int64
 		err := tx.QueryRowContext(ctx, "SELECT balance FROM accounts WHERE id = $1", id).Scan(&balance)
 		if errors.Is(err, sql.ErrNoRows) {
-			c.run.anomaly("client %d: account %s is missing", c.id, keyName(id))
+			c.run.anomaly(CheckerWorkload, "client %d: account %s is missing", c.id, keyName(id))
 			return 0, false
 		}
 		if err != nil {
@@ -494,7 +497,7 @@ func (c *client) bankSQL(ctx context.Context) {
 			return
 		}
 		if n, _ := res.RowsAffected(); n != 1 {
-			c.run.anomaly("client %d: update of account %s affected %d rows", c.id, keyName(step.id), n)
+			c.run.anomaly(CheckerWorkload, "client %d: update of account %s affected %d rows", c.id, keyName(step.id), n)
 			_ = tx.Rollback()
 			return
 		}
@@ -509,12 +512,12 @@ func (c *client) bankSQL(ctx context.Context) {
 	c.record(h)
 }
 
-// listReadError handles a failed read of a list: a missing packed list is an anomaly, and every
-// other error is a failed read.
+// listReadError handles a failed read of a list: a missing or corrupt packed list is an anomaly,
+// and every other error is a failed read.
 func (c *client) listReadError(ctx context.Context, startedAt time.Time, err error) {
 	c.run.trace("client %d: read: %v", c.id, err)
-	if errors.Is(err, errMissingList) {
-		c.run.anomaly("client %d: %v", c.id, err)
+	if errors.Is(err, errMissingList) || errors.Is(err, errCorruptList) {
+		c.run.anomaly(CheckerWorkload, "client %d: %v", c.id, err)
 		return
 	}
 	c.readErrorSQL(ctx, startedAt, err)

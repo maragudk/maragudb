@@ -11,7 +11,12 @@ import (
 	"maragu.dev/is"
 
 	"maragu.dev/maragudb/internal/history"
+	"maragu.dev/maragudb/internal/verify"
 )
+
+func TestMain(m *testing.M) {
+	verify.Main(m)
+}
 
 func app(key string, v int64) history.Op {
 	return history.Op{Kind: history.Append, Key: key, Value: v}
@@ -38,6 +43,7 @@ func anomalyKind(t *testing.T, err error) string {
 }
 
 func TestCheckListAppend(t *testing.T) {
+	verify.Covers(t, "the list-append checker accepts serializable histories and rejects stale reads, write skew, lost updates, reads of failed writes, duplicate values, and cycles through real-time edges", "AC-1.8", "INV-STRICT-SERIALIZABLE")
 	tests := []struct {
 		name  string
 		txs   []history.Tx
@@ -241,6 +247,7 @@ func TestCheckListAppend(t *testing.T) {
 }
 
 func TestCheckDurability(t *testing.T) {
+	verify.Covers(t, "the durability checker rejects a missing acknowledged write, an applied failed write, a partially applied unknown transaction, and values in the wrong key or never written", "AC-3.1", "AC-3.2")
 	tests := []struct {
 		name  string
 		txs   []history.Tx
@@ -307,6 +314,7 @@ func TestCheckDurability(t *testing.T) {
 }
 
 func TestCheckBank(t *testing.T) {
+	verify.Covers(t, "the bank checker accepts audits that sum to the total and rejects a wrong total and a negative balance", "AC-1.7")
 	t.Run("accepts audits that sum to the total", func(t *testing.T) {
 		is.NotError(t, history.CheckBank([]history.BankAudit{{TxID: 1, Balances: map[string]int64{"a": 60, "b": 40}}}, 100))
 	})
@@ -362,6 +370,7 @@ func serialHistory(ht *hegel.T) ([]history.Tx, map[string][]int64) {
 
 func TestChecks_Properties(t *testing.T) {
 	t.Run("accept every serial history", func(t *testing.T) {
+		verify.Covers(t, "the checkers accept every generated serial history, so they raise no false alarms", "AC-1.8")
 		hegel.Test(t, func(ht *hegel.T) {
 			txs, final := serialHistory(ht)
 			if err := history.CheckListAppend(txs, final); err != nil {
@@ -374,6 +383,7 @@ func TestChecks_Properties(t *testing.T) {
 	})
 
 	t.Run("reject a serial history whose acknowledged read was truncated by one value", func(t *testing.T) {
+		verify.Covers(t, "the checkers reject every generated serial history with one acknowledged read truncated", "AC-2", "AC-1.8")
 		hegel.Test(t, func(ht *hegel.T) {
 			txs, final := serialHistory(ht)
 			// Dropping a value written by an unknown transaction is consistent, because that
@@ -412,6 +422,7 @@ func TestChecks_Properties(t *testing.T) {
 	})
 
 	t.Run("reject a serial history where an acknowledged append was dropped from the final state", func(t *testing.T) {
+		verify.Covers(t, "the checkers reject every generated serial history whose final state lost one acknowledged append", "AC-2", "AC-3.1")
 		hegel.Test(t, func(ht *hegel.T) {
 			txs, final := serialHistory(ht)
 			var candidates []int64

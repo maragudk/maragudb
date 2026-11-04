@@ -11,6 +11,7 @@ import (
 
 	"maragu.dev/maragudb"
 	"maragu.dev/maragudb/internal/pgdiff"
+	"maragu.dev/maragudb/internal/verify"
 )
 
 // Each test here is one numbered deviation in /docs/deviations.md. It runs the statement on both
@@ -50,6 +51,7 @@ func scan[T any](ctx context.Context, db *sql.DB, query string, args ...any) (T,
 
 func TestDeviations(t *testing.T) {
 	t.Run("1 int and float do not mix, except an int literal next to a float", func(t *testing.T) {
+		verify.Covers(t, "runs the statements on both databases and asserts the documented difference: int and float do not mix, except an int literal next to a float", "DEV-1")
 		b := newBoth(t, "CREATE TABLE dev (i int PRIMARY KEY, f float)")
 		_, err := b.m.ExecContext(t.Context(), "INSERT INTO dev VALUES (1, 1.5)")
 		is.NotError(t, err)
@@ -67,6 +69,7 @@ func TestDeviations(t *testing.T) {
 	})
 
 	t.Run("2 no assignment casts", func(t *testing.T) {
+		verify.Covers(t, "runs the statements on both databases and asserts the documented difference: no assignment casts", "DEV-2")
 		b := newBoth(t, "CREATE TABLE dev (i int PRIMARY KEY)")
 		_, err := b.pg.ExecContext(t.Context(), "INSERT INTO dev VALUES (1.5)")
 		is.NotError(t, err)
@@ -78,6 +81,7 @@ func TestDeviations(t *testing.T) {
 	})
 
 	t.Run("3 parameters never adapt", func(t *testing.T) {
+		verify.Covers(t, "runs the statements on both databases and asserts the documented difference: parameters never adapt", "DEV-3")
 		b := newBoth(t, "CREATE TABLE dev (i int PRIMARY KEY, f float)")
 		_, err := b.pg.ExecContext(t.Context(), "INSERT INTO dev VALUES ($1, $2)", 1, 2)
 		is.NotError(t, err, "postgres converts the int to a float")
@@ -88,6 +92,7 @@ func TestDeviations(t *testing.T) {
 	})
 
 	t.Run("4 || concatenates strings with strings and bytes with bytes only", func(t *testing.T) {
+		verify.Covers(t, "runs the statements on both databases and asserts the documented difference: || concatenates strings with strings and bytes with bytes only", "DEV-4")
 		b := newBoth(t, "")
 		got, err := scan[string](t.Context(), b.pg, "SELECT 'a' || 1")
 		is.NotError(t, err)
@@ -97,6 +102,7 @@ func TestDeviations(t *testing.T) {
 	})
 
 	t.Run("5 LIMIT and OFFSET take an int", func(t *testing.T) {
+		verify.Covers(t, "runs the statements on both databases and asserts the documented difference: LIMIT and OFFSET take an int", "DEV-5")
 		b := newBoth(t, "CREATE TABLE dev (i int PRIMARY KEY)")
 		for _, db := range []*sql.DB{b.m, b.pg} {
 			_, err := db.ExecContext(t.Context(), "INSERT INTO dev VALUES (1), (2), (3)")
@@ -115,6 +121,7 @@ func TestDeviations(t *testing.T) {
 	})
 
 	t.Run("6 integer literals must fit in an int", func(t *testing.T) {
+		verify.Covers(t, "runs the statements on both databases and asserts the documented difference: integer literals must fit in an int", "DEV-6")
 		b := newBoth(t, "")
 		var s string
 		is.NotError(t, b.pg.QueryRowContext(t.Context(), "SELECT CAST(9223372036854775808 AS text)").Scan(&s))
@@ -124,6 +131,7 @@ func TestDeviations(t *testing.T) {
 	})
 
 	t.Run("7 time has nanosecond precision", func(t *testing.T) {
+		verify.Covers(t, "runs the statements on both databases and asserts the documented difference: time has nanosecond precision", "DEV-7")
 		b := newBoth(t, "")
 		want := time.Date(2024, 1, 1, 0, 0, 0, 123456789, time.UTC)
 		got, err := scan[time.Time](t.Context(), b.m, "SELECT TIME '2024-01-01T00:00:00.123456789Z'")
@@ -135,6 +143,7 @@ func TestDeviations(t *testing.T) {
 	})
 
 	t.Run("8 time casts use RFC 3339", func(t *testing.T) {
+		verify.Covers(t, "runs the statements on both databases and asserts the documented difference: time casts use RFC 3339", "DEV-8")
 		b := newBoth(t, "")
 		got, err := scan[string](t.Context(), b.m, "SELECT CAST(TIME '2024-01-02T03:04:05.5Z' AS string)")
 		is.NotError(t, err)
@@ -151,6 +160,7 @@ func TestDeviations(t *testing.T) {
 	})
 
 	t.Run("9 bytes casts use UTF-8", func(t *testing.T) {
+		verify.Covers(t, "runs the statements on both databases and asserts the documented difference: bytes casts use UTF-8", "DEV-9")
 		b := newBoth(t, "")
 		got, err := scan[string](t.Context(), b.m, "SELECT CAST(X'6869' AS string)")
 		is.NotError(t, err)
@@ -166,6 +176,7 @@ func TestDeviations(t *testing.T) {
 	})
 
 	t.Run("10 string to number casts accept decimal notation only", func(t *testing.T) {
+		verify.Covers(t, "runs the statements on both databases and asserts the documented difference: string to number casts accept decimal notation only", "DEV-10")
 		b := newBoth(t, "")
 		for _, s := range []string{"0x10", "1_000"} {
 			_, err := scan[int64](t.Context(), b.pg, "SELECT CAST($1 AS bigint)", s)
@@ -183,6 +194,7 @@ func TestDeviations(t *testing.T) {
 	})
 
 	t.Run("11 lower and upper fold all of Unicode", func(t *testing.T) {
+		verify.Covers(t, "runs the statements on both databases and asserts the documented difference: lower and upper fold all of Unicode", "DEV-11")
 		b := newBoth(t, "")
 		got, err := scan[string](t.Context(), b.m, "SELECT lower('ÄBC')")
 		is.NotError(t, err)
@@ -193,6 +205,7 @@ func TestDeviations(t *testing.T) {
 	})
 
 	t.Run("12 a failed statement does not abort the transaction", func(t *testing.T) {
+		verify.Covers(t, "runs the statements on both databases and asserts the documented difference: a failed statement does not abort the transaction", "DEV-12")
 		b := newBoth(t, "CREATE TABLE dev (i int PRIMARY KEY)")
 		for _, db := range []*sql.DB{b.m, b.pg} {
 			tx, err := db.BeginTx(t.Context(), nil)
@@ -215,6 +228,7 @@ func TestDeviations(t *testing.T) {
 	})
 
 	t.Run("13 statements visit rows in key order, so the first failing row can differ", func(t *testing.T) {
+		verify.Covers(t, "runs the statements on both databases and asserts the documented difference: statements visit rows in key order, so the first failing row can differ", "DEV-13")
 		b := newBoth(t, "CREATE TABLE dev (i int PRIMARY KEY)")
 		for _, db := range []*sql.DB{b.m, b.pg} {
 			_, err := db.ExecContext(t.Context(), "INSERT INTO dev VALUES (0), (-9223372036854775808)")
@@ -227,6 +241,7 @@ func TestDeviations(t *testing.T) {
 	})
 
 	t.Run("13 UPDATE of key columns visits rows in key order", func(t *testing.T) {
+		verify.Covers(t, "runs the statements on both databases and asserts the documented difference: UPDATE of key columns visits rows in key order", "DEV-13")
 		b := newBoth(t, "CREATE TABLE dev (i int PRIMARY KEY)")
 		for _, db := range []*sql.DB{b.m, b.pg} {
 			_, err := db.ExecContext(t.Context(), "INSERT INTO dev VALUES (3), (2)")
@@ -239,6 +254,7 @@ func TestDeviations(t *testing.T) {
 	})
 
 	t.Run("14 every table needs a primary key", func(t *testing.T) {
+		verify.Covers(t, "runs the statements on both databases and asserts the documented difference: every table needs a primary key", "DEV-14")
 		b := newBoth(t, "")
 		_, err := b.pg.ExecContext(t.Context(), "CREATE TABLE dev (i bigint)")
 		is.NotError(t, err)
@@ -247,6 +263,7 @@ func TestDeviations(t *testing.T) {
 	})
 
 	t.Run("15 more words are reserved", func(t *testing.T) {
+		verify.Covers(t, "runs the statements on both databases and asserts the documented difference: more words are reserved", "DEV-15")
 		b := newBoth(t, "")
 		_, err := b.pg.ExecContext(t.Context(), "CREATE TABLE dev (key bigint PRIMARY KEY)")
 		is.NotError(t, err)
@@ -257,6 +274,7 @@ func TestDeviations(t *testing.T) {
 	})
 
 	t.Run("16 the output name of a cast of a constant is the maragudb type name", func(t *testing.T) {
+		verify.Covers(t, "runs the statements on both databases and asserts the documented difference: the output name of a cast of a constant is the maragudb type name", "DEV-16")
 		b := newBoth(t, "")
 		name := func(db *sql.DB, q string) string {
 			rows, err := db.QueryContext(t.Context(), q)
@@ -275,6 +293,7 @@ func TestDeviations(t *testing.T) {
 	})
 
 	t.Run("17 a string literal where another type is expected is a type error", func(t *testing.T) {
+		verify.Covers(t, "runs the statements on both databases and asserts the documented difference: a string literal where another type is expected is a type error", "DEV-17")
 		b := newBoth(t, "CREATE TABLE dev (i int PRIMARY KEY)")
 		_, pgErr := b.pg.ExecContext(t.Context(), "INSERT INTO dev VALUES ('a')")
 		is.Equal(t, "22P02", pgdiff.SQLState(pgErr), "postgres reads the literal as bigint")
@@ -288,6 +307,7 @@ func TestDeviations(t *testing.T) {
 	})
 
 	t.Run("18 LIKE on a primary key column runs on every row", func(t *testing.T) {
+		verify.Covers(t, "runs the statements on both databases and asserts the documented difference: LIKE on a primary key column runs on every row", "DEV-18")
 		b := newBoth(t, "CREATE TABLE dev (s string PRIMARY KEY)")
 		for _, db := range []*sql.DB{b.m, b.pg} {
 			_, err := db.ExecContext(t.Context(), "INSERT INTO dev VALUES ('0')")
@@ -305,6 +325,7 @@ func TestDeviations(t *testing.T) {
 	})
 
 	t.Run("19 WHERE conjuncts are evaluated in the order they are written", func(t *testing.T) {
+		verify.Covers(t, "runs the statements on both databases and asserts the documented difference: WHERE conjuncts are evaluated in the order they are written", "DEV-19")
 		b := newBoth(t, "CREATE TABLE dev (i int PRIMARY KEY, s string, n int)")
 		for _, db := range []*sql.DB{b.m, b.pg} {
 			_, err := db.ExecContext(t.Context(), "INSERT INTO dev VALUES (1, '0', 1)")

@@ -10,9 +10,11 @@ import (
 
 	"maragu.dev/maragudb"
 	"maragu.dev/maragudb/internal/pgdiff"
+	"maragu.dev/maragudb/internal/verify"
 )
 
 func TestErrorClasses(t *testing.T) {
+	verify.Covers(t, "every maragudb error class fails with its mapped SQLSTATE code on Postgres for the same statement", "AC-4.3")
 	// Each case fails on both databases. Postgres is the Postgres spelling when it differs.
 	tests := []struct {
 		maragudb, postgres string

@@ -20,7 +20,12 @@ import (
 	"maragu.dev/maragudb/internal/s3"
 	"maragu.dev/maragudb/internal/s3fake"
 	"maragu.dev/maragudb/internal/tigristest"
+	"maragu.dev/maragudb/internal/verify"
 )
+
+func TestMain(m *testing.M) {
+	verify.Main(m)
+}
 
 // world is a fake store with a clock shared by several database instances, like several processes.
 type world struct {
@@ -131,6 +136,7 @@ func TestOpen(t *testing.T) {
 	})
 
 	t.Run("defaults to a memory cache and a one hour grace period", func(t *testing.T) {
+		verify.Covers(t, "options left unset get their defaults: a memory cache and a one hour grace period", "INV-OPTIONS")
 		w := newWorld(t)
 		db := w.open(1, engine.Options{})
 		put(t, db, "a", "1")
@@ -144,6 +150,7 @@ func TestOpen(t *testing.T) {
 	})
 
 	t.Run("logs creation and commits to the given logger", func(t *testing.T) {
+		verify.Covers(t, "the engine logs database creation and commits to the given slog logger", "INV-LOGGER")
 		w := newWorld(t)
 		var buf bytes.Buffer
 		logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
@@ -269,6 +276,7 @@ func TestTx(t *testing.T) {
 
 func TestTx_Commit(t *testing.T) {
 	t.Run("a commit from another process is visible to a transaction begun after it", func(t *testing.T) {
+		verify.Covers(t, "a transaction in another process sees a commit acknowledged before it began, read from the store", "INV-STRICT-SERIALIZABLE", "INV-S3-ONLY")
 		w := newWorld(t)
 		db1 := w.open(1, engine.Options{})
 		db2 := w.open(2, engine.Options{})
@@ -297,6 +305,7 @@ func TestTx_Commit(t *testing.T) {
 	})
 
 	t.Run("concurrent write transactions conflict and the loser's writes are not applied", func(t *testing.T) {
+		verify.Covers(t, "of two concurrent write transactions on different keys, the second commit gets ErrConflict and none of its writes are applied", "INV-DB-CONFLICTS", "INV-CAS-COMMIT")
 		w := newWorld(t)
 		db1 := w.open(1, engine.Options{})
 		db2 := w.open(2, engine.Options{})
@@ -315,6 +324,7 @@ func TestTx_Commit(t *testing.T) {
 	})
 
 	t.Run("read-only transactions never conflict", func(t *testing.T) {
+		verify.Covers(t, "a read-only transaction commits after a concurrent write commit", "INV-READ-ONLY")
 		w := newWorld(t)
 		db1 := w.open(1, engine.Options{})
 		db2 := w.open(2, engine.Options{})
@@ -337,6 +347,7 @@ func TestTx_Commit(t *testing.T) {
 	})
 
 	t.Run("a commit whose manifest write lost its acknowledgement is reported as success exactly once", func(t *testing.T) {
+		verify.Covers(t, "a commit whose manifest write lost its acknowledgement is resolved as landed, reported once, and visible", "AC-1.3", "AC-3.1")
 		lost := false
 		w := newWorld(t)
 		db := w.open(1, engine.Options{})
@@ -359,6 +370,7 @@ func TestTx_Commit(t *testing.T) {
 	})
 
 	t.Run("a commit whose manifest write failed before applying is retried and succeeds", func(t *testing.T) {
+		verify.Covers(t, "a manifest write that failed before applying is retried and the commit succeeds", "AC-1.1")
 		failures := 0
 		w := newWorld(t)
 		db := w.open(1, engine.Options{})
@@ -392,6 +404,7 @@ func TestTx_Commit(t *testing.T) {
 	})
 
 	t.Run("a lost acknowledgement followed by another process's commit is resolved as success", func(t *testing.T) {
+		verify.Covers(t, "a lost acknowledgement followed by another process's commit is resolved from the commit records as success", "AC-1.3")
 		var db2 *engine.DB
 		phase := 0
 		w := newWorld(t)
@@ -424,6 +437,7 @@ func TestTx_Commit(t *testing.T) {
 	})
 
 	t.Run("a commit returns ErrCommitUnknown when the store stops answering after the write", func(t *testing.T) {
+		verify.Covers(t, "a commit whose manifest write is never confirmed is not acknowledged and returns ErrCommitUnknown", "INV-DURABLE-ACK")
 		started := false
 		w := newWorld(t)
 		db := w.open(1, engine.Options{})
@@ -447,6 +461,7 @@ func TestTx_Commit(t *testing.T) {
 
 func TestDB_Compact(t *testing.T) {
 	t.Run("merges all segments into one and keeps the data", func(t *testing.T) {
+		verify.Covers(t, "compaction merges every segment into one and keeps every value", "AC-6.1")
 		w := newWorld(t)
 		db := w.open(1, engine.Options{})
 		for i := range 5 {
@@ -485,6 +500,7 @@ func TestDB_Compact(t *testing.T) {
 	})
 
 	t.Run("rebases on commits that only added segments, which keep shadowing the compacted one", func(t *testing.T) {
+		verify.Covers(t, "a compaction that lost to plain commits rebases on them, and their newer values stay visible", "AC-6.1")
 		w := newWorld(t)
 		db1 := w.open(1, engine.Options{})
 		db2 := w.open(2, engine.Options{})
@@ -615,6 +631,7 @@ func TestDB_GC(t *testing.T) {
 	grace := 10 * time.Minute
 
 	t.Run("deletes compacted segments only after the grace period, keeping old snapshots readable", func(t *testing.T) {
+		verify.Covers(t, "GC deletes compacted segments only after the grace period, and a snapshot taken before compaction stays readable until then", "AC-6.2")
 		w := newWorld(t)
 		db := w.open(1, engine.Options{GCGracePeriod: &grace, MemoryCacheBytes: new(int64)})
 		reader := w.open(2, engine.Options{GCGracePeriod: &grace, MemoryCacheBytes: new(int64)})
@@ -652,6 +669,7 @@ func TestDB_GC(t *testing.T) {
 	})
 
 	t.Run("stamps orphans from failed commits once the manifest has moved on and deletes them after the grace period", func(t *testing.T) {
+		verify.Covers(t, "segments of failed commits are stamped and deleted after the grace period, so failed commits do not grow the store", "AC-6.1")
 		crash := false
 		w := newWorld(t)
 		db := w.open(1, engine.Options{GCGracePeriod: &grace})
@@ -694,6 +712,7 @@ func TestDB_GC(t *testing.T) {
 	})
 
 	t.Run("never deletes the output of a compaction that rebases within the grace period", func(t *testing.T) {
+		verify.Covers(t, "GC never deletes the segment of a compaction that is still rebasing within the grace period", "AC-6.2")
 		w := newWorld(t)
 		db1 := w.open(1, engine.Options{GCGracePeriod: &grace, MemoryCacheBytes: new(int64)})
 		db2 := w.open(2, engine.Options{GCGracePeriod: &grace, MemoryCacheBytes: new(int64)})
@@ -775,6 +794,7 @@ func TestDB_GC(t *testing.T) {
 	})
 
 	t.Run("a reader older than the grace period gets ErrSnapshotExpired before reading anything", func(t *testing.T) {
+		verify.Covers(t, "a transaction older than the grace period gets ErrSnapshotExpired, never data", "AC-6.3")
 		w := newWorld(t)
 		db := w.open(1, engine.Options{GCGracePeriod: &grace})
 		put(t, db, "a", "1")
@@ -800,6 +820,7 @@ func TestDB_ReadRetries(t *testing.T) {
 	}
 
 	t.Run("retries a block read that fails transiently, backing off on the clock", func(t *testing.T) {
+		verify.Covers(t, "a block read that fails transiently is retried with backoff on the clock and succeeds", "AC-1.1")
 		w := newWorld(t)
 		db := cold(t, w, 1)
 		put(t, db, "a", "1")
@@ -887,6 +908,7 @@ func TestDB_ReadRetries(t *testing.T) {
 
 func TestDB_Stats(t *testing.T) {
 	t.Run("counts cache hits and misses per tier", func(t *testing.T) {
+		verify.Covers(t, "Stats counts memory and disk cache hits and misses", "INV-STATS")
 		w := newWorld(t)
 		disk := cache.NewMemory(0)
 		db := w.open(1, engine.Options{DiskCache: disk})
@@ -917,6 +939,7 @@ func TestDB_Stats(t *testing.T) {
 	})
 
 	t.Run("a stale disk-cached manifest is refreshed on open", func(t *testing.T) {
+		verify.Covers(t, "a stale manifest in the disk cache is replaced by the store's newer one on open", "INV-CACHE-LOSS")
 		w := newWorld(t)
 		disk := cache.NewMemory(0)
 		db := w.open(1, engine.Options{DiskCache: disk})
@@ -949,6 +972,7 @@ func TestRequestBudgets(t *testing.T) {
 	sizes := []int{100, 1_000, 10_000, 100_000}
 
 	t.Run("a commit uses two PUTs and one GET regardless of database size", func(t *testing.T) {
+		verify.Covers(t, "a commit makes one conditional GET, one PUT, and one conditional PUT at 100 to 100,000 keys", "AC-5.1")
 		for _, n := range sizes {
 			w := newWorld(t)
 			db := w.open(1, engine.Options{})
@@ -960,11 +984,13 @@ func TestRequestBudgets(t *testing.T) {
 			is.NotError(t, tx.Commit(t.Context()))
 			d := db.Stats().S3.Sub(before)
 			t.Logf("n=%d commit: %+v", n, d)
+			verify.CheckBudget(t, "engine commit: requests", n, d.Total(), 3)
 			is.Equal(t, s3.Counts{GetConditional: 1, Put: 1, PutConditional: 1}, d)
 		}
 	})
 
 	t.Run("a transaction with a warm cache uses one conditional GET and nothing else", func(t *testing.T) {
+		verify.Covers(t, "a read-only transaction with a warm cache makes exactly one conditional GET at 100 to 10,000 keys", "AC-5.2")
 		for _, n := range sizes[:3] {
 			w := newWorld(t)
 			db := w.open(1, engine.Options{})
@@ -984,11 +1010,13 @@ func TestRequestBudgets(t *testing.T) {
 			is.NotError(t, tx.Commit(t.Context()))
 			d := db.Stats().S3.Sub(before)
 			t.Logf("n=%d warm transaction: %+v", n, d)
+			verify.CheckBudget(t, "engine warm transaction: requests", n, d.Total(), 1)
 			is.Equal(t, s3.Counts{GetConditional: 1}, d)
 		}
 	})
 
 	t.Run("a point lookup with a cold cache uses a logarithmic number of GETs", func(t *testing.T) {
+		verify.Covers(t, "a cold point lookup makes one freshness check and at most one GET per tree level, 1 + log16(n), at 100 to 100,000 keys", "AC-5.3")
 		blockSize := 1024
 		for _, n := range sizes {
 			w := newWorld(t)
@@ -1007,6 +1035,7 @@ func TestRequestBudgets(t *testing.T) {
 			for m := n; m > 1; m = (m + 15) / 16 {
 				maxDepth++
 			}
+			verify.CheckBudget(t, "engine cold point lookup: GETs", n, d.Get, int64(maxDepth))
 			is.True(t, d.Get <= int64(maxDepth), fmt.Sprintf("n=%d: %d GETs, max depth %d", n, d.Get, maxDepth))
 			is.Equal(t, int64(1), d.GetConditional, "one manifest freshness check")
 		}
@@ -1015,6 +1044,7 @@ func TestRequestBudgets(t *testing.T) {
 
 func TestMutations(t *testing.T) {
 	t.Run("CommitWithoutCAS lets a stale commit overwrite a newer one", func(t *testing.T) {
+		verify.Covers(t, "with the mutant, a stale commit overwrites another process's newer commit", "MUT-COMMIT-WITHOUT-CAS")
 		w := newWorld(t)
 		db1 := w.open(1, engine.Options{Mutations: engine.Mutations{CommitWithoutCAS: true}})
 		db2 := w.open(2, engine.Options{})
@@ -1028,6 +1058,7 @@ func TestMutations(t *testing.T) {
 	})
 
 	t.Run("CompactedSegmentAhead lets a rebased compaction hide newer commits", func(t *testing.T) {
+		verify.Covers(t, "with the mutant, a rebased compaction resurrects values that a newer commit deleted and changed", "MUT-COMPACTED-AHEAD")
 		w := newWorld(t)
 		db1 := w.open(1, engine.Options{})
 		db2 := w.open(2, engine.Options{Mutations: engine.Mutations{CompactedSegmentAhead: true}})
@@ -1051,6 +1082,7 @@ func TestMutations(t *testing.T) {
 	})
 
 	t.Run("AckBeforeConfirm reports success for a write that never happened", func(t *testing.T) {
+		verify.Covers(t, "with the mutant, a commit whose manifest write failed is reported as successful and is invisible", "MUT-ACK-BEFORE-CONFIRM")
 		w := newWorld(t)
 		db := w.open(1, engine.Options{Mutations: engine.Mutations{AckBeforeConfirm: true}})
 		w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
@@ -1078,6 +1110,7 @@ func TestContext(t *testing.T) {
 }
 
 func TestDB_Tigris(t *testing.T) {
+	verify.Covers(t, "the engine's Tigris suite can run: the credentials are there and Tigris answers", "AC-7.1")
 	client, cfg := tigristest.NewClient(t)
 	// Each subtest gets its own database under the run's prefix, so they do not depend on each other.
 	open := func(t *testing.T, seed uint64, opts engine.Options) *engine.DB {
@@ -1091,6 +1124,7 @@ func TestDB_Tigris(t *testing.T) {
 	}
 
 	t.Run("commits are visible across processes and latencies are reported", func(t *testing.T) {
+		verify.Covers(t, "on Tigris, commits of one process are visible to another, and commit and read latencies are recorded", "AC-7.1", "AC-5.4")
 		db1 := open(t, 1, engine.Options{})
 		db2 := open(t, 2, engine.Options{})
 		var commitLatency, readLatency []time.Duration
@@ -1108,12 +1142,23 @@ func TestDB_Tigris(t *testing.T) {
 			is.True(t, ok)
 			is.Equal(t, fmt.Sprint("value-", i), v)
 		}
+		for _, d := range commitLatency {
+			verify.Record(t, verify.Fact{Latency: &verify.Latency{Name: "engine commit", Duration: d}})
+		}
+		for i, d := range readLatency {
+			name := "engine begin and point lookup, warm"
+			if i == 0 {
+				name = "engine begin and point lookup, cold"
+			}
+			verify.Record(t, verify.Fact{Latency: &verify.Latency{Name: name, Duration: d}})
+		}
 		t.Logf("commit latency: %v", commitLatency)
 		t.Logf("read latency (begin + point lookup, cold then warm): %v", readLatency)
 		t.Logf("db1 stats: %+v", db1.Stats())
 	})
 
 	t.Run("concurrent writers conflict and retry until every write lands", func(t *testing.T) {
+		verify.Covers(t, "on Tigris, concurrent writers conflict and retry until every write is in the database", "AC-7.1", "INV-DB-CONFLICTS")
 		const writers = 3
 		const perWriter = 4
 		var wg sync.WaitGroup
@@ -1161,6 +1206,7 @@ func TestDB_Tigris(t *testing.T) {
 	})
 
 	t.Run("the maintenance lease is acquired, renewed, and taken over after it expires", func(t *testing.T) {
+		verify.Covers(t, "on Tigris, the maintenance lease is acquired, renewed, and taken over after it expires", "AC-7.1")
 		db1 := open(t, 60, engine.Options{})
 		db2 := open(t, 61, engine.Options{})
 		// A probe measures how long acquiring and releasing takes on this run's network, and
@@ -1206,6 +1252,7 @@ func TestDB_Tigris(t *testing.T) {
 	})
 
 	t.Run("compaction and GC keep the data and bound the objects", func(t *testing.T) {
+		verify.Covers(t, "on Tigris, compaction and GC keep the data and leave one segment", "AC-7.1", "AC-6.1")
 		// Write with the default grace period and time each commit, so the grace period below is
 		// sized from this run's network latency instead of assumed.
 		writer := open(t, 50, engine.Options{})

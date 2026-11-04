@@ -146,11 +146,12 @@ func DefaultConfig(seed uint64) Config {
 
 // Result of a run.
 type Result struct {
-	Config    Config
-	History   []history.Tx
-	Audits    []history.BankAudit
-	Final     map[string][]int64
-	Balances  map[string]int64
+	Config   Config
+	History  []history.Tx
+	Audits   []history.BankAudit
+	Final    map[string][]int64
+	Balances map[string]int64
+	// Anomalies found, each an [*Anomaly].
 	Anomalies []error
 	Stats     Stats
 	// Reached counts the interesting states the run reached. See [reach.Declarations].
@@ -209,6 +210,50 @@ func (s *Stats) Add(o Stats) {
 	s.LeaseAcquisitions += o.LeaseAcquisitions
 	s.LeaseLosses += o.LeaseLosses
 	s.Elapsed += o.Elapsed
+}
+
+// Checkers that find anomalies.
+const (
+	// CheckerListAppend is [history.CheckListAppend], the strict serializability checker.
+	CheckerListAppend = "list-append"
+	// CheckerDurability is [history.CheckDurability] on the final state.
+	CheckerDurability = "durability"
+	// CheckerBank is [history.CheckBank], the conservation of money.
+	CheckerBank = "bank"
+	// CheckerGracePeriod finds readers younger than the GC grace period that lost their snapshot.
+	CheckerGracePeriod = "grace period"
+	// CheckerWorkload finds states the workload never writes, such as a missing account.
+	CheckerWorkload = "workload invariants"
+	// CheckerFinalRead fails when the final state cannot be read back.
+	CheckerFinalRead = "final read"
+)
+
+// Anomaly found in a run, with the checker that found it.
+type Anomaly struct {
+	Checker string
+	Err     error
+}
+
+func (a *Anomaly) Error() string {
+	return a.Checker + ": " + a.Err.Error()
+}
+
+func (a *Anomaly) Unwrap() error {
+	return a.Err
+}
+
+// Checkers that found the anomalies of the run, each once, in the order they found them.
+func (r Result) Checkers() []string {
+	var names []string
+	seen := map[string]bool{}
+	for _, err := range r.Anomalies {
+		var a *Anomaly
+		if errors.As(err, &a) && !seen[a.Checker] {
+			seen[a.Checker] = true
+			names = append(names, a.Checker)
+		}
+	}
+	return names
 }
 
 // Failed reports whether any anomaly was found.
@@ -321,7 +366,7 @@ func Run(cfg Config) Result {
 		final, balances, err = r.readFinal()
 	}
 	if err != nil {
-		r.anoms = append(r.anoms, fmt.Errorf("reading final state: %w", err))
+		r.anoms = append(r.anoms, &Anomaly{Checker: CheckerFinalRead, Err: fmt.Errorf("reading final state: %w", err)})
 	}
 	res.Final = final
 	res.Balances = balances
@@ -329,12 +374,12 @@ func Run(cfg Config) Result {
 	case ListAppend:
 		if err == nil {
 			if err := history.CheckDurability(r.txs, final); err != nil {
-				r.anoms = append(r.anoms, err)
+				r.anoms = append(r.anoms, &Anomaly{Checker: CheckerDurability, Err: err})
 			}
 		}
 		// The list-append checker works from the reads alone when the final state is unavailable.
 		if err := history.CheckListAppend(r.txs, final); err != nil {
-			r.anoms = append(r.anoms, err)
+			r.anoms = append(r.anoms, &Anomaly{Checker: CheckerListAppend, Err: err})
 		}
 	case Bank:
 		if err == nil {
@@ -342,7 +387,7 @@ func Run(cfg Config) Result {
 		}
 		res.Audits = r.audits
 		if err := history.CheckBank(r.audits, r.total); err != nil {
-			r.anoms = append(r.anoms, err)
+			r.anoms = append(r.anoms, &Anomaly{Checker: CheckerBank, Err: err})
 		}
 	}
 	res.Anomalies = r.anoms
@@ -372,8 +417,8 @@ func (r *run) trace(format string, args ...any) {
 	}
 }
 
-func (r *run) anomaly(format string, args ...any) {
-	err := fmt.Errorf(format, args...)
+func (r *run) anomaly(checker string, format string, args ...any) {
+	err := &Anomaly{Checker: checker, Err: fmt.Errorf(format, args...)}
 	r.trace("ANOMALY %v", err)
 	r.anoms = append(r.anoms, err)
 }
@@ -644,7 +689,7 @@ func (c *client) readError(ctx context.Context, tx *engine.Tx, err error) {
 			reach.Hit(ctx, reach.SnapshotExpiredRefused)
 		}
 		if age < c.run.cfg.GracePeriod {
-			c.run.anomaly("client %d: snapshot expired after %v, grace period is %v: %v", c.id, age, c.run.cfg.GracePeriod, err)
+			c.run.anomaly(CheckerGracePeriod, "client %d: snapshot expired after %v, grace period is %v: %v", c.id, age, c.run.cfg.GracePeriod, err)
 		}
 	}
 }
@@ -773,12 +818,12 @@ func (c *client) bankTx(ctx context.Context) {
 				return
 			}
 			if !ok {
-				c.run.anomaly("client %d: account %s is missing", c.id, keyName(i))
+				c.run.anomaly(CheckerWorkload, "client %d: account %s is missing", c.id, keyName(i))
 				return
 			}
 			balances[keyName(i)], err = strconv.ParseInt(string(v), 10, 64)
 			if err != nil {
-				c.run.anomaly("client %d: corrupt balance %q", c.id, v)
+				c.run.anomaly(CheckerWorkload, "client %d: corrupt balance %q", c.id, v)
 				return
 			}
 		}
@@ -804,12 +849,12 @@ func (c *client) bankTx(ctx context.Context) {
 			return 0, false
 		}
 		if !ok {
-			c.run.anomaly("client %d: account %s is missing", c.id, key)
+			c.run.anomaly(CheckerWorkload, "client %d: account %s is missing", c.id, key)
 			return 0, false
 		}
 		n, err := strconv.ParseInt(string(v), 10, 64)
 		if err != nil {
-			c.run.anomaly("client %d: corrupt balance %q", c.id, v)
+			c.run.anomaly(CheckerWorkload, "client %d: corrupt balance %q", c.id, v)
 			return 0, false
 		}
 		return n, true

@@ -16,7 +16,12 @@ import (
 	"maragu.dev/maragudb/internal/s3fake"
 	"maragu.dev/maragudb/internal/sql/exec"
 	"maragu.dev/maragudb/internal/sql/value"
+	"maragu.dev/maragudb/internal/verify"
 )
+
+func TestMain(m *testing.M) {
+	verify.Main(m)
+}
 
 // world is a fake store shared by sessions, like several processes on one database.
 type world struct {
@@ -172,6 +177,7 @@ func TestSession_Insert(t *testing.T) {
 	})
 
 	t.Run("checks constraints and types", func(t *testing.T) {
+		verify.Covers(t, "an INSERT of a value of the wrong type is a type error, never converted", "INV-STRICT-TYPES")
 		s := newSession(t)
 		setup(t, s)
 		is.Error(t, exec.ErrDuplicateKey, queryErr(t, s, "INSERT INTO t (id, name) VALUES (1, 'x')"))
@@ -188,6 +194,7 @@ func TestSession_Insert(t *testing.T) {
 	})
 
 	t.Run("adapts an int literal to a float column but not a parameter", func(t *testing.T) {
+		verify.Covers(t, "an int literal adapts to a float column and an int parameter does not", "INV-STRICT-TYPES")
 		s := newSession(t)
 		setup(t, s)
 		mustExec(t, s, "INSERT INTO t (id, name, f) VALUES (10, 'x', 2)")
@@ -264,6 +271,7 @@ func TestSession_Select(t *testing.T) {
 	})
 
 	t.Run("reports evaluation errors like Postgres", func(t *testing.T) {
+		verify.Covers(t, "int overflow in +, -, and * is ErrOutOfRange, among the other evaluation errors", "INV-INT-OVERFLOW")
 		s := newSession(t)
 		tests := []struct {
 			sql  string
@@ -672,6 +680,7 @@ func TestSession_Transactions(t *testing.T) {
 	})
 
 	t.Run("read-only transactions reject writes and DDL", func(t *testing.T) {
+		verify.Covers(t, "a read-only transaction rejects INSERT, UPDATE, DELETE, and DDL", "INV-READ-ONLY")
 		s := newSession(t)
 		mustExec(t, s, "CREATE TABLE t (id int PRIMARY KEY)")
 		mustExec(t, s, "BEGIN READ ONLY")
@@ -685,6 +694,7 @@ func TestSession_Transactions(t *testing.T) {
 	})
 
 	t.Run("a transaction sees a snapshot, and an explicit transaction gets ErrConflict while autocommit retries", func(t *testing.T) {
+		verify.Covers(t, "an explicit transaction that loses gets ErrConflict, while the same statement in autocommit retries and succeeds", "INV-RETRYABLE-ERROR", "INV-AUTOCOMMIT-RETRY")
 		w := newWorld(t)
 		a, _ := w.session(exec.Options{})
 		b, _ := w.session(exec.Options{})
@@ -715,6 +725,7 @@ func TestSession_Transactions(t *testing.T) {
 	})
 
 	t.Run("autocommit retries a conflict caused by a concurrent commit during the statement", func(t *testing.T) {
+		verify.Covers(t, "an autocommit statement that conflicts with a commit made during it retries and applies once", "INV-AUTOCOMMIT-RETRY")
 		w := newWorld(t)
 		a, _ := w.session(exec.Options{})
 		b, _ := w.session(exec.Options{})
@@ -739,6 +750,7 @@ func TestSession_Transactions(t *testing.T) {
 
 func TestMutations(t *testing.T) {
 	t.Run("UpdateSeesOwnWrites revisits moved rows, which the Halloween test catches", func(t *testing.T) {
+		verify.Covers(t, "with the mutant, an UPDATE that moves keys revisits rows it already moved", "MUT-UPDATE-SEES-OWN-WRITES")
 		w := newWorld(t)
 		s, _ := w.session(exec.Options{Mutations: exec.Mutations{UpdateSeesOwnWrites: true}})
 		mustExec(t, s, "CREATE TABLE h (id int PRIMARY KEY)")
@@ -748,6 +760,7 @@ func TestMutations(t *testing.T) {
 	})
 
 	t.Run("FreshSnapshotPerStatement lets a transaction see a commit made after it began", func(t *testing.T) {
+		verify.Covers(t, "with the mutant, a transaction sees a commit made after it began", "MUT-FRESH-SNAPSHOT")
 		for _, mutated := range []bool{false, true} {
 			w := newWorld(t)
 			a, _ := w.session(exec.Options{Mutations: exec.Mutations{FreshSnapshotPerStatement: mutated}})
@@ -767,6 +780,7 @@ func TestMutations(t *testing.T) {
 	})
 
 	t.Run("RetryAfterUnknownCommit applies a statement twice", func(t *testing.T) {
+		verify.Covers(t, "with the mutant, an autocommit UPDATE whose outcome was unknown is applied twice", "MUT-RETRY-UNKNOWN")
 		for _, mutated := range []bool{false, true} {
 			w := newWorld(t)
 			s, _ := w.session(exec.Options{Mutations: exec.Mutations{RetryAfterUnknownCommit: mutated}})

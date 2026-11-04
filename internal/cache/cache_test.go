@@ -8,7 +8,12 @@ import (
 	"maragu.dev/is"
 
 	"maragu.dev/maragudb/internal/cache"
+	"maragu.dev/maragudb/internal/verify"
 )
+
+func TestMain(m *testing.M) {
+	verify.Main(m)
+}
 
 func TestMemory(t *testing.T) {
 	t.Run("returns what was put", func(t *testing.T) {

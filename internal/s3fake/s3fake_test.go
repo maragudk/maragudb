@@ -15,7 +15,12 @@ import (
 
 	"maragu.dev/maragudb/internal/s3"
 	"maragu.dev/maragudb/internal/s3fake"
+	"maragu.dev/maragudb/internal/verify"
 )
+
+func TestMain(m *testing.M) {
+	verify.Main(m)
+}
 
 func TestClient_Put(t *testing.T) {
 	t.Run("returns the same ETag that a later Get returns", func(t *testing.T) {
@@ -40,6 +45,7 @@ func TestClient_Put(t *testing.T) {
 	})
 
 	t.Run("fails with ErrPreconditionFailed when IfMatch does not match", func(t *testing.T) {
+		verify.Covers(t, "the fake refuses a conditional write whose ETag does not match, as S3 does", "INV-CAS-COMMIT")
 		c := s3fake.New()
 		_, err := c.Put(t.Context(), "k", []byte("v2"), s3.PutOptions{IfMatch: `"nope"`})
 		is.Error(t, s3.ErrNotFound, err, "missing object, as S3 answers")
@@ -139,6 +145,7 @@ func TestClient_Counts(t *testing.T) {
 
 func TestClient_Faults(t *testing.T) {
 	t.Run("errors are not applied", func(t *testing.T) {
+		verify.Covers(t, "an injected error fails the write and leaves the store unchanged", "AC-1.1")
 		c := s3fake.New(s3fake.WithFaults(s3fake.Faults{Rand: rand.New(rand.NewPCG(1, 2)), ErrorRate: 1}))
 		_, err := c.Put(t.Context(), "k", []byte("v"), s3.PutOptions{})
 		is.Error(t, s3fake.ErrInjected, err)
@@ -146,6 +153,7 @@ func TestClient_Faults(t *testing.T) {
 	})
 
 	t.Run("lost acks are applied but reported as errors", func(t *testing.T) {
+		verify.Covers(t, "a lost acknowledgement applies the write and still reports an error", "AC-1.3")
 		c := s3fake.New(s3fake.WithFaults(s3fake.Faults{Rand: rand.New(rand.NewPCG(1, 2)), LostAckRate: 1}))
 		_, err := c.Put(t.Context(), "k", []byte("v"), s3.PutOptions{})
 		is.Error(t, s3fake.ErrInjected, err)
@@ -155,6 +163,7 @@ func TestClient_Faults(t *testing.T) {
 	})
 
 	t.Run("a lost ack hides a precondition failure too", func(t *testing.T) {
+		verify.Covers(t, "a lost acknowledgement also hides a precondition failure, so the client cannot tell what happened", "AC-1.3")
 		c := s3fake.New(s3fake.WithFaults(s3fake.Faults{Decide: func(kind s3.Kind, key string) s3fake.Outcome {
 			return s3fake.OutcomeLostAck
 		}}))
@@ -192,6 +201,7 @@ func TestClient_Faults(t *testing.T) {
 	})
 
 	t.Run("latency advances the virtual clock", func(t *testing.T) {
+		verify.Covers(t, "injected latency advances the virtual clock, by at most the maximum latency", "AC-1.2")
 		clock := s3fake.NewVirtualClock(time.Unix(0, 0))
 		c := s3fake.New(s3fake.WithClock(clock), s3fake.WithFaults(s3fake.Faults{Rand: rand.New(rand.NewPCG(1, 2)), MaxLatency: time.Second}))
 		before := clock.Now()
@@ -202,6 +212,7 @@ func TestClient_Faults(t *testing.T) {
 	})
 
 	t.Run("a crashed process cannot make further requests", func(t *testing.T) {
+		verify.Covers(t, "a crashed process fails every later request, and other processes are unaffected", "AC-1.4")
 		c := s3fake.New(s3fake.WithFaults(s3fake.Faults{Rand: rand.New(rand.NewPCG(1, 2)), CrashRate: 1}))
 		p := &s3fake.Process{Name: "p"}
 		ctx := s3fake.WithProcess(t.Context(), p)
@@ -217,6 +228,7 @@ func TestClient_Faults(t *testing.T) {
 	})
 
 	t.Run("crashes happen both before and after apply", func(t *testing.T) {
+		verify.Covers(t, "over 50 seeds, crashes happen both before and after the write is applied", "AC-1.4")
 		var before, after int
 		for seed := range uint64(50) {
 			c := s3fake.New(s3fake.WithFaults(s3fake.Faults{Rand: rand.New(rand.NewPCG(seed, 0)), CrashRate: 1}))
@@ -240,6 +252,7 @@ func TestClient_Faults(t *testing.T) {
 	})
 
 	t.Run("the same seed produces the same outcomes", func(t *testing.T) {
+		verify.Covers(t, "the same seed produces the same fault outcomes, final keys, and virtual time", "AC-1.9")
 		run := func() string {
 			c := s3fake.New(s3fake.WithFaults(s3fake.Faults{
 				Rand: rand.New(rand.NewPCG(7, 7)), ErrorRate: 0.2, LostAckRate: 0.2, CrashRate: 0.01, MaxLatency: time.Second,
@@ -265,6 +278,7 @@ func TestClient_Unavailable(t *testing.T) {
 	}
 
 	t.Run("an outage refuses every request until it ends, without crashing the process", func(t *testing.T) {
+		verify.Covers(t, "an outage fails every request until it ends, while the process keeps running", "AC-1.1")
 		c, clock := newClient(0)
 		p := &s3fake.Process{Name: "p"}
 		ctx := s3fake.WithProcess(t.Context(), p)

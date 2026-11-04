@@ -6,7 +6,12 @@ import (
 	"maragu.dev/is"
 
 	"maragu.dev/maragudb/internal/reach"
+	"maragu.dev/maragudb/internal/verify"
 )
+
+func TestMain(m *testing.M) {
+	verify.Main(m)
+}
 
 func TestHit(t *testing.T) {
 	t.Run("counts in the counter of the context", func(t *testing.T) {

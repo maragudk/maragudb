@@ -9,6 +9,8 @@ import (
 
 	"hegel.dev/go/hegel"
 	"maragu.dev/is"
+
+	"maragu.dev/maragudb/internal/verify"
 )
 
 // drawEntries draws unique keys in sorted order with random values and tombstones.
@@ -147,6 +149,7 @@ func TestSegment(t *testing.T) {
 	})
 
 	t.Run("a point lookup fetches at most one block per tree level, logarithmic in entry count", func(t *testing.T) {
+		verify.Covers(t, "a point lookup in a random segment fetches at most one block per tree level", "AC-5.3")
 		for _, n := range []int{1, 10, 100, 1000, 10000} {
 			var entries []entry
 			for i := range n {

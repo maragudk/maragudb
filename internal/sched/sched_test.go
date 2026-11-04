@@ -9,7 +9,12 @@ import (
 	"maragu.dev/is"
 
 	"maragu.dev/maragudb/internal/sched"
+	"maragu.dev/maragudb/internal/verify"
 )
+
+func TestMain(m *testing.M) {
+	verify.Main(m)
+}
 
 func TestScheduler(t *testing.T) {
 	t.Run("runs tasks in virtual time order and ties in creation order", func(t *testing.T) {
@@ -33,6 +38,7 @@ func TestScheduler(t *testing.T) {
 	})
 
 	t.Run("produces the same trace on every run", func(t *testing.T) {
+		verify.Covers(t, "the scheduler produces the same trace of task steps on every run", "AC-1.9")
 		run := func() string {
 			s := sched.New(time.Unix(0, 0))
 			var trace string

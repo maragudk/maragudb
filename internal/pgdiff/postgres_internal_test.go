@@ -1,6 +1,7 @@
 package pgdiff
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
 	"strings"
@@ -36,7 +37,7 @@ func TestPostgres(t *testing.T) {
 			_, err := admin.ExecContext(t.Context(), "CREATE DATABASE "+name)
 			is.NotError(t, err)
 		}
-		t.Cleanup(func() { _, _ = admin.ExecContext(t.Context(), "DROP DATABASE IF EXISTS "+fresh) })
+		t.Cleanup(func() { _, _ = admin.ExecContext(context.Background(), "DROP DATABASE IF EXISTS "+fresh) })
 
 		dropStale(t.Context(), admin, time.Now().Add(-24*time.Hour))
 

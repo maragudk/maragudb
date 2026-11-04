@@ -15,12 +15,11 @@ import (
 	"maragu.dev/maragudb/internal/s3fake"
 	"maragu.dev/maragudb/internal/s3test"
 	"maragu.dev/maragudb/internal/sql/ast"
+	"maragu.dev/maragudb/internal/verify"
 )
 
 func TestMain(m *testing.M) {
-	code := m.Run()
-	pgdiff.DropDatabase()
-	os.Exit(code)
+	verify.Main(m, pgdiff.DropDatabase)
 }
 
 func newRunner(t *testing.T) *pgdiff.Runner {
@@ -38,6 +37,7 @@ func newRunner(t *testing.T) *pgdiff.Runner {
 
 func TestDifferential(t *testing.T) {
 	t.Run("generated statements give the same results on Postgres and maragudb", func(t *testing.T) {
+		verify.Covers(t, "hegel-generated schemas, rows, and statements, rendered from one AST to both dialects, give the same results, ordered exactly when ORDER BY decides the order and as multisets otherwise, and fail on both sides with the same error class", "AC-4.1", "AC-4.2", "AC-4.3")
 		r := newRunner(t)
 		cases := 200
 		if s := os.Getenv("MARAGUDB_PGDIFF_CASES"); s != "" {
@@ -70,6 +70,11 @@ func TestDifferential(t *testing.T) {
 			// Shrinking skews the counts toward degenerate cases.
 			return
 		}
+		classMatches := 0
+		for _, n := range total.ErrorClasses {
+			classMatches += n
+		}
+		verify.Record(t, verify.Fact{Diff: &verify.Diff{Cases: cases, Statements: total.Statements, OK: total.OK, Errors: total.Errors, ClassMatches: classMatches, Classes: len(total.ErrorClasses), Ordered: total.Ordered}})
 		// The run must exercise real behavior, or agreement means nothing.
 		is.True(t, total.Statements >= cases, "statements")
 		is.True(t, total.OK > total.Statements/2, "most statements succeed on both sides")

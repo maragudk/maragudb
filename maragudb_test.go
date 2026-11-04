@@ -17,7 +17,12 @@ import (
 	"maragu.dev/maragudb/internal/s3"
 	"maragu.dev/maragudb/internal/s3fake"
 	"maragu.dev/maragudb/internal/s3test"
+	"maragu.dev/maragudb/internal/verify"
 )
+
+func TestMain(m *testing.M) {
+	verify.Main(m)
+}
 
 // world is a fake store shared by several databases, like several processes.
 type world struct {
@@ -108,6 +113,7 @@ func queryRows(t *testing.T, db interface {
 
 func TestRegisterDriver(t *testing.T) {
 	t.Run("registers under the given name and opens with sql.Open", func(t *testing.T) {
+		verify.Covers(t, "RegisterDriver registers the driver explicitly under a name, and sql.Open with an s3://bucket/prefix DSN works", "INV-REGISTER", "INV-DSN")
 		w := newWorld(t)
 		maragudb.RegisterDriver(maragudb.Options{Name: new("maragudb-test-register"), Store: s3test.NewStore(w.fake)})
 		db, err := sql.Open("maragudb-test-register", "s3://bucket/app")
@@ -120,6 +126,7 @@ func TestRegisterDriver(t *testing.T) {
 	})
 
 	t.Run("rejects a bad DSN when connecting", func(t *testing.T) {
+		verify.Covers(t, "DSNs that are not s3://bucket/prefix fail with ErrDSN", "INV-DSN")
 		w := newWorld(t)
 		for _, dsn := range []string{"bucket/app", "s3:///app", "http://bucket/app", "s3://bucket/app?x=1", "s3://user@bucket/app"} {
 			_, err := maragudb.NewConnector(maragudb.Options{Store: s3test.NewStore(w.fake)}, dsn)
@@ -135,6 +142,7 @@ func TestRegisterDriver(t *testing.T) {
 
 func TestDB(t *testing.T) {
 	t.Run("round trips every type through parameters and Scan", func(t *testing.T) {
+		verify.Covers(t, "every type and NULL round-trips through $1-style parameters and Scan", "INV-TYPES", "INV-PLACEHOLDERS")
 		db := newDB(t)
 		mustExec(t, db, "CREATE TABLE t (id int PRIMARY KEY, f float, b bool, s string, bs bytes, at time, n int)")
 		at := time.Date(2024, 5, 6, 7, 8, 9, 123456789, time.FixedZone("plus2", 2*3600))
@@ -169,6 +177,7 @@ func TestDB(t *testing.T) {
 	})
 
 	t.Run("never converts a parameter of the wrong type", func(t *testing.T) {
+		verify.Covers(t, "a parameter of the wrong Go type for its column is ErrType, never converted", "INV-STRICT-TYPES")
 		db := newDB(t)
 		mustExec(t, db, "CREATE TABLE t (id int PRIMARY KEY, f float, s string)")
 		_, err := db.ExecContext(t.Context(), "INSERT INTO t VALUES ($1, $2, $3)", "1", 1.5, "x")
@@ -233,6 +242,7 @@ func TestDB(t *testing.T) {
 	})
 
 	t.Run("reports statement errors with errors.Is", func(t *testing.T) {
+		verify.Covers(t, "statement errors, including int overflow as ErrOutOfRange, are detectable with errors.Is", "INV-INT-OVERFLOW")
 		db := newDB(t)
 		mustExec(t, db, "CREATE TABLE t (id int PRIMARY KEY, n int NOT NULL)")
 		mustExec(t, db, "INSERT INTO t VALUES (1, 1)")
@@ -280,6 +290,7 @@ func TestTx(t *testing.T) {
 	})
 
 	t.Run("an explicit transaction returns ErrConflict, which IsRetryable, and a retry succeeds", func(t *testing.T) {
+		verify.Covers(t, "an explicit transaction that loses to a concurrent commit returns ErrConflict, which errors.Is and IsRetryable detect, and a retry succeeds", "INV-RETRYABLE-ERROR", "INV-DB-CONFLICTS")
 		w := newWorld(t)
 		a := w.open(maragudb.Options{})
 		b := w.open(maragudb.Options{})
@@ -314,6 +325,7 @@ func TestTx(t *testing.T) {
 	})
 
 	t.Run("a read-only transaction never conflicts and rejects writes", func(t *testing.T) {
+		verify.Covers(t, "a read-only transaction commits despite a concurrent commit and rejects writes", "INV-READ-ONLY")
 		w := newWorld(t)
 		a := w.open(maragudb.Options{})
 		b := w.open(maragudb.Options{})
@@ -362,6 +374,7 @@ func TestTx(t *testing.T) {
 	})
 
 	t.Run("a statement outside a transaction retries on conflict", func(t *testing.T) {
+		verify.Covers(t, "an autocommit statement that conflicts retries by itself and succeeds", "INV-AUTOCOMMIT-RETRY")
 		w := newWorld(t)
 		a := w.open(maragudb.Options{})
 		b := w.open(maragudb.Options{})
@@ -387,6 +400,7 @@ func TestTx(t *testing.T) {
 
 func TestStats(t *testing.T) {
 	t.Run("counts requests and cache hits across connections", func(t *testing.T) {
+		verify.Covers(t, "Stats reports request counts by kind and cache hits across connections", "INV-STATS")
 		db := newDB(t)
 		before, err := maragudb.Stats(t.Context(), db)
 		is.NotError(t, err)
@@ -406,6 +420,7 @@ func TestStats(t *testing.T) {
 	})
 
 	t.Run("compaction and GC bound the objects", func(t *testing.T) {
+		verify.Covers(t, "after 11 commits, compaction leaves one segment, and GC deletes the 11 old ones only after the grace period", "AC-6.1", "AC-6.2")
 		synctest.Test(t, func(t *testing.T) {
 			w := newWorld(t)
 			grace := time.Minute
@@ -445,6 +460,7 @@ func TestStats(t *testing.T) {
 
 func TestMaintenance(t *testing.T) {
 	t.Run("compacts and collects garbage in the background and reports it in the statistics", func(t *testing.T) {
+		verify.Covers(t, "background maintenance compacts and collects garbage and reports it in Stats", "AC-6.1")
 		synctest.Test(t, func(t *testing.T) {
 			w := newWorld(t)
 			grace := time.Minute
@@ -475,6 +491,7 @@ func TestMaintenance(t *testing.T) {
 	})
 
 	t.Run("keeps the commit and warm-read budgets in steady state", func(t *testing.T) {
+		verify.Covers(t, "with background maintenance, an INSERT and a warm SELECT keep their request budgets", "AC-5.1", "AC-5.2")
 		synctest.Test(t, func(t *testing.T) {
 			w := newWorld(t)
 			interval := time.Second
@@ -588,6 +605,7 @@ func TestRequestBudgets(t *testing.T) {
 	}
 
 	t.Run("an autocommit INSERT makes one conditional GET and two PUTs regardless of database size", func(t *testing.T) {
+		verify.Covers(t, "an autocommit INSERT makes one conditional GET and two PUTs at every database size", "AC-5.1")
 		for _, n := range sizes {
 			w := newWorld(t)
 			db := w.open(maragudb.Options{})
@@ -598,6 +616,7 @@ func TestRequestBudgets(t *testing.T) {
 			mustExec(t, db, "INSERT INTO t VALUES ($1, $2, $3)", n+1, "new", 0.5)
 			d := stats(t, db).Sub(before)
 			t.Logf("n=%d warm insert: %+v", n, d)
+			verify.CheckBudget(t, "SQL autocommit INSERT, warm: requests", n, d.Total(), 3)
 			is.Equal(t, maragudb.Requests{GetConditional: 1, Put: 1, PutConditional: 1}, d)
 
 			// Cold, the duplicate key check and the table definition each cost a descent of the tree.
@@ -607,12 +626,15 @@ func TestRequestBudgets(t *testing.T) {
 			mustExec(t, cold, "INSERT INTO t VALUES ($1, $2, $3)", n/2, "back", 0.5)
 			d = stats(t, cold).Sub(before)
 			t.Logf("n=%d cold insert: %+v", n, d)
+			verify.CheckBudget(t, "SQL autocommit INSERT, cold: PUTs", n, d.Put + d.PutConditional, 2)
+			verify.CheckBudget(t, "SQL autocommit INSERT, cold: GETs", n, d.Get, int64(2 * maxDepth(n)))
 			is.Equal(t, maragudb.Requests{Get: d.Get, GetConditional: 1, Put: 1, PutConditional: 1}, d)
 			is.True(t, d.Get <= int64(2*maxDepth(n)), fmt.Sprintf("n=%d: %d GETs, max depth %d", n, d.Get, maxDepth(n)))
 		}
 	})
 
 	t.Run("a SELECT by primary key with a warm cache makes exactly one conditional GET", func(t *testing.T) {
+		verify.Covers(t, "a SELECT by primary key with a warm cache makes exactly one conditional GET", "AC-5.2")
 		for _, n := range sizes[:3] {
 			db := newDB(t)
 			load(t, db, n)
@@ -622,11 +644,13 @@ func TestRequestBudgets(t *testing.T) {
 			is.Equal(t, fmt.Sprintf("%q", fmt.Sprint("name-", n/2)), queryRows(t, db, q, n/2))
 			d := stats(t, db).Sub(before)
 			t.Logf("n=%d warm select: %+v", n, d)
+			verify.CheckBudget(t, "SQL SELECT by key, warm: requests", n, d.Total(), 1)
 			is.Equal(t, maragudb.Requests{GetConditional: 1}, d)
 		}
 	})
 
 	t.Run("a SELECT by primary key with a cold cache makes a logarithmic number of GETs", func(t *testing.T) {
+		verify.Covers(t, "a SELECT by primary key with a cold cache makes a logarithmic number of GETs", "AC-5.3")
 		for _, n := range sizes {
 			w := newWorld(t)
 			db := w.open(maragudb.Options{})
@@ -636,6 +660,7 @@ func TestRequestBudgets(t *testing.T) {
 			is.Equal(t, fmt.Sprintf("%q", fmt.Sprint("name-", n/2)), queryRows(t, cold, "SELECT name FROM t WHERE id = $1", n/2))
 			d := stats(t, cold).Sub(before)
 			t.Logf("n=%d cold select: %+v", n, d)
+			verify.CheckBudget(t, "SQL SELECT by key, cold: GETs", n, d.Get, int64(2 * maxDepth(n)))
 			// The table definition and the row are each found by one descent of the tree,
 			// one block per level.
 			is.True(t, d.Get <= int64(2*maxDepth(n)), fmt.Sprintf("n=%d: %d GETs, max depth %d", n, d.Get, maxDepth(n)))

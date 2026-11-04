@@ -8,17 +8,25 @@ import (
 
 	"maragu.dev/maragudb/internal/s3"
 	"maragu.dev/maragudb/internal/tigristest"
+	"maragu.dev/maragudb/internal/verify"
 )
 
+func TestMain(m *testing.M) {
+	verify.Main(m)
+}
+
 func TestAWSClient_Tigris(t *testing.T) {
+	verify.Covers(t, "the S3 client's Tigris suite can run: the credentials are there and Tigris answers", "AC-7.1")
 	client, cfg := tigristest.NewClient(t)
 	is.True(t, client.Tigris(), "Tigris endpoint detected")
 	key := cfg.Prefix + "/object"
 
 	t.Run("conditional writes and reads behave like the fake", func(t *testing.T) {
+		verify.Covers(t, "on Tigris, If-None-Match, If-Match, conditional and ranged reads, list, and delete behave like the fake, and the PUT ETag equals the GET ETag; latencies are recorded", "AC-7.1", "INV-CAS-COMMIT", "AC-5.4")
 		start := time.Now()
 		etag, err := client.Put(t.Context(), key, []byte("v1"), s3.PutOptions{IfNoneMatch: true})
 		is.NotError(t, err)
+		verify.Record(t, verify.Fact{Latency: &verify.Latency{Name: "conditional PUT", Duration: time.Since(start)}})
 		t.Logf("conditional PUT: %v", time.Since(start).Round(time.Millisecond))
 		is.True(t, etag != "")
 
@@ -31,6 +39,7 @@ func TestAWSClient_Tigris(t *testing.T) {
 		start = time.Now()
 		o, err := client.Get(t.Context(), key, s3.GetOptions{Consistent: true})
 		is.NotError(t, err)
+		verify.Record(t, verify.Fact{Latency: &verify.Latency{Name: "consistent GET", Duration: time.Since(start)}})
 		t.Logf("consistent GET: %v", time.Since(start).Round(time.Millisecond))
 		is.Equal(t, "v1", string(o.Body))
 		is.Equal(t, etag, o.ETag, "the PUT's ETag equals the GET's ETag")

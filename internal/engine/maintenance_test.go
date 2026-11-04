@@ -11,12 +11,14 @@ import (
 	"maragu.dev/maragudb/internal/engine"
 	"maragu.dev/maragudb/internal/s3"
 	"maragu.dev/maragudb/internal/s3fake"
+	"maragu.dev/maragudb/internal/verify"
 )
 
 func TestMaintainer_Step(t *testing.T) {
 	grace := 10 * time.Minute
 
 	t.Run("compacts at the segment threshold, collects garbage after the grace period, and makes no requests in between", func(t *testing.T) {
+		verify.Covers(t, "maintenance compacts at the segment threshold, deletes garbage after the grace period, and makes no requests when idle", "AC-6.1")
 		w := newWorld(t)
 		db := w.open(1, engine.Options{GCGracePeriod: &grace})
 		m := db.NewMaintainer(engine.MaintenanceOptions{SegmentThreshold: 4})

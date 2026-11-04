@@ -12,7 +12,12 @@ import (
 	"maragu.dev/is"
 
 	"maragu.dev/maragudb/internal/sql/value"
+	"maragu.dev/maragudb/internal/verify"
 )
+
+func TestMain(m *testing.M) {
+	verify.Main(m)
+}
 
 var allTypes = []value.Type{value.Int, value.Float, value.Bool, value.String, value.Bytes, value.Time}
 
@@ -145,6 +150,7 @@ func TestEncodeKey(t *testing.T) {
 
 func TestEncodeRow(t *testing.T) {
 	t.Run("round trips every type and NULL", func(t *testing.T) {
+		verify.Covers(t, "every value of the six types and NULL round-trips through the row encoding", "INV-TYPES")
 		hegel.Test(t, func(ht *hegel.T) {
 			types := hegel.Draw(ht, hegel.Lists(hegel.SampledFrom(allTypes)).MaxSize(6))
 			row := make([]value.Value, len(types))

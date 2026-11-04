@@ -1,0 +1,482 @@
+{
+  "seeds": 20,
+  "cells": [
+    "list-append through the engine, no maintainers",
+    "list-append through the engine, 2 maintainers",
+    "bank through the engine, no maintainers",
+    "bank through the engine, 2 maintainers",
+    "list-append through SQL, no maintainers",
+    "list-append through SQL, 2 maintainers",
+    "bank through SQL, no maintainers",
+    "bank through SQL, 2 maintainers"
+  ],
+  "mutants": [
+    {
+      "id": "MUT-COMMIT-WITHOUT-CAS",
+      "name": "commit without CAS",
+      "replay": "cas",
+      "description": "`engine.Mutations.CommitWithoutCAS` writes the manifest unconditionally, so a commit can overwrite a concurrent one.",
+      "results": [
+        {
+          "cell": "list-append through the engine, no maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "durability",
+            "list-append"
+          ]
+        },
+        {
+          "cell": "list-append through the engine, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "durability",
+            "list-append"
+          ]
+        },
+        {
+          "cell": "bank through the engine, no maintainers",
+          "status": "undetected",
+          "reason": "an unconditional manifest write drops whole concurrent commits, a dropped transfer conserves money, and the bank checker only checks totals"
+        },
+        {
+          "cell": "bank through the engine, 2 maintainers",
+          "status": "undetected",
+          "reason": "an unconditional manifest write drops whole concurrent commits, a dropped transfer conserves money, and the bank checker only checks totals"
+        },
+        {
+          "cell": "list-append through SQL, no maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "final read",
+            "list-append"
+          ]
+        },
+        {
+          "cell": "list-append through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "durability",
+            "list-append"
+          ]
+        },
+        {
+          "cell": "bank through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "an unconditional manifest write drops whole concurrent commits, a dropped transfer conserves money, and the bank checker only checks totals"
+        },
+        {
+          "cell": "bank through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "an unconditional manifest write drops whole concurrent commits, a dropped transfer conserves money, and the bank checker only checks totals"
+        }
+      ]
+    },
+    {
+      "id": "MUT-GC-IGNORE-GRACE",
+      "name": "GC ignoring the grace period",
+      "replay": "gc",
+      "description": "`engine.Mutations.GCIgnoreGrace` deletes unreferenced objects at once, so a reader younger than the grace period can lose its snapshot.",
+      "results": [
+        {
+          "cell": "list-append through the engine, no maintainers",
+          "status": "undetected",
+          "reason": "without maintainers nothing is ever deleted, so no reader can lose an object"
+        },
+        {
+          "cell": "list-append through the engine, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "final read",
+            "list-append"
+          ]
+        },
+        {
+          "cell": "bank through the engine, no maintainers",
+          "status": "undetected",
+          "reason": "without maintainers nothing is ever deleted, so no reader can lose an object"
+        },
+        {
+          "cell": "bank through the engine, 2 maintainers",
+          "status": "detected",
+          "seed": 2,
+          "checkers": [
+            "grace period"
+          ]
+        },
+        {
+          "cell": "list-append through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "without maintainers nothing is ever deleted, so no reader can lose an object"
+        },
+        {
+          "cell": "list-append through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 2,
+          "checkers": [
+            "grace period",
+            "final read",
+            "list-append"
+          ]
+        },
+        {
+          "cell": "bank through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "without maintainers nothing is ever deleted, so no reader can lose an object"
+        },
+        {
+          "cell": "bank through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 2,
+          "checkers": [
+            "grace period"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "MUT-SKIP-FRESHNESS",
+      "name": "serving the cache without a freshness check",
+      "replay": "freshness",
+      "description": "`engine.Mutations.SkipFreshnessCheck` starts transactions from the cached manifest without asking the store, so a transaction can miss commits acknowledged before it began.",
+      "results": [
+        {
+          "cell": "list-append through the engine, no maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "list-append"
+          ]
+        },
+        {
+          "cell": "list-append through the engine, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "list-append"
+          ]
+        },
+        {
+          "cell": "bank through the engine, no maintainers",
+          "status": "undetected",
+          "reason": "a stale snapshot makes a transfer conflict or read an older consistent state, which conserves money"
+        },
+        {
+          "cell": "bank through the engine, 2 maintainers",
+          "status": "undetected",
+          "reason": "a stale snapshot makes a transfer conflict or read an older consistent state, which conserves money"
+        },
+        {
+          "cell": "list-append through SQL, no maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "list-append"
+          ]
+        },
+        {
+          "cell": "list-append through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "list-append"
+          ]
+        },
+        {
+          "cell": "bank through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "a stale snapshot makes a transfer conflict or read an older consistent state, which conserves money"
+        },
+        {
+          "cell": "bank through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "a stale snapshot makes a transfer conflict or read an older consistent state, which conserves money"
+        }
+      ]
+    },
+    {
+      "id": "MUT-ACK-BEFORE-CONFIRM",
+      "name": "acking before the write is confirmed",
+      "replay": "ack",
+      "description": "`engine.Mutations.AckBeforeConfirm` reports a commit as successful without waiting for the store's answer.",
+      "results": [
+        {
+          "cell": "list-append through the engine, no maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "durability"
+          ]
+        },
+        {
+          "cell": "list-append through the engine, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "durability"
+          ]
+        },
+        {
+          "cell": "bank through the engine, no maintainers",
+          "status": "undetected",
+          "reason": "an acknowledged transfer that never landed is missing as a whole, which conserves money"
+        },
+        {
+          "cell": "bank through the engine, 2 maintainers",
+          "status": "undetected",
+          "reason": "an acknowledged transfer that never landed is missing as a whole, which conserves money"
+        },
+        {
+          "cell": "list-append through SQL, no maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "durability"
+          ]
+        },
+        {
+          "cell": "list-append through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "durability"
+          ]
+        },
+        {
+          "cell": "bank through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "an acknowledged transfer that never landed is missing as a whole, which conserves money"
+        },
+        {
+          "cell": "bank through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "an acknowledged transfer that never landed is missing as a whole, which conserves money"
+        }
+      ]
+    },
+    {
+      "id": "MUT-COMPACTED-AHEAD",
+      "name": "the compacted segment ahead of newer ones after a rebase",
+      "replay": "compacted-ahead",
+      "description": "`engine.Mutations.CompactedSegmentAhead` puts the compacted segment ahead of the segments committed during the compaction when it rebases, so that old values shadow newer ones.",
+      "results": [
+        {
+          "cell": "list-append through the engine, no maintainers",
+          "status": "undetected",
+          "reason": "without maintainers nothing compacts, so there is never a rebase"
+        },
+        {
+          "cell": "list-append through the engine, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "durability",
+            "list-append"
+          ]
+        },
+        {
+          "cell": "bank through the engine, no maintainers",
+          "status": "undetected",
+          "reason": "resurrected balances are a consistent older state, which conserves money"
+        },
+        {
+          "cell": "bank through the engine, 2 maintainers",
+          "status": "undetected",
+          "reason": "resurrected balances are a consistent older state, which conserves money"
+        },
+        {
+          "cell": "list-append through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "without maintainers nothing compacts, so there is never a rebase"
+        },
+        {
+          "cell": "list-append through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "durability",
+            "list-append"
+          ]
+        },
+        {
+          "cell": "bank through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "resurrected balances are a consistent older state, which conserves money"
+        },
+        {
+          "cell": "bank through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "resurrected balances are a consistent older state, which conserves money"
+        }
+      ]
+    },
+    {
+      "id": "MUT-FRESH-SNAPSHOT",
+      "name": "a fresh snapshot per statement",
+      "replay": "fresh-snapshot",
+      "description": "`exec.Mutations.FreshSnapshotPerStatement` starts every statement of an explicit transaction that has not written yet from the latest commit, so an audit can straddle a transfer and a reader can see two states.",
+      "results": [
+        {
+          "cell": "list-append through the engine, no maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "list-append through the engine, 2 maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "bank through the engine, no maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "bank through the engine, 2 maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "list-append through SQL, no maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "list-append"
+          ]
+        },
+        {
+          "cell": "list-append through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "list-append"
+          ]
+        },
+        {
+          "cell": "bank through SQL, no maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "bank"
+          ]
+        },
+        {
+          "cell": "bank through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "bank"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "MUT-RETRY-UNKNOWN",
+      "name": "retrying an autocommit statement after an unknown commit outcome",
+      "replay": "retry-unknown",
+      "description": "`exec.Mutations.RetryAfterUnknownCommit` retries an autocommit statement whose commit outcome is unknown, which can apply it twice.",
+      "results": [
+        {
+          "cell": "list-append through the engine, no maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "list-append through the engine, 2 maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "bank through the engine, no maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "bank through the engine, 2 maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "list-append through SQL, no maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "durability",
+            "list-append"
+          ]
+        },
+        {
+          "cell": "list-append through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 2,
+          "checkers": [
+            "durability",
+            "list-append"
+          ]
+        },
+        {
+          "cell": "bank through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "the bank workload writes only in explicit transactions, so no autocommit statement is ever retried, and a doubled transfer conserves money anyway"
+        },
+        {
+          "cell": "bank through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "the bank workload writes only in explicit transactions, so no autocommit statement is ever retried, and a doubled transfer conserves money anyway"
+        }
+      ]
+    },
+    {
+      "id": "MUT-UPDATE-SEES-OWN-WRITES",
+      "name": "an UPDATE that revisits the rows it wrote",
+      "replay": "update-sees-own-writes",
+      "description": "`exec.Mutations.UpdateSeesOwnWrites` restarts an UPDATE's scan after every row it writes, the Halloween problem. It only shows when an UPDATE moves rows to keys it has not visited yet.",
+      "results": [
+        {
+          "cell": "list-append through the engine, no maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "list-append through the engine, 2 maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "bank through the engine, no maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "bank through the engine, 2 maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "list-append through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "the workloads never update primary key columns, so no row moves ahead of the scan"
+        },
+        {
+          "cell": "list-append through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "the workloads never update primary key columns, so no row moves ahead of the scan"
+        },
+        {
+          "cell": "bank through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "the workloads never update primary key columns, so no row moves ahead of the scan"
+        },
+        {
+          "cell": "bank through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "the workloads never update primary key columns, so no row moves ahead of the scan"
+        }
+      ]
+    }
+  ]
+}

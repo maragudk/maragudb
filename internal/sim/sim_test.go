@@ -1,10 +1,13 @@
 package sim_test
 
 import (
-	"errors"
+	"encoding/json"
+	"flag"
 	"fmt"
 	"math/rand/v2"
 	"os"
+	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -13,11 +16,15 @@ import (
 	"maragu.dev/is"
 
 	"maragu.dev/maragudb/internal/engine"
-	"maragu.dev/maragudb/internal/history"
 	"maragu.dev/maragudb/internal/reach"
 	"maragu.dev/maragudb/internal/sim"
 	"maragu.dev/maragudb/internal/sql/exec"
+	"maragu.dev/maragudb/internal/verify"
 )
+
+func TestMain(m *testing.M) {
+	verify.Main(m)
+}
 
 // corpus of fixed seeds and configurations run in `make test`.
 func corpus() []sim.Config {
@@ -83,18 +90,56 @@ func corpus() []sim.Config {
 
 func failReport(t *testing.T, res sim.Result) {
 	t.Helper()
-	api := ""
-	if res.Config.SQL {
-		api = " API=sql"
+	cfg := res.Config
+	cfg.Trace = nil
+	api := "engine"
+	if cfg.SQL {
+		api = "sql"
 	}
-	t.Errorf("%s\n\nreplay with:\n  make replay SEED=%d WORKLOAD=%v%s\nor:\n  MARAGUDB_SEED=%d MARAGUDB_WORKLOAD=%v MARAGUDB_API=%s go test ./internal/sim -run TestSimulator/replay -v",
-		res.Report(), res.Config.Seed, res.Config.Workload, api, res.Config.Seed, res.Config.Workload, strings.TrimPrefix(api, " API="))
+	replay := fmt.Sprintf("make replay SEED=%d WORKLOAD=%v API=%s", cfg.Seed, cfg.Workload, api)
+	if inCorpus(cfg) {
+		replay += " CORPUS=1"
+	} else {
+		replay += fmt.Sprintf(" MAINTAINERS=%d MAINTENANCE=%s", cfg.Maintainers, maintenanceName(cfg.Maintenance))
+	}
+	t.Errorf("%s\n\nconfiguration: %+v\n\nreplay with:\n  %s", res.Report(), cfg, replay)
+}
+
+// inCorpus reports whether the configuration is one of the corpus, which `make replay CORPUS=1`
+// finds by its seed, workload, and API.
+func inCorpus(cfg sim.Config) bool {
+	for _, c := range corpus() {
+		if fmt.Sprintf("%+v", c) == fmt.Sprintf("%+v", cfg) {
+			return true
+		}
+	}
+	return false
+}
+
+// maintenanceName of a mode for `make replay MAINTENANCE=...`.
+func maintenanceName(m sim.MaintenanceMode) string {
+	switch m {
+	case sim.MaintenanceLease:
+		return "lease"
+	case sim.MaintenanceNoLease:
+		return "none"
+	case sim.MaintenanceOverlap:
+		return "overlap"
+	}
+	return "off"
 }
 
 func TestSimulator(t *testing.T) {
 	t.Run("corpus finds no anomalies", func(t *testing.T) {
+		verify.Covers(t, "the fixed corpus, with injected errors, latency, lost acknowledgements, outages, and crashes, finds no anomalies with any checker and exercises every fault", "AC-1.1", "AC-1.2", "AC-1.3", "AC-1.4", "AC-1.5", "AC-1.7", "AC-1.8", "AC-3.1", "AC-3.2", "AC-6.2", "INV-MULTI-WRITER", "INV-STRICT-SERIALIZABLE", "INV-CACHE-LOSS", "INV-S3-ONLY")
+		verify.Covers(t, "the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, and lost acknowledgements resolved both ways",
+			"AC-1.3", "AC-1.4", "STATE-LOST-ACK-LANDED", "STATE-LOST-ACK-CONFLICT", "STATE-LIVE-UNKNOWN", "STATE-AUTOCOMMIT-RETRY",
+			"STATE-COMPACTION-REBASE", "STATE-GC-REBASE", "STATE-LEASE-TAKEOVER", "STATE-LEASE-OVERLAP",
+			"STATE-SNAPSHOT-EXPIRED-REFUSED", "STATE-BLOCK-READ-RETRY-SUCCEEDED", "STATE-CRASH-MID-COMMIT-RECOVERED",
+			"STATE-CRASH-MID-COMPACTION", "STATE-CRASH-MID-GC")
 		var totals sim.Stats
-		reached := map[reach.State]int{}
+		batch := simBatch{name: "corpus"}
+		reached := map[string]int{}
 		start := time.Now()
 		for _, cfg := range corpus() {
 			res := sim.Run(cfg)
@@ -102,14 +147,17 @@ func TestSimulator(t *testing.T) {
 				failReport(t, res)
 			}
 			totals.Add(res.Stats)
+			batch.add(res)
 			for s, n := range res.Reached {
-				reached[s] += n
+				reached[string(s)] += n
 			}
 		}
+		batch.record(t)
+		verify.Record(t, verify.Fact{Reached: reached})
 		t.Logf("corpus of %d runs in %v: %+v", len(corpus()), time.Since(start).Round(time.Millisecond), totals)
 		for _, d := range reach.Declarations() {
-			t.Logf("reached %v %d times", d.State, reached[d.State])
-			is.True(t, reached[d.State] > 0, fmt.Sprintf("the corpus reaches %v: %s", d.State, d.Description))
+			t.Logf("reached %v %d times", d.State, reached[string(d.State)])
+			is.True(t, reached[string(d.State)] > 0, fmt.Sprintf("the corpus reaches %v: %s", d.State, d.Description))
 		}
 		// The corpus must exercise every interesting path, or passing means nothing.
 		is.True(t, totals.Commits > 1000, "commits")
@@ -124,6 +172,7 @@ func TestSimulator(t *testing.T) {
 	})
 
 	t.Run("compaction succeeds against steady writers by rebasing on their commits", func(t *testing.T) {
+		verify.Covers(t, "at least 90 percent of compactions succeed against fault-free steady writers, so storage stays bounded under load", "AC-6.1")
 		var totals sim.Stats
 		for seed := uint64(1); seed <= 40; seed++ {
 			cfg := sim.DefaultConfig(seed)
@@ -144,6 +193,7 @@ func TestSimulator(t *testing.T) {
 	})
 
 	t.Run("every checker passes with the lease working, disabled, and overlapping", func(t *testing.T) {
+		verify.Covers(t, "every checker passes with background maintenance under a working lease, without the lease, and with overlapping leases", "INV-MULTI-WRITER")
 		for _, mode := range []sim.MaintenanceMode{sim.MaintenanceLease, sim.MaintenanceNoLease, sim.MaintenanceOverlap} {
 			var totals sim.Stats
 			for seed := uint64(1); seed <= 12; seed++ {
@@ -206,6 +256,7 @@ func TestSimulator(t *testing.T) {
 	})
 
 	t.Run("the same seed produces the same history", func(t *testing.T) {
+		verify.Covers(t, "the same seed gives a byte-identical history, final state, and statistics, through the engine and SQL, in every maintenance mode", "AC-1.9")
 		for _, useSQL := range []bool{false, true} {
 			for _, w := range []sim.Workload{sim.ListAppend, sim.Bank} {
 				cfg := sim.DefaultConfig(7)
@@ -226,6 +277,7 @@ func TestSimulator(t *testing.T) {
 	})
 
 	t.Run("the SQL workloads exercise the same paths as the engine workloads", func(t *testing.T) {
+		verify.Covers(t, "the SQL corpus exercises commits, conflicts, unknown outcomes, outages, crashes, compactions, and deletes", "AC-1.5")
 		var totals sim.Stats
 		for _, cfg := range corpus() {
 			if !cfg.SQL {
@@ -252,6 +304,7 @@ func TestSimulator(t *testing.T) {
 	})
 
 	t.Run("replay", func(t *testing.T) {
+		verify.Covers(t, "a seed in MARAGUDB_SEED replays with a full trace, from make replay; skipped otherwise", "AC-1.9")
 		seedVar := os.Getenv("MARAGUDB_SEED")
 		if seedVar == "" {
 			t.Skip("set MARAGUDB_SEED to replay a seed")
@@ -264,6 +317,21 @@ func TestSimulator(t *testing.T) {
 		}
 		cfg.SQL = os.Getenv("MARAGUDB_API") == "sql"
 		cfg.Maintainers = 2
+		if os.Getenv("MARAGUDB_CORPUS") != "" {
+			found := false
+			for _, c := range corpus() {
+				if c.Seed == cfg.Seed && c.Workload == cfg.Workload && c.SQL == cfg.SQL {
+					cfg, found = c, true
+				}
+			}
+			if !found {
+				t.Fatalf("no corpus configuration with seed %d, workload %v, and SQL %v", cfg.Seed, cfg.Workload, cfg.SQL)
+			}
+		}
+		if n := os.Getenv("MARAGUDB_MAINTAINERS"); n != "" {
+			cfg.Maintainers, err = strconv.Atoi(n)
+			is.NotError(t, err)
+		}
 		switch os.Getenv("MARAGUDB_MAINTENANCE") {
 		case "lease":
 			cfg.Maintenance = sim.MaintenanceLease
@@ -272,21 +340,21 @@ func TestSimulator(t *testing.T) {
 		case "overlap":
 			cfg.Maintenance = sim.MaintenanceOverlap
 		}
-		switch os.Getenv("MARAGUDB_MUTATION") {
-		case "cas":
-			cfg.Mutations.CommitWithoutCAS = true
-		case "gc":
-			cfg.Mutations.GCIgnoreGrace = true
-		case "freshness":
-			cfg.Mutations.SkipFreshnessCheck = true
-		case "ack":
-			cfg.Mutations.AckBeforeConfirm = true
-		case "retry-unknown":
-			cfg.SQL = true
-			cfg.SQLMutations.RetryAfterUnknownCommit = true
-		case "fresh-snapshot":
-			cfg.SQL = true
-			cfg.SQLMutations.FreshSnapshotPerStatement = true
+		if name := os.Getenv("MARAGUDB_MUTATION"); name != "" {
+			found := false
+			for _, m := range mutants() {
+				if m.replay == name {
+					found = true
+					cfg.Mutations = m.mutations
+					cfg.SQLMutations = m.sqlMutations
+					if m.sqlMutations != (exec.Mutations{}) {
+						cfg.SQL = true
+					}
+				}
+			}
+			if !found {
+				t.Fatalf("unknown mutation %q", name)
+			}
 		}
 		cfg.Trace = func(line string) {
 			t.Log(line)
@@ -299,6 +367,7 @@ func TestSimulator(t *testing.T) {
 	})
 
 	t.Run("soak", func(t *testing.T) {
+		verify.Covers(t, "random seeds and configurations for a set duration find no anomalies, from make soak; skipped otherwise", "AC-1.6")
 		if os.Getenv("MARAGUDB_SOAK") == "" {
 			t.Skip("set MARAGUDB_SOAK to run the soak")
 		}
@@ -311,6 +380,8 @@ func TestSimulator(t *testing.T) {
 		rng := rand.New(rand.NewPCG(uint64(time.Now().UnixNano()), 0))
 		deadline := time.Now().Add(duration)
 		runs := 0
+		batch := simBatch{name: "soak"}
+		defer batch.record(t)
 		for time.Now().Before(deadline) {
 			seed := rng.Uint64()
 			cfg := sim.DefaultConfig(seed)
@@ -331,6 +402,7 @@ func TestSimulator(t *testing.T) {
 			cfg.GracePeriod = time.Duration(50+rng.IntN(3000)) * time.Millisecond
 			res := sim.Run(cfg)
 			runs++
+			batch.add(res)
 			if res.Failed() {
 				t.Errorf("config %+v", cfg)
 				failReport(t, res)
@@ -339,6 +411,28 @@ func TestSimulator(t *testing.T) {
 		}
 		t.Logf("soak: %d runs in %v without anomalies", runs, duration)
 	})
+}
+
+// simBatch sums the results of a batch of runs for the verification report.
+type simBatch struct {
+	name  string
+	seeds []uint64
+	sim   verify.Sim
+}
+
+func (b *simBatch) add(res sim.Result) {
+	b.seeds = append(b.seeds, res.Config.Seed)
+	b.sim.Runs++
+	b.sim.Transactions += len(res.History)
+	b.sim.Commits += res.Stats.Commits
+	b.sim.VirtualTime += res.Stats.Elapsed
+	b.sim.Anomalies += len(res.Anomalies)
+}
+
+func (b *simBatch) record(t *testing.T) {
+	b.sim.Name = b.name
+	b.sim.Seeds = verify.SeedRanges(b.seeds)
+	verify.Record(t, verify.Fact{Sim: &b.sim})
 }
 
 func diff(a, b string) string {
@@ -352,90 +446,238 @@ func diff(a, b string) string {
 	return fmt.Sprintf("lengths %d and %d", len(al), len(bl))
 }
 
-func TestMutants(t *testing.T) {
-	mutants := []struct {
-		name         string
-		mutations    engine.Mutations
-		sqlMutations exec.Mutations
-		workloads    []sim.Workload
-		// sql runs the workloads through the SQL layer.
-		sql bool
-		// maintainers to run; the history checkers alone must catch the mutants that run without.
-		maintainers int
-		// detectedBy is a substring of the anomaly that must be among those found.
-		detectedBy string
-	}{
-		// Without CAS a stale manifest write drops whole commits, which conserves money, so the bank
-		// checker cannot see it; the list-append checker can.
-		{name: "commit without CAS", mutations: engine.Mutations{CommitWithoutCAS: true}, workloads: []sim.Workload{sim.ListAppend}},
-		{name: "commit without CAS", mutations: engine.Mutations{CommitWithoutCAS: true}, workloads: []sim.Workload{sim.ListAppend}, maintainers: 2},
-		{name: "GC ignoring the grace period", mutations: engine.Mutations{GCIgnoreGrace: true}, workloads: []sim.Workload{sim.ListAppend, sim.Bank}, maintainers: 2, detectedBy: "grace period"},
-		{name: "serving the cache without a freshness check", mutations: engine.Mutations{SkipFreshnessCheck: true}, workloads: []sim.Workload{sim.ListAppend}, detectedBy: "cycle"},
-		{name: "acking before the write is confirmed", mutations: engine.Mutations{AckBeforeConfirm: true}, workloads: []sim.Workload{sim.ListAppend}},
-		// A rebased compaction that shadows the commits it rebased on resurrects the old values of
-		// the keys it merged. The engine list-append workload rewrites a list under one key, so a
-		// resurrected list loses appends, and so does the SQL list-append workload, which updates
-		// the row of a packed list in place. The bank workload cannot see it, because the
-		// resurrected balances are a consistent older state that conserves money.
-		{name: "the compacted segment ahead of newer ones after a rebase", mutations: engine.Mutations{CompactedSegmentAhead: true}, workloads: []sim.Workload{sim.ListAppend}, maintainers: 2},
-		{name: "the compacted segment ahead of newer ones after a rebase", mutations: engine.Mutations{CompactedSegmentAhead: true}, workloads: []sim.Workload{sim.ListAppend}, sql: true, maintainers: 2},
-		// The engine mutants are also visible through SQL.
-		{name: "commit without CAS", mutations: engine.Mutations{CommitWithoutCAS: true}, workloads: []sim.Workload{sim.ListAppend}, sql: true},
-		{name: "GC ignoring the grace period", mutations: engine.Mutations{GCIgnoreGrace: true}, workloads: []sim.Workload{sim.ListAppend, sim.Bank}, sql: true, maintainers: 2, detectedBy: "grace period"},
-		{name: "serving the cache without a freshness check", mutations: engine.Mutations{SkipFreshnessCheck: true}, workloads: []sim.Workload{sim.ListAppend}, sql: true, detectedBy: "cycle"},
-		{name: "acking before the write is confirmed", mutations: engine.Mutations{AckBeforeConfirm: true}, workloads: []sim.Workload{sim.ListAppend}, sql: true},
-		// The SQL layer's own mutants. A fresh snapshot per statement lets an audit straddle a
-		// transfer and lets a list reader see two different states.
-		{name: "a fresh snapshot per statement", sqlMutations: exec.Mutations{FreshSnapshotPerStatement: true}, workloads: []sim.Workload{sim.ListAppend, sim.Bank}, sql: true},
-		// Retrying an autocommit statement after an unknown commit outcome needs a process that
-		// keeps running after the outcome became unknown, which outages provide. When the first
-		// attempt landed, the retry fails, on the duplicate primary key or on the outage, and the
-		// statement reports a definite failure for a write that is in the database. Only the
-		// list-append workload has autocommit writes.
-		{name: "retrying an autocommit statement after an unknown commit outcome", sqlMutations: exec.Mutations{RetryAfterUnknownCommit: true}, workloads: []sim.Workload{sim.ListAppend}, sql: true, detectedBy: "failed"},
+// mutant is a deliberate bug that the simulator's checkers must detect.
+type mutant struct {
+	// id is the mutant's stable ID, and replay its name for `make replay MUTATION=...`.
+	id, replay, name, description string
+	mutations                     engine.Mutations
+	sqlMutations                  exec.Mutations
+	// cannot says, for every cell that cannot detect the mutant, why not.
+	cannot map[cell]string
+	// checkers that must each detect the mutant in at least one cell, so that the checker meant
+	// to catch it keeps doing so.
+	checkers []string
+}
+
+// cell of the kill matrix: a workload, through an API, with a number of maintainers.
+type cell struct {
+	workload    sim.Workload
+	sql         bool
+	maintainers int
+}
+
+func (c cell) String() string {
+	api := "the engine"
+	if c.sql {
+		api = "SQL"
 	}
-	for _, m := range mutants {
-		for _, w := range m.workloads {
-			api := "engine"
-			if m.sql {
-				api = "SQL"
+	maintainers := "no maintainers"
+	if c.maintainers > 0 {
+		maintainers = fmt.Sprint(c.maintainers, " maintainers")
+	}
+	return fmt.Sprintf("%v through %s, %s", c.workload, api, maintainers)
+}
+
+// cells of the kill matrix, in order.
+func cells() []cell {
+	var cs []cell
+	for _, sql := range []bool{false, true} {
+		for _, w := range []sim.Workload{sim.ListAppend, sim.Bank} {
+			for _, maintainers := range []int{0, 2} {
+				cs = append(cs, cell{workload: w, sql: sql, maintainers: maintainers})
 			}
-			t.Run(fmt.Sprintf("%s is detected by the %v workload through %s with %d maintainers", m.name, w, api, m.maintainers), func(t *testing.T) {
-				start := time.Now()
-				const maxSeeds = 20
-				for seed := uint64(1); seed <= maxSeeds; seed++ {
+		}
+	}
+	return cs
+}
+
+// Reasons that recur in the kill matrix.
+const (
+	bankConserves     = "an unconditional manifest write drops whole concurrent commits, a dropped transfer conserves money, and the bank checker only checks totals"
+	noGC              = "without maintainers nothing is ever deleted, so no reader can lose an object"
+	noCompaction      = "without maintainers nothing compacts, so there is never a rebase"
+	sqlOnly           = "the mutant is in the SQL layer, which the engine workloads do not use"
+	noAutocommitWrite = "the bank workload writes only in explicit transactions, so no autocommit statement is ever retried, and a doubled transfer conserves money anyway"
+)
+
+// mutants in the kill matrix.
+func mutants() []mutant {
+	bankCells := func(reason string) map[cell]string {
+		m := map[cell]string{}
+		for _, c := range cells() {
+			if c.workload == sim.Bank {
+				m[c] = reason
+			}
+		}
+		return m
+	}
+	merge := func(ms ...map[cell]string) map[cell]string {
+		out := map[cell]string{}
+		for _, m := range ms {
+			for c, r := range m {
+				out[c] = r
+			}
+		}
+		return out
+	}
+	noMaintainers := func(reason string) map[cell]string {
+		m := map[cell]string{}
+		for _, c := range cells() {
+			if c.maintainers == 0 {
+				m[c] = reason
+			}
+		}
+		return m
+	}
+	return []mutant{
+		{
+			id: "MUT-COMMIT-WITHOUT-CAS", replay: "cas", name: "commit without CAS",
+			description: "`engine.Mutations.CommitWithoutCAS` writes the manifest unconditionally, so a commit can overwrite a concurrent one.",
+			mutations:   engine.Mutations{CommitWithoutCAS: true},
+			cannot:      bankCells(bankConserves),
+			checkers:    []string{sim.CheckerListAppend},
+		},
+		{
+			id: "MUT-GC-IGNORE-GRACE", replay: "gc", name: "GC ignoring the grace period",
+			description: "`engine.Mutations.GCIgnoreGrace` deletes unreferenced objects at once, so a reader younger than the grace period can lose its snapshot.",
+			mutations:   engine.Mutations{GCIgnoreGrace: true},
+			cannot:      noMaintainers(noGC),
+			checkers:    []string{sim.CheckerGracePeriod},
+		},
+		{
+			id: "MUT-SKIP-FRESHNESS", replay: "freshness", name: "serving the cache without a freshness check",
+			description: "`engine.Mutations.SkipFreshnessCheck` starts transactions from the cached manifest without asking the store, so a transaction can miss commits acknowledged before it began.",
+			mutations:   engine.Mutations{SkipFreshnessCheck: true},
+			cannot:      bankCells("a stale snapshot makes a transfer conflict or read an older consistent state, which conserves money"),
+			checkers:    []string{sim.CheckerListAppend},
+		},
+		{
+			id: "MUT-ACK-BEFORE-CONFIRM", replay: "ack", name: "acking before the write is confirmed",
+			description: "`engine.Mutations.AckBeforeConfirm` reports a commit as successful without waiting for the store's answer.",
+			mutations:   engine.Mutations{AckBeforeConfirm: true},
+			cannot:      bankCells("an acknowledged transfer that never landed is missing as a whole, which conserves money"),
+			checkers:    []string{sim.CheckerDurability},
+		},
+		{
+			id: "MUT-COMPACTED-AHEAD", replay: "compacted-ahead", name: "the compacted segment ahead of newer ones after a rebase",
+			description: "`engine.Mutations.CompactedSegmentAhead` puts the compacted segment ahead of the segments committed during the compaction when it rebases, so that old values shadow newer ones.",
+			mutations:   engine.Mutations{CompactedSegmentAhead: true},
+			cannot:      merge(noMaintainers(noCompaction), bankCells("resurrected balances are a consistent older state, which conserves money")),
+			checkers:    []string{sim.CheckerListAppend},
+		},
+		{
+			id: "MUT-FRESH-SNAPSHOT", replay: "fresh-snapshot", name: "a fresh snapshot per statement",
+			description:  "`exec.Mutations.FreshSnapshotPerStatement` starts every statement of an explicit transaction that has not written yet from the latest commit, so an audit can straddle a transfer and a reader can see two states.",
+			sqlMutations: exec.Mutations{FreshSnapshotPerStatement: true},
+			checkers:     []string{sim.CheckerBank, sim.CheckerListAppend},
+		},
+		{
+			id: "MUT-RETRY-UNKNOWN", replay: "retry-unknown", name: "retrying an autocommit statement after an unknown commit outcome",
+			description:  "`exec.Mutations.RetryAfterUnknownCommit` retries an autocommit statement whose commit outcome is unknown, which can apply it twice.",
+			sqlMutations: exec.Mutations{RetryAfterUnknownCommit: true},
+			cannot:       bankCells(noAutocommitWrite),
+			checkers:     []string{sim.CheckerDurability},
+		},
+		{
+			id: "MUT-UPDATE-SEES-OWN-WRITES", replay: "update-sees-own-writes", name: "an UPDATE that revisits the rows it wrote",
+			description:  "`exec.Mutations.UpdateSeesOwnWrites` restarts an UPDATE's scan after every row it writes, the Halloween problem. It only shows when an UPDATE moves rows to keys it has not visited yet.",
+			sqlMutations: exec.Mutations{UpdateSeesOwnWrites: true},
+			cannot: func() map[cell]string {
+				m := map[cell]string{}
+				for _, c := range cells() {
+					m[c] = "the workloads never update primary key columns, so no row moves ahead of the scan"
+				}
+				return m
+			}(),
+		},
+	}
+}
+
+// applicable reports whether the mutant can run in the cell: a mutant in the SQL layer needs SQL.
+func (m mutant) applicable(c cell) bool {
+	return c.sql || m.sqlMutations == (exec.Mutations{})
+}
+
+var update = flag.Bool("update", false, "write the kill matrix to "+verify.KillMatrixPath)
+
+// killMatrixSeeds tried in every cell.
+const killMatrixSeeds = 20
+
+func TestMutants(t *testing.T) {
+	verify.Covers(t, "every mutant is detected by a checker in at least one simulator configuration, every configuration that cannot detect a mutant says why, and the kill matrix matches its golden file", "AC-2")
+
+	km := verify.KillMatrix{Seeds: killMatrixSeeds}
+	for _, c := range cells() {
+		km.Cells = append(km.Cells, c.String())
+	}
+	for _, m := range mutants() {
+		t.Run(m.id, func(t *testing.T) {
+			kmm := verify.KillMatrixMutant{ID: m.id, Name: m.name, Replay: m.replay, Description: m.description}
+			caught := map[string]bool{}
+			for _, c := range cells() {
+				r := verify.KillMatrixResult{Cell: c.String(), Status: verify.Undetected}
+				if !m.applicable(c) {
+					r.Status = verify.NotApplicable
+					r.Reason = sqlOnly
+					kmm.Results = append(kmm.Results, r)
+					continue
+				}
+				for seed := uint64(1); seed <= killMatrixSeeds; seed++ {
 					cfg := sim.DefaultConfig(seed)
-					cfg.Workload = w
-					cfg.SQL = m.sql
+					cfg.Workload = c.workload
+					cfg.SQL = c.sql
+					cfg.Maintainers = c.maintainers
 					cfg.Mutations = m.mutations
 					cfg.SQLMutations = m.sqlMutations
-					cfg.Maintainers = m.maintainers
 					res := sim.Run(cfg)
-					if !res.Failed() {
-						continue
+					if res.Failed() {
+						r.Status, r.Seed, r.Checkers = verify.Detected, seed, res.Checkers()
+						break
 					}
-					t.Logf("detected with seed %d after %v, %d anomalies:", seed, time.Since(start).Round(time.Millisecond), len(res.Anomalies))
-					var checker, named bool
-					for _, a := range res.Anomalies {
-						t.Logf("  %v", a)
-						var anomaly *history.Anomaly
-						if errors.As(a, &anomaly) {
-							checker = true
-						}
-						if m.detectedBy != "" && strings.Contains(a.Error(), m.detectedBy) {
-							named = true
-						}
-					}
-					if m.maintainers == 0 {
-						is.True(t, checker, "a history checker found the mutant")
-					}
-					if m.detectedBy != "" {
-						is.True(t, named, fmt.Sprintf("an anomaly mentions %q", m.detectedBy))
-					}
-					return
 				}
-				t.Fatalf("mutant %q not detected in %d seeds", m.name, maxSeeds)
-			})
-		}
+				for _, name := range r.Checkers {
+					caught[name] = true
+				}
+				if r.Status == verify.Detected && c.maintainers == 0 && !slices.ContainsFunc(r.Checkers, func(name string) bool {
+					return name == sim.CheckerListAppend || name == sim.CheckerDurability || name == sim.CheckerBank
+				}) {
+					t.Errorf("%v: without maintainers, a history checker must find the mutant, but only %v did", c, r.Checkers)
+				}
+				reason, cannot := m.cannot[c]
+				switch {
+				case r.Status == verify.Detected && cannot:
+					t.Errorf("%v: detected with seed %d by %v, but the mutant is said to be undetectable there: %s", c, r.Seed, r.Checkers, reason)
+				case r.Status == verify.Undetected && !cannot:
+					t.Errorf("%v: not detected in %d seeds, and no reason says why it cannot be", c, killMatrixSeeds)
+				case r.Status == verify.Undetected:
+					r.Reason = reason
+				}
+				verify.Record(t, verify.Fact{Mutant: &verify.Mutant{ID: m.id, Cell: c.String(), Detected: r.Status == verify.Detected, Seed: r.Seed, Checkers: r.Checkers}})
+				kmm.Results = append(kmm.Results, r)
+			}
+			for _, name := range m.checkers {
+				if !caught[name] {
+					t.Errorf("the %s checker never detects the mutant", name)
+				}
+			}
+			km.Mutants = append(km.Mutants, kmm)
+		})
+	}
+
+	if len(km.Mutants) != len(mutants()) {
+		// Only some mutants ran, with -run, so there is no whole matrix to compare.
+		return
+	}
+	got, err := json.MarshalIndent(km, "", "  ")
+	is.NotError(t, err)
+	got = append(got, '\n')
+	path := filepath.Join("..", "..", verify.KillMatrixPath)
+	if *update {
+		is.NotError(t, os.WriteFile(path, got, 0o644))
+	}
+	want, err := os.ReadFile(path)
+	is.NotError(t, err)
+	if string(got) != string(want) {
+		t.Errorf("the kill matrix differs from %s; run `make verification` to regenerate it:\n%s", verify.KillMatrixPath, diff(string(want), string(got)))
 	}
 }
