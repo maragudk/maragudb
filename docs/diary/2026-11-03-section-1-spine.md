@@ -473,3 +473,98 @@ Not changed: the bank workload cannot see the shadowing mutant, as above; `gc` r
 - A periodic GC sweep for orphans of crashed commits in a database that never reaches the compaction threshold; today they wait for the next compaction's GC.
 - `Deleted` in the simulator still shows a few duplicate deletes with the lease, from lease losses; a renewal in `Release`'s path is not worth it yet.
 - The disk cache never evicts, and compaction no longer primes it.
+
+## Step 7: Trust signals: a requirement-to-test map, a mutant kill matrix, reached-state coverage, and a report per CI run
+
+**Author:** trust-signals
+
+### Prompt Context
+
+**Verbatim prompt:** You are adding trust signals to maragudb, an embedded Go SQL database whose only durable state is in S3. [...] Your job is to make that verification visible and checkable by someone who reads only the docs and CI output, never the code. [...] ### 1. A machine-checked map from requirements to tests [...] Generate a committed document, /docs/verification.md. [...] Add a mutant kill matrix [...] Add a test that fails in each of these cases [...] ### 2. Reached-state coverage, Antithesis style [...] The fixed corpus must reach every declared state at least once, or a test fails. [...] ### 3. A verification report for each CI run [...] In CI, write the rendered report to `$GITHUB_STEP_SUMMARY` when that variable is set [...] Make it robust to `-shuffle`, to package parallelism [...] and to failed runs. [...] ### 4. Two coverage gaps found by the previous builder [...] ### 5. README [...]
+
+Mid-run message from the coordinator: the run was cut off because the machine ran out of disk space; check the files being written for truncation, check Docker, leave the scratchpad's `corpora/` alone, and continue.
+
+**Interpretation:** Give every requirement, deviation, mutant, and interesting state an ID; make tests declare the IDs they verify in a form a test can check statically; generate /docs/verification.md from that and fail when anything is uncovered, unknown, undetected, or stale; count reached states in the simulator; record facts from every test binary and publish a report into the GitHub job summary without being able to add a CI step; and close the two gaps.
+
+**Inferred intent:** Markus reads only documents and CI pages, so every claim of the test suite must be visible there, and must be checked by a test so that it cannot quietly become false.
+
+### What I did
+
+IDs. /docs/requirements.md and /docs/deviations.md got code-span tags after the text they name: 28 acceptance criteria (`AC-1.1` to `AC-8.3`), 19 key invariants (`INV-STRICT-SERIALIZABLE`, `INV-DURABLE-ACK`, and so on, from "What it is" and "Fixed product decisions"), and `DEV-1` to `DEV-19`. A script confirmed that removing the tags gives the original text byte for byte. Mutants are `MUT-<NAME>` and reached states `STATE-<NAME>`, both defined in code.
+
+Coverage declarations. `/internal/verify` has `verify.Covers(t, "<what is asserted>", "<ID>", ...)`. Its source is parsed with `go/ast` (`verify.Source.Coverage`), which attributes each call to its test and subtest path and rejects non-literal arguments and calls outside tests. At run time the same call records the test's result. 119 calls cover every ID. `verify.TestVerification` fails on an uncovered requirement, deviation, or state, an unknown ID, a mutant detected by nothing, a declared state without a `reach.Hit` and a matching Antithesis assertion, a test package without `verify.Main`, and a stale /docs/verification.md. `make verification` regenerates the document and the kill matrix.
+
+Uncovered IDs at the start: all 66, since nothing declared coverage. After tagging the existing tests, four had no test at all: `AC-8.2` (the harness was only checked by `make antithesis`), `AC-8.3` (cross-compilation), `AC-8.1` (assertions marking invariants), and `AC-4.4` as a machine check. I closed them with `TestCommands` in /antithesis/workload/main_test.go (every test command names a workload command, the compose file runs versitygw and the workload, the sim command runs eight seeds from a fixed source, and `go build` for linux/amd64 succeeds), and with subtests of `verify.TestVerification`. The 13 `STATE-` IDs are covered by the corpus test.
+
+Kill matrix. `sim.TestMutants` now has a catalog of eight mutants, each with an ID, a `make replay` name, the cells that cannot detect it with a reason, and the checkers that must catch it. It runs each in eight cells (list-append or bank, engine or SQL, 0 or 2 maintainers), seeds 1 to 20, records the first seed and the checkers (`sim.Result.Checkers`, from the new `sim.Anomaly` wrapper), and compares the matrix with /internal/sim/testdata/kill-matrix.json. It fails when a cell detects a mutant it is said not to, misses one without a reason, or the intended checker never fires. `make replay` takes `MAINTAINERS=` and `CORPUS=1`, and every mutation name, from the catalog.
+
+Reached states. `/internal/reach` declares 13 states with an Antithesis message each and counts `reach.Hit` calls in a `reach.Counter` carried by the context, so counting is exact per run and costs one context lookup elsewhere. The engine hits lost acknowledgements resolved as landed and as conflicts, compaction and GC rebases, lease takeovers after expiry, and retried block reads that succeed; the SQL layer hits autocommit conflict retries; the simulator hits unknown outcomes in live clients, refused expired snapshots, crashes during commits followed by a later successful commit, crashes during compactions and GC passes, and overlapping lease holders, which a store wrapper (`sim.leaseWatch`) sees before every request. Seven assertions are new; six reuse existing messages.
+
+Report. Every test package has `TestMain` calling `verify.Main`, which appends JSON lines to `pkg-<package>.jsonl` in `MARAGUDB_VERIFY_DIR`, or, when only `GITHUB_STEP_SUMMARY` is set, in a temp directory named after the summary file. At the start and the end of every binary it takes an flock in that directory, re-renders the report over every package's facts, and rewrites the summary file with its original content in front. Facts: simulator batches, mutant cells, reached counts, differential totals, budgets via `verify.CheckBudget`, Tigris latencies, and per-test coverage results; `make antithesis` appends its command results. `make report` renders `.verify`.
+
+Gaps. The SQL list-append workload keeps odd keys as one row of `packed` that appends update in place (overwrite in transactions, `vals || $1` in autocommit), and half the SQL bank transfers overwrite balances. `MUT-COMPACTED-AHEAD` is now detected through SQL with seed 1; with the packed lists turned off it is not detected in 20 seeds. `pgdiff.Postgres` creates `maragudb_diff_<unix>_<random>` from template0 with LOCALE 'C' once per process, `pgdiff.DropDatabase` drops it from `TestMain`, and databases over a day old are dropped.
+
+A writer sub-agent wrote the README section "How do we know it works?", the Development updates, and the introduction of /docs/verification.md, which lives in `verify.docIntro`. I corrected one sentence that said all eight mutants are caught by the simulator.
+
+### Why
+
+A static declaration is checkable without running the suite, so the map and its golden test work in any single package run. Recording the same call at run time lets the report say which IDs passed in this run. The report has to come from the test binaries themselves because the shared workflow cannot get a step; rewriting the whole summary under a lock means the last binary to finish leaves a complete report, whatever the order, and a binary that panics still shows as "did not finish" because its start was published.
+
+### What worked
+
+- The corpus reaches every state. In the last run: lost ack landed 440, lost ack conflict 1,696, live unknown 211, autocommit retry 789, compaction rebase 510, GC rebase 698, lease takeover 27, lease overlap 16, expired snapshot refused 443, block read retried then succeeded 2,720, crash mid-commit recovered 253, crash mid-compaction 134, crash mid-GC 227.
+- Kill matrix: 7 of 8 mutants detected by the simulator, in 24 of 52 applicable cells, all with seed 1 or 2; `MUT-UPDATE-SEES-OWN-WRITES` only by its unit test, because no workload updates primary keys. My first guesses for the undetectable cells all matched the runs.
+- The golden kill matrix and the corpus pass unchanged in a linux/amd64 golang:1.27 container, so the seeds are portable.
+- Two concurrent `go test ./internal/pgdiff` processes, one with `-race`, both pass and leave no databases.
+- A run whose `internal/sim` binary timed out (`-timeout 2s`) still produced a summary with "Package `internal/sim` did not finish."
+- `make test` 17 s, `go test -race ./...` about 2 min 13 s (the simulator package is 130 s of it), `make lint` clean, `make antithesis` passes with 5 of 5 commands in the report.
+
+### What didn't work
+
+- My first insertion script for TestMain asserted `'func TestMain' not in s` and stopped at /maragudb_test.go with `AssertionError: maragudb_test.go`, because `func TestMaintenance` contains that text.
+- The Covers insertion stopped with `internal/sql/exec/exec_test.go: anchor 't.Run("checks constraints and types"' matches 2 lines`; I added an nth-match syntax.
+- A Python heredoc that edited the Makefile was refused by a safety check because its text contained `rm -f $(VERIFY_DIR)/...`; I made the edits with the editor and used `find ... -delete` in the target.
+- The first linux/amd64 check failed with `docker: Error response from daemon: mkdir /var/lib/docker/overlay2/...: read-only file system`, then the machine ran out of disk. After Docker restarted, the image pulled during the outage was corrupt (`/usr/local/go/src/runtime/abi_test.go:1:1: expected 'package', found 'EOF'`); removing and pulling it again fixed that. `gofmt -l` then flagged /internal/sim/sim.go, which was only struct field alignment, not truncation.
+- An early test of the new required-checker rule passed for the wrong reason: `go test -run TestMutants/MUT-GC` failed the golden comparison because only one mutant ran. The golden comparison now skips partial runs, and the rule fails on its own when the expected checker is wrong.
+
+### Self-review
+
+I ran the code-review skill at high effort over the three earlier commits and the working tree. It found ten issues, none disputed, all fixed:
+
+- The kill-matrix rewrite had dropped the old per-mutant `detectedBy` checks. Each mutant now names the checkers that must catch it somewhere, and a cell without maintainers must be detected by a history checker.
+- A corrupt packed list read mid-run counted as a failed read; it is an anomaly now.
+- Replay hints did not reproduce corpus configurations. `failReport` prints the whole configuration and `make replay ... CORPUS=1` or the maintenance flags.
+- The new sim-command test drew seeds from the SDK's random source, which made `make test` nondeterministic; it uses a fixed PCG.
+- The Tigris tests could fail before any `Covers` registered, so their IDs read "not run"; the parent tests declare `AC-7.1` first.
+- A pgdiff test cleanup used a cancelled `t.Context()` and left a database behind; it uses `context.Background()`.
+- An empty reached-state map vanished under `omitempty`.
+- The differential fact was recorded before the failure guard and included shrinking cases.
+- Budget limits were written twice; `verify.CheckBudget` records and asserts in one place.
+- The verify tests parsed the module six times; they parse it once.
+
+### What I learned
+
+- The Antithesis SDK keeps only the first pass and fail per message and needs literal messages at the call site, so counting has to sit next to the assertion, not inside a wrapper.
+- `testing` runs cleanups for a panicking test, but not the code after `m.Run`, so a "started" fact published at the beginning is what lets a crashed package show up at all.
+- Go's test cache stays out of the way here: every binary reads `GITHUB_STEP_SUMMARY` in CI, and `-shuffle` is not a cacheable flag.
+
+### What was tricky
+
+- Deciding what counts as a lost acknowledgement resolved as a conflict. An ambiguous answer can come from a lost acknowledgement that hid a 412 or from a failed request; the client cannot tell them apart, so the state counts both, and its description says so.
+- Overlapping lease holders can only be seen from outside the engine. The lease holder only changes while one of its own requests is in flight, so looking before every request sees every overlap.
+- Extracting readable requirement text from tags without changing the documents. Tags after the sentence they name, plus the bold title of the enclosing item, give fragments such as "Serializability under faults: errors".
+
+### What warrants review
+
+- /internal/verify/report.go `publishTo` and /internal/verify/verify.go `Main`: the lock, the kept prefix, and the latest-PID rule.
+- /internal/verify/scan.go `Source.walkTest`: the subtest attribution. A `t.Run` with a non-literal name becomes `*`.
+- /internal/sim/sim_test.go `mutants` and `TestMutants`: the stated reasons in the matrix.
+- /internal/engine/engine.go `casManifest`: the `ambiguous` flag that separates the conflict state from an ordinary conflict.
+- Run `make test`, `make report`, `make verification` (no diff expected), `go test -race ./...`, `make lint`, and `make antithesis`.
+
+### Future work
+
+- `INV-TYPES` reads "Types: NULL is supported." in the map, because the tag sits on the table's last line; a tag placement or an override would read better.
+- The real-store workload in /internal/workload still has the insert-only SQL list-append; it could take the same packed lists.
+- The simulator package takes about two minutes under `-race` in CI; the mutant matrix and corpus could share runs if that grows.
+- Only tests that call `verify.Covers` show up by name under "What failed"; other failures show as a failed package.
