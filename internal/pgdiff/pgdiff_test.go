@@ -17,6 +17,12 @@ import (
 	"maragu.dev/maragudb/internal/sql/ast"
 )
 
+func TestMain(m *testing.M) {
+	code := m.Run()
+	pgdiff.DropDatabase()
+	os.Exit(code)
+}
+
 func newRunner(t *testing.T) *pgdiff.Runner {
 	t.Helper()
 	return &pgdiff.Runner{PG: pgdiff.Postgres(t), New: func() (*sql.DB, error) {
