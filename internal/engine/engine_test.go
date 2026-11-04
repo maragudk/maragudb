@@ -849,11 +849,20 @@ func TestDB_Tigris(t *testing.T) {
 	})
 
 	t.Run("compaction and GC keep the data and bound the objects", func(t *testing.T) {
-		grace := time.Second
-		db := open(t, 50, engine.Options{GCGracePeriod: &grace})
+		// Write with the default grace period and time each commit, so the grace period below is
+		// sized from this run's network latency instead of assumed.
+		writer := open(t, 50, engine.Options{})
+		var slowest time.Duration
 		for i := range 3 {
-			put(t, db, fmt.Sprint("k", i), fmt.Sprint("v", i))
+			start := time.Now()
+			put(t, writer, fmt.Sprint("k", i), fmt.Sprint("v", i))
+			slowest = max(slowest, time.Since(start))
 		}
+		// Compaction takes about twice the requests of a commit and must finish within the grace
+		// period, so five times the slowest commit leaves room for latency spikes.
+		grace := max(2*time.Second, 5*slowest)
+		t.Logf("slowest commit: %v, grace period: %v", slowest.Round(time.Millisecond), grace.Round(time.Millisecond))
+		db := open(t, 51, engine.Options{GCGracePeriod: &grace})
 		start := time.Now()
 		for {
 			err := db.Compact(t.Context())
@@ -864,10 +873,12 @@ func TestDB_Tigris(t *testing.T) {
 		}
 		t.Logf("compaction: %v", time.Since(start).Round(time.Millisecond))
 		is.Equal(t, 1, db.Stats().Segments)
-		_, err := db.GC(t.Context())
-		is.NotError(t, err)
-		time.Sleep(grace)
 		n, err := db.GC(t.Context())
+		is.NotError(t, err)
+		is.Equal(t, 0, n, "the first pass only stamps the garbage")
+		// The stamp is taken during the first pass, so a grace period after it returns has elapsed.
+		time.Sleep(grace)
+		n, err = db.GC(t.Context())
 		is.NotError(t, err)
 		is.Equal(t, 3, n, "expired segments were deleted")
 		infos, err := client.List(t.Context(), cfg.Prefix+"/"+strings.ReplaceAll(t.Name(), "/", "-"))

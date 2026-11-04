@@ -335,3 +335,54 @@ I did not change:
 - Under database-granularity conflicts, compaction rarely wins against steady clients. The local real-store runs had zero or one compaction each, which the rebase in the automatic maintenance decision should help.
 - An `ObjectInfo` with sizes and modification times on the public store contract, if the lease or size-based compaction needs them.
 - Launching a first Antithesis run once there is an account, and then triaging which reach claims fire.
+
+## Step 5: Making the Tigris compaction test robust to network latency
+
+**Author:** fix-tigris-flake
+
+### Prompt Context
+
+**Verbatim prompt:** Fix a test in maragudb, an embedded Go SQL database on S3, that is sensitive to network latency. CI failed on GitHub Actions (ubuntu runners, far from Tigris) with: `--- FAIL: TestDB_Tigris/compaction_and_GC_keep_the_data_and_bound_the_objects (2.79s) engine_test.go:855: Expected nil error, but got "engine: snapshot expired, the transaction is older than the GC grace period: transaction is 1.21715065s old"`. Make the test robust to real network latency of several seconds per operation, without weakening what it verifies. Use a grace period with generous headroom, a few multiples of the measured operation latency or a fixed number of seconds. Avoid sleeping for long periods. Check the rest of `TestDB_Tigris` and `/internal/s3/aws_test.go` for the same class of timing assumption. Do not change engine behavior.
+**Interpretation:** Size the test's GC grace period from the latency of the run, not a fixed second, and look for other wall-clock assumptions in the Tigris suites.
+**Inferred intent:** Keep the Tigris suite green on CI runners far from Tigris without losing its coverage of compaction and GC.
+
+### What I did
+
+In `/internal/engine/engine_test.go`, the compaction subtest now opens a writer with the default grace period, writes the three keys, and times each commit. It then opens a second `engine.DB` on the same prefix with `GCGracePeriod` set to `max(2s, 5 × slowest commit)`, and runs compaction and both GC passes with that DB. The test logs the slowest commit and the grace period it chose. It now also asserts that the first GC pass deletes nothing (`n == 0`), because that pass only stamps the garbage. The second pass after the sleep must still delete all three segments.
+
+In `/internal/tigristest/tigristest.go`, cleanup used to share one one-minute context between the List call and every Delete. Under seconds of latency per request, a large prefix could run out of time and leave objects behind. Now each request gets its own one-minute timeout.
+
+I checked the other two subtests of `TestDB_Tigris` and `/internal/s3/aws_test.go`. Both other subtests use the default one-hour grace period, and `aws_test.go` only logs its timings and asserts nothing about them, so neither needed a change.
+
+### Why
+
+The engine is correct to refuse a transaction older than the grace period. The CI failure came from the test: a one-second grace period cannot hold when a single commit takes 1.2 s. If the grace period scales with measured latency, the test keeps checking the same behavior at any distance from Tigris. Locally the sleep goes from 1 s to the 2 s floor.
+
+### What worked
+
+To simulate latency, I used a temporary `slowClient` wrapper in the engine test package. It sleeps between d and 2d before every Get, Put, Delete, and List. With `SLOW=600ms`, the old test failed every time with the CI error (`transaction is 1.0661915s old`, `1.139762042s old`). The new test passed both runs of the full `TestDB_Tigris` at the same delay: the slowest commit was about 3 s, the grace period about 15 s, and compaction about 6 s. I then deleted the wrapper. It added no lasting value, because the delay is a test-only hack and `tigristest.NewClient` returns the concrete `*s3.AWSClient`.
+
+`make test`, `go test -race ./...`, and `make lint` pass.
+
+I ran the code-review skill at low effort. It found no issues in the `tigristest` cleanup, but it skips test files at that level, so I reviewed the test change myself. Two DBs can share one prefix: the cross-process subtest already relies on that. The writer and the compacting DB use different seeds (50 and 51), so their object IDs cannot collide.
+
+### What didn't work
+
+At first I used a 300 to 500 ms delay per request, and the old test still passed (`ok ... 43.468s` for `-count 3`). At that delay a commit stays under one second. I had to double the delay to reproduce the CI failure before I could trust the fix.
+
+### What I learned
+
+The grace period applies to two things at once. A transaction must finish within it, and GC must wait for it to pass after the stamping pass. A bigger grace period makes the test robust, but the test must then sleep for the whole period. So the multiplier is a trade-off between headroom and suite time. Five times the slowest commit gives compaction, which takes about twice the requests of a commit, more than twice the time it needs.
+
+### What was tricky
+
+The sleep must start after the first GC pass returns, not before it starts. The stamp comes from `db.now()` inside the pass, after the manifest refresh, so only the time after the pass returns is a safe lower bound.
+
+### What warrants review
+
+- `/internal/engine/engine_test.go`, the compaction subtest: the grace formula, and the assertion that the first GC pass deletes nothing.
+- To check under latency again, add a wrapper around `s3.Client` that sleeps per request and run `go test ./internal/engine -run TestDB_Tigris -count 2 -v`.
+
+### Future work
+
+- With several seconds of latency per request, the whole Tigris suite takes about two minutes, almost all of it in requests. Nothing here needs fixing, but it limits how far from Tigris CI can run before `go test`'s default ten-minute timeout matters.

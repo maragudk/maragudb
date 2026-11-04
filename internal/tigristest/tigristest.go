@@ -111,15 +111,19 @@ func NewClient(t testing.TB) (*s3.AWSClient, Config) {
 		t.Fatalf("creating Tigris client: %v", err)
 	}
 	t.Cleanup(func() {
+		// Each request gets its own timeout, so slow requests cannot starve the deletes of a large prefix.
 		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-		defer cancel()
 		infos, err := client.List(ctx, cfg.Prefix)
+		cancel()
 		if err != nil {
 			t.Logf("cleanup: listing %q: %v", cfg.Prefix, err)
 			return
 		}
 		for _, info := range infos {
-			if err := client.Delete(ctx, info.Key); err != nil {
+			ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+			err := client.Delete(ctx, info.Key)
+			cancel()
+			if err != nil {
 				t.Logf("cleanup: deleting %q: %v", info.Key, err)
 			}
 		}
