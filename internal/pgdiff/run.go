@@ -14,6 +14,7 @@ import (
 
 	"maragu.dev/maragudb"
 	"maragu.dev/maragudb/internal/sql/ast"
+	"maragu.dev/maragudb/internal/sql/parser"
 )
 
 // Runner runs cases on Postgres and on a fresh maragudb per case. Runs are serialized, because
@@ -107,10 +108,51 @@ func (m *Mismatch) Error() string {
 // statements.
 type sides struct {
 	pg, m *sql.Conn
-	pk    []string
+	// keys maps every table that exists on both sides to its primary key columns.
+	keys map[string][]string
 	// inTx reports whether an explicit transaction is open on both sides, and readOnly whether
 	// it is read-only.
 	inTx, readOnly bool
+}
+
+// Session compares statements on one connection to each database, which share their state:
+// the tables and an explicit transaction.
+type Session struct {
+	s sides
+}
+
+// NewSession on a connection to Postgres and one to maragudb, with no tables and no open
+// transaction.
+func NewSession(pg, m *sql.Conn) *Session {
+	return &Session{s: sides{pg: pg, m: m, keys: map[string][]string{}}}
+}
+
+// Outcome of a statement on both sides.
+type Outcome struct {
+	// Executed reports whether the statement ran on both sides, as opposed to being rejected by
+	// maragudb with [maragudb.ErrUnsupported].
+	Executed bool
+	// Rejection is the reason of the rejection, when it was rejected.
+	Rejection string
+	// Err is the Postgres error, when the statement failed on both sides.
+	Err error
+}
+
+// Exec runs the statement on both sides and compares the outcomes, with the same rules as
+// [Runner.Run], and adds what it did to the report. It returns a [*Mismatch] error when the
+// sides disagree, and another error when a database fails in a way unrelated to the statement.
+func (s *Session) Exec(ctx context.Context, text string, rep *Report) (Outcome, error) {
+	st, err := parser.Parse(text)
+	if err != nil {
+		st = nil
+	}
+	rep.Statements++
+	return s.s.compare(ctx, text, st, rep)
+}
+
+// InTx reports whether an explicit transaction is open on both sides.
+func (s *Session) InTx() bool {
+	return s.s.inTx
 }
 
 // Run a case and compare both sides after every statement. Both run the same SQL text. A
@@ -137,7 +179,7 @@ func (r *Runner) Run(ctx context.Context, c Case) (Report, error) {
 	if _, err := m.ExecContext(ctx, create); err != nil {
 		return rep, fmt.Errorf("maragudb: %s: %w", create, err)
 	}
-	s := &sides{pk: c.Create.PrimaryKey}
+	s := &sides{keys: map[string][]string{tableName: c.Create.PrimaryKey}}
 	if s.pg, err = r.PG.Conn(ctx); err != nil {
 		return rep, fmt.Errorf("postgres: %w", err)
 	}
@@ -157,18 +199,18 @@ func (r *Runner) Run(ctx context.Context, c Case) (Report, error) {
 	}
 	for _, st := range c.Statements {
 		rep.Statements++
-		executed, err := s.compare(ctx, st, &rep)
+		o, err := s.compare(ctx, ast.Render(st), st, &rep)
 		if err != nil {
 			return rep, err
 		}
-		if !executed {
+		if !o.Executed {
 			continue
 		}
 		switch st.(type) {
 		case *ast.Select, *ast.Begin, *ast.Commit, *ast.Rollback:
 		default:
 			var check Report
-			if _, err := s.compare(ctx, stateCheck, &check); err != nil {
+			if _, err := s.compare(ctx, ast.Render(stateCheck), stateCheck, &check); err != nil {
 				return rep, fmt.Errorf("state after %s: %w", ast.Render(st), err)
 			}
 			rep.Checks++
@@ -176,7 +218,7 @@ func (r *Runner) Run(ctx context.Context, c Case) (Report, error) {
 	}
 	if s.inTx {
 		var end Report
-		if _, err := s.compare(ctx, &ast.Rollback{}, &end); err != nil {
+		if _, err := s.compare(ctx, "ROLLBACK", &ast.Rollback{}, &end); err != nil {
 			return rep, err
 		}
 	}
@@ -190,63 +232,70 @@ type result struct {
 	rows     [][]any
 }
 
-// compare runs a statement on both sides and compares the outcomes. It reports whether the
-// statement ran on both, as opposed to being rejected by maragudb.
-func (s *sides) compare(ctx context.Context, st ast.Statement, rep *Report) (bool, error) {
+// compare runs a statement on both sides and compares the outcomes. The statement is text,
+// and st is its parse by maragudb, or nil when maragudb cannot parse it.
+func (s *sides) compare(ctx context.Context, text string, st ast.Statement, rep *Report) (Outcome, error) {
 	if rep.ErrorClasses == nil {
 		rep.ErrorClasses = map[string]int{}
 	}
 	if rep.RejectedFor == nil {
 		rep.RejectedFor = map[string]int{}
 	}
-	text := ast.Render(st)
-	mg := run(ctx, s.m, text)
+	query := isQuery(text, st)
+	mg := run(ctx, s.m, text, query)
 	if errors.Is(mg.err, maragudb.ErrUnsupported) {
+		reason := rejectionReason(mg.err)
 		rep.Rejected++
-		rep.RejectedFor[rejectionReason(mg.err)]++
+		rep.RejectedFor[reason]++
 		if s.inTx {
-			if res := run(ctx, s.pg, "SELECT 1 / 0"); SQLState(res.err) != "22012" && SQLState(res.err) != "25P02" {
-				return false, fmt.Errorf("postgres: aborting the transaction after a rejection: %v", res.err)
+			if res := run(ctx, s.pg, "SELECT 1 / 0", true); SQLState(res.err) != "22012" && SQLState(res.err) != "25P02" {
+				return Outcome{}, fmt.Errorf("postgres: aborting the transaction after a rejection: %v", res.err)
 			}
 		}
-		return false, nil
+		return Outcome{Rejection: reason}, nil
 	}
 	rep.Executed++
+	executed := Outcome{Executed: true}
 	if s.inTx {
 		if _, err := s.pg.ExecContext(ctx, "SAVEPOINT pgdiff"); err != nil && SQLState(err) != "25P02" {
-			return true, fmt.Errorf("postgres: %w", err)
+			return executed, fmt.Errorf("postgres: %w", err)
 		}
 	}
-	pg := run(ctx, s.pg, text)
+	pg := run(ctx, s.pg, text, query)
 	mismatch := func(detail string) error {
 		return &Mismatch{Statement: text, Postgres: describe(pg), Maragudb: describe(mg), Detail: detail}
 	}
 	if (pg.err != nil) != (mg.err != nil) {
-		return true, mismatch("one side failed and the other succeeded")
+		return executed, mismatch("one side failed and the other succeeded")
 	}
 	if pg.err != nil {
 		rep.Errors++
+		executed.Err = pg.err
 		if !SameClass(mg.err, pg.err) {
 			if s.readOnly {
 				// A read-only transaction cannot store the rows again, and the writes in it fail
 				// before they read rows.
-				return true, mismatch(fmt.Sprintf("both failed, for different reasons: postgres SQLSTATE %s, maragudb %s", SQLState(pg.err), className(mg.err)))
+				return executed, mismatch(fmt.Sprintf("both failed, for different reasons: postgres SQLSTATE %s, maragudb %s", SQLState(pg.err), className(mg.err)))
 			}
 			// Different rows can fail for different reasons, and maragudb visits rows in key order
 			// where Postgres visits them in the order they are stored. Postgres gets the same
 			// chance in key order before this counts as a mismatch.
-			ordered, err := s.inKeyOrder(ctx, text)
+			table := tableOf(st)
+			if s.keys[table] == nil {
+				return executed, mismatch(fmt.Sprintf("both failed, for different reasons: postgres SQLSTATE %s, maragudb %s", SQLState(pg.err), className(mg.err)))
+			}
+			ordered, err := s.inKeyOrder(ctx, text, table)
 			if err != nil {
-				return true, err
+				return executed, err
 			}
 			if !SameClass(mg.err, ordered) {
-				return true, mismatch(fmt.Sprintf("both failed, for different reasons: postgres SQLSTATE %s, maragudb %s", SQLState(pg.err), className(mg.err)))
+				return executed, mismatch(fmt.Sprintf("both failed, for different reasons: postgres SQLSTATE %s, maragudb %s", SQLState(pg.err), className(mg.err)))
 			}
 			rep.Reordered++
 			pg.err = ordered
 		}
 		rep.ErrorClasses[ClassOf(mg.err).Name+"/"+SQLState(pg.err)]++
-		return true, nil
+		return executed, nil
 	}
 	rep.OK++
 	switch st := st.(type) {
@@ -258,23 +307,29 @@ func (s *sides) compare(ctx context.Context, st ast.Statement, rep *Report) (boo
 		s.inTx = true
 	case *ast.Commit, *ast.Rollback:
 		s.inTx, s.readOnly = false, false
+	case *ast.CreateTable:
+		// A table created in a transaction that rolls back is gone again, which only matters
+		// for the reruns in key order, which then fail.
+		s.keys[st.Name] = st.PrimaryKey
+	case *ast.DropTable:
+		delete(s.keys, st.Name)
 	}
 	sel, isSelect := st.(*ast.Select)
 	if !isSelect {
 		if pg.affected != mg.affected {
-			return true, mismatch(fmt.Sprintf("rows affected: postgres %d, maragudb %d", pg.affected, mg.affected))
+			return executed, mismatch(fmt.Sprintf("rows affected: postgres %d, maragudb %d", pg.affected, mg.affected))
 		}
-		return true, nil
+		return executed, nil
 	}
 	rep.Rows += len(mg.rows)
 	if strings.Join(pg.cols, ",") != strings.Join(mg.cols, ",") {
-		return true, mismatch(fmt.Sprintf("columns: postgres %q, maragudb %q", pg.cols, mg.cols))
+		return executed, mismatch(fmt.Sprintf("columns: postgres %q, maragudb %q", pg.cols, mg.cols))
 	}
 	if len(pg.rows) != len(mg.rows) {
-		return true, mismatch(fmt.Sprintf("row count: postgres %d, maragudb %d", len(pg.rows), len(mg.rows)))
+		return executed, mismatch(fmt.Sprintf("row count: postgres %d, maragudb %d", len(pg.rows), len(mg.rows)))
 	}
 	pgRows, mgRows := canonical(pg.rows), canonical(mg.rows)
-	if FullyOrdered(sel, s.pk) {
+	if FullyOrdered(sel, s.keys[sel.From]) {
 		rep.Ordered++
 	} else {
 		sort.Strings(pgRows)
@@ -282,10 +337,41 @@ func (s *sides) compare(ctx context.Context, st ast.Statement, rep *Report) (boo
 	}
 	for i := range pgRows {
 		if pgRows[i] != mgRows[i] {
-			return true, mismatch(fmt.Sprintf("row %d differs:\n    postgres: %s\n    maragudb: %s", i, pgRows[i], mgRows[i]))
+			return executed, mismatch(fmt.Sprintf("row %d differs:\n    postgres: %s\n    maragudb: %s", i, pgRows[i], mgRows[i]))
 		}
 	}
-	return true, nil
+	return executed, nil
+}
+
+// isQuery reports whether a statement returns rows: when maragudb parses it as a SELECT, or
+// when it cannot parse it and it starts like a query.
+func isQuery(text string, st ast.Statement) bool {
+	if st != nil {
+		_, ok := st.(*ast.Select)
+		return ok
+	}
+	head := strings.ToUpper(strings.TrimLeft(text, " \t\r\n("))
+	for _, prefix := range []string{"SELECT", "VALUES", "WITH", "TABLE"} {
+		if strings.HasPrefix(head, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// tableOf the statement, the table it reads or writes, or "" when it has none.
+func tableOf(st ast.Statement) string {
+	switch st := st.(type) {
+	case *ast.Select:
+		return st.From
+	case *ast.Insert:
+		return st.Table
+	case *ast.Update:
+		return st.Table
+	case *ast.Delete:
+		return st.Table
+	}
+	return ""
 }
 
 // rejectionReason is the message of an [maragudb.ErrUnsupported] error, cut before its first
@@ -296,6 +382,7 @@ func rejectionReason(err error) string {
 		msg = after
 	}
 	msg = strings.TrimLeft(msg, ": ")
+	msg = reasonPosition.ReplaceAllString(msg, "")
 	msg = strings.TrimPrefix(msg, "order-dependent: ")
 	for _, sep := range []string{",", ";", " because"} {
 		if i := strings.Index(msg, sep); i >= 0 {
@@ -306,17 +393,22 @@ func rejectionReason(err error) string {
 	return strings.ReplaceAll(strings.TrimSpace(msg), " ", "_")
 }
 
-var reasonDetail = regexp.MustCompile(`"[^"]*"|'[^']*'|\$?\d+|at position _`)
+var (
+	reasonPosition = regexp.MustCompile(`^at position \d+: `)
+	reasonDetail   = regexp.MustCompile(`"[^"]*"|'[^']*'|\$?\d+`)
+)
 
-// inKeyOrder runs a statement that failed on Postgres again, with the table's rows stored in
-// primary key order so that a scan visits them in that order, and returns the statement's error,
-// which is nil if it succeeded. Nothing it does is kept. Inside a transaction, it rolls back to
-// the savepoint taken before the statement, reruns it, and aborts the transaction again.
-func (s *sides) inKeyOrder(ctx context.Context, text string) (error, error) {
+// inKeyOrder runs a statement that failed on Postgres again, with the rows of its table stored
+// in primary key order so that a scan visits them in that order, and returns the statement's
+// error, which is nil if it succeeded. Nothing it does is kept. Inside a transaction, it rolls
+// back to the savepoint taken before the statement, reruns it, and aborts the transaction
+// again.
+func (s *sides) inKeyOrder(ctx context.Context, text, table string) (error, error) {
 	var keys []string
-	for _, k := range s.pk {
+	for _, k := range s.keys[table] {
 		keys = append(keys, ast.RenderExpr(&ast.ColumnRef{Name: k}))
 	}
+	tableName := ast.RenderExpr(&ast.ColumnRef{Name: table})
 	steps := []string{"BEGIN"}
 	if s.inTx {
 		steps = []string{"ROLLBACK TO SAVEPOINT pgdiff"}
@@ -331,7 +423,7 @@ func (s *sides) inKeyOrder(ctx context.Context, text string) (error, error) {
 			return nil, fmt.Errorf("postgres: %s: %w", q, err)
 		}
 	}
-	err := run(ctx, s.pg, text).err
+	err := run(ctx, s.pg, text, isQuery(text, nil)).err
 	end := "ROLLBACK"
 	if s.inTx {
 		end = "ROLLBACK TO SAVEPOINT pgdiff"
@@ -340,7 +432,7 @@ func (s *sides) inKeyOrder(ctx context.Context, text string) (error, error) {
 		return nil, fmt.Errorf("postgres: %s: %w", end, rerr)
 	}
 	if s.inTx {
-		if res := run(ctx, s.pg, "SELECT 1 / 0"); SQLState(res.err) != "22012" {
+		if res := run(ctx, s.pg, "SELECT 1 / 0", true); SQLState(res.err) != "22012" {
 			return nil, fmt.Errorf("postgres: aborting the transaction again: %v", res.err)
 		}
 	}
@@ -363,8 +455,9 @@ type querier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
-func run(ctx context.Context, db querier, sqlText string) result {
-	if !strings.HasPrefix(sqlText, "SELECT") {
+// run a statement, as a query when it returns rows.
+func run(ctx context.Context, db querier, sqlText string, query bool) result {
+	if !query {
 		res, err := db.ExecContext(ctx, sqlText)
 		if err != nil {
 			return result{err: err}
