@@ -285,7 +285,7 @@ func (g *gen) expr(t value.Type, s scope, depth int) ast.Expr {
 			if ref, ok := x.(*ast.ColumnRef); s.safe || ok && g.isKey(ref.Name) {
 				// Postgres turns a LIKE on an indexed column into an index condition and only
 				// evaluates it on the rows the index finds, so whether a trailing escape is an
-				// error depends on its plan. See deviation 17.
+				// error depends on its plan. See deviation 18.
 				pattern = strings.TrimRight(pattern, "\\")
 			}
 			return &ast.Like{Expr: x, Pattern: &ast.Literal{Value: value.NewString(pattern)}, Not: g.bool()}
@@ -422,9 +422,25 @@ func conjuncts(e ast.Expr) []ast.Expr {
 	if b, ok := e.(*ast.Binary); ok && b.Op == ast.And {
 		return append(conjuncts(b.Left), conjuncts(b.Right)...)
 	}
-	if b, ok := e.(*ast.Between); ok && !b.Not {
-		// BETWEEN is two conjuncts in Postgres.
-		return []ast.Expr{e, e}
+	switch x := e.(type) {
+	case *ast.Between:
+		if !x.Not {
+			// BETWEEN is two conjuncts in Postgres.
+			return []ast.Expr{e, e}
+		}
+	case *ast.In:
+		if x.Not && len(x.List) > 1 {
+			// NOT IN is a conjunct per element, or per element that reads columns.
+			return x.List
+		}
+	case *ast.Unary:
+		// Postgres pushes NOT down, so NOT (a OR b) is NOT a AND NOT b.
+		if b, ok := x.Expr.(*ast.Binary); ok && x.Op == ast.Not && b.Op == ast.Or {
+			return append(conjuncts(&ast.Unary{Op: ast.Not, Expr: b.Left}), conjuncts(&ast.Unary{Op: ast.Not, Expr: b.Right})...)
+		}
+		if u, ok := x.Expr.(*ast.Unary); ok && x.Op == ast.Not && u.Op == ast.Not {
+			return conjuncts(u.Expr)
+		}
 	}
 	return []ast.Expr{e}
 }
