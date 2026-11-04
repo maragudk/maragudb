@@ -3,6 +3,7 @@ package pgdiff
 import (
 	"fmt"
 	"math"
+	"math/rand/v2"
 	"strings"
 	"time"
 
@@ -19,9 +20,6 @@ type Case struct {
 	// Statements run in order after the table is created. Mutations are followed by a state
 	// check on both sides.
 	Statements []ast.Statement
-	// ASCII reports whether every string in the case is ASCII, which is when lower and upper
-	// are generated, because Postgres with the C locale folds case only in ASCII.
-	ASCII bool
 }
 
 // Table name used by every case.
@@ -29,40 +27,164 @@ const tableName = "t"
 
 var allTypes = []value.Type{value.Int, value.Float, value.Bool, value.String, value.Bytes, value.Time}
 
-// gen generates one case.
+// gen generates one case. It aims at statements that maragudb accepts, so that most of them
+// are compared with Postgres, and now and then draws a form that maragudb rejects with
+// [exec.ErrUnsupported], such as a LIMIT whose rows depend on Postgres's plan, so that the
+// rejections are exercised too.
 type gen struct {
-	ht    hegel.TestCase
+	src   Source
 	table *ast.CreateTable
-	ascii bool
 	// cols by type.
 	cols map[value.Type][]string
 }
 
+// Source of the generator's choices.
+type Source interface {
+	// Int in [min, max].
+	Int(min, max int64) int64
+	// Float that is finite.
+	Float() float64
+	// Text of at most max characters from alphabet, or of any characters but NUL when
+	// alphabet is empty.
+	Text(alphabet string, max int) string
+	// Bytes, at most max of them.
+	Bytes(max int) []byte
+}
+
+// HegelSource draws the choices from a hegel test case, which shrinks a failing case.
+func HegelSource(ht hegel.TestCase) Source {
+	return hegelSource{ht: ht}
+}
+
+type hegelSource struct {
+	ht hegel.TestCase
+}
+
+func (h hegelSource) Int(min, max int64) int64 {
+	return hegel.Draw(h.ht, hegel.Integers(min, max))
+}
+
+func (h hegelSource) Float() float64 {
+	return hegel.Draw(h.ht, hegel.Floats[float64]().AllowNaN(false).AllowInfinity(false))
+}
+
+func (h hegelSource) Text(alphabet string, max int) string {
+	if alphabet == "" {
+		return hegel.Draw(h.ht, hegel.Text().MaxSize(max).ExcludeCharacters("\x00"))
+	}
+	return hegel.Draw(h.ht, hegel.Text().Alphabet(alphabet).MaxSize(max))
+}
+
+func (h hegelSource) Bytes(max int) []byte {
+	return hegel.Draw(h.ht, hegel.Binary(0, max))
+}
+
+// RandSource draws the choices from r, which gives the same cases for the same seed on every
+// run, unlike hegel.
+func RandSource(r *rand.Rand) Source {
+	return randSource{r: r}
+}
+
+type randSource struct {
+	r *rand.Rand
+}
+
+func (s randSource) Int(min, max int64) int64 {
+	return min + s.r.Int64N(max-min+1)
+}
+
+func (s randSource) Float() float64 {
+	for {
+		if f := math.Float64frombits(s.r.Uint64()); !math.IsNaN(f) && !math.IsInf(f, 0) {
+			return f
+		}
+	}
+}
+
+func (s randSource) Text(alphabet string, max int) string {
+	runes := []rune(alphabet)
+	var b strings.Builder
+	for range s.r.IntN(max + 1) {
+		switch {
+		case len(runes) > 0:
+			b.WriteRune(runes[s.r.IntN(len(runes))])
+		case s.r.IntN(2) == 0:
+			b.WriteRune(rune(1 + s.r.IntN(127)))
+		default:
+			r := rune(0x80 + s.r.IntN(0x2000))
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+func (s randSource) Bytes(max int) []byte {
+	out := make([]byte, s.r.IntN(max+1))
+	for i := range out {
+		out[i] = byte(s.r.UintN(256))
+	}
+	return out
+}
+
 // Generate a case.
-func Generate(ht hegel.TestCase) Case {
-	g := &gen{ht: ht, ascii: hegel.Draw(ht, hegel.WeightedBooleans(0.7)), cols: map[value.Type][]string{}}
+func Generate(src Source) Case {
+	g := &gen{src: src, cols: map[value.Type][]string{}}
 	g.schema()
-	c := Case{Create: g.table, ASCII: g.ascii}
-	c.Statements = append(c.Statements, g.insert(hegel.Draw(ht, hegel.Integers(0, 6))))
-	for range hegel.Draw(ht, hegel.Integers(1, 6)) {
-		c.Statements = append(c.Statements, g.statement())
+	c := Case{Create: g.table}
+	c.Statements = append(c.Statements, g.insert(g.draw(0, 6)))
+	n := g.draw(1, 6)
+	// A third of the cases run some statements in an explicit transaction, which ends with a
+	// COMMIT, a ROLLBACK, or not at all.
+	begin, end := -1, -1
+	if g.draw(0, 2) == 0 {
+		begin = g.draw(0, n-1)
+		end = g.draw(begin, n)
+	}
+	for i := range n + 1 {
+		if i == begin {
+			c.Statements = append(c.Statements, &ast.Begin{ReadOnly: g.draw(0, 4) == 0})
+		}
+		if i == end && i > begin {
+			if g.bool() {
+				c.Statements = append(c.Statements, &ast.Commit{})
+			} else {
+				c.Statements = append(c.Statements, &ast.Rollback{})
+			}
+		}
+		if i < n {
+			c.Statements = append(c.Statements, g.statement())
+		}
 	}
 	return c
 }
 
 func (g *gen) draw(min, max int) int {
-	return hegel.Draw(g.ht, hegel.Integers(min, max))
+	return int(g.src.Int(int64(min), int64(max)))
+}
+
+func (g *gen) int64n(min, max int64) int64 {
+	return g.src.Int(min, max)
 }
 
 func (g *gen) bool() bool {
-	return hegel.Draw(g.ht, hegel.Booleans())
+	return g.src.Int(0, 1) == 1
+}
+
+// pick one of xs.
+func pick[T any](g *gen, xs []T) T {
+	return xs[g.draw(0, len(xs)-1)]
+}
+
+// rarely is true once in n draws.
+func (g *gen) rarely(n int) bool {
+	return g.draw(0, n-1) == 0
 }
 
 func (g *gen) schema() {
 	n := g.draw(1, 5)
 	t := &ast.CreateTable{Name: tableName}
 	for i := range n {
-		typ := hegel.Draw(g.ht, hegel.SampledFrom(allTypes))
+		typ := pick(g, allTypes)
 		name := fmt.Sprint("c", i)
 		t.Columns = append(t.Columns, ast.ColumnDef{Name: name, Type: typ, NotNull: g.draw(0, 4) == 0})
 		g.cols[typ] = append(g.cols[typ], name)
@@ -97,9 +219,60 @@ func (g *gen) isKey(name string) bool {
 	return false
 }
 
-// literal of type t, drawn from a distribution rich in edge cases.
+// literal of type t, written in one of the ways Postgres reads as that type: an integer as its
+// digits, which is an integer or a bigint by its size, or cast to bigint; a float as the cast
+// of its text, as a numeric literal, or as a numeric literal cast to double precision; and the
+// other types as a quoted literal, which takes its type from the context, or as its cast.
 func (g *gen) literal(t value.Type) ast.Expr {
-	return &ast.Literal{Value: g.value(t)}
+	v := g.value(t)
+	switch t {
+	case value.Int:
+		lit := &ast.Literal{Value: v}
+		if g.rarely(4) {
+			return &ast.Cast{Expr: lit, Type: value.Int, Style: ast.CastStyle(g.draw(0, 1))}
+		}
+		return lit
+	case value.Float:
+		text := value.FormatFloat(v.F)
+		finite := !math.IsNaN(v.F) && !math.IsInf(v.F, 0) && !strings.HasPrefix(text, "-")
+		switch {
+		case finite && g.rarely(5):
+			// A numeric literal, which is double precision only next to one.
+			return &ast.Literal{Value: value.NewNumeric(numericText(text))}
+		case finite && g.rarely(4):
+			return &ast.Cast{Expr: &ast.Literal{Value: value.NewNumeric(numericText(text))}, Type: value.Float, Style: ast.CastColons}
+		}
+		return g.typedText(text, t)
+	case value.Bool:
+		if g.rarely(8) {
+			return g.typedText(pick(g, []string{"t", "true", "no", "off", "1", " yes "}), t)
+		}
+		return &ast.Literal{Value: v}
+	}
+	text := value.Format(v)
+	if t == value.Time && g.rarely(3) {
+		// The ISO 8601 forms that Postgres reads, with a T, a zone of its own, or more digits than
+		// microseconds, which Postgres rounds.
+		at := v.T.Add(time.Duration(g.draw(0, 999))).In(time.FixedZone("", 3600*g.draw(-12, 14)))
+		text = at.Format(pick(g, []string{"2006-01-02T15:04:05.999999Z07:00", "2006-01-02 15:04:05.999999999-0700", "2006-01-02 15:04:05.999999-07", "2006-01-02 15:04:05"}))
+	}
+	if t != value.String && g.rarely(3) || t == value.String && g.rarely(6) {
+		return g.typedText(text, t)
+	}
+	return &ast.Literal{Value: value.NewUnknown(text)}
+}
+
+// numericText writes the text of a float as a numeric literal, with a decimal point.
+func numericText(s string) string {
+	if !strings.ContainsAny(s, ".e") {
+		s += ".0"
+	}
+	return s
+}
+
+// typedText is a quoted literal cast to type t.
+func (g *gen) typedText(text string, t value.Type) ast.Expr {
+	return &ast.Cast{Expr: &ast.Literal{Value: value.NewUnknown(text)}, Type: t, Style: ast.CastStyle(g.draw(0, 2))}
 }
 
 func (g *gen) value(t value.Type) value.Value {
@@ -107,18 +280,18 @@ func (g *gen) value(t value.Type) value.Value {
 	case value.Int:
 		switch g.draw(0, 9) {
 		case 0:
-			return value.NewInt(hegel.Draw(g.ht, hegel.SampledFrom([]int64{math.MinInt64, math.MaxInt64, math.MinInt64 + 1, math.MaxInt64 - 1, 1 << 32, -(1 << 32)})))
+			return value.NewInt(pick(g, []int64{math.MinInt64, math.MaxInt64, math.MinInt64 + 1, math.MaxInt64 - 1, 1 << 32, -(1 << 32), math.MaxInt32, math.MinInt32, math.MaxInt32 + 1}))
 		case 1, 2:
-			return value.NewInt(hegel.Draw(g.ht, hegel.Integers[int64](-100000, 100000)))
+			return value.NewInt(g.int64n(-100000, 100000))
 		default:
-			return value.NewInt(hegel.Draw(g.ht, hegel.Integers[int64](-5, 5)))
+			return value.NewInt(g.int64n(-5, 5))
 		}
 	case value.Float:
 		switch g.draw(0, 9) {
 		case 0:
-			return value.NewFloat(hegel.Draw(g.ht, hegel.SampledFrom([]float64{math.NaN(), math.Inf(1), math.Inf(-1), math.Copysign(0, -1), math.MaxFloat64, -math.MaxFloat64, math.SmallestNonzeroFloat64, 1e308, 1e-308})))
+			return value.NewFloat(pick(g, []float64{math.NaN(), math.Inf(1), math.Inf(-1), math.Copysign(0, -1), math.MaxFloat64, -math.MaxFloat64, math.SmallestNonzeroFloat64, 1e308, 1e-308, 1e15, 1e-5, 123456789012345678}))
 		case 1, 2:
-			return value.NewFloat(hegel.Draw(g.ht, hegel.Floats[float64]().AllowNaN(false).AllowInfinity(false)))
+			return value.NewFloat(g.src.Float())
 		case 3:
 			return value.NewFloat(float64(g.draw(-5, 5)))
 		default:
@@ -127,20 +300,19 @@ func (g *gen) value(t value.Type) value.Value {
 	case value.Bool:
 		return value.NewBool(g.bool())
 	case value.String:
-		if g.ascii {
-			return value.NewString(hegel.Draw(g.ht, hegel.Text().Alphabet("abcAB _%\\'\"").MaxSize(6)))
+		if g.rarely(3) {
+			return value.NewString(g.src.Text("", 6))
 		}
-		return value.NewString(hegel.Draw(g.ht, hegel.Text().MaxSize(6).ExcludeCharacters("\x00")))
+		return value.NewString(g.src.Text("abcAB _%\\'\"ÄéΣ", 6))
 	case value.Bytes:
-		return value.NewBytes(hegel.Draw(g.ht, hegel.Binary(0, 4)))
+		return value.NewBytes(g.src.Bytes(4))
 	case value.Time:
-		// Microsecond precision, which is what Postgres keeps.
-		sec := hegel.Draw(g.ht, hegel.Integers[int64](-2208988800, 4102444800))
-		usec := hegel.Draw(g.ht, hegel.Integers[int64](0, 999999))
+		sec := g.int64n(-2208988800, 4102444800)
+		nsec := g.int64n(0, 999999999)
 		if g.draw(0, 3) == 0 {
-			usec = 0
+			nsec = 0
 		}
-		return value.NewTime(time.Unix(sec, usec*1000))
+		return value.NewTime(time.Unix(sec, nsec))
 	}
 	panic(t)
 }
@@ -149,8 +321,8 @@ func (g *gen) value(t value.Type) value.Value {
 type scope struct {
 	// columns may be referenced.
 	columns bool
-	// safe forbids expressions that can fail at runtime, for queries with LIMIT or OFFSET,
-	// where Postgres may evaluate fewer rows than maragudb.
+	// safe forbids expressions that can fail at runtime, which maragudb rejects where the rows
+	// Postgres evaluates them on depend on its plan, as under a LIMIT.
 	safe bool
 	// null allows a bare NULL literal here.
 	null bool
@@ -168,14 +340,13 @@ func (g *gen) expr(t value.Type, s scope, depth int) ast.Expr {
 	}
 	s = s.withNull(false)
 	if s.columns && len(g.cols[t]) > 0 && g.draw(0, 2) == 0 {
-		return &ast.ColumnRef{Name: hegel.Draw(g.ht, hegel.SampledFrom(g.cols[t]))}
+		return &ast.ColumnRef{Name: pick(g, g.cols[t])}
 	}
 	if depth >= 3 || g.draw(0, 3) == 0 {
 		return g.literal(t)
 	}
 	depth++
-	// Forms shared by every type. At least one result or argument is not a bare NULL, because
-	// Postgres types an all-NULL CASE or COALESCE as text and then coerces it loosely.
+	// Forms shared by every type.
 	switch g.draw(0, 9) {
 	case 0:
 		c := &ast.Case{}
@@ -206,31 +377,34 @@ func (g *gen) expr(t value.Type, s scope, depth int) ast.Expr {
 	case value.Int:
 		switch g.draw(0, 7) {
 		case 0:
-			return &ast.Call{Name: "length", Args: []ast.Expr{g.expr(hegel.Draw(g.ht, hegel.SampledFrom([]value.Type{value.String, value.Bytes})), s.withNull(true), depth)}}
+			return &ast.Call{Name: "length", Args: []ast.Expr{g.expr(pick(g, []value.Type{value.String, value.Bytes}), s.withNull(true), depth)}}
 		case 1:
 			if s.safe {
 				return g.literal(t)
 			}
-			// Never a bare NULL: Postgres types abs(NULL) as double precision.
-			return &ast.Call{Name: "abs", Args: []ast.Expr{g.expr(t, s, depth)}}
+			return &ast.Call{Name: "abs", Args: []ast.Expr{g.expr(t, s.withNull(g.rarely(4)), depth)}}
 		case 2:
 			if s.safe {
 				return g.literal(t)
 			}
-			return &ast.Unary{Op: ast.Neg, Expr: g.expr(t, s, depth)}
+			return &ast.Unary{Op: pick(g, []ast.UnaryOp{ast.Neg, ast.Neg, ast.Pos}), Expr: g.expr(t, s, depth)}
 		case 3:
 			if s.safe {
 				return g.literal(t)
 			}
-			return &ast.Cast{Expr: g.expr(value.Float, s.withNull(true), depth), Type: value.Int}
+			return &ast.Cast{Expr: g.expr(value.Float, s.withNull(true), depth), Type: value.Int, Style: ast.CastStyle(g.draw(0, 1))}
 		case 4:
-			// A string that came from an int reads back as that int.
-			return &ast.Cast{Expr: &ast.Cast{Expr: g.expr(value.Int, s.withNull(true), depth), Type: value.String}, Type: value.Int}
+			if s.safe {
+				return g.literal(t)
+			}
+			// A string that came from a bigint reads back as that bigint, and other text mostly
+			// fails.
+			return &ast.Cast{Expr: g.expr(value.String, s.withNull(true), depth), Type: value.Int}
 		default:
 			if s.safe {
 				return g.literal(t)
 			}
-			op := hegel.Draw(g.ht, hegel.SampledFrom([]ast.BinaryOp{ast.Add, ast.Sub, ast.Mul, ast.Div, ast.Mod}))
+			op := pick(g, []ast.BinaryOp{ast.Add, ast.Sub, ast.Mul, ast.Div, ast.Mod})
 			return &ast.Binary{Op: op, Left: g.expr(t, s, depth), Right: g.expr(t, s.withNull(true), depth)}
 		}
 	case value.Float:
@@ -243,18 +417,17 @@ func (g *gen) expr(t value.Type, s scope, depth int) ast.Expr {
 			return &ast.Cast{Expr: g.expr(value.Int, s.withNull(true), depth), Type: value.Float}
 		case 3:
 			if s.safe {
-				// A subnormal float does not read back.
 				return g.literal(t)
 			}
 			return &ast.Cast{Expr: &ast.Cast{Expr: g.expr(value.Float, s.withNull(true), depth), Type: value.String}, Type: value.Float}
 		case 4:
-			// An integer literal adapts to a float.
+			// An integer adapts to a double precision.
 			return &ast.Binary{Op: ast.Add, Left: g.expr(t, s, depth), Right: g.literal(value.Int)}
 		default:
 			if s.safe {
 				return g.literal(t)
 			}
-			op := hegel.Draw(g.ht, hegel.SampledFrom([]ast.BinaryOp{ast.Add, ast.Sub, ast.Mul, ast.Div}))
+			op := pick(g, []ast.BinaryOp{ast.Add, ast.Sub, ast.Mul, ast.Div})
 			return &ast.Binary{Op: op, Left: g.expr(t, s, depth), Right: g.expr(t, s.withNull(true), depth)}
 		}
 	case value.Bool:
@@ -262,7 +435,7 @@ func (g *gen) expr(t value.Type, s scope, depth int) ast.Expr {
 		case 0:
 			return &ast.Unary{Op: ast.Not, Expr: g.expr(t, s.withNull(true), depth)}
 		case 1:
-			op := hegel.Draw(g.ht, hegel.SampledFrom([]ast.BinaryOp{ast.And, ast.Or}))
+			op := pick(g, []ast.BinaryOp{ast.And, ast.Or})
 			return &ast.Binary{Op: op, Left: g.expr(t, s.withNull(true), depth), Right: g.expr(t, s.withNull(true), depth)}
 		case 2:
 			return &ast.IsNull{Expr: g.expr(g.anyType(), s.withNull(true), depth), Not: g.bool()}
@@ -277,45 +450,48 @@ func (g *gen) expr(t value.Type, s scope, depth int) ast.Expr {
 			}
 			return in
 		case 5:
-			pattern := hegel.Draw(g.ht, hegel.Text().Alphabet("ab%_").MaxSize(5))
-			if g.bool() {
-				pattern = hegel.Draw(g.ht, hegel.Text().Alphabet("aA%_\\").MaxSize(5))
+			pattern := g.src.Text("ab%_", 5)
+			if g.bool() && !s.safe {
+				pattern = g.src.Text("aA%_\\", 5)
 			}
-			x := g.expr(value.String, s.withNull(true), depth)
-			if ref, ok := x.(*ast.ColumnRef); s.safe || ok && g.isKey(ref.Name) {
-				// Postgres turns a LIKE on an indexed column into an index condition and only
-				// evaluates it on the rows the index finds, so whether a trailing escape is an
-				// error depends on its plan. See deviation 18.
-				pattern = strings.TrimRight(pattern, "\\")
-			}
-			return &ast.Like{Expr: x, Pattern: &ast.Literal{Value: value.NewString(pattern)}, Not: g.bool()}
+			return &ast.Like{Expr: g.expr(value.String, s.withNull(true), depth), Pattern: &ast.Literal{Value: value.NewUnknown(pattern)}, Not: g.bool()}
 		default:
 			ot := g.anyType()
-			op := hegel.Draw(g.ht, hegel.SampledFrom([]ast.BinaryOp{ast.Eq, ast.Ne, ast.Lt, ast.Le, ast.Gt, ast.Ge}))
+			op := pick(g, []ast.BinaryOp{ast.Eq, ast.Ne, ast.Lt, ast.Le, ast.Gt, ast.Ge})
 			return &ast.Binary{Op: op, Left: g.expr(ot, s, depth), Right: g.expr(ot, s.withNull(true), depth)}
 		}
 	case value.String:
 		switch g.draw(0, 4) {
 		case 0:
-			return &ast.Binary{Op: ast.Concat, Left: g.expr(t, s, depth), Right: g.expr(t, s.withNull(true), depth)}
-		case 1:
-			if !g.ascii {
-				return g.literal(t)
+			// || writes a value of any type next to text as text.
+			rt := t
+			if g.rarely(3) {
+				rt = g.anyType()
 			}
-			name := hegel.Draw(g.ht, hegel.SampledFrom([]string{"lower", "upper"}))
+			return &ast.Binary{Op: ast.Concat, Left: g.expr(t, s, depth), Right: g.expr(rt, s.withNull(true), depth)}
+		case 1:
+			name := pick(g, []string{"lower", "upper"})
 			return &ast.Call{Name: name, Args: []ast.Expr{g.expr(t, s.withNull(true), depth)}}
 		case 2:
-			from := hegel.Draw(g.ht, hegel.SampledFrom([]value.Type{value.Int, value.Float, value.Bool}))
-			return &ast.Cast{Expr: g.expr(from, s.withNull(true), depth), Type: value.String}
+			return &ast.Cast{Expr: g.expr(g.anyType(), s.withNull(true), depth), Type: value.String, Style: ast.CastStyle(g.draw(0, 1))}
 		default:
 			return g.literal(t)
 		}
 	case value.Bytes:
-		if g.bool() {
+		switch g.draw(0, 2) {
+		case 0:
 			return &ast.Binary{Op: ast.Concat, Left: g.expr(t, s, depth), Right: g.expr(t, s.withNull(true), depth)}
+		case 1:
+			if !s.safe {
+				// Text that is a bytea in hex or escape format, or not.
+				return &ast.Cast{Expr: g.expr(value.String, s.withNull(true), depth), Type: value.Bytes}
+			}
 		}
 		return g.literal(t)
 	case value.Time:
+		if g.rarely(3) && !s.safe {
+			return &ast.Cast{Expr: &ast.Cast{Expr: g.expr(value.Time, s.withNull(true), depth), Type: value.String}, Type: value.Time}
+		}
 		return g.literal(t)
 	}
 	panic(t)
@@ -332,7 +508,7 @@ func (g *gen) anyType() value.Type {
 	if len(withCols) > 0 && g.draw(0, 2) > 0 {
 		return withCols[g.draw(0, len(withCols)-1)]
 	}
-	return hegel.Draw(g.ht, hegel.SampledFrom(allTypes))
+	return pick(g, allTypes)
 }
 
 // row of literal values for every column, respecting NOT NULL most of the time.
@@ -375,7 +551,7 @@ func (g *gen) rowKey(row []ast.Expr) string {
 	var parts []string
 	for i, c := range g.table.Columns {
 		if g.isKey(c.Name) {
-			parts = append(parts, ast.RenderExpr(row[i], ast.Maragudb))
+			parts = append(parts, ast.RenderExpr(row[i]))
 		}
 	}
 	return fmt.Sprint(parts)
@@ -392,57 +568,31 @@ func (g *gen) rowKey2(row []ast.Expr) []ast.Expr {
 	return out
 }
 
+// where draws a WHERE clause, or none. Several conditions where one can fail make an outcome
+// that can depend on the order in which Postgres evaluates them, which maragudb rejects, so
+// they are mostly combined only with conditions that cannot fail.
 func (g *gen) where(s scope) ast.Expr {
 	if g.draw(0, 3) == 0 {
 		return nil
 	}
+	if !g.rarely(6) {
+		s.safe = true
+	}
 	if g.draw(0, 2) == 0 && len(g.table.PrimaryKey) > 0 {
 		// A comparison on a key column, so that key access paths are exercised.
-		name := hegel.Draw(g.ht, hegel.SampledFrom(g.table.PrimaryKey))
-		op := hegel.Draw(g.ht, hegel.SampledFrom([]ast.BinaryOp{ast.Eq, ast.Eq, ast.Lt, ast.Le, ast.Gt, ast.Ge}))
+		name := pick(g, g.table.PrimaryKey)
+		op := pick(g, []ast.BinaryOp{ast.Eq, ast.Eq, ast.Lt, ast.Le, ast.Gt, ast.Ge})
 		var e ast.Expr = &ast.Binary{Op: op, Left: &ast.ColumnRef{Name: name}, Right: g.literal(g.column(name).Type)}
 		if g.bool() {
-			s.safe = true
 			e = &ast.Binary{Op: ast.And, Left: e, Right: g.expr(value.Bool, s, 1)}
 		}
 		return e
 	}
-	e := g.expr(value.Bool, s, 0)
-	if len(conjuncts(e)) > 1 && !s.safe {
-		s.safe = true
-		e = g.expr(value.Bool, s, 0)
+	if g.bool() {
+		// A single condition is evaluated on every row in every plan, so it may fail.
+		s.safe = false
 	}
-	return e
-}
-
-// conjuncts of the top level of a WHERE clause. When there are several, Postgres evaluates them
-// in an order its planner picks, cheapest first and equalities with a constant last, so only
-// conjuncts that cannot fail are combined. See deviation 19.
-func conjuncts(e ast.Expr) []ast.Expr {
-	if b, ok := e.(*ast.Binary); ok && b.Op == ast.And {
-		return append(conjuncts(b.Left), conjuncts(b.Right)...)
-	}
-	switch x := e.(type) {
-	case *ast.Between:
-		if !x.Not {
-			// BETWEEN is two conjuncts in Postgres.
-			return []ast.Expr{e, e}
-		}
-	case *ast.In:
-		if x.Not && len(x.List) > 1 {
-			// NOT IN is a conjunct per element, or per element that reads columns.
-			return x.List
-		}
-	case *ast.Unary:
-		// Postgres pushes NOT down, so NOT (a OR b) is NOT a AND NOT b.
-		if b, ok := x.Expr.(*ast.Binary); ok && x.Op == ast.Not && b.Op == ast.Or {
-			return append(conjuncts(&ast.Unary{Op: ast.Not, Expr: b.Left}), conjuncts(&ast.Unary{Op: ast.Not, Expr: b.Right})...)
-		}
-		if u, ok := x.Expr.(*ast.Unary); ok && x.Op == ast.Not && u.Op == ast.Not {
-			return conjuncts(u.Expr)
-		}
-	}
-	return []ast.Expr{e}
+	return g.expr(value.Bool, s, 0)
 }
 
 func (g *gen) statement() ast.Statement {
@@ -457,17 +607,19 @@ func (g *gen) statement() ast.Statement {
 				nonKey = append(nonKey, c.Name)
 			}
 		}
-		if len(nonKey) == 0 {
-			return g.insert(1)
+		targets := nonKey
+		if len(nonKey) == 0 || g.rarely(5) {
+			// An update of key columns, whose outcome may depend on the order of the rows.
+			targets = g.table.PrimaryKey
 		}
 		seen := map[string]bool{}
 		for range g.draw(1, 2) {
-			name := hegel.Draw(g.ht, hegel.SampledFrom(nonKey))
+			name := pick(g, targets)
 			if seen[name] {
 				continue
 			}
 			seen[name] = true
-			u.Set = append(u.Set, ast.Assignment{Column: name, Value: g.expr(g.column(name).Type, scope{columns: true, null: true}, 0)})
+			u.Set = append(u.Set, ast.Assignment{Column: name, Value: g.expr(g.column(name).Type, scope{columns: true, null: !g.isKey(name)}, 0)})
 		}
 		u.Where = g.where(scope{columns: true})
 		return u
@@ -481,7 +633,7 @@ func (g *gen) statement() ast.Statement {
 func (g *gen) selectStmt() *ast.Select {
 	s := &ast.Select{From: tableName}
 	limited := g.draw(0, 2) == 0
-	sc := scope{columns: true, safe: limited}
+	sc := scope{columns: true, safe: limited && !g.rarely(8)}
 	n := g.draw(1, 3)
 	for i := range n {
 		if g.draw(0, 3) == 0 {
@@ -499,7 +651,7 @@ func (g *gen) selectStmt() *ast.Select {
 		o := ast.OrderItem{Desc: g.bool(), Nulls: ast.NullsOrder(g.draw(0, 2))}
 		switch g.draw(0, 2) {
 		case 0:
-			o.Expr = &ast.Literal{Value: value.NewInt(int64(g.draw(1, g.outputs(s))))}
+			o.Expr = &ast.Literal{Value: value.NewInt4(int32(g.draw(1, g.outputs(s))))}
 		case 1:
 			o.Expr = &ast.ColumnRef{Name: g.table.Columns[g.draw(0, len(g.table.Columns)-1)].Name}
 		default:
@@ -508,24 +660,27 @@ func (g *gen) selectStmt() *ast.Select {
 		s.OrderBy = append(s.OrderBy, o)
 	}
 	if limited {
-		// The order must be fully determined, so every key column is a sort key. An output
-		// column named like a key column would shadow it in ORDER BY, so then there is no LIMIT.
+		// The order must be fully determined, so every key column is a sort key, except now and
+		// then. An output column named like a key column would shadow it in ORDER BY, so then
+		// there is no LIMIT.
 		for _, k := range g.table.PrimaryKey {
 			if shadowed(s, k) {
 				return s
 			}
 		}
-		for _, k := range g.table.PrimaryKey {
-			s.OrderBy = append(s.OrderBy, ast.OrderItem{Expr: &ast.ColumnRef{Name: k}, Desc: g.bool()})
+		if !g.rarely(10) {
+			for _, k := range g.table.PrimaryKey {
+				s.OrderBy = append(s.OrderBy, ast.OrderItem{Expr: &ast.ColumnRef{Name: k}, Desc: g.bool()})
+			}
 		}
 		if g.bool() {
-			s.Limit = &ast.Literal{Value: value.NewInt(int64(g.draw(0, 4)))}
+			s.Limit = &ast.Literal{Value: value.NewInt4(int32(g.draw(0, 4)))}
 		}
 		if g.bool() {
-			s.Offset = &ast.Literal{Value: value.NewInt(int64(g.draw(0, 3)))}
+			s.Offset = &ast.Literal{Value: value.NewInt4(int32(g.draw(0, 3)))}
 		}
 		if s.Limit == nil && s.Offset == nil {
-			s.Limit = &ast.Literal{Value: value.NewInt(2)}
+			s.Limit = &ast.Literal{Value: value.NewInt4(2)}
 		}
 	}
 	return s

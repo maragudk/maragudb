@@ -30,7 +30,7 @@ func (s *Session) createTable(ctx context.Context, st *ast.CreateTable) error {
 		if st.IfNotExists {
 			return nil
 		}
-		return fmt.Errorf("%w: table %q already exists", ErrTableExists, st.Name)
+		return fmt.Errorf("%w: relation %q already exists", ErrTableExists, st.Name)
 	}
 	t, err := newTable(st)
 	if err != nil {
@@ -67,21 +67,6 @@ func (s *Session) dropTable(ctx context.Context, st *ast.DropTable) error {
 	return nil
 }
 
-// assignable checks that an expression can be stored in a column, adapting an int constant to a
-// float column and a NULL to the column's type.
-func assignable(e *cexpr, t *table, col int) (*cexpr, error) {
-	c := t.Columns[col]
-	switch {
-	case e.typ == c.Type:
-		return e, nil
-	case e.typ == value.Unknown:
-		return retypeNull(e, c.Type), nil
-	case e.typ == value.Int && c.Type == value.Float && e.literal:
-		return constant(value.NewFloat(float64(e.val.I))), nil
-	}
-	return nil, fmt.Errorf("%w: column %q is of type %v but the expression is of type %v", ErrType, c.Name, c.Type, e.typ)
-}
-
 func (s *Session) insert(ctx context.Context, st *ast.Insert, params []value.Value) (Result, error) {
 	t, err := s.getTable(ctx, st.Table)
 	if err != nil {
@@ -97,7 +82,7 @@ func (s *Session) insert(ctx context.Context, st *ast.Insert, params []value.Val
 		for _, name := range st.Columns {
 			i, ok := t.columnIndex(name)
 			if !ok {
-				return Result{}, fmt.Errorf("%w: column %q of table %q does not exist", ErrInvalid, name, t.Name)
+				return Result{}, fmt.Errorf("%w: column %q of relation %q does not exist", ErrInvalid, name, t.Name)
 			}
 			if seen[i] {
 				return Result{}, fmt.Errorf("%w: column %q specified more than once", ErrInvalid, name)
@@ -106,31 +91,45 @@ func (s *Session) insert(ctx context.Context, st *ast.Insert, params []value.Val
 			cols = append(cols, i)
 		}
 	}
-	// Every row is checked and evaluated before any is written, as in Postgres.
+	// Every row is bound and folded before any is evaluated, as in Postgres.
 	b := &binder{params: params}
 	var bound [][]*cexpr
+	// As in Postgres, each row is analyzed, checked against the first row's length and the
+	// target columns, and converted to the column types before the next row.
 	for _, exprRow := range st.Rows {
-		if len(exprRow) != len(cols) {
-			return Result{}, fmt.Errorf("%w: INSERT has %d expressions but %d target columns", ErrInvalid, len(exprRow), len(cols))
-		}
 		var es []*cexpr
-		for i, e := range exprRow {
+		for _, e := range exprRow {
 			c, err := b.bind(e)
 			if err != nil {
 				return Result{}, err
 			}
-			if c, err = assignable(c, t, cols[i]); err != nil {
+			es = append(es, c)
+		}
+		switch {
+		case len(bound) > 0 && len(es) != len(bound[0]):
+			return Result{}, fmt.Errorf("%w: VALUES lists must all be the same length", ErrSyntax)
+		case len(es) > len(cols):
+			return Result{}, fmt.Errorf("%w: INSERT has more expressions than target columns", ErrSyntax)
+		case len(es) < len(cols):
+			return Result{}, fmt.Errorf("%w: INSERT has more target columns than expressions", ErrSyntax)
+		}
+		for i := range es {
+			var err error
+			if es[i], err = b.assignable(es[i], t, cols[i]); err != nil {
 				return Result{}, err
 			}
-			es = append(es, c)
 		}
 		bound = append(bound, es)
 	}
 	if err := b.folding(); err != nil {
 		return Result{}, err
 	}
-	rows := make([][]value.Value, len(bound))
-	for r, es := range bound {
+	if err := s.writable(st); err != nil {
+		return Result{}, err
+	}
+	// Postgres evaluates and inserts the rows one at a time, which matters for the expressions
+	// it does not fold.
+	for _, es := range bound {
 		row := make([]value.Value, len(t.Columns))
 		for i, c := range t.Columns {
 			row[i] = value.NewNull(c.Type)
@@ -141,9 +140,6 @@ func (s *Session) insert(ctx context.Context, st *ast.Insert, params []value.Val
 				return Result{}, err
 			}
 		}
-		rows[r] = row
-	}
-	for _, row := range rows {
 		if err := s.writeRow(ctx, t, nil, row); err != nil {
 			return Result{}, err
 		}
@@ -153,13 +149,8 @@ func (s *Session) insert(ctx context.Context, st *ast.Insert, params []value.Val
 
 // writeRow checks constraints and writes row, replacing the row at oldKey when given.
 func (s *Session) writeRow(ctx context.Context, t *table, oldKey []byte, row []value.Value) error {
-	for i, c := range t.Columns {
-		if c.NotNull && row[i].Null {
-			return fmt.Errorf("%w: column %q of table %q", ErrNotNull, c.Name, t.Name)
-		}
-		if row[i].Type == value.String && !utf8.ValidString(row[i].S) {
-			return fmt.Errorf("%w: column %q is not valid UTF-8", ErrInvalid, c.Name)
-		}
+	if err := t.checkRow(row); err != nil {
+		return err
 	}
 	key := t.rowKey(row)
 	if oldKey == nil || string(key) != string(oldKey) {
@@ -176,6 +167,19 @@ func (s *Session) writeRow(ctx context.Context, t *table, oldKey []byte, row []v
 	return nil
 }
 
+// checkRow checks the NOT NULL constraints and that strings are valid UTF-8.
+func (t *table) checkRow(row []value.Value) error {
+	for i, c := range t.Columns {
+		if c.NotNull && row[i].Null {
+			return fmt.Errorf("%w: null value in column %q of relation %q violates not-null constraint", ErrNotNull, c.Name, t.Name)
+		}
+		if row[i].Type == value.String && !utf8.ValidString(row[i].S) {
+			return fmt.Errorf("%w: column %q is not valid UTF-8", ErrInvalid, c.Name)
+		}
+	}
+	return nil
+}
+
 func keyDescription(t *table, row []value.Value) string {
 	var parts []string
 	for _, i := range t.PrimaryKey {
@@ -184,90 +188,34 @@ func keyDescription(t *table, row []value.Value) string {
 	return fmt.Sprintf("(%s)", strings.Join(parts, ", "))
 }
 
-// filter is a bound WHERE clause: its top-level conjuncts, evaluated in order until one is not
-// true. Postgres evaluates the conjuncts of a WHERE clause the same way, stopping at the first
-// false or NULL, so a later conjunct that would fail is never evaluated for that row.
-type filter struct {
-	conds []*cexpr
-	// never is set when a conjunct is known false, so no row can match.
-	never bool
-}
-
-func (b *binder) where(e ast.Expr) (filter, error) {
-	if e == nil {
-		return filter{}, nil
-	}
-	var f filter
-	pruned := false
-	var null *cexpr
-	for _, c := range conjuncts(e) {
-		var ce *cexpr
-		var err error
-		if pruned {
-			ce, err = b.bindPruned(c)
-		} else {
-			ce, err = b.bind(c)
-		}
-		if err != nil {
-			return filter{}, err
-		}
-		if ce.typ != value.Bool && ce.typ != value.Unknown {
-			return filter{}, fmt.Errorf("%w: argument of WHERE must be bool, not %v", ErrType, ce.typ)
-		}
-		if pruned {
-			continue
-		}
-		if ce.folded && !ce.val.Null {
-			if ce.val.B {
-				continue
-			}
-			// A known false conjunct decides the clause; the rest is only type-checked.
-			pruned = true
-			f.never = true
-			f.conds = []*cexpr{ce}
-			continue
-		}
-		if ce.folded && null == nil {
-			null = ce
-		}
-		f.conds = append(f.conds, ce)
-	}
-	if null != nil && !f.never {
-		// A known NULL conjunct decides the clause too, because Postgres evaluates a conjunct
-		// without columns once before it reads any row. Unlike FALSE, it does not stop the
-		// folding of the conjuncts after it.
-		f.never = true
-		f.conds = []*cexpr{null}
-	}
-	return f, nil
-}
-
-func (f filter) matches(row []value.Value) (bool, error) {
-	for _, c := range f.conds {
-		v, err := c.value(row)
-		if err != nil {
-			return false, err
-		}
-		if v.Null || !v.B {
-			return false, nil
-		}
-	}
-	return true, nil
-}
-
 // scanRows calls fn with the key and decoded row of every row of t that the access path and
 // filter admit, in key order, until fn returns false.
+//
+// A row whose outcome depends on the order in which Postgres evaluates the WHERE conditions
+// does not stop the scan at once: a later row may fail in every order, and then the statement
+// fails in Postgres for certain, with that row's error as one of the possible ones. Only when no
+// row fails for certain is the statement [errOrderDependent].
 func (s *Session) scanRows(ctx context.Context, t *table, a access, f filter, fn func(key []byte, row []value.Value) (bool, error)) error {
 	if a.empty {
 		return nil
 	}
+	if ok, err := f.open(); err != nil || !ok {
+		return err
+	}
 	types := t.types()
+	var orderDependent error
 	visit := func(key, val []byte) (bool, error) {
 		row, err := value.DecodeRow(val, types)
 		if err != nil {
 			return false, fmt.Errorf("exec: table %q: %w", t.Name, err)
 		}
 		ok, err := f.matches(row)
+		if errors.Is(err, errOrderDependent) {
+			if orderDependent == nil {
+				orderDependent = err
+			}
+			return true, nil
+		}
 		if err != nil || !ok {
 			return err == nil, err
 		}
@@ -278,8 +226,10 @@ func (s *Session) scanRows(ctx context.Context, t *table, a access, f filter, fn
 		if err != nil || !ok {
 			return err
 		}
-		_, err = visit(a.point, val)
-		return err
+		if _, err = visit(a.point, val); err != nil {
+			return err
+		}
+		return orderDependent
 	}
 	it := s.kv.scan(ctx, a.start, a.end)
 	for it.Next() {
@@ -287,7 +237,10 @@ func (s *Session) scanRows(ctx context.Context, t *table, a access, f filter, fn
 			return err
 		}
 	}
-	return it.Err()
+	if err := it.Err(); err != nil {
+		return err
+	}
+	return orderDependent
 }
 
 func (s *Session) update(ctx context.Context, st *ast.Update, params []value.Value) (Result, error) {
@@ -300,47 +253,67 @@ func (s *Session) update(ctx context.Context, st *ast.Update, params []value.Val
 		col int
 		e   *cexpr
 	}
-	var sets []assignment
-	seen := map[int]bool{}
-	for _, a := range st.Set {
-		i, ok := t.columnIndex(a.Column)
-		if !ok {
-			return Result{}, fmt.Errorf("%w: column %q of table %q does not exist", ErrInvalid, a.Column, t.Name)
-		}
-		if seen[i] {
-			return Result{}, fmt.Errorf("%w: column %q specified more than once", ErrInvalid, a.Column)
-		}
-		seen[i] = true
-		e, err := b.bind(a.Value)
-		if err != nil {
-			return Result{}, err
-		}
-		if e, err = assignable(e, t, i); err != nil {
-			return Result{}, err
-		}
-		sets = append(sets, assignment{i, e})
-	}
+	// Postgres analyzes WHERE first, then every SET expression, and then converts each to its
+	// column's type. It folds the SET expressions before WHERE.
 	b.phase = phaseWhere
 	f, err := b.where(st.Where)
 	if err != nil {
 		return Result{}, err
 	}
+	b.phase = phaseOutput
+	values := make([]*cexpr, len(st.Set))
+	for i, a := range st.Set {
+		if values[i], err = b.bind(a.Value); err != nil {
+			return Result{}, err
+		}
+	}
+	var sets []assignment
+	movesKeys := false
+	for j, a := range st.Set {
+		i, ok := t.columnIndex(a.Column)
+		if !ok {
+			return Result{}, fmt.Errorf("%w: column %q of relation %q does not exist", ErrInvalid, a.Column, t.Name)
+		}
+		e, err := b.assignable(values[j], t, i)
+		if err != nil {
+			return Result{}, err
+		}
+		sets = append(sets, assignment{i, e})
+		movesKeys = movesKeys || t.isPrimaryKey(i)
+	}
+	seen := map[int]bool{}
+	for _, set := range sets {
+		if seen[set.col] {
+			return Result{}, fmt.Errorf("%w: multiple assignments to same column %q", ErrSyntax, t.Columns[set.col].Name)
+		}
+		seen[set.col] = true
+	}
 	// The planner needs the folded constants.
 	if err := b.folding(); err != nil {
 		return Result{}, err
 	}
-	a, err := b.plan(t, st.Where, f)
-	if err != nil {
+	if f.unsupported != nil {
+		return Result{}, f.unsupported
+	}
+	if err := s.writable(st); err != nil {
 		return Result{}, err
 	}
+	a := t.plan(f)
 	var n int64
-	apply := func(key []byte, old []value.Value) (bool, error) {
+	assign := func(old []value.Value) ([]value.Value, error) {
 		row := append([]value.Value{}, old...)
 		for _, set := range sets {
 			var err error
 			if row[set.col], err = set.e.value(old); err != nil {
-				return false, err
+				return nil, err
 			}
+		}
+		return row, nil
+	}
+	apply := func(key []byte, old []value.Value) (bool, error) {
+		row, err := assign(old)
+		if err != nil {
+			return false, err
 		}
 		if err := s.writeRow(ctx, t, key, row); err != nil {
 			return false, err
@@ -348,13 +321,78 @@ func (s *Session) update(ctx context.Context, st *ast.Update, params []value.Val
 		n++
 		return true, nil
 	}
-	if s.opts.Mutations.UpdateSeesOwnWrites {
+	switch {
+	case s.opts.Mutations.UpdateSeesOwnWrites:
 		return Result{RowsAffected: n}, s.updateRestarting(ctx, t, a, f, apply, &n)
+	case movesKeys:
+		return s.updateKeys(ctx, t, a, f, assign)
 	}
 	if err := s.scanRows(ctx, t, a, f, apply); err != nil {
 		return Result{}, err
 	}
 	return Result{RowsAffected: n}, nil
+}
+
+// updateKeys runs an UPDATE that assigns primary key columns. Postgres checks the primary key
+// of each row as it writes it, in the order it stores the rows, so when a row moves onto the key
+// of a row that the same statement moves away, whether the statement fails depends on that
+// order. Such a statement is rejected; every other outcome is the same in every order: a move
+// onto a key that stays is a duplicate, two rows moving onto one key are a duplicate, and
+// anything else succeeds.
+func (s *Session) updateKeys(ctx context.Context, t *table, a access, f filter, assign func([]value.Value) ([]value.Value, error)) (Result, error) {
+	type move struct {
+		oldKey, newKey []byte
+		row            []value.Value
+	}
+	var moves []move
+	err := s.scanRows(ctx, t, a, f, func(key []byte, old []value.Value) (bool, error) {
+		row, err := assign(old)
+		if err != nil {
+			return false, err
+		}
+		if err := t.checkRow(row); err != nil {
+			return false, err
+		}
+		moves = append(moves, move{oldKey: append([]byte{}, key...), newKey: t.rowKey(row), row: row})
+		return true, nil
+	})
+	if err != nil {
+		return Result{}, err
+	}
+	vacated := map[string]bool{}
+	for _, m := range moves {
+		if string(m.newKey) != string(m.oldKey) {
+			vacated[string(m.oldKey)] = true
+		}
+	}
+	taken := map[string]bool{}
+	for _, m := range moves {
+		k := string(m.newKey)
+		if taken[k] {
+			return Result{}, fmt.Errorf("%w: table %q already has a row with key %s", ErrDuplicateKey, t.Name, keyDescription(t, m.row))
+		}
+		taken[k] = true
+		if k == string(m.oldKey) {
+			continue
+		}
+		if vacated[k] {
+			return Result{}, fmt.Errorf("%w: whether this UPDATE fails in Postgres depends on the order it stores the rows in, because a row moves onto the key %s of a row that the statement moves away; update the rows in two statements", ErrUnsupported, keyDescription(t, m.row))
+		}
+		if _, exists, err := s.kv.get(ctx, m.newKey); err != nil {
+			return Result{}, err
+		} else if exists {
+			return Result{}, fmt.Errorf("%w: table %q already has a row with key %s", ErrDuplicateKey, t.Name, keyDescription(t, m.row))
+		}
+	}
+	for _, m := range moves {
+		if string(m.newKey) != string(m.oldKey) {
+			s.kv.del(m.oldKey)
+		}
+	}
+	for _, m := range moves {
+		s.kv.put(m.newKey, value.EncodeRow(nil, m.row))
+	}
+	return Result{RowsAffected: int64(len(moves))}, nil
 }
 
 // updateRestarting is the mutated UPDATE: it applies each write to the transaction at once and
@@ -397,10 +435,13 @@ func (s *Session) delete(ctx context.Context, st *ast.Delete, params []value.Val
 	if err := b.folding(); err != nil {
 		return Result{}, err
 	}
-	a, err := b.plan(t, st.Where, f)
-	if err != nil {
+	if f.unsupported != nil {
+		return Result{}, f.unsupported
+	}
+	if err := s.writable(st); err != nil {
 		return Result{}, err
 	}
+	a := t.plan(f)
 	var n int64
 	err = s.scanRows(ctx, t, a, f, func(key []byte, _ []value.Value) (bool, error) {
 		s.kv.del(key)
@@ -421,6 +462,8 @@ type orderKey struct {
 	desc   bool
 	// nullsFirst after applying the Postgres default: last when ascending, first when descending.
 	nullsFirst bool
+	// keyColumn is the index of the primary key column the item sorts by, or -1.
+	keyColumn int
 }
 
 func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value.Value) (*Rows, error) {
@@ -440,7 +483,7 @@ func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value
 	for _, item := range st.Items {
 		if item.Star {
 			if t == nil {
-				return nil, fmt.Errorf("%w: SELECT * needs a FROM clause", ErrInvalid)
+				return nil, fmt.Errorf("%w: SELECT * with no tables specified is not valid", ErrSyntax)
 			}
 			for i, c := range t.Columns {
 				ref := &ast.ColumnRef{Name: c.Name}
@@ -454,6 +497,13 @@ func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value
 		e, err := b.bind(item.Expr)
 		if err != nil {
 			return nil, err
+		}
+		// An output column of unknown type is text, as in Postgres.
+		if e, err = resolve(e, value.String); err != nil {
+			return nil, err
+		}
+		if e.typ == value.Numeric {
+			return nil, fmt.Errorf("%w: the numeric type is not supported, cast the literal %s to double precision or bigint", ErrUnsupported, e.val.S)
 		}
 		items = append(items, e)
 		itemExprs = append(itemExprs, item.Expr)
@@ -479,7 +529,7 @@ func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value
 	b.phase = phaseOutput
 	var order []orderKey
 	for _, o := range st.OrderBy {
-		k := orderKey{output: -1, desc: o.Desc}
+		k := orderKey{output: -1, desc: o.Desc, keyColumn: -1}
 		switch o.Nulls {
 		case ast.NullsFirst:
 			k.nullsFirst = true
@@ -490,16 +540,15 @@ func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value
 		}
 		switch e := o.Expr.(type) {
 		case *ast.Literal:
-			// An int constant is an output position. Other untyped constants are an error, as in
-			// Postgres, while bytes and time literals are typed and sort as constants. Postgres
-			// only takes a literal in its 32-bit integer range as a position.
+			// An integer constant is an output position. Other constants are an error, as in
+			// Postgres, which only takes a literal whose digits fit in 32 bits as a position, so
+			// that -2147483648 is not one.
 			switch {
-			case e.Value.Null, e.Value.Type == value.Float, e.Value.Type == value.String, e.Value.Type == value.Bool,
-				e.Value.Type == value.Int && (e.Value.I < -math.MaxInt32 || e.Value.I > math.MaxInt32):
+			case e.Value.Null, e.Value.Type != value.Int4, e.Value.I == math.MinInt32:
 				return nil, fmt.Errorf("%w: non-integer constant in ORDER BY", ErrSyntax)
-			case e.Value.Type == value.Int:
+			default:
 				if e.Value.I < 1 || e.Value.I > int64(len(columns)) {
-					return nil, fmt.Errorf("%w: ORDER BY position %d is not in the select list", ErrInvalid, e.Value.I)
+					return nil, fmt.Errorf("%w: ORDER BY position %d is not in select list", ErrInvalid, e.Value.I)
 				}
 				k.output = int(e.Value.I) - 1
 			}
@@ -509,7 +558,7 @@ func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value
 			matches := -1
 			for i, c := range columns {
 				if c.Name == e.Name {
-					if matches >= 0 && ast.RenderExpr(itemExprs[matches], ast.Maragudb) != ast.RenderExpr(itemExprs[i], ast.Maragudb) {
+					if matches >= 0 && ast.RenderExpr(itemExprs[matches]) != ast.RenderExpr(itemExprs[i]) {
 						return nil, fmt.Errorf("%w: ORDER BY %q is ambiguous", ErrInvalid, e.Name)
 					}
 					if matches < 0 {
@@ -522,6 +571,23 @@ func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value
 		if k.output < 0 {
 			if k.expr, err = b.bind(o.Expr); err != nil {
 				return nil, err
+			}
+			if k.expr, err = resolve(k.expr, value.String); err != nil {
+				return nil, err
+			}
+			if k.expr.typ == value.Numeric {
+				return nil, fmt.Errorf("%w: the numeric type is not supported, cast the literal to double precision or bigint", ErrUnsupported)
+			}
+		}
+		// The item sorts by a primary key column when it is that column, either directly or
+		// through an output column that is a plain reference to it.
+		sorted := o.Expr
+		if k.output >= 0 {
+			sorted = itemExprs[k.output]
+		}
+		if ref, ok := sorted.(*ast.ColumnRef); ok && t != nil {
+			if i, ok := t.columnIndex(ref.Name); ok && t.isPrimaryKey(i) {
+				k.keyColumn = i
 			}
 		}
 		order = append(order, k)
@@ -541,12 +607,18 @@ func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value
 	if err := b.folding(); err != nil {
 		return nil, err
 	}
+	if f.unsupported != nil {
+		return nil, f.unsupported
+	}
+	if (st.Limit != nil || st.Offset != nil) && t != nil {
+		if err := limitable(t, order, items, f); err != nil {
+			return nil, err
+		}
+	}
 	// The planner needs the folded constants.
 	var a access
 	if t != nil {
-		if a, err = b.plan(t, st.Where, f); err != nil {
-			return nil, err
-		}
+		a = t.plan(f)
 	}
 	offset, err := limitValue(offsetExpr, "OFFSET")
 	if err != nil {
@@ -555,6 +627,10 @@ func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value
 	limit, err := limitValue(limitExpr, "LIMIT")
 	if err != nil {
 		return nil, err
+	}
+	if limit == 0 {
+		// Postgres does not read any row under LIMIT 0.
+		return &Rows{Columns: columns, Rows: [][]value.Value{}}, nil
 	}
 
 	type sortable struct {
@@ -604,9 +680,13 @@ func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value
 		return limit < 0 || int64(len(out)) < limit, nil
 	}
 	if t == nil {
+		open, err := f.open()
+		if err != nil {
+			return nil, err
+		}
 		if ok, err := f.matches(nil); err != nil {
 			return nil, err
-		} else if ok {
+		} else if ok && open {
 			if _, err := visit(nil, nil); err != nil {
 				return nil, err
 			}
@@ -634,8 +714,36 @@ func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value
 	return &Rows{Columns: columns, Rows: out}, nil
 }
 
-// limit binds a LIMIT or OFFSET expression, which must be an int that reads no columns. It
-// returns nil when e is.
+// limitable checks that a SELECT with LIMIT or OFFSET gives the same rows and the same errors
+// in every plan Postgres could choose: the ORDER BY must sort by every primary key column, so
+// that the row order is fully determined, and no output expression or WHERE condition may be
+// one that can fail, because an index scan under a LIMIT evaluates them on fewer rows than a
+// sequential scan and a sort.
+func limitable(t *table, order []orderKey, items []*cexpr, f filter) error {
+	for _, col := range t.PrimaryKey {
+		found := false
+		for _, k := range order {
+			found = found || k.keyColumn == col
+		}
+		if !found {
+			return fmt.Errorf("%w: LIMIT and OFFSET without an ORDER BY on every primary key column are not supported, because which rows Postgres returns is then not determined; add %s to ORDER BY", ErrUnsupported, t.Columns[col].Name)
+		}
+	}
+	for _, e := range items {
+		if e.fallible {
+			return fmt.Errorf("%w: LIMIT and OFFSET with an output expression that can fail are not supported, because how many rows Postgres evaluates it on depends on its plan; select the rows first and compute the expression on them", ErrUnsupported)
+		}
+	}
+	for _, c := range f.conds {
+		if c.fallible {
+			return fmt.Errorf("%w: LIMIT and OFFSET with a WHERE condition that can fail are not supported, because how many rows Postgres evaluates it on depends on its plan; select the rows first and filter them", ErrUnsupported)
+		}
+	}
+	return nil
+}
+
+// limit binds a LIMIT or OFFSET expression, which must be a bigint that reads no columns, or
+// convert to one as an assignment does. It returns nil when e is.
 func (b *binder) limit(e ast.Expr, what string) (*cexpr, error) {
 	if e == nil {
 		return nil, nil
@@ -645,24 +753,38 @@ func (b *binder) limit(e ast.Expr, what string) (*cexpr, error) {
 		return nil, err
 	}
 	if c.refs {
-		return nil, fmt.Errorf("%w: argument of %s must not read columns", ErrInvalid, what)
+		return nil, fmt.Errorf("%w: argument of %s must not contain variables", ErrInvalid, what)
 	}
-	if c.typ != value.Int && c.typ != value.Unknown {
-		return nil, fmt.Errorf("%w: argument of %s must be int, not %v", ErrType, what, c.typ)
+	switch c.typ {
+	case value.Unknown:
+		return resolve(c, value.Int)
+	case value.Numeric:
+		return b.numericTo(c, value.Int)
+	case value.Int4:
+		return widen(c, value.Int), nil
+	case value.Float:
+		return b.cast(c, value.Int)
+	case value.Int:
+		return c, nil
 	}
-	return c, nil
+	return nil, fmt.Errorf("%w: argument of %s must be type bigint, not type %v", ErrType, what, c.typ)
 }
 
 // limitValue of a bound LIMIT or OFFSET expression whose folding succeeded. It returns -1 when
 // the expression is absent or NULL.
 func limitValue(c *cexpr, what string) (int64, error) {
-	if c == nil || c.val.Null {
+	if c == nil {
 		return -1, nil
 	}
-	if c.val.I < 0 {
+	// A stable expression is evaluated now, when the statement runs.
+	v, err := c.value(nil)
+	if err != nil || v.Null {
+		return -1, err
+	}
+	if v.I < 0 {
 		return 0, fmt.Errorf("%w: %s must not be negative", ErrInvalid, what)
 	}
-	return c.val.I, nil
+	return v.I, nil
 }
 
 func compareKeys(order []orderKey, a, b []value.Value) int {
@@ -724,7 +846,7 @@ func outputNameStrength(e ast.Expr) (string, int) {
 		if name, strength := outputNameStrength(e.Expr); strength > 1 {
 			return name, strength
 		}
-		return e.Type.String(), 1
+		return e.Type.OutputName(), 1
 	}
 	return "?column?", 0
 }

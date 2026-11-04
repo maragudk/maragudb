@@ -49,8 +49,8 @@ func load(t *testing.T) (string, verify.Catalog, *verify.Source) {
 }
 
 func TestVerification(t *testing.T) {
-	t.Run("every requirement and deviation is verified by a test, and every test names IDs that exist", func(t *testing.T) {
-		verify.Covers(t, "every acceptance criterion, invariant, and deviation has a verifying test, and no test declares an unknown ID", "AC-4.4")
+	t.Run("every requirement and unsupported statement is verified by a test, and every test names IDs that exist", func(t *testing.T) {
+		verify.Covers(t, "every acceptance criterion, invariant, class of unsupported statements, and remaining difference has a verifying test, and no test declares an unknown ID", "AC-4.4")
 		_, c, src := load(t)
 		covs, errs := src.Coverage()
 		for _, err := range errs {
@@ -176,19 +176,25 @@ func TestParseRequirements(t *testing.T) {
 		}, got)
 	})
 
-	t.Run("takes the bold title as the text of a deviation", func(t *testing.T) {
-		reqs, err := verify.ParseRequirements("docs/deviations.md", "1. **No coercion.** `DEV-1` Details.\n")
+	t.Run("takes the bold title as the text of an unsupported statement or a remaining difference", func(t *testing.T) {
+		reqs, err := verify.ParseRequirements("docs/unsupported.md", "- **The numeric type.** `UNS-NUMERIC` Details.\n1. **No coercion.** `DEV-1` Details.\n")
 		is.NotError(t, err)
-		is.Equal(t, 1, len(reqs))
-		is.Equal(t, "No coercion.", reqs[0].Text)
-		is.Equal(t, "DEV", reqs[0].Kind())
+		is.Equal(t, 2, len(reqs))
+		is.Equal(t, "The numeric type.", reqs[0].Text)
+		is.Equal(t, "UNS", reqs[0].Kind())
+		is.Equal(t, "No coercion.", reqs[1].Text)
+		is.Equal(t, "DEV", reqs[1].Kind())
 	})
 
 	t.Run("rejects an ID defined twice and a malformed ID", func(t *testing.T) {
 		_, err := verify.ParseRequirements("docs/requirements.md", "a `AC-1` b `AC-1`\n")
 		is.True(t, err != nil)
-		_, err = verify.ParseRequirements("docs/deviations.md", "1. **x** `DEV-A`\n")
+		_, err = verify.ParseRequirements("docs/unsupported.md", "1. **x** `DEV-A`\n")
 		is.True(t, err != nil)
+		_, err = verify.ParseRequirements("docs/unsupported.md", "- **x** `UNS-1`\n")
+		is.True(t, err != nil)
+		_, err = verify.ParseRequirements("docs/requirements.md", "- **x** `UNS-A`\n")
+		is.True(t, err != nil, "an unsupported statement belongs in its own document")
 	})
 }
 
@@ -299,7 +305,7 @@ func TestCatalog_IDs(t *testing.T) {
 	t.Run("has every requirement, mutant, and state", func(t *testing.T) {
 		_, c, _ := load(t)
 		ids := c.IDs()
-		for _, id := range []string{"AC-1.5", "INV-STRICT-SERIALIZABLE", "DEV-19", "MUT-COMMIT-WITHOUT-CAS", string(reach.LeaseOverlap)} {
+		for _, id := range []string{"AC-1.5", "INV-STRICT-SERIALIZABLE", "INV-PG-SUBSET", "UNS-NUMERIC", "MUT-COMMIT-WITHOUT-CAS", string(reach.LeaseOverlap)} {
 			is.True(t, ids[id], id)
 		}
 		var kinds []string
@@ -308,7 +314,7 @@ func TestCatalog_IDs(t *testing.T) {
 				kinds = append(kinds, r.Kind())
 			}
 		}
-		is.EqualSlice(t, []string{"INV", "AC", "DEV"}, kinds)
+		is.EqualSlice(t, []string{"INV", "AC", "UNS"}, kinds)
 	})
 }
 

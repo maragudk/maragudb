@@ -120,7 +120,7 @@ func TestRegisterDriver(t *testing.T) {
 		is.NotError(t, err)
 		defer func() { _ = db.Close() }()
 		is.NotError(t, db.PingContext(t.Context()))
-		mustExec(t, db, "CREATE TABLE t (id int PRIMARY KEY, name string)")
+		mustExec(t, db, "CREATE TABLE t (id bigint PRIMARY KEY, name text)")
 		mustExec(t, db, "INSERT INTO t VALUES ($1, $2)", 1, "a")
 		is.Equal(t, `1 "a"`, queryRows(t, db, "SELECT * FROM t"))
 	})
@@ -144,7 +144,7 @@ func TestDB(t *testing.T) {
 	t.Run("round trips every type through parameters and Scan", func(t *testing.T) {
 		verify.Covers(t, "every type and NULL round-trips through $1-style parameters and Scan", "INV-TYPES", "INV-PLACEHOLDERS")
 		db := newDB(t)
-		mustExec(t, db, "CREATE TABLE t (id int PRIMARY KEY, f float, b bool, s string, bs bytes, at time, n int)")
+		mustExec(t, db, "CREATE TABLE t (id bigint PRIMARY KEY, f double precision, b boolean, s text, bs bytea, at timestamptz, n bigint)")
 		at := time.Date(2024, 5, 6, 7, 8, 9, 123456789, time.FixedZone("plus2", 2*3600))
 		mustExec(t, db, "INSERT INTO t VALUES ($1, $2, $3, $4, $5, $6, $7)", int64(1), 1.5, true, "héllo", []byte{0, 1, 2}, at, nil)
 		mustExec(t, db, "INSERT INTO t (id) VALUES ($1)", 2)
@@ -165,7 +165,7 @@ func TestDB(t *testing.T) {
 		is.True(t, b)
 		is.Equal(t, "héllo", s)
 		is.EqualSlice(t, []byte{0, 1, 2}, by)
-		is.True(t, got.Equal(at))
+		is.True(t, got.Equal(at.Truncate(time.Microsecond)), "a timestamptz keeps microseconds")
 		is.Equal(t, time.UTC, got.Location(), "times come back in UTC")
 		is.True(t, !n.Valid)
 
@@ -176,33 +176,39 @@ func TestDB(t *testing.T) {
 		is.True(t, !nf.Valid && !ns.Valid && !n.Valid)
 	})
 
-	t.Run("never converts a parameter of the wrong type", func(t *testing.T) {
-		verify.Covers(t, "a parameter of the wrong Go type for its column is ErrType, never converted", "INV-STRICT-TYPES")
+	t.Run("gives a parameter the type of its context, as Postgres does", func(t *testing.T) {
+		verify.Covers(t, "a string parameter is read like a quoted literal of the type its context gives it, an int64 converts to a double precision, and a conversion that a Postgres driver might make differently is ErrUnsupported", "INV-PLACEHOLDERS", "UNS-PARAMETERS")
 		db := newDB(t)
-		mustExec(t, db, "CREATE TABLE t (id int PRIMARY KEY, f float, s string)")
-		_, err := db.ExecContext(t.Context(), "INSERT INTO t VALUES ($1, $2, $3)", "1", 1.5, "x")
-		is.Error(t, maragudb.ErrType, err, "a string for an int column")
-		_, err = db.ExecContext(t.Context(), "INSERT INTO t VALUES ($1, $2, $3)", 1, 2, "x")
-		is.Error(t, maragudb.ErrType, err, "an int for a float column")
-		_, err = db.ExecContext(t.Context(), "INSERT INTO t VALUES ($1, $2, $3)", 1, 1.5, 3)
-		is.Error(t, maragudb.ErrType, err, "an int for a string column")
+		mustExec(t, db, "CREATE TABLE t (id bigint PRIMARY KEY, f double precision, s text)")
+		mustExec(t, db, "INSERT INTO t VALUES ($1, $2, $3)", "1", 2, "x")
+		is.Equal(t, `1 2 "x"`, queryRows(t, db, "SELECT * FROM t"), "a string reads as a bigint, and an int64 widens")
+		_, err := db.ExecContext(t.Context(), "INSERT INTO t VALUES ($1, $2, $3)", "x", 1.5, "x")
+		is.Error(t, maragudb.ErrCast, err, "a string that is not a bigint")
+		_, err = db.ExecContext(t.Context(), "INSERT INTO t VALUES ($1, $2, $3)", 2, 1.5, 3)
+		is.Error(t, maragudb.ErrUnsupported, err, "an int64 for a text column")
+		_, err = db.ExecContext(t.Context(), "INSERT INTO t VALUES ($1, $2, $3)", 2.0, 1.5, "x")
+		is.Error(t, maragudb.ErrUnsupported, err, "a float64 for a bigint column")
+		_, err = db.ExecContext(t.Context(), "INSERT INTO t VALUES ($1, $2, $3)", 2, true, "x")
+		is.Error(t, maragudb.ErrType, err, "a bool for a double precision column")
+		_, err = db.ExecContext(t.Context(), "SELECT $1 + 2147483647", 1)
+		is.Error(t, maragudb.ErrOutOfRange, err, "an integer context makes the parameter an integer, which overflows as in Postgres")
 		_, err = db.ExecContext(t.Context(), "INSERT INTO t VALUES ($1, $2, $3)", int32(1), 1.5, "x")
 		is.True(t, err != nil && strings.Contains(err.Error(), "unsupported parameter type int32"), fmt.Sprint(err))
 		_, err = db.ExecContext(t.Context(), "INSERT INTO t VALUES ($1, $2, $3)", 1, 1.5)
 		is.True(t, err != nil && strings.Contains(err.Error(), "3 parameters, 2 given"), fmt.Sprint(err))
-		is.Equal(t, "", queryRows(t, db, "SELECT * FROM t"))
+		is.Equal(t, `1 2 "x"`, queryRows(t, db, "SELECT * FROM t"))
 		mustExec(t, db, "INSERT INTO t VALUES ($1, $2, $3)", sql.NullInt64{Int64: 7, Valid: true}, sql.NullFloat64{}, sql.NullString{String: "v", Valid: true})
-		is.Equal(t, `7 NULL "v"`, queryRows(t, db, "SELECT * FROM t"), "driver.Valuer parameters are unwrapped")
+		is.Equal(t, `1 2 "x"`+"\n"+`7 NULL "v"`, queryRows(t, db, "SELECT * FROM t"), "driver.Valuer parameters are unwrapped")
 		var nilValuer *nullableValuer
 		mustExec(t, db, "INSERT INTO t VALUES ($1, $2, $3)", 8, nilValuer, nil)
-		is.Equal(t, `7 NULL "v"`+"\n"+`8 NULL NULL`, queryRows(t, db, "SELECT * FROM t"), "a nil pointer Valuer is NULL")
+		is.Equal(t, `1 2 "x"`+"\n"+`7 NULL "v"`+"\n"+`8 NULL NULL`, queryRows(t, db, "SELECT * FROM t"), "a nil pointer Valuer is NULL")
 		_, err = db.ExecContext(t.Context(), "INSERT INTO t VALUES ($1, $2, $3)", 9, 1.5, "x", "extra")
 		is.True(t, err != nil && strings.Contains(err.Error(), "3 parameters, 4 given"), fmt.Sprint(err))
 	})
 
 	t.Run("prepares statements and reports parameter count mismatches", func(t *testing.T) {
 		db := newDB(t)
-		mustExec(t, db, "CREATE TABLE t (id int PRIMARY KEY, n int)")
+		mustExec(t, db, "CREATE TABLE t (id bigint PRIMARY KEY, n bigint)")
 		st, err := db.PrepareContext(t.Context(), "INSERT INTO t VALUES ($1, $2)")
 		is.NotError(t, err)
 		defer func() { _ = st.Close() }()
@@ -221,8 +227,8 @@ func TestDB(t *testing.T) {
 
 	t.Run("reports column types", func(t *testing.T) {
 		db := newDB(t)
-		mustExec(t, db, "CREATE TABLE t (id int PRIMARY KEY, f float, b bool, s string, bs bytes, at time)")
-		rows, err := db.QueryContext(t.Context(), "SELECT id, f, b, s, bs, at, NULL, id + 1 AS next FROM t")
+		mustExec(t, db, "CREATE TABLE t (id bigint PRIMARY KEY, f double precision, b boolean, s text, bs bytea, at timestamptz)")
+		rows, err := db.QueryContext(t.Context(), "SELECT id, f, b, s, bs, at, NULL, id + 1 AS next, length(s) FROM t")
 		is.NotError(t, err)
 		defer func() { _ = rows.Close() }()
 		types, err := rows.ColumnTypes()
@@ -232,7 +238,7 @@ func TestDB(t *testing.T) {
 			nullable, _ := ct.Nullable()
 			got = append(got, fmt.Sprintf("%s:%s:%v:%v", ct.Name(), ct.DatabaseTypeName(), ct.ScanType(), nullable))
 		}
-		is.EqualSlice(t, []string{"id:INT:int64:false", "f:FLOAT:float64:true", "b:BOOL:bool:true", "s:STRING:string:true", "bs:BYTES:[]uint8:true", "at:TIME:time.Time:true", "?column?::interface {}:true", "next:INT:int64:true"}, got)
+		is.EqualSlice(t, []string{"id:INT8:int64:false", "f:FLOAT8:float64:true", "b:BOOL:bool:true", "s:TEXT:string:true", "bs:BYTEA:[]uint8:true", "at:TIMESTAMPTZ:time.Time:true", "?column?:TEXT:string:true", "next:INT8:int64:true", "length:INT4:int64:true"}, got)
 		res := mustExec(t, db, "INSERT INTO t (id) VALUES (1), (2)")
 		n, err := res.RowsAffected()
 		is.NotError(t, err)
@@ -244,7 +250,7 @@ func TestDB(t *testing.T) {
 	t.Run("reports statement errors with errors.Is", func(t *testing.T) {
 		verify.Covers(t, "statement errors, including int overflow as ErrOutOfRange, are detectable with errors.Is", "INV-INT-OVERFLOW")
 		db := newDB(t)
-		mustExec(t, db, "CREATE TABLE t (id int PRIMARY KEY, n int NOT NULL)")
+		mustExec(t, db, "CREATE TABLE t (id bigint PRIMARY KEY, n bigint NOT NULL)")
 		mustExec(t, db, "INSERT INTO t VALUES (1, 1)")
 		tests := []struct {
 			sql  string
@@ -253,13 +259,15 @@ func TestDB(t *testing.T) {
 			{"INSERT INTO t VALUES (1, 1)", maragudb.ErrDuplicateKey},
 			{"INSERT INTO t VALUES (2, NULL)", maragudb.ErrNotNull},
 			{"SELECT * FROM nope", maragudb.ErrNoTable},
-			{"CREATE TABLE t (id int PRIMARY KEY)", maragudb.ErrTableExists},
+			{"CREATE TABLE t (id bigint PRIMARY KEY)", maragudb.ErrTableExists},
 			{"SELECT 1 / 0", maragudb.ErrDivisionByZero},
 			{"SELECT 9223372036854775807 + 1", maragudb.ErrOutOfRange},
-			{"SELECT CAST('x' AS int)", maragudb.ErrCast},
-			{"SELECT 1 + 'a'", maragudb.ErrType},
+			{"SELECT CAST('x' AS bigint)", maragudb.ErrCast},
+			{"SELECT 1 + 'a'", maragudb.ErrCast},
+			{"SELECT 1 + TRUE", maragudb.ErrType},
 			{"SELECT nope FROM t", maragudb.ErrInvalid},
-			{"SELECT", maragudb.ErrSyntax},
+			{"SELEC 1", maragudb.ErrSyntax},
+			{"SELECT 1.5", maragudb.ErrUnsupported},
 		}
 		for _, test := range tests {
 			_, err := db.ExecContext(t.Context(), test.sql)
@@ -273,7 +281,7 @@ func TestTx(t *testing.T) {
 		db := newDB(t)
 		tx, err := db.BeginTx(t.Context(), nil)
 		is.NotError(t, err)
-		mustExec(t, tx, "CREATE TABLE t (id int PRIMARY KEY, n int)")
+		mustExec(t, tx, "CREATE TABLE t (id bigint PRIMARY KEY, n bigint)")
 		mustExec(t, tx, "INSERT INTO t VALUES (1, 1)")
 		mustExec(t, tx, "UPDATE t SET n = n + 1")
 		is.Equal(t, "1 2", queryRows(t, tx, "SELECT * FROM t"))
@@ -283,7 +291,7 @@ func TestTx(t *testing.T) {
 
 		tx, err = db.BeginTx(t.Context(), nil)
 		is.NotError(t, err)
-		mustExec(t, tx, "CREATE TABLE t (id int PRIMARY KEY, n int)")
+		mustExec(t, tx, "CREATE TABLE t (id bigint PRIMARY KEY, n bigint)")
 		mustExec(t, tx, "INSERT INTO t VALUES (1, 1)")
 		is.NotError(t, tx.Commit())
 		is.Equal(t, "1 1", queryRows(t, db, "SELECT * FROM t"))
@@ -294,7 +302,7 @@ func TestTx(t *testing.T) {
 		w := newWorld(t)
 		a := w.open(maragudb.Options{})
 		b := w.open(maragudb.Options{})
-		mustExec(t, a, "CREATE TABLE t (id int PRIMARY KEY, n int)")
+		mustExec(t, a, "CREATE TABLE t (id bigint PRIMARY KEY, n bigint)")
 		mustExec(t, a, "INSERT INTO t VALUES (1, 0)")
 
 		transfer := func() error {
@@ -329,16 +337,19 @@ func TestTx(t *testing.T) {
 		w := newWorld(t)
 		a := w.open(maragudb.Options{})
 		b := w.open(maragudb.Options{})
-		mustExec(t, a, "CREATE TABLE t (id int PRIMARY KEY, n int)")
+		mustExec(t, a, "CREATE TABLE t (id bigint PRIMARY KEY, n bigint)")
 		mustExec(t, a, "INSERT INTO t VALUES (1, 0)")
 		tx, err := a.BeginTx(t.Context(), &sql.TxOptions{ReadOnly: true})
 		is.NotError(t, err)
 		is.Equal(t, "0", queryRows(t, tx, "SELECT n FROM t"))
 		mustExec(t, b, "UPDATE t SET n = 1")
 		is.Equal(t, "0", queryRows(t, tx, "SELECT n FROM t"), "the snapshot holds")
+		is.NotError(t, tx.Commit())
+		tx, err = a.BeginTx(t.Context(), &sql.TxOptions{ReadOnly: true})
+		is.NotError(t, err)
 		_, err = tx.ExecContext(t.Context(), "UPDATE t SET n = 2")
 		is.Error(t, maragudb.ErrReadOnlyTx, err)
-		is.NotError(t, tx.Commit())
+		is.Error(t, maragudb.ErrTxAborted, tx.Commit(), "the failed write aborted the transaction, as in Postgres")
 		is.Equal(t, "1", queryRows(t, a, "SELECT n FROM t"))
 	})
 
@@ -353,7 +364,7 @@ func TestTx(t *testing.T) {
 
 	t.Run("SQL BEGIN, COMMIT, and ROLLBACK work on a dedicated connection", func(t *testing.T) {
 		db := newDB(t)
-		mustExec(t, db, "CREATE TABLE t (id int PRIMARY KEY)")
+		mustExec(t, db, "CREATE TABLE t (id bigint PRIMARY KEY)")
 		conn, err := db.Conn(t.Context())
 		is.NotError(t, err)
 		mustExec(t, conn, "BEGIN")
@@ -378,7 +389,7 @@ func TestTx(t *testing.T) {
 		w := newWorld(t)
 		a := w.open(maragudb.Options{})
 		b := w.open(maragudb.Options{})
-		mustExec(t, a, "CREATE TABLE t (id int PRIMARY KEY, n int)")
+		mustExec(t, a, "CREATE TABLE t (id bigint PRIMARY KEY, n bigint)")
 		mustExec(t, a, "INSERT INTO t VALUES (1, 0)")
 		interfered := 0
 		w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
@@ -404,7 +415,7 @@ func TestStats(t *testing.T) {
 		db := newDB(t)
 		before, err := maragudb.Stats(t.Context(), db)
 		is.NotError(t, err)
-		mustExec(t, db, "CREATE TABLE t (id int PRIMARY KEY)")
+		mustExec(t, db, "CREATE TABLE t (id bigint PRIMARY KEY)")
 		mustExec(t, db, "INSERT INTO t VALUES (1)")
 		is.Equal(t, "1", queryRows(t, db, "SELECT * FROM t"))
 		after, err := maragudb.Stats(t.Context(), db)
@@ -425,7 +436,7 @@ func TestStats(t *testing.T) {
 			w := newWorld(t)
 			grace := time.Minute
 			db := w.open(maragudb.Options{GCGracePeriod: &grace})
-			mustExec(t, db, "CREATE TABLE t (id int PRIMARY KEY)")
+			mustExec(t, db, "CREATE TABLE t (id bigint PRIMARY KEY)")
 			for i := range 10 {
 				mustExec(t, db, "INSERT INTO t VALUES ($1)", i)
 			}
@@ -466,7 +477,7 @@ func TestMaintenance(t *testing.T) {
 			grace := time.Minute
 			interval := time.Second
 			db := w.open(maragudb.Options{Maintenance: new(true), MaintenanceInterval: &interval, CompactionThreshold: new(4), GCGracePeriod: &grace})
-			mustExec(t, db, "CREATE TABLE t (id int PRIMARY KEY)")
+			mustExec(t, db, "CREATE TABLE t (id bigint PRIMARY KEY)")
 			for i := range 3 {
 				mustExec(t, db, "INSERT INTO t VALUES ($1)", i)
 			}
@@ -496,7 +507,7 @@ func TestMaintenance(t *testing.T) {
 			w := newWorld(t)
 			interval := time.Second
 			db := w.open(maragudb.Options{Maintenance: new(true), MaintenanceInterval: &interval, CompactionThreshold: new(4)})
-			mustExec(t, db, "CREATE TABLE t (id int PRIMARY KEY, name string)")
+			mustExec(t, db, "CREATE TABLE t (id bigint PRIMARY KEY, name text)")
 			stats := func() maragudb.Statistics {
 				s, err := maragudb.Stats(t.Context(), db)
 				is.NotError(t, err)
@@ -535,7 +546,7 @@ func TestMaintenance(t *testing.T) {
 			w := newWorld(t)
 			interval := time.Second
 			db := w.open(maragudb.Options{Maintenance: new(true), MaintenanceInterval: &interval, CompactionThreshold: new(4)})
-			mustExec(t, db, "CREATE TABLE t (id int PRIMARY KEY)")
+			mustExec(t, db, "CREATE TABLE t (id bigint PRIMARY KEY)")
 			for i := range 3 {
 				mustExec(t, db, "INSERT INTO t VALUES ($1)", i)
 			}
@@ -556,7 +567,7 @@ func TestMaintenance(t *testing.T) {
 			w := newWorld(t)
 			interval := time.Second
 			db := w.open(maragudb.Options{Maintenance: new(false), MaintenanceInterval: &interval, CompactionThreshold: new(2)})
-			mustExec(t, db, "CREATE TABLE t (id int PRIMARY KEY)")
+			mustExec(t, db, "CREATE TABLE t (id bigint PRIMARY KEY)")
 			for i := range 3 {
 				mustExec(t, db, "INSERT INTO t VALUES ($1)", i)
 			}
@@ -573,7 +584,7 @@ func TestRequestBudgets(t *testing.T) {
 	sizes := []int{100, 1_000, 10_000, 100_000}
 	load := func(t *testing.T, db *sql.DB, n int) {
 		t.Helper()
-		mustExec(t, db, "CREATE TABLE t (id int PRIMARY KEY, name string, f float)")
+		mustExec(t, db, "CREATE TABLE t (id bigint PRIMARY KEY, name text, f double precision)")
 		const batch = 1000
 		for i := 0; i < n; i += batch {
 			var b strings.Builder

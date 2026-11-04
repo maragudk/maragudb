@@ -65,7 +65,7 @@ func TestConnector(t *testing.T) {
 		db.SetMaxOpenConns(3)
 		is.NotError(t, db.PingContext(t.Context()))
 		is.EqualSlice(t, []string{"db/manifest"}, fake.Keys())
-		_, err = db.ExecContext(t.Context(), "CREATE TABLE t (id int PRIMARY KEY)")
+		_, err = db.ExecContext(t.Context(), "CREATE TABLE t (id bigint PRIMARY KEY)")
 		is.NotError(t, err)
 		var conns []*sql.Conn
 		for range 3 {
@@ -93,7 +93,7 @@ func TestConnector(t *testing.T) {
 			c, err := sqldriver.NewConnector(d, "s3://bucket/db")
 			is.NotError(t, err)
 			db := sql.OpenDB(c)
-			_, err = db.ExecContext(t.Context(), "CREATE TABLE t (id int PRIMARY KEY)")
+			_, err = db.ExecContext(t.Context(), "CREATE TABLE t (id bigint PRIMARY KEY)")
 			is.NotError(t, err)
 			_, err = db.ExecContext(t.Context(), "INSERT INTO t VALUES (1)")
 			is.NotError(t, err)
@@ -126,7 +126,7 @@ func TestConnector(t *testing.T) {
 			d := sqldriver.New(sqldriver.Options{Engine: engine.Options{Client: fake}, Maintenance: sqldriver.MaintenanceOptions{Interval: time.Second}})
 			conn, err := d.Open("s3://bucket/db")
 			is.NotError(t, err)
-			_, err = conn.(driver.ExecerContext).ExecContext(t.Context(), "CREATE TABLE t (id int PRIMARY KEY)", nil)
+			_, err = conn.(driver.ExecerContext).ExecContext(t.Context(), "CREATE TABLE t (id bigint PRIMARY KEY)", nil)
 			is.NotError(t, err)
 			is.NotError(t, conn.Close())
 			before := fake.Counts()
@@ -150,7 +150,7 @@ func TestConnector(t *testing.T) {
 		is.NotError(t, err)
 		db := sql.OpenDB(c)
 		defer func() { _ = db.Close() }()
-		_, err = db.ExecContext(t.Context(), "CREATE TABLE t (id int PRIMARY KEY)")
+		_, err = db.ExecContext(t.Context(), "CREATE TABLE t (id bigint PRIMARY KEY)")
 		is.NotError(t, err)
 		_, err = db.ExecContext(t.Context(), "INSERT INTO t VALUES (1)")
 		is.NotError(t, err)
@@ -177,7 +177,7 @@ func TestConn(t *testing.T) {
 		_, err = db.ExecContext(t.Context(), "SELECT $1", struct{}{})
 		is.True(t, err != nil)
 		var got int64
-		is.NotError(t, db.QueryRowContext(t.Context(), "SELECT $1", 1).Scan(&got))
+		is.NotError(t, db.QueryRowContext(t.Context(), "SELECT $1::bigint", 1).Scan(&got))
 		is.Equal(t, int64(1), got)
 	})
 

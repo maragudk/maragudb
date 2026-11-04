@@ -1,19 +1,27 @@
-// Package ast is the syntax tree of the SQL dialect, with renderers to that dialect and to
-// Postgres.
+// Package ast is the syntax tree of the SQL subset, with a renderer to Postgres SQL, which is
+// also the SQL of maragudb.
 package ast
 
 import "maragu.dev/maragudb/internal/sql/value"
 
-// Keywords of the dialect, which cannot be unquoted identifiers.
+// Keywords that cannot be unquoted column names: Postgres's reserved words and its
+// type_func_name words. Every other keyword is recognized in context and can name a column.
 var Keywords = map[string]bool{
-	"all": true, "and": true, "as": true, "asc": true, "begin": true, "between": true, "by": true,
-	"case": true, "cast": true, "commit": true, "create": true, "default": true, "delete": true, "desc": true,
-	"distinct": true, "drop": true, "else": true, "end": true, "exists": true, "false": true, "from": true,
-	"group": true, "having": true, "if": true, "in": true, "insert": true, "into": true, "is": true, "key": true,
-	"like": true, "limit": true, "not": true, "null": true, "nulls": true, "offset": true, "on": true,
-	"only": true, "or": true, "order": true, "primary": true, "rollback": true, "select": true, "set": true,
-	"start": true, "table": true, "then": true, "transaction": true, "true": true, "union": true,
-	"unique": true, "update": true, "using": true, "values": true, "when": true, "where": true, "with": true,
+	"all": true, "analyse": true, "analyze": true, "and": true, "any": true, "array": true, "as": true, "asc": true,
+	"asymmetric": true, "authorization": true, "binary": true, "both": true, "case": true, "cast": true, "check": true,
+	"collate": true, "collation": true, "column": true, "concurrently": true, "constraint": true, "create": true,
+	"cross": true, "current_catalog": true, "current_date": true, "current_role": true, "current_schema": true,
+	"current_time": true, "current_timestamp": true, "current_user": true, "default": true, "deferrable": true,
+	"desc": true, "distinct": true, "do": true, "else": true, "end": true, "except": true, "false": true, "fetch": true,
+	"for": true, "foreign": true, "freeze": true, "from": true, "full": true, "grant": true, "group": true, "having": true,
+	"ilike": true, "in": true, "initially": true, "inner": true, "intersect": true, "into": true, "is": true,
+	"isnull": true, "join": true, "lateral": true, "leading": true, "left": true, "like": true, "limit": true,
+	"localtime": true, "localtimestamp": true, "natural": true, "not": true, "notnull": true, "null": true,
+	"offset": true, "on": true, "only": true, "or": true, "order": true, "outer": true, "overlaps": true, "placing": true,
+	"primary": true, "references": true, "returning": true, "right": true, "select": true, "session_user": true,
+	"similar": true, "some": true, "symmetric": true, "system_user": true, "table": true, "tablesample": true,
+	"then": true, "to": true, "trailing": true, "true": true, "union": true, "unique": true, "user": true, "using": true,
+	"variadic": true, "verbose": true, "when": true, "where": true, "window": true, "with": true,
 }
 
 // Statement is any SQL statement.
@@ -130,7 +138,9 @@ type Expr interface {
 	expr()
 }
 
-// Literal value. A NULL literal has a Value with Null set and type [value.Unknown].
+// Literal value as the parser produces it: an integer of type [value.Int4] or [value.Int], a
+// numeric literal of type [value.Numeric], a quoted string of type [value.Unknown], a boolean,
+// or a NULL with type [value.Unknown]. A literal of another type renders as a cast of its text.
 type Literal struct {
 	Value value.Value
 }
@@ -152,6 +162,7 @@ type UnaryOp int
 const (
 	Neg UnaryOp = iota
 	Not
+	Pos
 )
 
 // Unary expression.
@@ -230,11 +241,22 @@ type Call struct {
 	Args []Expr
 }
 
-// Cast is `CAST(expr AS type)`.
+// Cast is `CAST(expr AS type)`, `expr::type`, or, for a quoted string, `type 'string'`.
 type Cast struct {
-	Expr Expr
-	Type value.Type
+	Expr  Expr
+	Type  value.Type
+	Style CastStyle
 }
+
+// CastStyle is the syntax a [Cast] was written in.
+type CastStyle int
+
+// Cast styles.
+const (
+	CastExplicit CastStyle = iota
+	CastColons
+	CastPrefix
+)
 
 func (*Literal) expr()   {}
 func (*Param) expr()     {}

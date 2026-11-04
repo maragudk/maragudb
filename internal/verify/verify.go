@@ -1,5 +1,5 @@
 // Package verify makes the automated verification visible. Tests declare which requirement,
-// deviation, mutant, and reached-state IDs they verify with [Covers], and record facts about
+// unsupported-statement, mutant, and reached-state IDs they verify with [Covers], and record facts about
 // what they checked with [Record]. Every test binary runs through [Main], which collects the
 // facts of its package as JSON lines in a directory, and renders the report of every package so
 // far to the GitHub step summary when it runs in GitHub Actions.
@@ -44,6 +44,7 @@ type Fact struct {
 	Mutant     *Mutant        `json:"mutant,omitempty"`
 	Reached    map[string]int `json:"reached"`
 	Diff       *Diff          `json:"diff,omitempty"`
+	Ratchet    *Ratchet       `json:"ratchet,omitempty"`
 	Budget     *Budget        `json:"budget,omitempty"`
 	Latency    *Latency       `json:"latency,omitempty"`
 	Antithesis *Antithesis    `json:"antithesis,omitempty"`
@@ -110,6 +111,20 @@ type Diff struct {
 	ClassMatches int `json:"classMatches"`
 	Classes      int `json:"classes"`
 	Ordered      int `json:"ordered"`
+	// Executed statements ran on both sides; Rejected ones were rejected by maragudb as
+	// unsupported and skipped on Postgres. Transactions counts explicit transactions.
+	Executed     int `json:"executed"`
+	Rejected     int `json:"rejected"`
+	Transactions int `json:"transactions"`
+}
+
+// Ratchet is the fixed-seed differential run whose executed statements must not drop below
+// the committed Baseline.
+type Ratchet struct {
+	Cases      int `json:"cases"`
+	Statements int `json:"statements"`
+	Executed   int `json:"executed"`
+	Baseline   int `json:"baseline"`
 }
 
 // Budget is a measured S3 request count against its limit.

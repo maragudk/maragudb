@@ -2,60 +2,32 @@ package ast
 
 import (
 	"fmt"
-	"math"
 	"strconv"
 	"strings"
-	"time"
 
 	"maragu.dev/maragudb/internal/sql/value"
 )
 
-// Dialect to render to.
-type Dialect int
-
-// Dialects.
-const (
-	Maragudb Dialect = iota
-	Postgres
-)
-
-// Render a statement in the given dialect.
-func Render(s Statement, d Dialect) string {
-	r := renderer{d: d}
+// Render a statement as Postgres SQL.
+func Render(s Statement) string {
+	var r renderer
 	r.stmt(s)
 	return r.b.String()
 }
 
-// RenderExpr in the given dialect.
-func RenderExpr(e Expr, d Dialect) string {
-	r := renderer{d: d}
+// RenderExpr as Postgres SQL.
+func RenderExpr(e Expr) string {
+	var r renderer
 	r.expr(e, 0)
 	return r.b.String()
 }
 
-// TypeName of t in the given dialect.
-func TypeName(t value.Type, d Dialect) string {
-	if d == Postgres {
-		switch t {
-		case value.Int:
-			return "bigint"
-		case value.Float:
-			return "double precision"
-		case value.Bool:
-			return "boolean"
-		case value.String:
-			return "text"
-		case value.Bytes:
-			return "bytea"
-		case value.Time:
-			return "timestamptz"
-		}
-	}
+// TypeName of a column type in SQL.
+func TypeName(t value.Type) string {
 	return t.String()
 }
 
 type renderer struct {
-	d Dialect
 	b strings.Builder
 }
 
@@ -74,7 +46,7 @@ func (r *renderer) stmt(s Statement) {
 			}
 			r.ident(c.Name)
 			r.b.WriteByte(' ')
-			r.b.WriteString(TypeName(c.Type, r.d))
+			r.b.WriteString(TypeName(c.Type))
 			if c.NotNull {
 				r.b.WriteString(" NOT NULL")
 			}
@@ -149,15 +121,7 @@ func (r *renderer) stmt(s Statement) {
 				if i > 0 {
 					r.b.WriteString(", ")
 				}
-				// A bare constant is an output position when it is an int and an error otherwise,
-				// in both dialects, so a literal is rendered untyped in Postgres too.
-				if lit, ok := o.Expr.(*Literal); ok && (lit.Value.Null || lit.Value.Type == value.Int || lit.Value.Type == value.String || lit.Value.Type == value.Bool || (lit.Value.Type == value.Float && !math.IsNaN(lit.Value.F) && !math.IsInf(lit.Value.F, 0))) {
-					bare := renderer{d: Maragudb}
-					bare.literal(lit.Value)
-					r.b.WriteString(bare.b.String())
-				} else {
-					r.expr(o.Expr, 0)
-				}
+				r.expr(o.Expr, 0)
 				if o.Desc {
 					r.b.WriteString(" DESC")
 				}
@@ -256,6 +220,7 @@ const (
 	bpAdd
 	bpMul
 	bpUnary
+	bpCast
 	bpPrimary
 )
 
@@ -282,6 +247,10 @@ func bindingPower(e Expr) int {
 		return bpIs
 	case *Between, *In, *Like:
 		return bpLike
+	case *Cast:
+		if e.Style == CastColons {
+			return bpCast
+		}
 	}
 	return bpPrimary
 }
@@ -307,14 +276,18 @@ func (r *renderer) expr(e Expr, minimum int) {
 			r.expr(e.Expr, bpNot)
 			return
 		}
-		r.b.WriteByte('-')
+		if e.Op == Pos {
+			r.b.WriteByte('+')
+		} else {
+			r.b.WriteByte('-')
+		}
 		// A literal is parenthesized so that the sign is not folded into it when parsed again,
-		// and a nested negation so that the two signs do not form a comment.
+		// and a nested sign so that two minus signs do not form a comment.
 		if _, ok := e.Expr.(*Literal); ok {
 			r.expr(e.Expr, bpPrimary+1)
 			return
 		}
-		if u, ok := e.Expr.(*Unary); ok && u.Op == Neg {
+		if u, ok := e.Expr.(*Unary); ok && u.Op != Not {
 			r.expr(e.Expr, bpPrimary+1)
 			return
 		}
@@ -385,14 +358,44 @@ func (r *renderer) expr(e Expr, minimum int) {
 		r.exprs(e.Args)
 		r.b.WriteByte(')')
 	case *Cast:
-		r.b.WriteString("CAST(")
-		r.expr(e.Expr, 0)
-		r.b.WriteString(" AS ")
-		r.b.WriteString(TypeName(e.Type, r.d))
-		r.b.WriteByte(')')
+		switch e.Style {
+		case CastColons:
+			// A negative number is parenthesized so that its sign is not read as an operator
+			// applied to the cast when parsed again.
+			if lit, ok := e.Expr.(*Literal); ok && isNegativeNumber(lit.Value) {
+				r.expr(e.Expr, bpPrimary+1)
+			} else {
+				r.expr(e.Expr, bpCast)
+			}
+			r.b.WriteString("::")
+			r.b.WriteString(TypeName(e.Type))
+		case CastPrefix:
+			r.b.WriteString(TypeName(e.Type))
+			r.b.WriteByte(' ')
+			r.expr(e.Expr, 0)
+		default:
+			r.b.WriteString("CAST(")
+			r.expr(e.Expr, 0)
+			r.b.WriteString(" AS ")
+			r.b.WriteString(TypeName(e.Type))
+			r.b.WriteByte(')')
+		}
 	default:
 		panic(fmt.Sprintf("ast: rendering %T", e))
 	}
+}
+
+// isNegativeNumber reports whether a literal is a number written with a minus sign.
+func isNegativeNumber(v value.Value) bool {
+	switch {
+	case v.Null:
+		return false
+	case v.Type == value.Int, v.Type == value.Int4:
+		return v.I < 0
+	case v.Type == value.Numeric:
+		return strings.HasPrefix(v.S, "-")
+	}
+	return false
 }
 
 func (r *renderer) literal(v value.Value) {
@@ -401,55 +404,25 @@ func (r *renderer) literal(v value.Value) {
 		return
 	}
 	switch v.Type {
-	case value.Int:
-		if r.d == Postgres {
-			fmt.Fprintf(&r.b, "(%d)::bigint", v.I)
-		} else {
-			r.b.WriteString(strconv.FormatInt(v.I, 10))
-		}
-	case value.Float:
-		if math.IsNaN(v.F) || math.IsInf(v.F, 0) {
-			if r.d == Postgres {
-				fmt.Fprintf(&r.b, "'%s'::float8", value.FormatFloat(v.F))
-			} else {
-				fmt.Fprintf(&r.b, "CAST('%s' AS float)", value.FormatFloat(v.F))
-			}
-			return
-		}
-		s := value.FormatFloat(v.F)
-		if r.d == Postgres {
-			// A quoted literal goes through float8in directly. A numeric literal would be
-			// parsed as numeric first, which has no negative zero.
-			fmt.Fprintf(&r.b, "'%s'::float8", s)
-			return
-		}
-		if !strings.ContainsAny(s, ".e") {
-			s += ".0"
-		}
-		r.b.WriteString(s)
+	case value.Int, value.Int4:
+		r.b.WriteString(strconv.FormatInt(v.I, 10))
+	case value.Numeric:
+		r.b.WriteString(v.S)
+	case value.Unknown:
+		r.b.WriteString(QuoteString(v.S))
 	case value.Bool:
 		if v.B {
 			r.b.WriteString("TRUE")
 		} else {
 			r.b.WriteString("FALSE")
 		}
-	case value.String:
-		r.b.WriteString(QuoteString(v.S))
-	case value.Bytes:
-		if r.d == Postgres {
-			fmt.Fprintf(&r.b, "'\\x%x'::bytea", v.Raw)
-		} else {
-			fmt.Fprintf(&r.b, "X'%x'", v.Raw)
-		}
-	case value.Time:
-		s := v.T.UTC().Format(time.RFC3339Nano)
-		if r.d == Postgres {
-			fmt.Fprintf(&r.b, "'%s'::timestamptz", s)
-		} else {
-			fmt.Fprintf(&r.b, "TIME '%s'", s)
-		}
 	default:
-		panic(fmt.Sprintf("ast: rendering literal of type %v", v.Type))
+		// A typed value is written as the cast of its text, which is how Postgres reads it.
+		r.b.WriteString("CAST(")
+		r.b.WriteString(QuoteString(value.Format(v)))
+		r.b.WriteString(" AS ")
+		r.b.WriteString(TypeName(v.Type))
+		r.b.WriteByte(')')
 	}
 }
 

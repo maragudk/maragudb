@@ -1,6 +1,7 @@
 package exec
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"strings"
@@ -18,11 +19,20 @@ type cexpr struct {
 	refs bool
 	// folded reports that the expression is a constant whose value is in val.
 	folded bool
-	// literal reports that the expression is built from literals only, so it is not a parameter.
-	// Only such a constant adapts its type, as an integer literal does next to a float.
-	literal bool
-	val     value.Value
-	eval    func(row []value.Value) (value.Value, error)
+	val    value.Value
+	eval   func(row []value.Value) (value.Value, error)
+	// fallible reports that evaluating the expression on a row can fail: an overflow, a
+	// division, a cast of text or a float, a LIKE whose pattern is not constant.
+	fallible bool
+	// stable reports that the expression contains a function that Postgres marks stable rather
+	// than immutable, which among the supported ones are the conversions between timestamptz and
+	// text. Postgres does not fold such an expression, so it is evaluated when the statement
+	// runs, even when it reads no columns.
+	stable bool
+	// param is the number of the parameter the expression is, when it is a parameter of a Go
+	// type other than string, which has type [value.Unknown] until its context gives it one.
+	// Its value is in val, typed by its Go type.
+	param int
 }
 
 // value of the expression for row.
@@ -34,11 +44,6 @@ func (e *cexpr) value(row []value.Value) (value.Value, error) {
 }
 
 func constant(v value.Value) *cexpr {
-	return &cexpr{typ: v.Type, folded: true, literal: true, val: v}
-}
-
-// param is a constant from a parameter, which never adapts its type.
-func param(v value.Value) *cexpr {
 	return &cexpr{typ: v.Type, folded: true, val: v}
 }
 
@@ -76,29 +81,36 @@ func (b *binder) folding() error {
 }
 
 // fold a node whose children are all constants by evaluating it now, which also reports errors
-// such as division by zero at bind time, as Postgres does when it folds constants.
+// such as division by zero at bind time, as Postgres does when it folds constants. The node's
+// fallibility is its own or its children's.
 func (b *binder) fold(e *cexpr, children ...*cexpr) (*cexpr, error) {
-	literal := true
 	for _, c := range children {
-		if c.refs {
-			e.refs = true
-			return e, nil
+		e.fallible = e.fallible || c.fallible
+		e.refs = e.refs || c.refs
+		e.stable = e.stable || c.stable
+	}
+	if e.refs {
+		return e, nil
+	}
+	if e.stable {
+		// Postgres evaluates a stable expression without columns when the statement runs, but
+		// also while it plans, to estimate how many rows a condition matches, depending on where
+		// the expression is. When it can fail, whether the statement fails then depends on the
+		// plan.
+		if e.fallible && b.pruned == 0 {
+			return nil, fmt.Errorf("%w: a conversion between text and timestamptz that reads no columns and can fail is not supported, because whether Postgres evaluates it depends on its plan; write the timestamptz as a quoted literal, such as '2024-01-02 03:04:05+00'", ErrUnsupported)
 		}
-		literal = literal && c.literal
+		return e, nil
 	}
 	v, err := e.eval(nil)
 	if err != nil {
 		if b.pruned == 0 && (b.foldErr == nil || b.phase < b.foldPhase) {
 			b.foldErr, b.foldPhase = err, b.phase
 		}
-		// The expression stays unfolded, but it is still built from literals, so it adapts its
-		// type like one and binding goes on as if it had folded.
-		e.literal = literal
+		// The expression stays unfolded, and binding goes on as if it had folded.
 		return e, nil
 	}
-	c := constant(v)
-	c.literal = literal
-	return c, nil
+	return constant(v), nil
 }
 
 // bindPruned binds a branch that is known never to be evaluated.
@@ -108,54 +120,256 @@ func (b *binder) bindPruned(e ast.Expr) (*cexpr, error) {
 	return b.bind(e)
 }
 
-// unify two operand types for a binary operation. A NULL of unknown type takes the other type,
-// and an int constant becomes a float when the other side is a float, which is how an integer
-// literal adapts to a float column. Anything else is an error: there is no implicit coercion.
-func unify(a, b *cexpr, what string) (*cexpr, *cexpr, error) {
+// castError maps a text input error of the value package to the statement error it is.
+func castError(err error) error {
 	switch {
-	case a.typ == b.typ:
-		return a, b, nil
-	case a.typ == value.Unknown:
-		return retypeNull(a, b.typ), b, nil
-	case b.typ == value.Unknown:
-		return a, retypeNull(b, a.typ), nil
-	case a.typ == value.Int && b.typ == value.Float && a.literal:
-		return constant(value.NewFloat(float64(a.val.I))), b, nil
-	case b.typ == value.Int && a.typ == value.Float && b.literal:
-		return a, constant(value.NewFloat(float64(b.val.I))), nil
+	case errors.Is(err, value.ErrOutOfRange):
+		return fmt.Errorf("%w: %v", ErrOutOfRange, err)
+	case errors.Is(err, value.ErrUnsupportedInput):
+		return fmt.Errorf("%w: %v", ErrUnsupported, err)
 	}
-	return nil, nil, fmt.Errorf("%w: %s %v and %v", ErrType, what, a.typ, b.typ)
+	return fmt.Errorf("%w: %v", ErrCast, err)
 }
 
-func retypeNull(e *cexpr, t value.Type) *cexpr {
-	if !e.folded {
+// resolve gives a constant of unknown type, a NULL or a quoted string literal, the type its
+// context demands, by reading the string with the type's input function as Postgres does. Other
+// expressions are returned as they are.
+func resolve(e *cexpr, t value.Type) (*cexpr, error) {
+	if e.typ != value.Unknown || !e.folded {
+		return e, nil
+	}
+	if e.val.Null {
+		return constant(value.NewNull(t)), nil
+	}
+	if e.param > 0 {
+		v, err := resolveParam(e.param, e.val, t)
+		if err != nil {
+			return nil, err
+		}
+		return constant(v), nil
+	}
+	if t == value.Unknown {
+		return constant(value.NewString(e.val.S)), nil
+	}
+	v, err := value.Parse(e.val.S, t)
+	if err != nil {
+		return nil, castError(err)
+	}
+	return constant(v), nil
+}
+
+// resolveParam converts a parameter of a Go type other than string to the type t that its
+// context infers for it, the way a Postgres client library encodes the value for a parameter of
+// that type: an int64 is a bigint, an integer if it fits, or a double precision, and every Go
+// type is its own SQL type. A conversion that a client library might make in some other way, such
+// as an int64 into text, is not supported.
+func resolveParam(n int, v value.Value, t value.Type) (value.Value, error) {
+	if t == value.Unknown {
+		t = value.String
+	}
+	switch {
+	case v.Type == t:
+		return v, nil
+	case v.Type == value.Int && t == value.Int4:
+		if v.I < math.MinInt32 || v.I > math.MaxInt32 {
+			return value.Value{}, fmt.Errorf("%w: parameter $%d is %d, which is out of range for type integer", ErrOutOfRange, n, v.I)
+		}
+		return value.NewInt4(int32(v.I)), nil
+	case v.Type == value.Int && t == value.Float:
+		return value.NewFloat(float64(v.I)), nil
+	case t == value.String || numeric(v.Type) && numeric(t):
+		return value.Value{}, fmt.Errorf("%w: parameter $%d is of type %v here, and a Go %s is not converted to it; pass a %s, or cast the parameter, such as $%d::%v", ErrUnsupported, n, t, goTypeName(v.Type), goTypeFor(t), n, v.Type)
+	}
+	return value.Value{}, fmt.Errorf("%w: parameter $%d is of type %v here, which a Go %s cannot be", ErrType, n, t, goTypeName(v.Type))
+}
+
+// goTypeName is the Go type of a parameter of SQL type t.
+func goTypeName(t value.Type) string {
+	return map[value.Type]string{value.Int: "int64", value.Float: "float64", value.Bool: "bool", value.Bytes: "[]byte", value.Time: "time.Time"}[t]
+}
+
+// goTypeFor is the Go type to pass for a parameter of SQL type t.
+func goTypeFor(t value.Type) string {
+	if t == value.String {
+		return "string"
+	}
+	if t == value.Int4 {
+		return "int64"
+	}
+	return goTypeName(t)
+}
+
+// numericTo converts a numeric literal to double precision, bigint, or text, which are the
+// casts Postgres has for it among the supported types. Postgres converts with a function call
+// that it folds like any other, so a conversion that fails is a folding error, which a pruned
+// branch does not report.
+func (b *binder) numericTo(e *cexpr, t value.Type) (*cexpr, error) {
+	var conv func(s string) (value.Value, error)
+	switch t {
+	case value.Float:
+		conv = func(s string) (value.Value, error) {
+			f, err := value.NumericToFloat(s)
+			return value.NewFloat(f), err
+		}
+	case value.Int:
+		conv = func(s string) (value.Value, error) {
+			i, err := value.NumericToInt(s)
+			return value.NewInt(i), err
+		}
+	case value.String:
+		text, err := value.NumericText(e.val.S)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrUnsupported, err)
+		}
+		return constant(value.NewString(text)), nil
+	default:
+		return nil, fmt.Errorf("%w: the numeric type is not supported, cast the literal %s to double precision or bigint", ErrUnsupported, e.val.S)
+	}
+	return b.fold(&cexpr{typ: t, eval: func([]value.Value) (value.Value, error) {
+		v, err := conv(e.val.S)
+		if err != nil {
+			return value.Value{}, castError(err)
+		}
+		return v, nil
+	}}, e)
+}
+
+// widen an expression of type integer to bigint, or an integer or bigint to double precision,
+// which are the implicit casts Postgres applies between the numeric types. A constant is
+// converted now; an expression that reads columns gets a conversion step, which Postgres prices
+// as a function call.
+func widen(e *cexpr, t value.Type) *cexpr {
+	if e.typ == t {
 		return e
 	}
-	return constant(value.NewNull(t))
+	conv := func(v value.Value) value.Value {
+		switch {
+		case v.Null:
+			return value.NewNull(t)
+		case t == value.Int:
+			return value.NewInt(v.I)
+		case v.Type == value.Float:
+			return v
+		}
+		return value.NewFloat(float64(v.I))
+	}
+	if e.folded {
+		return constant(conv(e.val))
+	}
+	return &cexpr{typ: t, refs: e.refs, fallible: e.fallible, stable: e.stable, eval: func(row []value.Value) (value.Value, error) {
+		v, err := e.value(row)
+		if err != nil {
+			return value.Value{}, err
+		}
+		return conv(v), nil
+	}}
 }
 
-// unifyAll unifies every expression to one common type, for IN lists, CASE results and COALESCE.
-func unifyAll(es []*cexpr, what string) ([]*cexpr, value.Type, error) {
+// numeric reports whether t is one of the numeric types, by Postgres's categories.
+func numeric(t value.Type) bool {
+	return t == value.Int4 || t == value.Int || t == value.Float || t == value.Numeric
+}
+
+// errNoCommonType is returned by [commonType] when two types do not unify.
+var errNoCommonType = errors.New("no common type")
+
+// commonType of two operand types under Postgres's rules for its binary operators: an unknown
+// takes the other type, integer widens to bigint, both widen to double precision, and a numeric
+// literal is double precision next to one. Two unknowns are text. Anything else does not unify,
+// which is [errNoCommonType].
+func commonType(a, c value.Type) (value.Type, error) {
+	switch {
+	case a == c && a != value.Unknown && a != value.Numeric:
+		return a, nil
+	case a == value.Unknown && c == value.Unknown:
+		return value.String, nil
+	case a == value.Unknown && c == value.Numeric, c == value.Unknown && a == value.Numeric, a == value.Numeric && c == value.Numeric:
+		return 0, fmt.Errorf("%w: the numeric type is not supported, cast the literal to double precision or bigint", ErrUnsupported)
+	case a == value.Unknown:
+		return c, nil
+	case c == value.Unknown:
+		return a, nil
+	case numeric(a) && numeric(c):
+		if a == value.Float || c == value.Float {
+			return value.Float, nil
+		}
+		if a == value.Numeric || c == value.Numeric {
+			return 0, fmt.Errorf("%w: the numeric type is not supported, cast the literal to double precision or bigint", ErrUnsupported)
+		}
+		return value.Int, nil
+	}
+	return 0, errNoCommonType
+}
+
+// coerce an expression to a type that [commonType] chose for it, with the implicit casts
+// Postgres has between the supported types.
+func (b *binder) coerce(e *cexpr, t value.Type) (*cexpr, error) {
+	switch {
+	case e.typ == t:
+		return e, nil
+	case e.typ == value.Unknown:
+		return resolve(e, t)
+	case e.typ == value.Numeric:
+		return b.numericTo(e, t)
+	case e.typ == value.Int4 && t == value.Int, (e.typ == value.Int4 || e.typ == value.Int) && t == value.Float:
+		return widen(e, t), nil
+	}
+	return nil, errNoCommonType
+}
+
+// unify two operands of the operator sym to one type.
+func (b *binder) unify(a, c *cexpr, sym string) (*cexpr, *cexpr, error) {
+	t, err := commonType(a.typ, c.typ)
+	if errors.Is(err, errNoCommonType) {
+		return nil, nil, fmt.Errorf("%w: operator does not exist: %v %s %v", ErrType, a.typ, sym, c.typ)
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	if a, err = b.coerce(a, t); err != nil {
+		return nil, nil, err
+	}
+	if c, err = b.coerce(c, t); err != nil {
+		return nil, nil, err
+	}
+	return a, c, nil
+}
+
+// unifyAll unifies every expression to one common type, for IN lists, CASE results and COALESCE,
+// as Postgres resolves the type of a UNION: the first known type is the candidate, a later type
+// that the candidate converts to implicitly replaces it, and unknowns take the result. All
+// unknowns make text.
+func (b *binder) unifyAll(es []*cexpr, what string) ([]*cexpr, value.Type, error) {
 	t := value.Unknown
 	for _, e := range es {
 		switch {
 		case e.typ == value.Unknown:
-		case e.typ == value.Int && e.literal && t == value.Float:
-		case t == value.Unknown, t == value.Int && e.typ == value.Float:
+		case t == value.Unknown:
 			t = e.typ
+		case t == e.typ:
+		case numeric(t) && numeric(e.typ):
+			if e.typ == value.Float {
+				t = value.Float
+			} else if e.typ == value.Int && t == value.Int4 {
+				t = value.Int
+			} else if e.typ == value.Numeric && t != value.Float {
+				return nil, 0, fmt.Errorf("%w: the numeric type is not supported, cast the literal to double precision or bigint", ErrUnsupported)
+			}
+		default:
+			return nil, 0, fmt.Errorf("%w: %s %v and %v", ErrType, what, t, e.typ)
 		}
+	}
+	if t == value.Numeric {
+		return nil, 0, fmt.Errorf("%w: the numeric type is not supported, cast the literal to double precision or bigint", ErrUnsupported)
+	}
+	if t == value.Unknown {
+		t = value.String
 	}
 	out := make([]*cexpr, len(es))
 	for i, e := range es {
-		switch {
-		case e.typ == t:
-			out[i] = e
-		case e.typ == value.Unknown:
-			out[i] = retypeNull(e, t)
-		case e.typ == value.Int && t == value.Float && e.literal:
-			out[i] = constant(value.NewFloat(float64(e.val.I)))
-		default:
-			return nil, 0, fmt.Errorf("%w: %s %v and %v", ErrType, what, t, e.typ)
+		var err error
+		if out[i], err = b.coerce(e, t); err != nil {
+			return nil, 0, err
 		}
 	}
 	return out, t, nil
@@ -167,9 +381,16 @@ func (b *binder) bind(e ast.Expr) (*cexpr, error) {
 		return constant(e.Value), nil
 	case *ast.Param:
 		if e.Index > len(b.params) {
-			return nil, fmt.Errorf("%w: parameter $%d is missing, %d given", ErrInvalid, e.Index, len(b.params))
+			return nil, fmt.Errorf("%w: there is no parameter $%d, %d given", ErrInvalid, e.Index, len(b.params))
 		}
-		return param(b.params[e.Index-1]), nil
+		// A parameter has no type of its own, as in Postgres, which infers it from the context
+		// like the type of a quoted literal. A Go string or nil is exactly such a literal; a
+		// value of another Go type converts to the inferred type when it can.
+		v := b.params[e.Index-1]
+		if v.Type == value.Unknown {
+			return constant(v), nil
+		}
+		return &cexpr{typ: value.Unknown, folded: true, val: v, param: e.Index}, nil
 	case *ast.ColumnRef:
 		if b.table == nil {
 			return nil, fmt.Errorf("%w: column %q does not exist", ErrInvalid, e.Name)
@@ -189,6 +410,12 @@ func (b *binder) bind(e ast.Expr) (*cexpr, error) {
 		x, err := b.bind(e.Expr)
 		if err != nil {
 			return nil, err
+		}
+		if x, err = resolve(x, value.String); err != nil {
+			return nil, err
+		}
+		if x.typ == value.Numeric {
+			return constant(value.NewBool(e.Not)), nil
 		}
 		not := e.Not
 		return b.fold(&cexpr{typ: value.Bool, eval: func(row []value.Value) (value.Value, error) {
@@ -229,8 +456,11 @@ func (b *binder) unary(e *ast.Unary) (*cexpr, error) {
 	}
 	switch e.Op {
 	case ast.Not:
-		if x.typ != value.Bool && x.typ != value.Unknown {
-			return nil, fmt.Errorf("%w: argument of NOT must be bool, not %v", ErrType, x.typ)
+		if x, err = resolve(x, value.Bool); err != nil {
+			return nil, err
+		}
+		if x.typ != value.Bool {
+			return nil, fmt.Errorf("%w: argument of NOT must be type boolean, not type %v", ErrType, x.typ)
 		}
 		return b.fold(&cexpr{typ: value.Bool, eval: func(row []value.Value) (value.Value, error) {
 			v, err := x.value(row)
@@ -239,20 +469,45 @@ func (b *binder) unary(e *ast.Unary) (*cexpr, error) {
 			}
 			return value.NewBool(!v.B), nil
 		}}, x)
-	case ast.Neg:
-		if x.typ != value.Int && x.typ != value.Float {
-			return nil, fmt.Errorf("%w: operator - does not exist for %v", ErrType, x.typ)
+	case ast.Neg, ast.Pos:
+		sym := "-"
+		if e.Op == ast.Pos {
+			sym = "+"
 		}
-		return b.fold(&cexpr{typ: x.typ, eval: func(row []value.Value) (value.Value, error) {
+		switch x.typ {
+		case value.Unknown:
+			// Postgres has unary minus and plus for several types, so an unknown operand is
+			// ambiguous.
+			if x.val.Null {
+				return nil, fmt.Errorf("%w: operator is not unique: %s unknown", ErrType, sym)
+			}
+			return nil, fmt.Errorf("%w: operator is not unique: %s unknown", ErrType, sym)
+		case value.Numeric:
+			return nil, fmt.Errorf("%w: the numeric type is not supported, write the sign as part of the literal or cast the literal to double precision or bigint", ErrUnsupported)
+		case value.Int4, value.Int, value.Float:
+		default:
+			return nil, fmt.Errorf("%w: operator does not exist: %s %v", ErrType, sym, x.typ)
+		}
+		if e.Op == ast.Pos {
+			return b.fold(&cexpr{typ: x.typ, eval: x.value}, x)
+		}
+		t := x.typ
+		return b.fold(&cexpr{typ: t, fallible: t != value.Float, eval: func(row []value.Value) (value.Value, error) {
 			v, err := x.value(row)
 			if err != nil || v.Null {
 				return v, err
 			}
-			if v.Type == value.Float {
+			switch t {
+			case value.Float:
 				return value.NewFloat(-v.F), nil
+			case value.Int4:
+				if v.I == math.MinInt32 {
+					return value.Value{}, fmt.Errorf("%w: integer out of range", ErrOutOfRange)
+				}
+				return value.NewInt4(int32(-v.I)), nil
 			}
 			if v.I == math.MinInt64 {
-				return value.Value{}, fmt.Errorf("%w: int out of range", ErrOutOfRange)
+				return value.Value{}, fmt.Errorf("%w: bigint out of range", ErrOutOfRange)
 			}
 			return value.NewInt(-v.I), nil
 		}}, x)
@@ -273,45 +528,39 @@ func (b *binder) binary(e *ast.Binary) (*cexpr, error) {
 	if err != nil {
 		return nil, err
 	}
+	if e.Op == ast.Concat {
+		return b.concat(l, r)
+	}
 	sym := operatorSymbols[e.Op]
-	l, r, err = unify(l, r, "operator "+sym+" does not exist for")
+	l, r, err = b.unify(l, r, sym)
 	if err != nil {
 		return nil, err
 	}
 	t := l.typ
-	if resultType, ok := binaryResultType(e.Op, t); ok && ((l.folded && l.val.Null) || (r.folded && r.val.Null)) {
-		// Operators are strict, so a known NULL operand makes the result NULL without evaluating
-		// the other operand, as Postgres folds it.
-		return constant(value.NewNull(resultType)), nil
-	}
 	var op func(a, c value.Value) (value.Value, error)
 	var resultType value.Type
+	fallible := false
 	switch e.Op {
 	case ast.Add, ast.Sub, ast.Mul, ast.Div, ast.Mod:
-		if t != value.Int && t != value.Float && t != value.Unknown {
-			return nil, fmt.Errorf("%w: operator %s does not exist for %v and %v", ErrType, sym, t, t)
+		if !numeric(t) {
+			return nil, fmt.Errorf("%w: operator does not exist: %v %s %v", ErrType, t, sym, t)
 		}
 		if e.Op == ast.Mod && t == value.Float {
-			return nil, fmt.Errorf("%w: operator %% does not exist for float and float", ErrType)
+			return nil, fmt.Errorf("%w: operator does not exist: double precision %% double precision", ErrType)
 		}
 		resultType = t
-		op = arithmetic(e.Op)
-	case ast.Concat:
-		if t != value.String && t != value.Bytes && t != value.Unknown {
-			return nil, fmt.Errorf("%w: operator || does not exist for %v and %v", ErrType, t, t)
-		}
-		resultType = t
-		op = func(a, c value.Value) (value.Value, error) {
-			if a.Type == value.Bytes {
-				return value.NewBytes(append(append([]byte{}, a.Raw...), c.Raw...)), nil
-			}
-			return value.NewString(a.S + c.S), nil
-		}
+		op = arithmetic(e.Op, t)
+		fallible = true
 	default:
 		resultType = value.Bool
 		op = comparison(e.Op)
 	}
-	return b.fold(&cexpr{typ: resultType, eval: func(row []value.Value) (value.Value, error) {
+	if (l.folded && l.val.Null) || (r.folded && r.val.Null) {
+		// Operators are strict, so a known NULL operand makes the result NULL without evaluating
+		// the other operand, as Postgres folds it.
+		return constant(value.NewNull(resultType)), nil
+	}
+	return b.fold(&cexpr{typ: resultType, fallible: fallible, eval: func(row []value.Value) (value.Value, error) {
 		a, err := l.value(row)
 		if err != nil {
 			return value.Value{}, err
@@ -327,13 +576,84 @@ func (b *binder) binary(e *ast.Binary) (*cexpr, error) {
 	}}, l, r)
 }
 
+// concat binds ||, which Postgres defines for text with text, bytea with bytea, and text with
+// any other type, whose value is written as text.
+func (b *binder) concat(l, r *cexpr) (*cexpr, error) {
+	lt, rt := l.typ, r.typ
+	var t value.Type
+	var err error
+	switch {
+	case lt == value.Bytes && rt == value.Bytes, lt == value.Bytes && rt == value.Unknown, lt == value.Unknown && rt == value.Bytes:
+		t = value.Bytes
+	case lt == value.String || rt == value.String, lt == value.Unknown && rt == value.Unknown, lt == value.Unknown, rt == value.Unknown:
+		t = value.String
+	default:
+		return nil, fmt.Errorf("%w: operator does not exist: %v || %v", ErrType, lt, rt)
+	}
+	text := func(e *cexpr) (*cexpr, error) {
+		switch e.typ {
+		case value.Unknown:
+			return resolve(e, t)
+		case t:
+			return e, nil
+		case value.Numeric:
+			return b.numericTo(e, value.String)
+		}
+		// Written as text, which Postgres does through the type's output function, in its
+		// operators anytextcat and textanycat. Postgres inlines them into a cast to text, which
+		// is immutable except from timestamptz.
+		if e.folded && e.val.Null {
+			return constant(value.NewNull(value.String)), nil
+		}
+		if e.folded && e.typ != value.Time {
+			return constant(value.NewString(value.Format(e.val))), nil
+		}
+		return &cexpr{typ: value.String, refs: e.refs, fallible: e.fallible, stable: e.stable || e.typ == value.Time, eval: func(row []value.Value) (value.Value, error) {
+			v, err := e.value(row)
+			if err != nil || v.Null {
+				return value.NewNull(value.String), err
+			}
+			return value.NewString(value.Format(v)), nil
+		}}, nil
+	}
+	if l, err = text(l); err != nil {
+		return nil, err
+	}
+	if r, err = text(r); err != nil {
+		return nil, err
+	}
+	if (l.folded && l.val.Null) || (r.folded && r.val.Null) {
+		return constant(value.NewNull(t)), nil
+	}
+	return b.fold(&cexpr{typ: t, eval: func(row []value.Value) (value.Value, error) {
+		a, err := l.value(row)
+		if err != nil {
+			return value.Value{}, err
+		}
+		c, err := r.value(row)
+		if err != nil {
+			return value.Value{}, err
+		}
+		if a.Null || c.Null {
+			return value.NewNull(t), nil
+		}
+		if t == value.Bytes {
+			return value.NewBytes(append(append([]byte{}, a.Raw...), c.Raw...)), nil
+		}
+		return value.NewString(a.S + c.S), nil
+	}}, l, r)
+}
+
 func (b *binder) logical(e *ast.Binary) (*cexpr, error) {
 	l, err := b.bind(e.Left)
 	if err != nil {
 		return nil, err
 	}
-	if l.typ != value.Bool && l.typ != value.Unknown {
-		return nil, fmt.Errorf("%w: argument of %s must be bool, not %v", ErrType, logicalName(e.Op), l.typ)
+	if l, err = resolve(l, value.Bool); err != nil {
+		return nil, err
+	}
+	if l.typ != value.Bool {
+		return nil, fmt.Errorf("%w: argument of %s must be type boolean, not type %v", ErrType, logicalName(e.Op), l.typ)
 	}
 	// Postgres folds AND and OR left to right and stops at a constant that decides the result, so
 	// the right side is only type-checked, and an error in folding it is not reported.
@@ -348,8 +668,11 @@ func (b *binder) logical(e *ast.Binary) (*cexpr, error) {
 	if err != nil {
 		return nil, err
 	}
-	if r.typ != value.Bool && r.typ != value.Unknown {
-		return nil, fmt.Errorf("%w: argument of %s must be bool, not %v", ErrType, logicalName(e.Op), r.typ)
+	if r, err = resolve(r, value.Bool); err != nil {
+		return nil, err
+	}
+	if r.typ != value.Bool {
+		return nil, fmt.Errorf("%w: argument of %s must be type boolean, not type %v", ErrType, logicalName(e.Op), r.typ)
 	}
 	// A constant that decides the result also decides it on the right, after a left side that is
 	// not constant, because Postgres drops the other arguments of an AND with a FALSE constant
@@ -384,17 +707,6 @@ var operatorSymbols = map[ast.BinaryOp]string{
 	ast.Eq: "=", ast.Ne: "<>", ast.Lt: "<", ast.Le: "<=", ast.Gt: ">", ast.Ge: ">=",
 }
 
-// binaryResultType of a non-logical operator on operands of type t, when the operator exists.
-func binaryResultType(op ast.BinaryOp, t value.Type) (value.Type, bool) {
-	switch op {
-	case ast.Add, ast.Sub, ast.Mul, ast.Div, ast.Mod:
-		return t, t == value.Int || t == value.Float || (t == value.Unknown && op != ast.Mod)
-	case ast.Concat:
-		return t, t == value.String || t == value.Bytes || t == value.Unknown
-	}
-	return value.Bool, true
-}
-
 func logicalName(op ast.BinaryOp) string {
 	if op == ast.And {
 		return "AND"
@@ -424,12 +736,12 @@ func comparison(op ast.BinaryOp) func(a, b value.Value) (value.Value, error) {
 	}
 }
 
-// arithmetic on two non-null values of the same numeric type, with the checks Postgres makes:
-// int overflow and division by zero are errors, and float overflow to infinity and underflow to
-// zero are errors unless an operand already was infinite or zero.
-func arithmetic(op ast.BinaryOp) func(a, b value.Value) (value.Value, error) {
+// arithmetic on two non-null values of one numeric type, with the checks Postgres makes: integer
+// and bigint overflow and division by zero are errors, and float overflow to infinity and
+// underflow to zero are errors unless an operand already was infinite or zero.
+func arithmetic(op ast.BinaryOp, t value.Type) func(a, b value.Value) (value.Value, error) {
 	return func(a, b value.Value) (value.Value, error) {
-		if a.Type == value.Float {
+		if t == value.Float {
 			return floatArithmetic(op, a.F, b.F)
 		}
 		x, y := a.I, b.I
@@ -438,24 +750,24 @@ func arithmetic(op ast.BinaryOp) func(a, b value.Value) (value.Value, error) {
 		case ast.Add:
 			r = x + y
 			if (r > x) != (y > 0) {
-				return value.Value{}, fmt.Errorf("%w: int out of range", ErrOutOfRange)
+				return value.Value{}, fmt.Errorf("%w: %v out of range", ErrOutOfRange, t)
 			}
 		case ast.Sub:
 			r = x - y
 			if (r < x) != (y > 0) {
-				return value.Value{}, fmt.Errorf("%w: int out of range", ErrOutOfRange)
+				return value.Value{}, fmt.Errorf("%w: %v out of range", ErrOutOfRange, t)
 			}
 		case ast.Mul:
 			r = x * y
 			if x != 0 && (r/x != y || (x == -1 && y == math.MinInt64) || (y == -1 && x == math.MinInt64)) {
-				return value.Value{}, fmt.Errorf("%w: int out of range", ErrOutOfRange)
+				return value.Value{}, fmt.Errorf("%w: %v out of range", ErrOutOfRange, t)
 			}
 		case ast.Div:
 			if y == 0 {
 				return value.Value{}, ErrDivisionByZero
 			}
 			if x == math.MinInt64 && y == -1 {
-				return value.Value{}, fmt.Errorf("%w: int out of range", ErrOutOfRange)
+				return value.Value{}, fmt.Errorf("%w: %v out of range", ErrOutOfRange, t)
 			}
 			r = x / y
 		case ast.Mod:
@@ -463,11 +775,14 @@ func arithmetic(op ast.BinaryOp) func(a, b value.Value) (value.Value, error) {
 				return value.Value{}, ErrDivisionByZero
 			}
 			if y == -1 {
-				return value.NewInt(0), nil
+				return value.Value{Type: t, I: 0}, nil
 			}
 			r = x % y
 		}
-		return value.NewInt(r), nil
+		if t == value.Int4 && (r < math.MinInt32 || r > math.MaxInt32) {
+			return value.Value{}, fmt.Errorf("%w: integer out of range", ErrOutOfRange)
+		}
+		return value.Value{Type: t, I: r}, nil
 	}
 }
 
@@ -507,7 +822,7 @@ func floatArithmetic(op ast.BinaryOp, x, y float64) (value.Value, error) {
 // x >= a AND x <= b, NOT BETWEEN is x < a OR x > b, x IN (a, b) is x = a OR x = b, and NOT IN is
 // x <> a AND x <> b. When several elements read no columns, they stay together as one IN, which
 // is an array comparison in Postgres, and come first, followed by the other elements in order.
-// An IN of only such elements is not rewritten.
+// An IN of only such elements, and at least two of them, is not rewritten.
 func desugar(e ast.Expr) (ast.Expr, bool) {
 	switch e := e.(type) {
 	case *ast.Between:
@@ -562,6 +877,7 @@ func readsColumns(e ast.Expr) bool {
 	return found
 }
 
+// in binds an IN whose elements are all constants, which is an array comparison in Postgres.
 func (b *binder) in(e *ast.In) (*cexpr, error) {
 	x, err := b.bind(e.Expr)
 	if err != nil {
@@ -575,54 +891,53 @@ func (b *binder) in(e *ast.In) (*cexpr, error) {
 		}
 		es = append(es, c)
 	}
-	es, _, err = unifyAll(es, "IN mixes")
+	es, _, err = b.unifyAll(es, "IN mixes")
+	if errors.Is(err, ErrType) {
+		// Without a common type there is no array, and Postgres compares the elements one at a
+		// time instead, each with its own types.
+		cmp, join := ast.Eq, ast.Or
+		if e.Not {
+			cmp, join = ast.Ne, ast.And
+		}
+		var chain ast.Expr
+		for _, item := range e.List {
+			var c ast.Expr = &ast.Binary{Op: cmp, Left: e.Expr, Right: item}
+			if chain != nil {
+				c = &ast.Binary{Op: join, Left: chain, Right: c}
+			}
+			chain = c
+		}
+		return b.bind(chain)
+	}
 	if err != nil {
 		return nil, err
 	}
 	x, list := es[0], es[1:]
 	if x.folded && x.val.Null {
-		// The array comparison and the comparison with each element that reads columns are
-		// strict, so a known NULL makes them all NULL without evaluating the elements.
+		// The array comparison is strict, so a known NULL makes it NULL without evaluating the
+		// elements.
 		return constant(value.NewNull(value.Bool)), nil
 	}
 	not := e.Not
-	// Postgres puts the constant elements into an array that is evaluated as a whole, and
-	// compares each element that reads columns separately, left to right, stopping at the first
-	// match. Constants have been folded already, so only the other elements can fail, and they
-	// fail in order and only until a match. An element that is neither folded nor reads columns
-	// is a constant whose folding failed in a pruned branch; it is evaluated like a column.
-	var consts, columns []*cexpr
-	for _, item := range list {
-		if item.folded {
-			consts = append(consts, item)
-		} else {
-			columns = append(columns, item)
-		}
-	}
+	// Postgres prices the comparison with an array of n elements at n/2 operator calls. An
+	// element that is not folded is a constant whose folding failed in a pruned branch; it is
+	// evaluated like a column.
 	return b.fold(&cexpr{typ: value.Bool, eval: func(row []value.Value) (value.Value, error) {
 		v, err := x.value(row)
 		if err != nil {
 			return value.Value{}, err
 		}
 		sawNull := false
-		matches := func(item value.Value) bool {
-			if item.Null {
-				sawNull = true
-				return false
-			}
-			return !v.Null && value.Compare(v, item) == 0
-		}
-		for _, c := range consts {
-			if matches(c.val) {
-				return value.NewBool(!not), nil
-			}
-		}
-		for _, c := range columns {
+		for _, c := range list {
 			item, err := c.value(row)
 			if err != nil {
 				return value.Value{}, err
 			}
-			if matches(item) {
+			if item.Null {
+				sawNull = true
+				continue
+			}
+			if !v.Null && value.Compare(v, item) == 0 {
 				return value.NewBool(!not), nil
 			}
 		}
@@ -642,16 +957,25 @@ func (b *binder) like(e *ast.Like) (*cexpr, error) {
 	if err != nil {
 		return nil, err
 	}
-	for _, c := range []*cexpr{x, p} {
-		if c.typ != value.String && c.typ != value.Unknown {
-			return nil, fmt.Errorf("%w: LIKE needs strings, not %v", ErrType, c.typ)
-		}
+	if x.typ == value.Bytes || p.typ == value.Bytes {
+		return nil, fmt.Errorf("%w: LIKE on bytea is not supported, compare text", ErrUnsupported)
+	}
+	if x, err = resolve(x, value.String); err != nil {
+		return nil, err
+	}
+	if p, err = resolve(p, value.String); err != nil {
+		return nil, err
+	}
+	if x.typ != value.String || p.typ != value.String {
+		return nil, fmt.Errorf("%w: operator does not exist: %v ~~ %v", ErrType, x.typ, p.typ)
 	}
 	if (x.folded && x.val.Null) || (p.folded && p.val.Null) {
 		return constant(value.NewNull(value.Bool)), nil
 	}
 	not := e.Not
-	return b.fold(&cexpr{typ: value.Bool, eval: func(row []value.Value) (value.Value, error) {
+	// A constant pattern can only fail when it ends in its escape character, and then only on a
+	// row whose value is long enough for the matching to reach it.
+	return b.fold(&cexpr{typ: value.Bool, fallible: !p.folded || endsInEscape(p.val.S), eval: func(row []value.Value) (value.Value, error) {
 		v, err := x.value(row)
 		if err != nil {
 			return value.Value{}, err
@@ -671,11 +995,28 @@ func (b *binder) like(e *ast.Like) (*cexpr, error) {
 	}}, x, p)
 }
 
+// endsInEscape reports whether a LIKE pattern ends in an unescaped backslash.
+func endsInEscape(pattern string) bool {
+	escaped := false
+	for _, r := range pattern {
+		if escaped {
+			escaped = false
+			continue
+		}
+		escaped = r == '\\'
+	}
+	return escaped
+}
+
 func (b *binder) caseExpr(e *ast.Case) (*cexpr, error) {
 	var operand *cexpr
 	var err error
 	if e.Operand != nil {
 		if operand, err = b.bind(e.Operand); err != nil {
+			return nil, err
+		}
+		// An operand of unknown type is text, as in Postgres, before it meets the WHEN values.
+		if operand, err = resolve(operand, value.String); err != nil {
 			return nil, err
 		}
 	}
@@ -700,11 +1041,13 @@ func (b *binder) caseExpr(e *ast.Case) (*cexpr, error) {
 				return nil, err
 			}
 			if operand != nil {
-				if _, _, err = unify(operand, cond, "CASE mixes"); err != nil {
+				if _, _, err = b.unify(operand, cond, "="); err != nil {
 					return nil, err
 				}
-			} else if cond.typ != value.Bool && cond.typ != value.Unknown {
-				return nil, fmt.Errorf("%w: argument of CASE WHEN must be bool, not %v", ErrType, cond.typ)
+			} else if cond, err = resolve(cond, value.Bool); err != nil {
+				return nil, err
+			} else if cond.typ != value.Bool {
+				return nil, fmt.Errorf("%w: argument of CASE/WHEN must be type boolean, not type %v", ErrType, cond.typ)
 			}
 			result, err := b.bindPruned(w.Result)
 			if err != nil {
@@ -720,7 +1063,7 @@ func (b *binder) caseExpr(e *ast.Case) (*cexpr, error) {
 		var known, matched bool
 		o := operand
 		if operand != nil {
-			if o, cond, err = unify(operand, cond, "CASE mixes"); err != nil {
+			if o, cond, err = b.unify(operand, cond, "="); err != nil {
 				return nil, err
 			}
 			// A NULL operand or value never matches, and the comparison is strict, so the WHEN
@@ -730,8 +1073,11 @@ func (b *binder) caseExpr(e *ast.Case) (*cexpr, error) {
 				matched = o.folded && cond.folded && !o.val.Null && !cond.val.Null && value.Compare(o.val, cond.val) == 0
 			}
 		} else {
-			if cond.typ != value.Bool && cond.typ != value.Unknown {
-				return nil, fmt.Errorf("%w: argument of CASE WHEN must be bool, not %v", ErrType, cond.typ)
+			if cond, err = resolve(cond, value.Bool); err != nil {
+				return nil, err
+			}
+			if cond.typ != value.Bool {
+				return nil, fmt.Errorf("%w: argument of CASE/WHEN must be type boolean, not type %v", ErrType, cond.typ)
 			}
 			if cond.folded {
 				known = true
@@ -777,16 +1123,9 @@ func (b *binder) caseExpr(e *ast.Case) (*cexpr, error) {
 		return constant(value.NewNull(value.Unknown)), nil
 	}
 	resultsBefore := results
-	results, t, err := unifyAll(results, "CASE results mix")
+	results, t, err := b.unifyAll(results, "CASE types")
 	if err != nil {
 		return nil, err
-	}
-	if t == value.Unknown {
-		// Results that are all untyped NULLs make a string, as Postgres resolves unknown to text.
-		t = value.String
-		for i := range results {
-			results[i] = retypeNull(results[i], t)
-		}
 	}
 	// The unified results are matched back to the live WHENs by identity, because pruned
 	// results are in the list too.
@@ -851,14 +1190,18 @@ func (b *binder) call(e *ast.Call) (*cexpr, error) {
 	}
 	arity := func(n int) error {
 		if len(args) != n {
-			return fmt.Errorf("%w: function %s takes %d argument(s), %d given", ErrInvalid, e.Name, n, len(args))
+			var types []string
+			for _, a := range args {
+				types = append(types, a.typ.String())
+			}
+			return fmt.Errorf("%w: function %s(%s) does not exist", ErrInvalid, e.Name, strings.Join(types, ", "))
 		}
 		return nil
 	}
 	switch e.Name {
 	case "coalesce":
 		if len(e.Args) == 0 {
-			return nil, fmt.Errorf("%w: coalesce needs at least one argument", ErrInvalid)
+			return nil, fmt.Errorf("%w: COALESCE needs at least one argument", ErrSyntax)
 		}
 		// Known NULLs are dropped, and a known value ends the list, so later arguments are only
 		// type-checked, as in Postgres.
@@ -884,13 +1227,9 @@ func (b *binder) call(e *ast.Call) (*cexpr, error) {
 				decided = true
 			}
 		}
-		unifiedAll, t, err := unifyAll(all, "coalesce mixes")
+		unifiedAll, t, err := b.unifyAll(all, "COALESCE types")
 		if err != nil {
 			return nil, err
-		}
-		if t == value.Unknown {
-			// Arguments that are all untyped NULLs make a string, as Postgres resolves unknown to text.
-			t = value.String
 		}
 		if len(kept) == 0 {
 			return constant(value.NewNull(t)), nil
@@ -915,31 +1254,37 @@ func (b *binder) call(e *ast.Call) (*cexpr, error) {
 		if err := arity(1); err != nil {
 			return nil, err
 		}
-		x := args[0]
-		if x.typ != value.String && x.typ != value.Bytes && x.typ != value.Unknown {
-			return nil, fmt.Errorf("%w: length takes a string or bytes, not %v", ErrType, x.typ)
+		x, err := resolve(args[0], value.String)
+		if err != nil {
+			return nil, err
 		}
-		return b.fold(&cexpr{typ: value.Int, eval: func(row []value.Value) (value.Value, error) {
+		if x.typ != value.String && x.typ != value.Bytes {
+			return nil, fmt.Errorf("%w: function length(%v) does not exist", ErrType, x.typ)
+		}
+		return b.fold(&cexpr{typ: value.Int4, eval: func(row []value.Value) (value.Value, error) {
 			v, err := x.value(row)
 			if err != nil || v.Null {
-				return value.NewNull(value.Int), err
+				return value.NewNull(value.Int4), err
 			}
 			if v.Type == value.Bytes {
-				return value.NewInt(int64(len(v.Raw))), nil
+				return value.NewInt4(int32(len(v.Raw))), nil
 			}
-			return value.NewInt(int64(utf8.RuneCountInString(v.S))), nil
+			return value.NewInt4(int32(utf8.RuneCountInString(v.S))), nil
 		}}, x)
 	case "lower", "upper":
 		if err := arity(1); err != nil {
 			return nil, err
 		}
-		x := args[0]
-		if x.typ != value.String && x.typ != value.Unknown {
-			return nil, fmt.Errorf("%w: %s takes a string, not %v", ErrType, e.Name, x.typ)
+		x, err := resolve(args[0], value.String)
+		if err != nil {
+			return nil, err
 		}
-		f := strings.ToLower
+		if x.typ != value.String {
+			return nil, fmt.Errorf("%w: function %s(%v) does not exist", ErrType, e.Name, x.typ)
+		}
+		f := asciiLower
 		if e.Name == "upper" {
-			f = strings.ToUpper
+			f = asciiUpper
 		}
 		return b.fold(&cexpr{typ: value.String, eval: func(row []value.Value) (value.Value, error) {
 			v, err := x.value(row)
@@ -953,31 +1298,59 @@ func (b *binder) call(e *ast.Call) (*cexpr, error) {
 			return nil, err
 		}
 		x := args[0]
-		if x.typ != value.Int && x.typ != value.Float && x.typ != value.Unknown {
-			return nil, fmt.Errorf("%w: abs takes an int or float, not %v", ErrType, x.typ)
+		var err error
+		switch x.typ {
+		case value.Unknown:
+			// Postgres resolves an unknown argument to its preferred numeric type, double
+			// precision.
+			if x, err = resolve(x, value.Float); err != nil {
+				return nil, err
+			}
+		case value.Numeric:
+			return nil, fmt.Errorf("%w: the numeric type is not supported, cast the literal to double precision or bigint", ErrUnsupported)
+		case value.Int4, value.Int, value.Float:
+		default:
+			return nil, fmt.Errorf("%w: function abs(%v) does not exist", ErrType, x.typ)
 		}
-		if x.typ == value.Unknown {
-			// Postgres resolves abs(NULL) to its preferred numeric type, double precision.
-			return constant(value.NewNull(value.Float)), nil
-		}
-		return b.fold(&cexpr{typ: x.typ, eval: func(row []value.Value) (value.Value, error) {
+		t := x.typ
+		return b.fold(&cexpr{typ: t, fallible: t != value.Float, eval: func(row []value.Value) (value.Value, error) {
 			v, err := x.value(row)
 			if err != nil || v.Null {
 				return v, err
 			}
-			if v.Type == value.Float {
+			switch {
+			case v.Type == value.Float:
 				return value.NewFloat(math.Abs(v.F)), nil
-			}
-			if v.I == math.MinInt64 {
-				return value.Value{}, fmt.Errorf("%w: int out of range", ErrOutOfRange)
-			}
-			if v.I < 0 {
-				return value.NewInt(-v.I), nil
+			case t == value.Int4 && v.I == math.MinInt32:
+				return value.Value{}, fmt.Errorf("%w: integer out of range", ErrOutOfRange)
+			case t == value.Int && v.I == math.MinInt64:
+				return value.Value{}, fmt.Errorf("%w: bigint out of range", ErrOutOfRange)
+			case v.I < 0:
+				return value.Value{Type: t, I: -v.I}, nil
 			}
 			return v, nil
 		}}, x)
 	}
 	return nil, fmt.Errorf("%w: function %s does not exist", ErrInvalid, e.Name)
+}
+
+// asciiLower folds ASCII letters only, as Postgres does with the C locale.
+func asciiLower(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r >= 'A' && r <= 'Z' {
+			return r + 'a' - 'A'
+		}
+		return r
+	}, s)
+}
+
+func asciiUpper(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r >= 'a' && r <= 'z' {
+			return r - ('a' - 'A')
+		}
+		return r
+	}, s)
 }
 
 // like matches s against a LIKE pattern, where _ matches one character, % matches any sequence,

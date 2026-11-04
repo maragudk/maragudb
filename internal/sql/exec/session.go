@@ -51,6 +51,9 @@ type Session struct {
 	readOnly bool
 	// wrote reports whether the transaction has applied any writes.
 	wrote bool
+	// aborted is set when a statement of the explicit transaction failed. Every later statement
+	// fails with [ErrTxAborted] until the transaction ends, as in Postgres.
+	aborted bool
 	// tables caches definitions read in the transaction. A nil entry is a known-missing table.
 	tables map[string]*table
 	kv     kvstore
@@ -179,16 +182,23 @@ func (s *Session) begin(ctx context.Context, readOnly bool) error {
 	s.tx = tx
 	s.readOnly = readOnly
 	s.wrote = false
+	s.aborted = false
 	s.tables = map[string]*table{}
 	s.kv = kvstore{tx: tx}
 	return nil
 }
 
 // Commit the explicit transaction. The session leaves the transaction whether or not the commit
-// succeeds. It returns [engine.ErrConflict] when the transaction lost to a concurrent commit.
+// succeeds. It returns [engine.ErrConflict] when the transaction lost to a concurrent commit,
+// and [ErrTxAborted] when a statement of the transaction failed, in which case the transaction
+// is rolled back instead, as Postgres does on COMMIT in an aborted transaction.
 func (s *Session) Commit(ctx context.Context) error {
 	if !s.explicit {
 		return ErrNoTx
+	}
+	if s.aborted {
+		s.rollback()
+		return fmt.Errorf("%w: the transaction was rolled back", ErrTxAborted)
 	}
 	return s.commit(ctx)
 }
@@ -219,21 +229,44 @@ func (s *Session) end() {
 	s.tx = nil
 	s.explicit = false
 	s.readOnly = false
+	s.aborted = false
 	s.tables = nil
 	s.kv = kvstore{}
 }
 
-// Execute a statement. SELECT returns rows; other statements return a result.
+// Execute a statement. SELECT returns rows; other statements return a result. The transaction
+// statements behave as in Postgres: BEGIN inside a transaction and COMMIT or ROLLBACK outside
+// one do nothing but warn, and COMMIT of a transaction in which a statement failed rolls it
+// back.
 func (s *Session) Execute(ctx context.Context, st *Statement, params []value.Value) (*Rows, Result, error) {
 	switch stmt := st.ast.(type) {
 	case *ast.Begin:
+		if s.explicit {
+			s.log.Warn("there is already a transaction in progress")
+			return nil, Result{}, nil
+		}
 		return nil, Result{}, s.Begin(ctx, stmt.ReadOnly)
 	case *ast.Commit:
+		if !s.explicit {
+			s.log.Warn("there is no transaction in progress")
+			return nil, Result{}, nil
+		}
+		if s.aborted {
+			s.rollback()
+			return nil, Result{}, nil
+		}
 		return nil, Result{}, s.Commit(ctx)
 	case *ast.Rollback:
+		if !s.explicit {
+			s.log.Warn("there is no transaction in progress")
+			return nil, Result{}, nil
+		}
 		return nil, Result{}, s.Rollback()
 	}
 	if s.explicit {
+		if s.aborted {
+			return nil, Result{}, ErrTxAborted
+		}
 		if s.opts.Mutations.FreshSnapshotPerStatement && !s.wrote {
 			if err := s.begin(ctx, s.readOnly); err != nil {
 				return nil, Result{}, err
@@ -274,7 +307,8 @@ func (s *Session) Execute(ctx context.Context, st *Statement, params []value.Val
 	}
 }
 
-// run one statement in the current transaction, applying its writes only when it succeeds.
+// run one statement in the current transaction, applying its writes only when it succeeds. A
+// failure in an explicit transaction aborts it.
 func (s *Session) run(ctx context.Context, st *Statement, params []value.Value) (*Rows, Result, error) {
 	rows, res, err := s.execute(ctx, st.ast, params)
 	_, ddl := st.ast.(*ast.CreateTable)
@@ -286,6 +320,7 @@ func (s *Session) run(ctx context.Context, st *Statement, params []value.Value) 
 		if ddl {
 			s.tables = map[string]*table{}
 		}
+		s.aborted = s.explicit
 		return nil, Result{}, err
 	}
 	wrote := len(s.kv.pending) > 0
@@ -304,9 +339,12 @@ func (s *Session) execute(ctx context.Context, st ast.Statement, params []value.
 	case *ast.Select:
 		rows, err := s.selectStmt(ctx, st, params)
 		return rows, Result{}, err
-	case *ast.CreateTable, *ast.DropTable, *ast.Insert, *ast.Update, *ast.Delete:
-		if s.readOnly {
-			return nil, Result{}, fmt.Errorf("%w: cannot run %s", ErrReadOnlyTx, verb(st))
+	case *ast.CreateTable, *ast.DropTable:
+		// Postgres refuses DDL in a read-only transaction before it looks at the statement, and
+		// INSERT, UPDATE, and DELETE only once they are analyzed and planned, which
+		// [Session.writable] checks.
+		if err := s.writable(st); err != nil {
+			return nil, Result{}, err
 		}
 	}
 	var res Result
@@ -326,6 +364,14 @@ func (s *Session) execute(ctx context.Context, st ast.Statement, params []value.
 		err = fmt.Errorf("exec: unsupported statement %T", st)
 	}
 	return nil, res, err
+}
+
+// writable checks that the transaction can run a statement that writes.
+func (s *Session) writable(st ast.Statement) error {
+	if s.readOnly {
+		return fmt.Errorf("%w: cannot run %s", ErrReadOnlyTx, verb(st))
+	}
+	return nil
 }
 
 func verb(st ast.Statement) string {

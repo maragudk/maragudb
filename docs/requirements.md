@@ -19,19 +19,19 @@ The project is not reviewed manually. Automated tests are the only quality gate,
   - An explicit transaction returns a typed, retryable serialization error, similar to Postgres SQLSTATE 40001. Callers detect it with `errors.Is` or `errors.As`. `INV-RETRYABLE-ERROR`
   - Read-only transactions never conflict. `INV-READ-ONLY`
 - **Durability:** a commit is acknowledged only after its S3 write is confirmed. `INV-DURABLE-ACK`
-- **SQL flavor:** our own. It follows Postgres semantics where it is sensible and has none of SQLite's quirks: no type affinity, no implicit coercion, and values are type-checked. `INV-STRICT-TYPES`
+- **SQL flavor:** a strict subset of Postgres 18. The same SQL text runs on both, and for every statement that maragudb accepts, the result is identical to Postgres: rows, values, column names, affected-row counts, and transaction state. When Postgres fails a statement, maragudb fails it too, with the same error class wherever the error does not depend on evaluation order or physical row order. `INV-PG-SUBSET` maragudb is stricter than Postgres only through `ErrUnsupported`, SQLSTATE 0A000 (feature_not_supported), whose message says what is unsupported and, where possible, what to write instead. Every class of statement it rejects is listed in `docs/unsupported.md`. `INV-UNSUPPORTED`
 - **Types:**
 
-  | Type | Meaning |
-  |------|---------|
-  | `int` | int64. Overflow is an error. `INV-INT-OVERFLOW` |
-  | `float` | float64 |
-  | `bool` | boolean |
-  | `string` | UTF-8 text |
-  | `bytes` | binary data |
-  | `time` | UTC instant with nanosecond precision |
+  | Type | Aliases | Meaning |
+  |------|---------|---------|
+  | `bigint` | `int8` | 64-bit integer. Overflow is an error. `INV-INT-OVERFLOW` |
+  | `double precision` | `float8`, `float` | 64-bit float |
+  | `boolean` | `bool` | boolean |
+  | `text` | | UTF-8 text |
+  | `bytea` | | binary data |
+  | `timestamptz` | `timestamp with time zone` | instant with microsecond precision, from 0001-01-01 to the end of 294276, read and written in UTC |
 
-  NULL is supported. `INV-TYPES`
+  As in Postgres, an integer literal that fits in 32 bits has type `integer`, and arithmetic on it overflows at 32 bits; `integer` itself is not a column type. NULL is supported. `INV-TYPES`
 - **Telemetry:** an optional `*slog.Logger` in Options, plus `Stats()`. `INV-LOGGER` OpenTelemetry is out of scope for now.
 - **Repo bootstrap:** copy LICENSE, `.editorconfig`, `.github`, `.gitignore`, AGENTS.md, CLAUDE.md, and the Makefile from <https://github.com/maragudk/template>, then adapt them. Do not copy `template.go`.
 - **Workflow:** no PRs. Commit directly to `main`.
@@ -87,10 +87,11 @@ These apply to every section, for the SQL surface that exists at that point.
    Each failure can be reproduced from its seed alone. `AC-1.9`
 2. **The checkers can fail.** Deliberately broken builds must be detected by criterion 1. Examples: commit without CAS, GC that deletes too early, a cache served without a freshness check. This proves that the tests are not vacuous. `AC-2`
 3. **Durability and atomicity.** Every acknowledged commit stays visible after any crash. `AC-3.1` An unacknowledged commit is either completely visible or completely invisible, never partial. `AC-3.2`
-4. **Differential testing against Postgres.** Hegel generates schemas, data, and queries as an AST. The AST is rendered both to maragudb SQL and to Postgres SQL, and the Postgres side runs in Docker. `AC-4.1` Comparison rules:
+4. **Differential testing against Postgres.** Hegel generates schemas, data, transactions, and statements as an AST, which is rendered once to Postgres SQL. Both systems run the same text, and the Postgres side runs in Docker. `AC-4.1` Comparison rules:
    - When `ORDER BY` determines the order completely, results must match exactly. Otherwise they must match as multisets. `AC-4.2`
-   - Both systems must agree on whether a statement succeeds or fails. `AC-4.3`
-   - Intentional deviations are listed in `docs/deviations.md`, and each one has its own test. `AC-4.4`
+   - Both systems must agree on whether a statement succeeds or fails, and on the error class when both fail. `AC-4.3`
+   - Every class of statement that maragudb rejects with `ErrUnsupported` is listed in `docs/unsupported.md` with a stable `UNS-` ID and a test that shows Postgres accepting it and maragudb rejecting it. Any remaining difference from Postgres is listed there too, with a `DEV-` ID and its own test. `AC-4.4`
+   - A statement that maragudb rejects with `ErrUnsupported` is not run on Postgres, and the harness counts it as rejected. With a fixed seed, at least 70% of the generated statements run on both systems, and the number that do never drops below a committed baseline. `AC-4.5`
 5. **S3 request budgets.** These are deterministic and are checked against the fake S3 via `Stats()`:
    - A commit uses O(1) PUTs, independent of database size. `AC-5.1`
    - A transaction with a warm cache uses one conditional GET (or HEAD) for the freshness check, plus nothing else for cached data. `AC-5.2`
@@ -109,3 +110,10 @@ These apply to every section, for the SQL surface that exists at that point.
 - `NUMERIC` and JSON types
 - `ALTER TABLE`, unless a section needs it
 - Row-level or range-level conflict detection
+
+## Retired IDs
+
+These IDs named requirements that no longer hold. They are not reused.
+
+- INV-STRICT-TYPES: the own SQL flavor without implicit coercion. Replaced by INV-PG-SUBSET and INV-UNSUPPORTED, because maragudb now applies Postgres's implicit and assignment casts.
+- DEV-1 to DEV-19: the deviations from Postgres in the former `docs/deviations.md`. Each one is either eliminated or an explicit rejection, as `docs/unsupported.md` lists.

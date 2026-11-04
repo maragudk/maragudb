@@ -1,5 +1,5 @@
-// Package value has the SQL value types, their comparison, an order-preserving key encoding,
-// and a row encoding.
+// Package value has the SQL value types, their comparison, an order-preserving key encoding, a
+// row encoding, and the text input and output of every type as Postgres defines them.
 package value
 
 import (
@@ -16,7 +16,11 @@ import (
 // Type of a SQL value.
 type Type int
 
-// Types. Unknown is the type of a bare NULL whose type has not been inferred.
+// Types. The first six are the column types. [Int4] is the type of an integer literal that fits
+// in 32 bits and of the functions that return one, as in Postgres, and it widens to [Int] when
+// it meets one. [Numeric] is the type of a numeric literal, one with a decimal point, an
+// exponent, or too many digits for [Int]; it only exists until it is cast. [Unknown] is the type
+// of a NULL or a quoted string literal whose type has not been inferred from its context.
 const (
 	Unknown Type = iota
 	Int
@@ -25,10 +29,16 @@ const (
 	String
 	Bytes
 	Time
+	Int4
+	Numeric
 )
 
-var typeNames = map[Type]string{Unknown: "unknown", Int: "int", Float: "float", Bool: "bool", String: "string", Bytes: "bytes", Time: "time"}
+var typeNames = map[Type]string{
+	Unknown: "unknown", Int: "bigint", Float: "double precision", Bool: "boolean", String: "text",
+	Bytes: "bytea", Time: "timestamptz", Int4: "integer", Numeric: "numeric",
+}
 
+// String is the SQL name of the type.
 func (t Type) String() string {
 	if s, ok := typeNames[t]; ok {
 		return s
@@ -36,18 +46,29 @@ func (t Type) String() string {
 	return fmt.Sprintf("type(%d)", int(t))
 }
 
-// ParseType by its SQL name.
-func ParseType(name string) (Type, bool) {
-	for t, s := range typeNames {
-		if t != Unknown && s == name {
-			return t, true
-		}
+// OutputName is the name Postgres gives an output column that is a cast to the type.
+func (t Type) OutputName() string {
+	switch t {
+	case Int:
+		return "int8"
+	case Float:
+		return "float8"
+	case Bool:
+		return "bool"
+	case Int4:
+		return "int4"
 	}
-	return Unknown, false
+	return t.String()
+}
+
+// IsColumnType reports whether a column can have the type.
+func (t Type) IsColumnType() bool {
+	return t >= Int && t <= Time
 }
 
 // Value is a SQL value: a typed payload or a NULL. A NULL carries the type it was inferred to
-// have, or [Unknown].
+// have, or [Unknown]. A non-null value of type [Unknown] is a quoted string literal whose type
+// has not been inferred, and of type [Numeric] a numeric literal; both hold their text in S.
 type Value struct {
 	Type Type
 	Null bool
@@ -61,6 +82,9 @@ type Value struct {
 
 // NewInt value.
 func NewInt(i int64) Value { return Value{Type: Int, I: i} }
+
+// NewInt4 value.
+func NewInt4(i int32) Value { return Value{Type: Int4, I: int64(i)} }
 
 // NewFloat value.
 func NewFloat(f float64) Value { return Value{Type: Float, F: f} }
@@ -79,43 +103,59 @@ func NewBytes(b []byte) Value {
 	return Value{Type: Bytes, Raw: b}
 }
 
-// NewTime value, converted to UTC.
-func NewTime(t time.Time) Value { return Value{Type: Time, T: t.UTC()} }
+// NewTime value, converted to UTC and truncated to microseconds, which is the precision of
+// timestamptz.
+func NewTime(t time.Time) Value { return Value{Type: Time, T: t.UTC().Truncate(time.Microsecond)} }
+
+// NewUnknown is a quoted string literal whose type is not inferred yet.
+func NewUnknown(s string) Value { return Value{Type: Unknown, S: s} }
+
+// NewNumeric is a numeric literal, kept as its text.
+func NewNumeric(s string) Value { return Value{Type: Numeric, S: s} }
 
 // NewNull of type t.
 func NewNull(t Type) Value { return Value{Type: t, Null: true} }
 
-// String renders the value as it would appear in SQL.
+// String renders the value for messages: NULL, a quoted string, or the text output of
+// [Format].
 func (v Value) String() string {
-	if v.Null {
+	switch {
+	case v.Null:
 		return "NULL"
+	case v.Type == String, v.Type == Unknown:
+		return strconv.Quote(v.S)
 	}
+	return Format(v)
+}
+
+// Format a non-null value as text, the way Postgres outputs the type with its default
+// settings and the UTC time zone: an integer in decimal, a float as the shortest digits that
+// read back exactly, a boolean as true or false, bytes as a hex escape such as \x6869, and a
+// timestamptz as 2006-01-02 15:04:05.999999+00.
+func Format(v Value) string {
 	switch v.Type {
-	case Int:
+	case Int, Int4:
 		return strconv.FormatInt(v.I, 10)
 	case Float:
-		s := FormatFloat(v.F)
-		if !strings.ContainsAny(s, ".eIN") {
-			s += ".0"
-		}
-		return s
+		return FormatFloat(v.F)
 	case Bool:
 		if v.B {
 			return "true"
 		}
 		return "false"
-	case String:
-		return strconv.Quote(v.S)
+	case String, Unknown, Numeric:
+		return v.S
 	case Bytes:
-		return fmt.Sprintf("X'%x'", v.Raw)
+		return "\\x" + fmt.Sprintf("%x", v.Raw)
 	case Time:
-		return v.T.Format(time.RFC3339Nano)
+		return FormatTime(v.T)
 	}
-	return "?"
+	panic(fmt.Sprintf("value: formatting %v", v.Type))
 }
 
-// FormatFloat the way a float is rendered as a string: the shortest representation that
-// reads back exactly, with NaN and Infinity spelled as in Postgres.
+// FormatFloat like Postgres: the shortest digits that read back exactly, in plain notation when
+// the decimal exponent is in [-4, 15) and in exponent notation otherwise, with NaN and Infinity
+// spelled as Postgres does.
 func FormatFloat(f float64) string {
 	switch {
 	case math.IsNaN(f):
@@ -124,8 +164,45 @@ func FormatFloat(f float64) string {
 		return "Infinity"
 	case math.IsInf(f, -1):
 		return "-Infinity"
+	case f == 0:
+		if math.Signbit(f) {
+			return "-0"
+		}
+		return "0"
 	}
-	return strconv.FormatFloat(f, 'g', -1, 64)
+	e := strconv.FormatFloat(f, 'e', -1, 64)
+	exp, _ := strconv.Atoi(e[strings.IndexByte(e, 'e')+1:])
+	if exp >= -4 && exp < 15 {
+		return strconv.FormatFloat(f, 'f', -1, 64)
+	}
+	// Postgres writes the exponent with at least two digits and a sign.
+	mantissa, expText, _ := strings.Cut(e, "e")
+	sign, digits := expText[:1], expText[1:]
+	if len(digits) < 2 {
+		digits = "0" + digits
+	}
+	return mantissa + "e" + sign + digits
+}
+
+// FormatTime like Postgres in the UTC time zone: 2006-01-02 15:04:05.999999+00, with the
+// fraction only when it is not zero, and years before 1 AD suffixed with BC.
+func FormatTime(t time.Time) string {
+	t = t.UTC()
+	year := t.Year()
+	bc := false
+	if year <= 0 {
+		year, bc = 1-year, true
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%04d-%02d-%02d %02d:%02d:%02d", year, t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second())
+	if usec := t.Nanosecond() / 1000; usec != 0 {
+		b.WriteString(strings.TrimRight(fmt.Sprintf(".%06d", usec), "0"))
+	}
+	b.WriteString("+00")
+	if bc {
+		b.WriteString(" BC")
+	}
+	return b.String()
 }
 
 // Compare two non-null values of the same type and return -1, 0 or 1. Strings and bytes compare
@@ -140,7 +217,7 @@ func Compare(a, b Value) int {
 		panic(fmt.Sprintf("value: comparing %v with %v", a.Type, b.Type))
 	}
 	switch a.Type {
-	case Int:
+	case Int, Int4:
 		return cmp(a.I, b.I)
 	case Float:
 		return compareFloats(a.F, b.F)
@@ -194,9 +271,10 @@ func btoi(b bool) int {
 	return 0
 }
 
-// EncodeKey appends the order-preserving encoding of v to dst and returns the result. For any two
-// values of the same type, the byte order of their encodings equals their [Compare] order, with
-// NULL before everything. Encodings are self-delimiting, so composite keys are concatenations.
+// EncodeKey appends the order-preserving encoding of v, which must have a column type, to dst
+// and returns the result. For any two values of the same type, the byte order of their
+// encodings equals their [Compare] order, with NULL before everything. Encodings are
+// self-delimiting, so composite keys are concatenations.
 func EncodeKey(dst []byte, v Value) []byte {
 	// The first byte is 0x00 for NULL and 0x01 for a value, so NULL sorts first.
 	if v.Null {
@@ -256,7 +334,7 @@ const (
 	rowNull byte = 0
 )
 
-// EncodeRow appends the encoding of a row to dst and returns the result.
+// EncodeRow appends the encoding of a row of column-typed values to dst and returns the result.
 func EncodeRow(dst []byte, row []Value) []byte {
 	for _, v := range row {
 		if v.Null {

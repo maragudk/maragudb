@@ -58,6 +58,8 @@ func newSession(t *testing.T) *exec.Session {
 	return s
 }
 
+// run a statement with parameters as the driver passes them: a Go string is a value of unknown
+// type, like a quoted literal, and the other Go types are their SQL types.
 func run(ctx context.Context, s *exec.Session, sql string, params ...any) (*exec.Rows, exec.Result, error) {
 	st, err := exec.Prepare(sql)
 	if err != nil {
@@ -75,7 +77,7 @@ func run(ctx context.Context, s *exec.Session, sql string, params ...any) (*exec
 		case bool:
 			vals = append(vals, value.NewBool(p))
 		case string:
-			vals = append(vals, value.NewString(p))
+			vals = append(vals, value.NewUnknown(p))
 		case []byte:
 			vals = append(vals, value.NewBytes(p))
 		case time.Time:
@@ -96,7 +98,8 @@ func mustExec(t *testing.T, s *exec.Session, sql string, params ...any) exec.Res
 	return res
 }
 
-// query runs a SELECT and renders the rows as one line per row, values separated by spaces.
+// query runs a SELECT and renders the rows as one line per row, values separated by spaces:
+// strings quoted, NULL as NULL, and everything else as Postgres outputs it.
 func query(t *testing.T, s *exec.Session, sql string, params ...any) string {
 	t.Helper()
 	rows, _, err := run(t.Context(), s, sql, params...)
@@ -125,37 +128,47 @@ func queryErr(t *testing.T, s *exec.Session, sql string, params ...any) error {
 
 func setup(t *testing.T, s *exec.Session) {
 	t.Helper()
-	mustExec(t, s, "CREATE TABLE t (id int PRIMARY KEY, name string NOT NULL, f float, b bool, data bytes, at time)")
-	mustExec(t, s, `INSERT INTO t VALUES (1, 'alice', 1.5, TRUE, X'01', TIME '2024-01-01T00:00:00Z'), (2, 'bob', NULL, FALSE, NULL, NULL), (3, 'carol', -2.5, NULL, X'', TIME '2024-06-01T12:30:00.5Z')`)
+	mustExec(t, s, "CREATE TABLE t (id bigint PRIMARY KEY, name text NOT NULL, f double precision, b boolean, data bytea, at timestamptz)")
+	mustExec(t, s, `INSERT INTO t VALUES (1, 'alice', 1.5, TRUE, '\x01', '2024-01-01T00:00:00Z'), (2, 'bob', NULL, FALSE, NULL, NULL), (3, 'carol', -2.5, NULL, '\x', '2024-06-01 12:30:00.5+00')`)
 }
 
 func TestSession_DDL(t *testing.T) {
 	t.Run("creates and drops tables, with IF EXISTS variants", func(t *testing.T) {
 		s := newSession(t)
-		mustExec(t, s, "CREATE TABLE t (id int PRIMARY KEY)")
-		is.Error(t, exec.ErrTableExists, queryErr(t, s, "CREATE TABLE t (id int PRIMARY KEY)"))
-		mustExec(t, s, "CREATE TABLE IF NOT EXISTS t (id int PRIMARY KEY)")
+		mustExec(t, s, "CREATE TABLE t (id bigint PRIMARY KEY)")
+		is.Error(t, exec.ErrTableExists, queryErr(t, s, "CREATE TABLE t (id bigint PRIMARY KEY)"))
+		mustExec(t, s, "CREATE TABLE IF NOT EXISTS t (id bigint PRIMARY KEY)")
 		mustExec(t, s, "INSERT INTO t VALUES (1)")
 		mustExec(t, s, "DROP TABLE t")
 		is.Error(t, exec.ErrNoTable, queryErr(t, s, "DROP TABLE t"))
 		is.Error(t, exec.ErrNoTable, queryErr(t, s, "SELECT * FROM t"))
 		mustExec(t, s, "DROP TABLE IF EXISTS t")
-		mustExec(t, s, "CREATE TABLE t (id int PRIMARY KEY)")
+		mustExec(t, s, "CREATE TABLE t (id bigint PRIMARY KEY)")
 		is.Equal(t, "", query(t, s, "SELECT * FROM t"), "the old rows are gone")
 	})
 
 	t.Run("rejects bad definitions", func(t *testing.T) {
 		s := newSession(t)
-		is.Error(t, exec.ErrInvalid, queryErr(t, s, "CREATE TABLE t (id int, PRIMARY KEY (nope))"))
-		is.Error(t, exec.ErrInvalid, queryErr(t, s, "CREATE TABLE t (id int, id string, PRIMARY KEY (id))"))
-		is.Error(t, exec.ErrInvalid, queryErr(t, s, "CREATE TABLE t (id int, PRIMARY KEY (id, id))"))
-		is.True(t, strings.Contains(queryErr(t, s, "SELECT 1 + 'a'").Error(), "operator + does not exist for int and string"))
+		is.Error(t, exec.ErrInvalid, queryErr(t, s, "CREATE TABLE t (id bigint, PRIMARY KEY (nope))"))
+		is.Error(t, exec.ErrInvalid, queryErr(t, s, "CREATE TABLE t (id bigint, id text, PRIMARY KEY (id))"))
+		is.Error(t, exec.ErrInvalid, queryErr(t, s, "CREATE TABLE t (id bigint, PRIMARY KEY (id, id))"))
+		is.True(t, strings.Contains(queryErr(t, s, "SELECT 1 + TRUE").Error(), "operator does not exist: integer + boolean"))
 	})
 
 	t.Run("primary key columns are not null", func(t *testing.T) {
 		s := newSession(t)
-		mustExec(t, s, "CREATE TABLE t (a int, b int, PRIMARY KEY (a, b))")
+		mustExec(t, s, "CREATE TABLE t (a bigint, b bigint, PRIMARY KEY (a, b))")
 		is.Error(t, exec.ErrNotNull, queryErr(t, s, "INSERT INTO t VALUES (1, NULL)"))
+	})
+
+	t.Run("accepts Postgres's unreserved words as column names and rejects its reserved words", func(t *testing.T) {
+		s := newSession(t)
+		mustExec(t, s, "CREATE TABLE kw (key bigint PRIMARY KEY, if bigint, exists bigint, set bigint, begin bigint, nulls bigint, first bigint, values bigint, delete bigint)")
+		mustExec(t, s, "INSERT INTO kw (key, set, begin, values) VALUES (1, 2, 3, 4)")
+		mustExec(t, s, "UPDATE kw SET set = 5, begin = 6 WHERE key = 1")
+		is.Equal(t, "1 5 6 4", query(t, s, "SELECT key, set, begin, values FROM kw ORDER BY key"))
+		is.Error(t, exec.ErrSyntax, queryErr(t, s, "CREATE TABLE kw2 (limit bigint PRIMARY KEY)"))
+		mustExec(t, s, `CREATE TABLE kw2 ("limit" bigint PRIMARY KEY)`)
 	})
 }
 
@@ -163,9 +176,9 @@ func TestSession_Insert(t *testing.T) {
 	t.Run("inserts rows and reads them back in key order", func(t *testing.T) {
 		s := newSession(t)
 		setup(t, s)
-		is.Equal(t, `1 "alice" 1.5 true X'01' 2024-01-01T00:00:00Z
+		is.Equal(t, `1 "alice" 1.5 true \x01 2024-01-01 00:00:00+00
 2 "bob" NULL false NULL NULL
-3 "carol" -2.5 NULL X'' 2024-06-01T12:30:00.5Z`, query(t, s, "SELECT * FROM t"))
+3 "carol" -2.5 NULL \x 2024-06-01 12:30:00.5+00`, query(t, s, "SELECT * FROM t"))
 	})
 
 	t.Run("uses the column list and defaults the rest to NULL", func(t *testing.T) {
@@ -177,34 +190,45 @@ func TestSession_Insert(t *testing.T) {
 	})
 
 	t.Run("checks constraints and types", func(t *testing.T) {
-		verify.Covers(t, "an INSERT of a value of the wrong type is a type error, never converted", "INV-STRICT-TYPES")
 		s := newSession(t)
 		setup(t, s)
 		is.Error(t, exec.ErrDuplicateKey, queryErr(t, s, "INSERT INTO t (id, name) VALUES (1, 'x')"))
 		is.Error(t, exec.ErrNotNull, queryErr(t, s, "INSERT INTO t (id) VALUES (9)"))
 		is.Error(t, exec.ErrNotNull, queryErr(t, s, "INSERT INTO t (id, name) VALUES (9, NULL)"))
-		is.Error(t, exec.ErrType, queryErr(t, s, "INSERT INTO t (id, name) VALUES ('9', 'x')"))
-		is.Error(t, exec.ErrType, queryErr(t, s, "INSERT INTO t (id, name, f) VALUES (9, 'x', '1.5')"))
-		is.Error(t, exec.ErrType, queryErr(t, s, "INSERT INTO t (id, name) VALUES (9.0, 'x')"))
+		is.Error(t, exec.ErrCast, queryErr(t, s, "INSERT INTO t (id, name) VALUES ('x', 'x')"), "a quoted literal is read as the column's type")
+		is.Error(t, exec.ErrType, queryErr(t, s, "INSERT INTO t (id, name) VALUES (TRUE, 'x')"))
+		is.Error(t, exec.ErrType, queryErr(t, s, "INSERT INTO t (id, name, b) VALUES (9, 'x', 1)"))
 		is.Error(t, exec.ErrInvalid, queryErr(t, s, "INSERT INTO t (id, nope) VALUES (9, 'x')"))
 		is.Error(t, exec.ErrInvalid, queryErr(t, s, "INSERT INTO t (id, id) VALUES (9, 9)"))
-		is.Error(t, exec.ErrInvalid, queryErr(t, s, "INSERT INTO t (id, name) VALUES (9)"))
-		is.Error(t, exec.ErrInvalid, queryErr(t, s, "INSERT INTO t (id, name) VALUES (9, 'x', 1)"))
+		is.Error(t, exec.ErrSyntax, queryErr(t, s, "INSERT INTO t (id, name) VALUES (9)"))
+		is.Error(t, exec.ErrSyntax, queryErr(t, s, "INSERT INTO t (id, name) VALUES (9, 'x', 1)"))
+		is.Error(t, exec.ErrSyntax, queryErr(t, s, "INSERT INTO t (id, name) VALUES (9, 'x'), (10)"))
+		is.Error(t, exec.ErrSyntax, queryErr(t, s, "INSERT INTO t (id, name) VALUES (9, 'x', 1), (10, 'y', CAST('z' AS bigint))"), "a row is checked before the next is analyzed")
+		is.Error(t, exec.ErrCast, queryErr(t, s, "INSERT INTO t (id, name) VALUES (9, 'x'), (CAST('z' AS bigint), 'y', 1)"), "and is analyzed before its length is checked")
+		is.Error(t, exec.ErrCast, queryErr(t, s, "UPDATE t SET data = coalesce('a'), id = CAST('x' AS bigint)"), "every SET expression is analyzed before any is converted")
+		is.Error(t, exec.ErrType, queryErr(t, s, "UPDATE t SET data = coalesce('a'), id = 1 WHERE 1"), "and WHERE before any of them")
+		is.Error(t, exec.ErrSyntax, queryErr(t, s, "UPDATE t SET id = 1, id = 2"))
 		is.Error(t, exec.ErrInvalid, queryErr(t, s, "INSERT INTO t (id, name) VALUES (id, 'x')"))
 	})
 
-	t.Run("adapts an int literal to a float column but not a parameter", func(t *testing.T) {
-		verify.Covers(t, "an int literal adapts to a float column and an int parameter does not", "INV-STRICT-TYPES")
+	t.Run("applies Postgres's assignment casts", func(t *testing.T) {
+		verify.Covers(t, "an INSERT applies the assignment casts Postgres has: a quoted literal as the column's type, numeric and float literals rounded into bigint, integers widened to double precision, and any value written into text", "INV-TYPES", "INV-PG-SUBSET")
 		s := newSession(t)
 		setup(t, s)
-		mustExec(t, s, "INSERT INTO t (id, name, f) VALUES (10, 'x', 2)")
-		is.Equal(t, "2.0", query(t, s, "SELECT f FROM t WHERE id = 10"))
-		is.Error(t, exec.ErrType, queryErr(t, s, "INSERT INTO t (id, name, f) VALUES (11, 'x', $1)", 2))
-		is.Error(t, exec.ErrType, queryErr(t, s, "INSERT INTO t (id, name, f) VALUES (11, 'x', $1 + 1)", 2))
-		is.Error(t, exec.ErrType, queryErr(t, s, "SELECT f + $1 FROM t", 2))
-		is.Error(t, exec.ErrType, queryErr(t, s, "SELECT * FROM t WHERE f = $1", 2))
-		mustExec(t, s, "INSERT INTO t (id, name, f) VALUES (11, 'x', $1)", 2.0)
-		is.Equal(t, "2.0", query(t, s, "SELECT f FROM t WHERE id = $1 AND f = $2", 11, 2.0))
+		mustExec(t, s, "INSERT INTO t (id, name, f, b, data, at) VALUES ('10', 'x', 2, 't', '\\x6869', '2024-01-02 03:04:05+02')")
+		is.Equal(t, `10 "x" 2 true \x6869 2024-01-02 01:04:05+00`, query(t, s, "SELECT * FROM t WHERE id = 10"))
+		mustExec(t, s, "INSERT INTO t (id, name, f) VALUES (11, 1.5, $1)", 2)
+		is.Equal(t, `11 "1.5" 2`, query(t, s, "SELECT id, name, f FROM t WHERE id = 11"), "an integer parameter widens, and a numeric literal is written as text")
+		mustExec(t, s, "INSERT INTO t (id, name) VALUES (12.5, TRUE), (13.5, 2.5::float8), (16.5::float8, '2024-01-01'::timestamptz)")
+		is.Equal(t, "13 \"true\"\n14 \"2.5\"\n16 \"2024-01-01 00:00:00+00\"", query(t, s, "SELECT id, name FROM t WHERE id >= 13 ORDER BY id"))
+		is.Error(t, exec.ErrDuplicateKey, queryErr(t, s, "INSERT INTO t (id, name) VALUES (13.5::float8, 'x')"), "a numeric literal rounds half away from zero, a float half to even")
+		is.Error(t, exec.ErrOutOfRange, queryErr(t, s, "INSERT INTO t (id, name) VALUES (1e30::float8, 'x')"))
+		is.Error(t, exec.ErrOutOfRange, queryErr(t, s, "INSERT INTO t (id, name) VALUES (99999999999999999999, 'x')"))
+		is.Error(t, exec.ErrType, queryErr(t, s, "INSERT INTO t (id, name, f) VALUES (15, 'x', TRUE)"))
+		is.Error(t, exec.ErrType, queryErr(t, s, "INSERT INTO t (id, name, f) VALUES (15, 'x', $1)", true))
+		is.Error(t, exec.ErrCast, queryErr(t, s, "INSERT INTO t (id, name, f) VALUES (15, 'x', $1)", "x"), "a string parameter is read like a quoted literal")
+		mustExec(t, s, "INSERT INTO t (id, name, f) VALUES (15, 'x', $1)", "1.5")
+		is.Equal(t, "1.5", query(t, s, "SELECT f FROM t WHERE id = 15"))
 	})
 
 	t.Run("a multi-row insert that fails leaves nothing behind", func(t *testing.T) {
@@ -215,17 +239,19 @@ func TestSession_Insert(t *testing.T) {
 	})
 
 	t.Run("binds parameters of every type", func(t *testing.T) {
+		verify.Covers(t, "every type binds through a parameter, and a timestamptz keeps microseconds", "INV-TYPES", "INV-PLACEHOLDERS")
 		s := newSession(t)
 		setup(t, s)
-		at := time.Date(2025, 2, 3, 4, 5, 6, 7, time.FixedZone("x", 3600))
+		at := time.Date(2025, 2, 3, 4, 5, 6, 7000, time.FixedZone("x", 3600))
 		mustExec(t, s, "INSERT INTO t VALUES ($1, $2, $3, $4, $5, $6)", 5, "eve", 0.25, true, []byte{0xAB}, at)
-		is.Equal(t, `5 "eve" 0.25 true X'ab' 2025-02-03T03:05:06.000000007Z`, query(t, s, "SELECT * FROM t WHERE id = $1", 5))
+		is.Equal(t, `5 "eve" 0.25 true \xab 2025-02-03 03:05:06.000007+00`, query(t, s, "SELECT * FROM t WHERE id = $1", 5))
 		is.Error(t, exec.ErrInvalid, queryErr(t, s, "SELECT * FROM t WHERE id = $2", 5))
 	})
 }
 
 func TestSession_Select(t *testing.T) {
 	t.Run("evaluates expressions like Postgres", func(t *testing.T) {
+		verify.Covers(t, "expressions evaluate as in Postgres: integer literals are 32-bit, numeric literals adapt to double precision, quoted literals take the type their context demands, || writes any type next to text, and casts use Postgres's text formats", "INV-PG-SUBSET", "INV-TYPES")
 		s := newSession(t)
 		tests := []struct {
 			sql  string
@@ -233,35 +259,41 @@ func TestSession_Select(t *testing.T) {
 		}{
 			{"SELECT 1 + 2 * 3 - 4 / 2 % 3", "5"},
 			{"SELECT 7 / 2, -7 / 2, 7 % 3, -7 % 3", "3 -3 1 -1"},
-			{"SELECT 1.5 + 1, 2 * 2.5, 1 / 4.0", "2.5 5.0 0.25"},
-			{"SELECT -(-5), -5, abs(-3), abs(-2.5), abs(0.0)", "5 -5 3 2.5 0.0"},
-			{"SELECT 'a' || 'b' || 'c', 'a' || NULL, X'01' || X'02'", `"abc" NULL X'0102'`},
-			{"SELECT length('héllo'), length(X'0102'), lower('ÄBC'), upper('äbc')", `5 2 "äbc" "ÄBC"`},
+			{"SELECT 1.5::float8 + 1, 2 * 2.5::float8, 1 / 4.0::float8, 1.5 + 1.5::float8", "2.5 5 0.25 3"},
+			{"SELECT -(-5), -5, abs(-3), abs(-2.5::float8), abs(0.0::float8), +5, +(-5)", "5 -5 3 2.5 0 5 -5"},
+			{"SELECT 'a' || 'b' || 'c', 'a' || NULL, '\\x01'::bytea || '\\x02', 1 || '2', 'a' || 1, TRUE || 'x', 1.5::float8 || 'x', '\\x01'::bytea || 'x'::text, 'x' || '\\x01'::bytea", `"abc" NULL \x0102 "12" "a1" "truex" "1.5x" "\\x01x" \x7801`},
+			{"SELECT length('héllo'), length('\\x0102'::bytea), lower('ÄBC'), upper('äbc'), lower('ΑΒΓ')", `5 2 "Äbc" "äBC" "ΑΒΓ"`},
 			{"SELECT 1 = 1, 1 <> 1, 1 < 2, 2 <= 2, 3 > 2, 2 >= 3", "true false true true true false"},
 			{"SELECT 'a' < 'b', 'B' < 'a', 'abc' < 'abd', '' < 'a'", "true true true true"},
-			{"SELECT X'01' < X'0102', X'02' > X'0199', TRUE > FALSE", "true true true"},
-			{"SELECT TIME '2024-01-01T00:00:00Z' < TIME '2024-01-01T00:00:00.000000001Z'", "true"},
-			{"SELECT TRUE AND NULL, FALSE AND NULL, TRUE OR NULL, FALSE OR NULL, NOT NULL, NULL AND NULL", "NULL false true NULL NULL NULL"},
-			{"SELECT NULL = NULL, NULL IS NULL, NULL IS NOT NULL, 1 IS NULL, 1 = NULL", "NULL true false false NULL"},
+			{"SELECT '\\x01'::bytea < '\\x0102', '\\x02'::bytea > '\\x0199', TRUE > FALSE", "true true true"},
+			{"SELECT '2024-01-01T00:00:00Z'::timestamptz < '2024-01-01 00:00:00.000001+00', timestamptz '2024-01-01 02:00:00+02' = '2024-01-01'", "true true"},
+			{"SELECT TRUE AND NULL, FALSE AND NULL, TRUE OR NULL, FALSE OR NULL, NOT NULL, NULL AND NULL, 'true' AND 't', NOT 'f'", "NULL false true NULL NULL NULL true true"},
+			{"SELECT NULL = NULL, NULL IS NULL, NULL IS NOT NULL, 1 IS NULL, 1 = NULL, 'a' IS NULL", "NULL true false false NULL false"},
 			{"SELECT 2 BETWEEN 1 AND 3, 0 BETWEEN 1 AND 3, 2 NOT BETWEEN 1 AND 3, NULL BETWEEN 1 AND 3, 5 BETWEEN 1 AND NULL, 0 BETWEEN 1 AND NULL", "true false false NULL NULL false"},
-			{"SELECT 1 IN (1, 2), 3 IN (1, 2), 3 IN (1, NULL), 1 IN (1, NULL), NULL IN (1), 3 NOT IN (1, 2), 3 NOT IN (1, NULL)", "true false NULL true NULL true NULL"},
+			{"SELECT 1 IN (1, 2), 3 IN (1, 2), 3 IN (1, NULL), 1 IN (1, NULL), NULL IN (1), 3 NOT IN (1, 2), 3 NOT IN (1, NULL), 1 IN ('1'), '1' IN (1, 2), 'a' IN ('a')", "true false NULL true NULL true NULL true true true"},
 			{"SELECT 'abc' LIKE 'a%', 'abc' LIKE 'a_c', 'abc' LIKE 'a_', 'a%c' LIKE 'a\\%c', 'abc' LIKE 'a\\%c', 'abc' NOT LIKE '%b%', 'héllo' LIKE 'h_llo', '' LIKE '%', '' LIKE '_', NULL LIKE 'a'", "true true false true false false true true false NULL"},
-			{"SELECT CASE WHEN 1 > 2 THEN 'a' WHEN 2 > 1 THEN 'b' ELSE 'c' END, CASE WHEN NULL THEN 1 ELSE 2 END, CASE WHEN FALSE THEN 1 END", `"b" 2 NULL`},
-			{"SELECT CASE 2 WHEN 1 THEN 'one' WHEN 2 THEN 'two' END, CASE NULL WHEN NULL THEN 'null' ELSE 'other' END", `"two" "other"`},
-			{"SELECT coalesce(NULL, 1), coalesce(NULL, NULL), coalesce(1, 2), coalesce(NULL, 1.5, 2)", "1 NULL 1 1.5"},
-			{"SELECT -abs(NULL), abs(NULL) + 1, length(NULL) + 1, lower(NULL) || 'a'", "NULL NULL NULL NULL"},
-			{"SELECT CAST(1 AS float), CAST(2.5 AS int), CAST(3.5 AS int), CAST(-2.5 AS int), CAST(2.4 AS int)", "1.0 2 4 -2 2"},
-			{"SELECT CAST(42 AS string), CAST(TRUE AS string), CAST(1.5 AS string), CAST(X'6869' AS string), CAST(TIME '2024-01-01T00:00:00.25Z' AS string)", `"42" "true" "1.5" "hi" "2024-01-01T00:00:00.25Z"`},
-			{"SELECT CAST(' 42 ' AS int), CAST('1.5e3' AS float), CAST('t' AS bool), CAST('NO' AS bool), CAST('on' AS bool), CAST('hi' AS bytes), CAST('2024-01-01 00:00:00Z' AS time)", `42 1500.0 true false true X'6869' 2024-01-01T00:00:00Z`},
-			{"SELECT CAST('NaN' AS float) > CAST('Infinity' AS float), CAST('NaN' AS float) = CAST('nan' AS float), CAST('-inf' AS float) < -1e308", "true true true"},
-			{"SELECT CAST('Infinity' AS float) - CAST('Infinity' AS float), CAST('Infinity' AS float) * 0", "NaN NaN"},
-			{"SELECT CAST(CAST('NaN' AS float) AS string), CAST(1e20 AS string), CAST(1e14 AS string), CAST(0.0001 AS string), CAST(0.00001 AS string), CAST(-0.0 AS string)", `"NaN" "1e+20" "100000000000000" "0.0001" "1e-05" "-0"`},
-			{"SELECT CAST(NULL AS int) IS NULL, CAST(NULL AS string)", "true NULL"},
-			{"SELECT 1 AS one, 2 two", "1 2"},
+			{"SELECT CASE WHEN 1 > 2 THEN 'a' WHEN 2 > 1 THEN 'b' ELSE 'c' END, CASE WHEN NULL THEN 1 ELSE 2 END, CASE WHEN FALSE THEN 1 END, CASE WHEN 't' THEN 1 END", `"b" 2 NULL 1`},
+			{"SELECT CASE 2 WHEN 1 THEN 'one' WHEN 2 THEN 'two' END, CASE NULL WHEN NULL THEN 'null' ELSE 'other' END, CASE 'a' WHEN 'a' THEN 1 END, CASE 1 WHEN '1' THEN 1 END", `"two" "other" 1 1`},
+			{"SELECT coalesce(NULL, 1), coalesce(NULL, NULL), coalesce(1, 2), coalesce(NULL, 1.5::float8, 2), coalesce('1', 2), coalesce(1, 2::bigint)", "1 NULL 1 1.5 1 1"},
+			{"SELECT -abs(NULL), abs(NULL) + 1, length(NULL) + 1, lower(NULL) || 'a', abs('-1')", "NULL NULL NULL NULL 1"},
+			{"SELECT CAST(1 AS double precision), CAST(2.5::float8 AS bigint), CAST(3.5::float8 AS bigint), CAST(-2.5::float8 AS bigint), CAST(2.4::float8 AS bigint), 2.5::bigint, 3.5::bigint, -2.5::bigint, (-2.5)::bigint", "1 2 4 -2 2 3 4 -3 -3"},
+			{"SELECT CAST(42 AS text), CAST(TRUE AS text), CAST(1.5::float8 AS text), CAST('\\x6869'::bytea AS text), CAST('2024-01-01T00:00:00.25Z'::timestamptz AS text), 2::bigint::text", `"42" "true" "1.5" "\\x6869" "2024-01-01 00:00:00.25+00" "2"`},
+			{"SELECT CAST(' 42 ' AS bigint), CAST('1.5e3' AS double precision), CAST('t' AS boolean), CAST('NO' AS bool), CAST('on' AS boolean), CAST('hi' AS bytea), CAST('2024-01-01 00:00:00Z' AS timestamptz), '0x10'::bigint, '0x10'::float8", `42 1500 true false true \x6869 2024-01-01 00:00:00+00 16 16`},
+			{"SELECT CAST('NaN' AS float8) > CAST('Infinity' AS float8), CAST('NaN' AS double precision) = CAST('nan' AS double precision), CAST('-inf' AS float8) < -1e308::float8", "true true true"},
+			{"SELECT 'Infinity'::float8 - 'Infinity'::float8, 'Infinity'::float8 * 0, 'nan'::float8 / 0", "NaN NaN NaN"},
+			{"SELECT CAST('NaN'::float8 AS text), CAST(1e20::float8 AS text), CAST(1e14::float8 AS text), CAST(0.0001::float8 AS text), CAST(0.00001::float8 AS text), CAST(-0.0::float8 AS text), (-0.0)::float8::text, '-0'::float8::text, -(0.0::float8) || ''", `"NaN" "1e+20" "100000000000000" "0.0001" "1e-05" "-0" "0" "-0" "-0"`},
+			{"SELECT CAST(NULL AS bigint) IS NULL, CAST(NULL AS text), NULL::bigint", "true NULL NULL"},
+			{"SELECT 1 AS one, 2 two, 'a', NULL", `1 2 "a" NULL`},
 			{"SELECT 1 WHERE FALSE", ""},
 			{"SELECT 1 WHERE NULL", ""},
+			{"SELECT 1 WHERE 'true'", "1"},
 			{"SELECT 9223372036854775807, -9223372036854775808, 9223372036854775807 % -1, -9223372036854775808 % -1", "9223372036854775807 -9223372036854775808 0 0"},
-			{"SELECT 1e308 * 0.5, 1e-308 * 0.0, 0.0 / 1.5", "5e+307 0.0 0.0"},
+			{"SELECT 1e308::float8 * 0.5, 1e-308::float8 * 0.0, 0.0::float8 / 1.5", "5e+307 0 0"},
+			{"SELECT 2147483647 + 0, -2147483647 - 1, 2147483647::bigint + 1, 2000000000 * 2::bigint", "2147483647 -2147483648 2147483648 4000000000"},
+			{"SELECT 5 % -1, (-2147483647 - 1) % -1, abs(-2147483647)", "0 0 2147483647"},
+			{"SELECT 1 LIMIT '1'", "1"},
+			{"SELECT 1.5::text, 1e5 || 'x', 01.50::text, .5::text, (-0.0)::text, 1.5e1::text, 1e-3 || '', 1.::text, 000.0::text, 1.0e-2::text, 'a' || 9223372036854775808, 1.5E+2::text", `"1.5" "100000x" "1.50" "0.5" "0.0" "15" "0.001" "1" "0.0" "0.010" "a9223372036854775808" "150"`},
+			{"SELECT CASE WHEN FALSE THEN 1e400::float8 END, CASE WHEN FALSE THEN 9223372036854775808::bigint END", "NULL NULL"},
 		}
 		for _, test := range tests {
 			t.Run(test.sql, func(t *testing.T) {
@@ -271,7 +303,7 @@ func TestSession_Select(t *testing.T) {
 	})
 
 	t.Run("reports evaluation errors like Postgres", func(t *testing.T) {
-		verify.Covers(t, "int overflow in +, -, and * is ErrOutOfRange, among the other evaluation errors", "INV-INT-OVERFLOW")
+		verify.Covers(t, "integer and bigint overflow in +, -, *, /, unary minus, and abs is ErrOutOfRange, at 32 bits for integer literals, among the other evaluation errors", "INV-INT-OVERFLOW")
 		s := newSession(t)
 		tests := []struct {
 			sql  string
@@ -279,78 +311,96 @@ func TestSession_Select(t *testing.T) {
 		}{
 			{"SELECT 1 / 0", exec.ErrDivisionByZero},
 			{"SELECT 1 % 0", exec.ErrDivisionByZero},
-			{"SELECT 1.0 / 0.0", exec.ErrDivisionByZero},
+			{"SELECT 1.0::float8 / 0.0", exec.ErrDivisionByZero},
+			{"SELECT 1::bigint / 0", exec.ErrDivisionByZero},
 			{"SELECT 9223372036854775807 + 1", exec.ErrOutOfRange},
 			{"SELECT -9223372036854775808 - 1", exec.ErrOutOfRange},
 			{"SELECT 4611686018427387904 * 2", exec.ErrOutOfRange},
 			{"SELECT -9223372036854775808 * -1", exec.ErrOutOfRange},
 			{"SELECT -9223372036854775808 / -1", exec.ErrOutOfRange},
-			{"SELECT -(-9223372036854775808)", exec.ErrOutOfRange},
+			{"SELECT -(-9223372036854775807 - 1)", exec.ErrOutOfRange},
 			{"SELECT abs(-9223372036854775808)", exec.ErrOutOfRange},
-			{"SELECT 1e308 * 10", exec.ErrOutOfRange},
-			{"SELECT 1e308 + 1e308", exec.ErrOutOfRange},
-			{"SELECT 1e-308 * 1e-308", exec.ErrOutOfRange},
-			{"SELECT 1e-308 / 1e308", exec.ErrOutOfRange},
-			{"SELECT CAST(1e19 AS int)", exec.ErrOutOfRange},
-			{"SELECT CAST(CAST('NaN' AS float) AS int)", exec.ErrOutOfRange},
-			{"SELECT CAST('99999999999999999999' AS int)", exec.ErrOutOfRange},
-			{"SELECT CAST('x' AS int)", exec.ErrCast},
-			{"SELECT CAST('1.5' AS int)", exec.ErrCast},
-			{"SELECT CAST('x' AS float)", exec.ErrCast},
-			{"SELECT CAST('1_000' AS float)", exec.ErrCast},
-			{"SELECT CAST('0x1p-2' AS float)", exec.ErrCast},
-			{"SELECT CAST('0x10' AS int)", exec.ErrCast},
-			{"SELECT CAST('1_000' AS int)", exec.ErrCast},
-			{"SELECT CAST('o' AS bool)", exec.ErrCast},
-			{"SELECT CAST('' AS bool)", exec.ErrCast},
-			{"SELECT CAST('yesterday' AS time)", exec.ErrCast},
-			{"SELECT CAST(1 AS bool)", exec.ErrCast},
-			{"SELECT CAST(TRUE AS int)", exec.ErrCast},
-			{"SELECT CAST(1 AS time)", exec.ErrCast},
-			{"SELECT CAST(X'ff' AS string) IS NULL", exec.ErrCast},
-			{"SELECT 1 + 'a'", exec.ErrType},
-			{"SELECT 1 + 1.5 WHERE 'a' = 1", exec.ErrType},
-			{"SELECT 'a' || 1", exec.ErrType},
-			{"SELECT 1.5 % 1.0", exec.ErrType},
+			{"SELECT 2147483647 + 1", exec.ErrOutOfRange},
+			{"SELECT -2147483647 - 2", exec.ErrOutOfRange},
+			{"SELECT 2000000000 * 2", exec.ErrOutOfRange},
+			{"SELECT 2147483647 * 2147483647", exec.ErrOutOfRange},
+			{"SELECT (-2147483647 - 1) / -1", exec.ErrOutOfRange},
+			{"SELECT -(-2147483647 - 1)", exec.ErrOutOfRange},
+			{"SELECT abs(-2147483647 - 1)", exec.ErrOutOfRange},
+			{"SELECT length('a') + 2147483647", exec.ErrOutOfRange},
+			{"SELECT 1e308::float8 * 10", exec.ErrOutOfRange},
+			{"SELECT 1e308::float8 + 1e308::float8", exec.ErrOutOfRange},
+			{"SELECT 1e-308::float8 * 1e-308::float8", exec.ErrOutOfRange},
+			{"SELECT 1e-308::float8 / 1e308::float8", exec.ErrOutOfRange},
+			{"SELECT CAST(1e19::float8 AS bigint)", exec.ErrOutOfRange},
+			{"SELECT CAST(CAST('NaN' AS float8) AS bigint)", exec.ErrOutOfRange},
+			{"SELECT CAST('99999999999999999999' AS bigint)", exec.ErrOutOfRange},
+			{"SELECT CAST('1e400' AS float8)", exec.ErrOutOfRange},
+			{"SELECT 9223372036854775807.5::bigint", exec.ErrOutOfRange},
+			{"SELECT 1 LIMIT 1e30", exec.ErrOutOfRange},
+			{"SELECT CAST('x' AS bigint)", exec.ErrCast},
+			{"SELECT CAST('1.5' AS bigint)", exec.ErrCast},
+			{"SELECT CAST('x' AS double precision)", exec.ErrCast},
+			{"SELECT CAST('1_000' AS float8)", exec.ErrCast},
+			{"SELECT CAST('o' AS boolean)", exec.ErrCast},
+			{"SELECT CAST('' AS boolean)", exec.ErrCast},
+			{"SELECT CAST('2024-13-01' AS timestamptz)", exec.ErrCast},
+			{"SELECT CAST('a\\' AS bytea)", exec.ErrCast},
+			{"SELECT CAST(1 AS boolean)", exec.ErrCast},
+			{"SELECT CAST(TRUE AS bigint)", exec.ErrCast},
+			{"SELECT CAST(1 AS timestamptz)", exec.ErrCast},
+			{"SELECT 1 + 'a'", exec.ErrCast},
+			{"SELECT '1.5' + 1", exec.ErrCast},
+			{"SELECT 1 WHERE 'x'", exec.ErrCast},
+			{"SELECT 1 LIMIT 'x'", exec.ErrCast},
+			{"SELECT coalesce('a', 1)", exec.ErrCast},
+			{"SELECT CASE WHEN FALSE THEN 'a' ELSE 1 END", exec.ErrCast},
+			{"SELECT 1 + TRUE", exec.ErrType},
+			{"SELECT 1.5::float8 % 1.0::float8", exec.ErrType},
 			{"SELECT -'a'", exec.ErrType},
 			{"SELECT -NULL", exec.ErrType},
-			{"SELECT 'abc' LIKE 'a\\'", exec.ErrInvalid},
-			{"SELECT 'x' LIKE '%\\'", exec.ErrInvalid},
+			{"SELECT +NULL", exec.ErrType},
+			{"SELECT '1' + '2'", exec.ErrType},
+			{"SELECT NULL + NULL", exec.ErrType},
+			{"SELECT 1 || 2", exec.ErrType},
 			{"SELECT NOT 1", exec.ErrType},
 			{"SELECT 1 AND TRUE", exec.ErrType},
-			{"SELECT 1 BETWEEN 'a' AND 'b'", exec.ErrType},
-			{"SELECT 1 IN ('a')", exec.ErrType},
+			{"SELECT 1 BETWEEN TRUE AND FALSE", exec.ErrType},
+			{"SELECT 1 IN (TRUE)", exec.ErrType},
 			{"SELECT 1 LIKE 'a'", exec.ErrType},
 			{"SELECT CASE WHEN 1 THEN 1 END", exec.ErrType},
 			{"SELECT TRUE AND CASE WHEN TRUE THEN NULL END", exec.ErrType},
 			{"SELECT TRUE AND coalesce(NULL, NULL)", exec.ErrType},
 			{"SELECT 1 + coalesce(CASE WHEN FALSE THEN FALSE END)", exec.ErrType},
 			{"SELECT 1 + CASE WHEN FALSE THEN NULL END", exec.ErrType},
-			{"SELECT CASE WHEN TRUE THEN 1 ELSE 'a' END", exec.ErrType},
-			{"SELECT CASE 1 WHEN 'a' THEN 1 END", exec.ErrType},
-			{"SELECT coalesce(1, 'a')", exec.ErrType},
+			{"SELECT CASE WHEN TRUE THEN 1 ELSE TRUE END", exec.ErrType},
+			{"SELECT CASE 1 WHEN TRUE THEN 1 END", exec.ErrType},
+			{"SELECT coalesce(1, TRUE)", exec.ErrType},
 			{"SELECT length(1)", exec.ErrType},
 			{"SELECT lower(1)", exec.ErrType},
-			{"SELECT abs('a')", exec.ErrType},
-			{"SELECT 'abc' LIKE 'a\\'", exec.ErrInvalid},
-			{"SELECT nope(1)", exec.ErrInvalid},
+			{"SELECT abs(TRUE)", exec.ErrType},
+			{"SELECT 1 LIMIT TRUE", exec.ErrType},
+			{"SELECT 1 OFFSET '1'::text", exec.ErrType},
+			{"SELECT 'abc' LIKE 'a' || '\\'", exec.ErrInvalid},
+			{"SELECT 'ab' LIKE 'a\\'", exec.ErrInvalid},
+			{"SELECT 'x' LIKE '%\\'", exec.ErrInvalid},
 			{"SELECT length()", exec.ErrInvalid},
-			{"SELECT coalesce()", exec.ErrInvalid},
 			{"SELECT x", exec.ErrInvalid},
-			{"SELECT *", exec.ErrInvalid},
-			{"SELECT 1 WHERE 1", exec.ErrType},
 			{"SELECT 1 LIMIT -1", exec.ErrInvalid},
-			{"SELECT 1 OFFSET 'a'", exec.ErrType},
 			{"SELECT 1 ORDER BY 2", exec.ErrInvalid},
 			{"SELECT 1 ORDER BY 0", exec.ErrInvalid},
+			{"SELECT 1 ORDER BY 2147483647", exec.ErrInvalid},
+			{"SELECT 1 ORDER BY -2147483647", exec.ErrInvalid},
+			{"SELECT 1 AS a, 2 AS a ORDER BY a", exec.ErrInvalid},
+			{"SELECT coalesce()", exec.ErrSyntax},
+			{"SELECT *", exec.ErrSyntax},
+			{"SELECT 1 WHERE 1", exec.ErrType},
 			{"SELECT 1 ORDER BY FALSE", exec.ErrSyntax},
 			{"SELECT 1 ORDER BY 'a'", exec.ErrSyntax},
 			{"SELECT 1 ORDER BY NULL", exec.ErrSyntax},
-			{"SELECT 1 ORDER BY 2147483647", exec.ErrInvalid},
-			{"SELECT 1 ORDER BY -2147483647", exec.ErrInvalid},
+			{"SELECT 1 ORDER BY 1.5", exec.ErrSyntax},
 			{"SELECT 1 ORDER BY 2147483648", exec.ErrSyntax},
 			{"SELECT 1 ORDER BY -2147483648", exec.ErrSyntax},
-			{"SELECT 1 AS a, 2 AS a ORDER BY a", exec.ErrInvalid},
 		}
 		for _, test := range tests {
 			t.Run(test.sql, func(t *testing.T) {
@@ -358,14 +408,32 @@ func TestSession_Select(t *testing.T) {
 			})
 		}
 		is.Error(t, exec.ErrType, queryErr(t, s, "SELECT FALSE AND 1"), "a pruned branch is still type-checked")
-		is.Error(t, exec.ErrType, queryErr(t, s, "SELECT CASE WHEN FALSE THEN 1 ELSE 'a' END"))
-		is.Error(t, exec.ErrType, queryErr(t, s, "SELECT CASE WHEN TRUE THEN 1 WHEN TRUE THEN 'a' END"))
-		is.Error(t, exec.ErrType, queryErr(t, s, "SELECT coalesce(NULL, 1, 'a')"))
+		is.Error(t, exec.ErrType, queryErr(t, s, "SELECT CASE WHEN FALSE THEN 1 ELSE TRUE END"))
+		is.Error(t, exec.ErrType, queryErr(t, s, "SELECT CASE WHEN TRUE THEN 1 WHEN TRUE THEN TRUE END"))
+		is.Error(t, exec.ErrType, queryErr(t, s, "SELECT coalesce(NULL, 1, TRUE)"))
+	})
+
+	t.Run("rejects what Postgres accepts only with ErrUnsupported", func(t *testing.T) {
+		verify.Covers(t, "the numeric type, bit strings, non-ISO timestamps, LIKE on bytea, and the other rejections of accepted Postgres SQL are ErrUnsupported with a hint", "INV-UNSUPPORTED")
+		s := newSession(t)
+		for _, sql := range []string{
+			"SELECT 1.5", "SELECT 1 + 1.5", "SELECT 1.5 + 1.5", "SELECT -(1.5)", "SELECT abs(1.5)", "SELECT 1 = 1.5", "SELECT '1' + 1.5",
+			"SELECT 9223372036854775808", "SELECT 9223372036854775808 + 1", "SELECT -(-9223372036854775808)", "SELECT 1.5::boolean",
+			"SELECT 'January 2, 2024'::timestamptz", "SELECT 'now'::timestamptz", "SELECT '0001-01-01 00:00:00+01'::timestamptz",
+			"SELECT '\\x01'::bytea LIKE '\\x01'", "SELECT 1::integer", "SELECT count(1)", "SELECT now()", "SELECT nope(1)", "SELECT 1::nope",
+		} {
+			is.Error(t, exec.ErrUnsupported, queryErr(t, s, sql), sql)
+		}
+		is.Equal(t, "3", query(t, s, "SELECT 1.5::float8 + 1.5"), "a numeric literal adapts to double precision")
+		is.Equal(t, "true", query(t, s, "SELECT 1.5::float8 = 1.5"))
+		is.Equal(t, "false", query(t, s, "SELECT 'a' LIKE 'a\\\\'"), "an escaped backslash is not a trailing escape")
+		is.Equal(t, "false", query(t, s, "SELECT 'a' LIKE 'a\\'"), "the trailing escape is only an error when matching reaches it")
+		is.Equal(t, "false", query(t, s, "SELECT '' LIKE '%\\'"))
 	})
 
 	t.Run("folds constants before reading rows, like Postgres, except behind a false branch", func(t *testing.T) {
 		s := newSession(t)
-		mustExec(t, s, "CREATE TABLE e (id int PRIMARY KEY, b bool)")
+		mustExec(t, s, "CREATE TABLE e (id bigint PRIMARY KEY, b boolean)")
 		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT * FROM e WHERE 1 / 0 = 1"))
 		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT * FROM e WHERE id = 1 AND 1 / 0 = 1"))
 		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT CASE WHEN b THEN 1 / 0 ELSE 0 END FROM e"))
@@ -381,7 +449,7 @@ func TestSession_Select(t *testing.T) {
 		is.Equal(t, "1", query(t, s, "SELECT CASE WHEN TRUE THEN 1 ELSE 1 / 0 END"))
 		is.Equal(t, "1", query(t, s, "SELECT CASE WHEN TRUE THEN 1 WHEN 1 / 0 = 1 THEN 2 END"))
 		is.Equal(t, "1", query(t, s, "SELECT CASE 1 WHEN 1 THEN 1 WHEN 1 / 0 THEN 2 END"))
-		is.Error(t, exec.ErrType, queryErr(t, s, "SELECT CASE 1 WHEN 1 THEN 1 WHEN 'a' THEN 2 END"))
+		is.Error(t, exec.ErrCast, queryErr(t, s, "SELECT CASE 1 WHEN 1 THEN 1 WHEN 'a' THEN 2 END"))
 		is.Error(t, exec.ErrType, queryErr(t, s, "SELECT CASE WHEN TRUE THEN 1 WHEN 1 THEN 2 END"))
 		is.Equal(t, "1", query(t, s, "SELECT coalesce(1, 1 / 0)"))
 		is.Equal(t, "true", query(t, s, "SELECT TRUE OR 1 / 0 = 1"))
@@ -400,9 +468,10 @@ func TestSession_Select(t *testing.T) {
 		is.Error(t, exec.ErrOutOfRange, queryErr(t, s, "SELECT -id IN (NULL, id) FROM e"))
 		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT 1 / 0 IN (NULL)"))
 		is.Equal(t, "NULL", query(t, s, "SELECT NULL + -id FROM e"), "a strict operator with a known NULL does not evaluate the other side")
-		is.Equal(t, "NULL", query(t, s, "SELECT -id * CAST(NULL AS int) FROM e"))
-		is.Equal(t, "NULL", query(t, s, "SELECT CAST(id AS string) LIKE NULL FROM e"))
-		is.Equal(t, "1", query(t, s, "SELECT CASE NULL WHEN id THEN -id ELSE 1 END FROM e"))
+		is.Equal(t, "NULL", query(t, s, "SELECT -id * CAST(NULL AS bigint) FROM e"))
+		is.Equal(t, "NULL", query(t, s, "SELECT CAST(id AS text) LIKE NULL FROM e"))
+		is.Error(t, exec.ErrType, queryErr(t, s, "SELECT CASE NULL WHEN id THEN -id ELSE 1 END FROM e"), "an operand of unknown type is text")
+		is.Equal(t, "1", query(t, s, "SELECT CASE NULL::bigint WHEN id THEN -id ELSE 1 END FROM e"))
 		is.Equal(t, "1", query(t, s, "SELECT CASE id WHEN NULL THEN -id ELSE 1 END FROM e"))
 		is.Equal(t, "NULL", query(t, s, "SELECT CASE id WHEN NULL THEN id END = -id FROM e"), "a CASE with no live WHEN and no ELSE is a NULL constant")
 		is.Equal(t, "NULL", query(t, s, "SELECT CASE WHEN FALSE THEN id END + -id FROM e"))
@@ -411,10 +480,8 @@ func TestSession_Select(t *testing.T) {
 		is.Equal(t, "NULL", query(t, s, "SELECT NULL BETWEEN -id AND 1 FROM e"))
 		mustExec(t, s, "INSERT INTO e VALUES (5, NULL)")
 		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT b BETWEEN TRUE AND (1 / (id - 5) > 0) FROM e WHERE id = 5"), "a NULL column still evaluates the bounds")
-		is.Equal(t, "", query(t, s, "SELECT id FROM e WHERE b AND 1 / (id - 5) > 0 AND id = 5"), "a WHERE conjunct that is NULL stops the row's evaluation")
-		is.Equal(t, "", query(t, s, "SELECT id FROM e WHERE b BETWEEN TRUE AND (1 / (id - 5) > 0) AND id = 5"), "BETWEEN at the top level splits into conjuncts")
-		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT id FROM e WHERE id = 5 AND 1 / (id - 5) > 0"), "a true conjunct continues")
-		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT id FROM e WHERE (b OR 1 / (id - 5) > 0) AND id = 5"), "but not inside OR")
+		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT id FROM e WHERE id + 0 = 5 AND 1 / (id - 5) > 0"), "a true conjunct continues")
+		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT id FROM e WHERE (b OR 1 / (id - 5) > 0) AND id + 0 = 5"), "but not inside OR")
 		mustExec(t, s, "DELETE FROM e WHERE id = 5")
 		is.Equal(t, "false", query(t, s, "SELECT id NOT IN (id, -id) FROM e"), "IN stops at the first matching column element")
 		is.Equal(t, "true", query(t, s, "SELECT id IN (1, id, -id) FROM e"))
@@ -422,21 +489,73 @@ func TestSession_Select(t *testing.T) {
 		is.Equal(t, "NULL", query(t, s, "SELECT NULL IN (id, -id) FROM e"), "a NULL left side makes every comparison NULL without evaluating the elements")
 		is.Equal(t, "NULL", query(t, s, "SELECT NULL IN (id, -id, 1, 2) FROM e"), "also with an array")
 		is.Equal(t, "NULL", query(t, s, "SELECT NULL NOT IN (1, 2, -id) FROM e"))
-		is.Equal(t, "false", query(t, s, "SELECT 1 IN (1.5, id) FROM e"), "each comparison adapts its own literal")
-		is.Equal(t, "", query(t, s, "SELECT id FROM e WHERE id NOT IN (NULL, NULL, -id)"), "the array of constants is a conjunct of its own")
+		is.Equal(t, "false", query(t, s, "SELECT 1 IN (1.5::float8, id) FROM e"), "each comparison adapts its own literal")
+		is.Error(t, exec.ErrUnsupported, queryErr(t, s, "SELECT id FROM e WHERE id NOT IN (NULL, NULL, -id)"), "the array of constants is a conjunct of its own, which rejects the row on which the other fails")
 		is.Error(t, exec.ErrOutOfRange, queryErr(t, s, "SELECT id NOT IN (NULL, NULL, -id) FROM e"), "but NULL does not stop AND inside an expression")
 		is.Equal(t, "NULL", query(t, s, "SELECT TRUE AND coalesce(CASE WHEN FALSE THEN FALSE END)"), "a pruned branch still types the CASE")
 		is.Equal(t, "false", query(t, s, "SELECT 0 BETWEEN 1 AND 1 / 0"))
 		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT 2 BETWEEN 1 AND 1 / 0"))
 		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT NULL BETWEEN 1 AND 1 / 0"))
-		is.Equal(t, "false", query(t, s, "SELECT 'a' LIKE 'a\\'"), "the trailing escape is only an error when matching reaches it")
-		is.Equal(t, "false", query(t, s, "SELECT '' LIKE '\\'"))
-		is.Equal(t, "false", query(t, s, "SELECT '' LIKE '%\\'"))
+	})
+
+	t.Run("accepts a WHERE clause only when its outcome is the same in every order and plan Postgres could pick", func(t *testing.T) {
+		verify.Covers(t, "a WHERE clause whose outcome on a row depends on the order Postgres evaluates its conditions in, including the equalities its equivalence classes imply, is ErrUnsupported, and so is a condition that can fail next to a primary key condition that an index scan could use; every other WHERE clause fails exactly when Postgres fails in every order", "INV-PG-SUBSET", "UNS-ORDER-DEPENDENT-WHERE", "UNS-PLAN-DEPENDENT-WHERE")
+		s := newSession(t)
+		mustExec(t, s, "CREATE TABLE w (id bigint PRIMARY KEY, n bigint, m bigint, s text)")
+		mustExec(t, s, "INSERT INTO w VALUES (1, 1, 0, 'a'), (2, 7, 5, 'b\\'), (3, 9223372036854775806, 5, 'c')")
+		for _, sql := range []string{
+			// A condition fails on a row that another rejects.
+			"SELECT id FROM w WHERE n = 2 AND 1 / m = 1",
+			"SELECT id FROM w WHERE 1 / m = 1 AND n = 2",
+			"SELECT id FROM w WHERE m <> 0 AND 1 / m = 1",
+			"SELECT id FROM w WHERE s LIKE 'a%' AND n * 2 = 0",
+			"SELECT id FROM w WHERE 1 / m = 0 AND id + 0 > 1",
+			"DELETE FROM w WHERE n = 2 AND 1 / m = 1",
+			"UPDATE w SET n = 0 WHERE NOT (n <> 2 OR 1 / m = 1)",
+			// The equivalence class of n = 1 / m and 1 / m = 7 implies n = 7, which rejects the row
+			// where 1 / m fails.
+			"SELECT id FROM w WHERE n = 1 / m AND 1 / m = 7",
+			// An index scan would evaluate the condition that can fail on fewer rows.
+			"SELECT id FROM w WHERE id = 2 AND 1 / m = 1",
+			"SELECT id FROM w WHERE id > 1 AND 1 / m = 0",
+			"SELECT id FROM w WHERE NOT (id <= 1) AND 1 / m = 0",
+			"SELECT id FROM w WHERE id IN (2, 3) AND 1 / m = 0",
+			"SELECT id FROM w WHERE (id = 1 OR id = 2) AND 1 / m = 1",
+			"SELECT id FROM w WHERE id = n AND n = 2 AND 1 / m = 1",
+			"SELECT id FROM w WHERE s LIKE s AND id > 1",
+			"UPDATE w SET n = 1 WHERE s LIKE s AND id > 1",
+			"DELETE FROM w WHERE s LIKE s AND id > 1",
+			"SELECT m FROM w WHERE s LIKE 'b\\' AND id = 1",
+		} {
+			err := queryErr(t, s, sql)
+			is.Error(t, exec.ErrUnsupported, err, sql)
+			is.True(t, strings.Contains(err.Error(), "write CASE WHEN"), "the message says what to write instead")
+		}
+		mustExec(t, s, "CREATE TABLE wk (s text PRIMARY KEY, m bigint)")
+		mustExec(t, s, "INSERT INTO wk VALUES ('a', 0), ('b', 5)")
+		is.Error(t, exec.ErrUnsupported, queryErr(t, s, "SELECT s FROM wk WHERE s LIKE 'b\\'"), "a LIKE that can fail is an index condition itself")
+		is.Error(t, exec.ErrUnsupported, queryErr(t, s, "SELECT s FROM wk WHERE s LIKE s AND s LIKE 'b%'"))
+		is.Equal(t, "a\nb", strings.ReplaceAll(query(t, s, "SELECT s FROM wk WHERE s LIKE s"), `"`, ""), "a LIKE whose pattern is not a constant is no index condition")
+
+		is.Equal(t, "", query(t, s, "SELECT id FROM w WHERE CASE WHEN m <> 0 THEN 1 / m = 1 END"), "CASE fixes the order")
+		is.Equal(t, "2", query(t, s, "SELECT id FROM w WHERE id = 2 AND n = 7"), "conditions that cannot fail combine freely")
+		is.Equal(t, "2", query(t, s, "SELECT id FROM w WHERE n = 7 AND 1 / (m + 1) = 0"), "a row on which no condition fails is fine in every order")
+		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT id FROM w WHERE 1 / m = 1 AND n = 1"), "a row that every other condition accepts fails in every order")
+		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT id FROM w WHERE n = 1 AND m = 0 AND 1 / m = 1"))
+		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT id FROM w WHERE n = 1 / m AND 1 / m = 1"), "the implied n = 1 holds on the failing row")
+		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT id FROM w WHERE id + 0 >= 1 AND 1 / m = 0"), "a key column in an expression is no index condition")
+		is.Error(t, exec.ErrOutOfRange, queryErr(t, s, "SELECT id FROM w WHERE n * 2 = 0"), "a single condition is evaluated on every row")
+		is.Error(t, exec.ErrInvalid, queryErr(t, s, "SELECT id FROM w WHERE s LIKE 'b\\'"), "a trailing escape on a column that is not a key is evaluated like any other condition")
+		is.Error(t, exec.ErrOutOfRange, queryErr(t, s, "SELECT id FROM w WHERE m <> 0 AND 1 / m >= 0 AND n * 2 > 0"), "a row that fails in every order wins over an earlier row whose outcome depends on the order")
+		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT id FROM w WHERE id = 1 AND 1 / 0 = 1"), "a folding error comes before the rejection")
+		is.Error(t, exec.ErrInvalid, queryErr(t, s, "SELECT nope FROM w WHERE id = 1 AND 1 / m = 1"), "and so does a mistake")
+		is.Equal(t, int64(0), mustExec(t, s, "DELETE FROM w WHERE n = 2 AND 1 / m = 1 AND FALSE").RowsAffected, "a known false conjunct reads no rows")
+		is.Equal(t, "1\n2\n3", query(t, s, "SELECT id FROM w"), "nothing was deleted or updated")
 	})
 
 	t.Run("reports a mistake anywhere in the statement before a folding error, and folding errors in Postgres's order", func(t *testing.T) {
 		s := newSession(t)
-		mustExec(t, s, "CREATE TABLE e (id int PRIMARY KEY, j int)")
+		mustExec(t, s, "CREATE TABLE e (id bigint PRIMARY KEY, j bigint)")
 		mustExec(t, s, "INSERT INTO e VALUES (1, 1)")
 		tests := []struct {
 			sql  string
@@ -446,12 +565,12 @@ func TestSession_Select(t *testing.T) {
 			{"SELECT 1 WHERE 1 / 0 = 1 ORDER BY 'a'", exec.ErrSyntax},
 			{"SELECT 1 / 0 ORDER BY 2", exec.ErrInvalid},
 			{"SELECT 1 / 0 FROM e WHERE nope = 1", exec.ErrInvalid},
-			{"SELECT 1 / 0 FROM e WHERE j = 'a'", exec.ErrType},
+			{"SELECT 1 / 0 FROM e WHERE j = TRUE", exec.ErrType},
 			{"SELECT 1 / 0 LIMIT TRUE", exec.ErrType},
 			{"SELECT id FROM e LIMIT 1 / 0 OFFSET id", exec.ErrInvalid},
-			{"DELETE FROM e WHERE 1 / 0 = 1 AND j = 'a'", exec.ErrType},
-			{"UPDATE e SET j = 1 / 0 WHERE j = 'a'", exec.ErrType},
-			{"INSERT INTO e VALUES (3, 1 / 0), (4, 'a')", exec.ErrType},
+			{"DELETE FROM e WHERE 1 / 0 = 1 AND j = TRUE", exec.ErrType},
+			{"UPDATE e SET j = 1 / 0 WHERE j = TRUE", exec.ErrType},
+			{"INSERT INTO e VALUES (3, 1 / 0), (4, TRUE)", exec.ErrType},
 			// Then folding: output expressions, ORDER BY among them, then WHERE, OFFSET, and LIMIT.
 			{"SELECT 1 / 0 WHERE 9223372036854775807 + 1 = 1", exec.ErrDivisionByZero},
 			{"SELECT 9223372036854775807 + 1, 1 / 0", exec.ErrOutOfRange},
@@ -459,7 +578,7 @@ func TestSession_Select(t *testing.T) {
 			{"SELECT 1 WHERE 9223372036854775807 + 1 = 1 AND 1 / 0 = 1", exec.ErrOutOfRange},
 			{"SELECT 1 LIMIT 1 / 0 OFFSET 9223372036854775807 + 1", exec.ErrOutOfRange},
 			{"UPDATE e SET j = 1 / 0 WHERE 9223372036854775807 + 1 = 1", exec.ErrDivisionByZero},
-			{"SELECT 1 / 0 + 1.5", exec.ErrDivisionByZero},
+			{"SELECT 1 / 0 + 1.5::float8", exec.ErrDivisionByZero},
 			// Then running: a negative LIMIT, and constraints, only once every value is known.
 			{"SELECT 1 LIMIT -1 OFFSET 1 / 0", exec.ErrDivisionByZero},
 			{"INSERT INTO e VALUES (1, 1), (2, 1 / 0)", exec.ErrDivisionByZero},
@@ -482,6 +601,8 @@ func TestSession_Select(t *testing.T) {
 			{"SELECT id FROM t WHERE id = 2", "2"},
 			{"SELECT id FROM t WHERE 2 = id", "2"},
 			{"SELECT id FROM t WHERE id = $1", "3"},
+			{"SELECT id FROM t WHERE id = '2'", "2"},
+			{"SELECT id FROM t WHERE id = 2.0::float8", "2"},
 			{"SELECT id FROM t WHERE id = NULL", ""},
 			{"SELECT id FROM t WHERE id = 1 AND id = 2", ""},
 			{"SELECT id FROM t WHERE id = 2 AND id = 2", "2"},
@@ -499,8 +620,9 @@ func TestSession_Select(t *testing.T) {
 			{"SELECT id FROM t WHERE NOT b", "2"},
 			{"SELECT id FROM t WHERE b IS NULL", "3"},
 			{"SELECT id FROM t WHERE name LIKE '%o%'", "2\n3"},
-			{"SELECT id FROM t WHERE at > TIME '2024-01-01T00:00:00Z'", "3"},
-			{"SELECT id FROM t WHERE data = X''", "3"},
+			{"SELECT id FROM t WHERE at > '2024-01-01T00:00:00Z'", "3"},
+			{"SELECT id FROM t WHERE at > timestamptz '2024-01-01 00:00:00+00'", "3"},
+			{"SELECT id FROM t WHERE data = '\\x'", "3"},
 			{"SELECT id, name FROM t ORDER BY name DESC", `3 "carol"
 2 "bob"
 1 "alice"`},
@@ -511,23 +633,26 @@ func TestSession_Select(t *testing.T) {
 			{"SELECT id FROM t ORDER BY b, id DESC", "2\n1\n3"},
 			{"SELECT id FROM t ORDER BY b IS NULL, id", "1\n2\n3"},
 			{"SELECT id FROM t ORDER BY 1 DESC", "3\n2\n1"},
-			{"SELECT id FROM t ORDER BY TIME '2024-01-01T00:00:00Z', id DESC", "3\n2\n1"},
-			{"SELECT id FROM t ORDER BY X'01', id DESC", "3\n2\n1"},
+			{"SELECT id FROM t ORDER BY '2024-01-01T00:00:00Z'::timestamptz, id DESC", "3\n2\n1"},
+			{"SELECT id FROM t ORDER BY '\\x01'::bytea, id DESC", "3\n2\n1"},
 			{"SELECT id AS x FROM t ORDER BY x DESC", "3\n2\n1"},
 			{"SELECT -id AS id FROM t ORDER BY id", "-3\n-2\n-1"},
 			{"SELECT id FROM t ORDER BY -id", "3\n2\n1"},
 			{"SELECT id, id FROM t ORDER BY id DESC", "3 3\n2 2\n1 1"},
-			{"SELECT *, * FROM t ORDER BY id DESC LIMIT 1", `3 "carol" -2.5 NULL X'' 2024-06-01T12:30:00.5Z 3 "carol" -2.5 NULL X'' 2024-06-01T12:30:00.5Z`},
+			{"SELECT *, * FROM t ORDER BY id DESC LIMIT 1", `3 "carol" -2.5 NULL \x 2024-06-01 12:30:00.5+00 3 "carol" -2.5 NULL \x 2024-06-01 12:30:00.5+00`},
 			{"SELECT id FROM t ORDER BY id DESC LIMIT 2", "3\n2"},
 			{"SELECT id FROM t ORDER BY id LIMIT 1 OFFSET 1", "2"},
-			{"SELECT id FROM t LIMIT 2", "1\n2"},
-			{"SELECT id FROM t OFFSET 2", "3"},
-			{"SELECT id FROM t LIMIT 0", ""},
-			{"SELECT id FROM t LIMIT NULL", "1\n2\n3"},
-			{"SELECT id FROM t LIMIT $1 OFFSET $2", "2"},
-			{"SELECT id, id * 2 AS double, length(name), CAST(id AS string) || name FROM t WHERE id = 1", `1 2 5 "1alice"`},
-			{"SELECT f + 1, f * 2, -f FROM t WHERE id = 1", "2.5 3.0 -1.5"},
-			{"SELECT 1 / (id - 1) FROM t WHERE id > 1 LIMIT 1", "1"},
+			{"SELECT id FROM t ORDER BY id LIMIT 0", ""},
+			{"SELECT id FROM t ORDER BY id LIMIT NULL", "1\n2\n3"},
+			{"SELECT id FROM t ORDER BY id LIMIT ALL OFFSET 2", "3"},
+			{"SELECT id FROM t ORDER BY id LIMIT $1 OFFSET $2", "2"},
+			{"SELECT id FROM t ORDER BY id LIMIT 1.5", "1\n2"},
+			{"SELECT id FROM t ORDER BY id LIMIT 1.5::float8 OFFSET 0.5", "2\n3"},
+			{"SELECT id FROM t ORDER BY id LIMIT 0.5::float8", ""},
+			{"SELECT id FROM t ORDER BY f, id LIMIT 2", "3\n1"},
+			{"SELECT id, id * 2 AS double, length(name), CAST(id AS text) || name FROM t WHERE id = 1", `1 2 5 "1alice"`},
+			{"SELECT f + 1, f * 2, -f FROM t WHERE id = 1", "2.5 3 -1.5"},
+			{"SELECT id FROM t WHERE id = 2 ORDER BY 1 / (id - 1), id LIMIT 1", "2"},
 		}
 		for _, test := range tests {
 			t.Run(test.sql, func(t *testing.T) {
@@ -541,28 +666,55 @@ func TestSession_Select(t *testing.T) {
 			})
 		}
 		is.Error(t, exec.ErrInvalid, queryErr(t, s, "SELECT id AS a, name AS a FROM t ORDER BY a"))
-		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT 1 / (id - 1) FROM t LIMIT 1"))
-		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT 1 / (id - 1) FROM t LIMIT 1 OFFSET 1"), "OFFSET evaluates the skipped rows")
-		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT 1 / (id - 1) FROM t ORDER BY id DESC LIMIT 1"), "ORDER BY evaluates every row")
+		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT 1 / (id - 1) FROM t ORDER BY id DESC"), "ORDER BY evaluates every row")
+	})
+
+	t.Run("rejects LIMIT and OFFSET whose rows or errors would depend on Postgres's plan", func(t *testing.T) {
+		verify.Covers(t, "LIMIT and OFFSET need an ORDER BY on every primary key column and no expression that can fail, else ErrUnsupported", "UNS-LIMIT-ORDER", "UNS-PLAN-DEPENDENT-LIMIT")
+		s := newSession(t)
+		setup(t, s)
+		for _, sql := range []string{
+			"SELECT id FROM t LIMIT 2",
+			"SELECT id FROM t OFFSET 2",
+			"SELECT id FROM t ORDER BY name LIMIT 2",
+			"SELECT -id AS id FROM t ORDER BY id LIMIT 2",
+			"SELECT 1 / (id - 1) FROM t ORDER BY id LIMIT 1",
+			"SELECT id FROM t WHERE 1 / (id - 1) > 0 ORDER BY id LIMIT 1",
+			"SELECT id FROM t WHERE f / 2 > 0 ORDER BY id OFFSET 1",
+			"SELECT CAST(name AS bigint) FROM t ORDER BY id LIMIT 1",
+		} {
+			is.Error(t, exec.ErrUnsupported, queryErr(t, s, sql), sql)
+		}
+		is.Equal(t, "1", query(t, s, "SELECT id FROM t WHERE id = 1 ORDER BY id LIMIT 1"))
+		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT id FROM t ORDER BY 1 / (id - 1), id LIMIT 1 OFFSET 1"), "an ORDER BY expression is evaluated on every row in every plan")
+		is.Equal(t, "1", query(t, s, "SELECT id FROM t WHERE name LIKE 'a%' ORDER BY id LIMIT 1"))
+		is.Equal(t, "1", query(t, s, "SELECT id FROM t WHERE f = 1.5 ORDER BY id LIMIT 1"))
+		mustExec(t, s, "CREATE TABLE c (a text, b bigint, PRIMARY KEY (a, b))")
+		mustExec(t, s, "INSERT INTO c VALUES ('x', 1), ('x', 2)")
+		is.Error(t, exec.ErrUnsupported, queryErr(t, s, "SELECT b FROM c ORDER BY a LIMIT 1"))
+		is.Equal(t, "2", query(t, s, "SELECT b FROM c ORDER BY a, b DESC LIMIT 1"))
+		is.Equal(t, "1", query(t, s, "SELECT b AS x FROM c ORDER BY x, a LIMIT 1"), "an output column that is a key column counts")
 	})
 
 	t.Run("names and types output columns", func(t *testing.T) {
 		s := newSession(t)
 		setup(t, s)
-		rows, _, err := run(t.Context(), s, "SELECT id, name AS n, f + 1, length(name), CASE WHEN TRUE THEN 1 END, CAST(f AS int), NULL, 1, CASE WHEN FALSE THEN 1 ELSE id END, CASE WHEN FALSE THEN 1 ELSE CAST(2 AS int) END, CAST(1 AS float), CASE WHEN TRUE THEN 1 ELSE coalesce(id) END FROM t")
+		rows, _, err := run(t.Context(), s, "SELECT id, name AS n, f + 1, length(name), CASE WHEN TRUE THEN 1 END, CAST(f AS bigint), NULL, 1, CASE WHEN FALSE THEN 1 ELSE id END, CASE WHEN FALSE THEN 1 ELSE CAST(2 AS bigint) END, CAST(1 AS double precision), CASE WHEN TRUE THEN 1 ELSE coalesce(id) END, 'a', 1::bigint, timestamptz '2024-01-01', '1.5'::float8, TRUE::text, 2147483648 FROM t")
 		is.NotError(t, err)
 		is.Equal(t, fmt.Sprint([]exec.Column{
 			{Name: "id", Type: value.Int}, {Name: "n", Type: value.String}, {Name: "?column?", Type: value.Float, Nullable: true},
-			{Name: "length", Type: value.Int, Nullable: true}, {Name: "case", Type: value.Int, Nullable: true}, {Name: "f", Type: value.Int, Nullable: true},
-			{Name: "?column?", Type: value.Unknown, Nullable: true}, {Name: "?column?", Type: value.Int, Nullable: true},
-			{Name: "id", Type: value.Int, Nullable: true}, {Name: "case", Type: value.Int, Nullable: true}, {Name: "float", Type: value.Float, Nullable: true}, {Name: "coalesce", Type: value.Int, Nullable: true},
+			{Name: "length", Type: value.Int4, Nullable: true}, {Name: "case", Type: value.Int4, Nullable: true}, {Name: "f", Type: value.Int, Nullable: true},
+			{Name: "?column?", Type: value.String, Nullable: true}, {Name: "?column?", Type: value.Int4, Nullable: true},
+			{Name: "id", Type: value.Int, Nullable: true}, {Name: "case", Type: value.Int, Nullable: true}, {Name: "float8", Type: value.Float, Nullable: true}, {Name: "coalesce", Type: value.Int, Nullable: true},
+			{Name: "?column?", Type: value.String, Nullable: true}, {Name: "int8", Type: value.Int, Nullable: true}, {Name: "timestamptz", Type: value.Time, Nullable: true},
+			{Name: "float8", Type: value.Float, Nullable: true}, {Name: "text", Type: value.String, Nullable: true}, {Name: "?column?", Type: value.Int, Nullable: true},
 		}), fmt.Sprint(rows.Columns))
 		is.Error(t, exec.ErrInvalid, queryErr(t, s, "SELECT *, CASE WHEN FALSE THEN id ELSE id END FROM t ORDER BY id"), "ambiguous, as in Postgres")
 	})
 
 	t.Run("uses composite primary keys for ranges", func(t *testing.T) {
 		s := newSession(t)
-		mustExec(t, s, "CREATE TABLE c (a string, b int, v int, PRIMARY KEY (a, b))")
+		mustExec(t, s, "CREATE TABLE c (a text, b bigint, v bigint, PRIMARY KEY (a, b))")
 		mustExec(t, s, "INSERT INTO c VALUES ('x', 1, 1), ('x', 2, 2), ('x\u0000', 1, 3), ('y', 1, 4), ('', 0, 5)")
 		is.Equal(t, "1\n2", query(t, s, "SELECT v FROM c WHERE a = 'x'"))
 		is.Equal(t, "2", query(t, s, "SELECT v FROM c WHERE a = 'x' AND b = 2"))
@@ -581,46 +733,59 @@ func TestSession_Update(t *testing.T) {
 		res := mustExec(t, s, "UPDATE t SET f = coalesce(f, 0) + 1, name = upper(name) WHERE id > 1")
 		is.Equal(t, int64(2), res.RowsAffected)
 		is.Equal(t, `1 "alice" 1.5
-2 "BOB" 1.0
+2 "BOB" 1
 3 "CAROL" -1.5`, query(t, s, "SELECT id, name, f FROM t"))
 		res = mustExec(t, s, "UPDATE t SET f = NULL WHERE id = 99")
 		is.Equal(t, int64(0), res.RowsAffected)
 		mustExec(t, s, "UPDATE t SET f = $1, b = $2 WHERE id = $3", 2.0, nil, 1)
-		is.Equal(t, "2.0 NULL", query(t, s, "SELECT f, b FROM t WHERE id = 1"))
+		is.Equal(t, "2 NULL", query(t, s, "SELECT f, b FROM t WHERE id = 1"))
 	})
 
 	t.Run("evaluates every assignment against the old row", func(t *testing.T) {
 		s := newSession(t)
-		mustExec(t, s, "CREATE TABLE p (id int PRIMARY KEY, a int, b int)")
+		mustExec(t, s, "CREATE TABLE p (id bigint PRIMARY KEY, a bigint, b bigint)")
 		mustExec(t, s, "INSERT INTO p VALUES (1, 1, 2)")
 		mustExec(t, s, "UPDATE p SET a = b, b = a")
 		is.Equal(t, "1 2 1", query(t, s, "SELECT * FROM p"))
 	})
 
-	t.Run("moves rows when the primary key changes and does not revisit them", func(t *testing.T) {
+	t.Run("moves rows when the primary key changes, and rejects a move whose outcome depends on row order", func(t *testing.T) {
+		verify.Covers(t, "an UPDATE of primary key columns succeeds or fails as in Postgres in every row order, and a row that moves onto a key another row moves away from is ErrUnsupported", "UNS-KEY-UPDATE-ORDER", "INV-PG-SUBSET")
 		s := newSession(t)
-		mustExec(t, s, "CREATE TABLE h (id int PRIMARY KEY)")
+		mustExec(t, s, "CREATE TABLE h (id bigint PRIMARY KEY)")
 		mustExec(t, s, "INSERT INTO h VALUES (1), (2), (3)")
 		res := mustExec(t, s, "UPDATE h SET id = id + 10 WHERE id < 100")
 		is.Equal(t, int64(3), res.RowsAffected)
 		is.Equal(t, "11\n12\n13", query(t, s, "SELECT id FROM h"))
-		mustExec(t, s, "UPDATE h SET id = id - 1")
-		is.Equal(t, "10\n11\n12", query(t, s, "SELECT id FROM h"))
-		is.Error(t, exec.ErrDuplicateKey, queryErr(t, s, "UPDATE h SET id = 11 WHERE id = 10"))
-		is.Equal(t, "10\n11\n12", query(t, s, "SELECT id FROM h"), "a failed update changes nothing")
+		is.Error(t, exec.ErrUnsupported, queryErr(t, s, "UPDATE h SET id = id - 1"), "12 moves onto 11, which moves away")
+		is.Error(t, exec.ErrUnsupported, queryErr(t, s, "UPDATE h SET id = id + 1"))
+		is.Equal(t, "11\n12\n13", query(t, s, "SELECT id FROM h"), "a rejected update changes nothing")
+		is.Error(t, exec.ErrDuplicateKey, queryErr(t, s, "UPDATE h SET id = 11 WHERE id = 13"), "a move onto a key that stays is a duplicate")
+		is.Error(t, exec.ErrDuplicateKey, queryErr(t, s, "UPDATE h SET id = 5"), "two rows onto one key is a duplicate")
+		is.Error(t, exec.ErrDuplicateKey, queryErr(t, s, "UPDATE h SET id = 11 WHERE id > 11"))
+		is.Equal(t, int64(3), mustExec(t, s, "UPDATE h SET id = id").RowsAffected, "a row that stays is no move")
+		is.Equal(t, int64(2), mustExec(t, s, "UPDATE h SET id = id * 2 WHERE id > 11").RowsAffected)
+		is.Equal(t, "11\n24\n26", query(t, s, "SELECT id FROM h"))
+		is.Equal(t, int64(1), mustExec(t, s, "UPDATE h SET id = 12 WHERE id = 11").RowsAffected)
+		is.Equal(t, "12\n24\n26", query(t, s, "SELECT id FROM h"))
+		mustExec(t, s, "CREATE TABLE k (a bigint, b bigint, PRIMARY KEY (a, b))")
+		mustExec(t, s, "INSERT INTO k VALUES (1, 1), (1, 2)")
+		is.Error(t, exec.ErrUnsupported, queryErr(t, s, "UPDATE k SET b = 3 - b"), "the rows swap keys")
+		is.Equal(t, int64(2), mustExec(t, s, "UPDATE k SET a = 2").RowsAffected)
+		is.Equal(t, "2 1\n2 2", query(t, s, "SELECT * FROM k"))
 	})
 
 	t.Run("checks constraints and types", func(t *testing.T) {
 		s := newSession(t)
 		setup(t, s)
 		is.Error(t, exec.ErrNotNull, queryErr(t, s, "UPDATE t SET name = NULL WHERE id = 1"))
-		is.Error(t, exec.ErrType, queryErr(t, s, "UPDATE t SET name = 1"))
-		is.Error(t, exec.ErrType, queryErr(t, s, "UPDATE t SET f = id"))
+		is.Error(t, exec.ErrType, queryErr(t, s, "UPDATE t SET b = 1"))
+		is.Error(t, exec.ErrType, queryErr(t, s, "UPDATE t SET f = b"))
 		is.Error(t, exec.ErrInvalid, queryErr(t, s, "UPDATE t SET nope = 1"))
-		is.Error(t, exec.ErrInvalid, queryErr(t, s, "UPDATE t SET f = 1, f = 2"))
+		is.Error(t, exec.ErrSyntax, queryErr(t, s, "UPDATE t SET f = 1, f = 2"))
 		is.Error(t, exec.ErrType, queryErr(t, s, "UPDATE t SET f = 1 WHERE name"))
-		mustExec(t, s, "UPDATE t SET f = 2")
-		is.Equal(t, "2.0\n2.0\n2.0", query(t, s, "SELECT f FROM t"), "an int literal adapts to the float column")
+		mustExec(t, s, "UPDATE t SET f = 2, name = id")
+		is.Equal(t, "2 \"1\"\n2 \"2\"\n2 \"3\"", query(t, s, "SELECT f, name FROM t"), "an integer widens to the float column and is written into the text column")
 	})
 }
 
@@ -646,7 +811,7 @@ func TestSession_Transactions(t *testing.T) {
 		s := newSession(t)
 		mustExec(t, s, "BEGIN")
 		is.True(t, s.InTx())
-		mustExec(t, s, "CREATE TABLE t (id int PRIMARY KEY, n int)")
+		mustExec(t, s, "CREATE TABLE t (id bigint PRIMARY KEY, n bigint)")
 		mustExec(t, s, "INSERT INTO t VALUES (1, 1)")
 		mustExec(t, s, "UPDATE t SET n = n + 1")
 		is.Equal(t, "1 2", query(t, s, "SELECT * FROM t"))
@@ -654,41 +819,74 @@ func TestSession_Transactions(t *testing.T) {
 		is.True(t, !s.InTx())
 		is.Error(t, exec.ErrNoTable, queryErr(t, s, "SELECT * FROM t"))
 		mustExec(t, s, "BEGIN")
-		mustExec(t, s, "CREATE TABLE t (id int PRIMARY KEY, n int)")
+		mustExec(t, s, "CREATE TABLE t (id bigint PRIMARY KEY, n bigint)")
 		mustExec(t, s, "INSERT INTO t VALUES (1, 1)")
 		mustExec(t, s, "COMMIT")
 		is.Equal(t, "1 1", query(t, s, "SELECT * FROM t"))
 	})
 
-	t.Run("a failed statement in a transaction leaves earlier statements intact", func(t *testing.T) {
+	t.Run("a failed statement aborts the transaction until it ends, as in Postgres", func(t *testing.T) {
+		verify.Covers(t, "after a failed statement every statement of the transaction fails with ErrTxAborted, COMMIT rolls it back, and ROLLBACK ends it", "INV-PG-SUBSET")
 		s := newSession(t)
-		mustExec(t, s, "CREATE TABLE t (id int PRIMARY KEY)")
+		mustExec(t, s, "CREATE TABLE t (id bigint PRIMARY KEY)")
 		mustExec(t, s, "BEGIN")
 		mustExec(t, s, "INSERT INTO t VALUES (1)")
 		is.Error(t, exec.ErrDuplicateKey, queryErr(t, s, "INSERT INTO t VALUES (2), (1)"))
+		is.Error(t, exec.ErrTxAborted, queryErr(t, s, "SELECT id FROM t"))
+		is.Error(t, exec.ErrTxAborted, queryErr(t, s, "INSERT INTO t VALUES (3)"))
+		is.Error(t, exec.ErrTxAborted, queryErr(t, s, "SELECT 1"))
+		mustExec(t, s, "BEGIN")
+		is.True(t, s.InTx(), "BEGIN inside a transaction only warns")
+		mustExec(t, s, "COMMIT")
+		is.True(t, !s.InTx())
+		is.Equal(t, "", query(t, s, "SELECT id FROM t"), "COMMIT of an aborted transaction rolls it back")
+		mustExec(t, s, "BEGIN")
+		mustExec(t, s, "INSERT INTO t VALUES (1)")
+		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT 1 / 0"))
+		is.Error(t, exec.ErrTxAborted, s.Commit(t.Context()), "the driver's commit reports the rollback")
+		is.True(t, !s.InTx())
+		is.Equal(t, "", query(t, s, "SELECT id FROM t"))
+		mustExec(t, s, "BEGIN")
+		mustExec(t, s, "INSERT INTO t VALUES (1)")
+		is.Error(t, exec.ErrUnsupported, queryErr(t, s, "SELECT 1.5"), "a rejection aborts the transaction too")
+		mustExec(t, s, "ROLLBACK")
+		mustExec(t, s, "BEGIN")
+		mustExec(t, s, "INSERT INTO t VALUES (1)")
 		mustExec(t, s, "COMMIT")
 		is.Equal(t, "1", query(t, s, "SELECT id FROM t"))
 	})
 
-	t.Run("rejects nested BEGIN and COMMIT or ROLLBACK without a transaction", func(t *testing.T) {
+	t.Run("COMMIT and ROLLBACK without a transaction only warn, and the driver's calls are strict", func(t *testing.T) {
 		s := newSession(t)
-		is.Error(t, exec.ErrNoTx, queryErr(t, s, "COMMIT"))
-		is.Error(t, exec.ErrNoTx, queryErr(t, s, "ROLLBACK"))
+		mustExec(t, s, "COMMIT")
+		mustExec(t, s, "ROLLBACK")
+		is.Error(t, exec.ErrNoTx, s.Commit(t.Context()))
+		is.Error(t, exec.ErrNoTx, s.Rollback())
 		mustExec(t, s, "BEGIN")
-		is.Error(t, exec.ErrTxInProgress, queryErr(t, s, "BEGIN"))
+		is.Error(t, exec.ErrTxInProgress, s.Begin(t.Context(), false))
 		mustExec(t, s, "COMMIT")
 	})
 
 	t.Run("read-only transactions reject writes and DDL", func(t *testing.T) {
 		verify.Covers(t, "a read-only transaction rejects INSERT, UPDATE, DELETE, and DDL", "INV-READ-ONLY")
 		s := newSession(t)
-		mustExec(t, s, "CREATE TABLE t (id int PRIMARY KEY)")
+		mustExec(t, s, "CREATE TABLE t (id bigint PRIMARY KEY)")
 		mustExec(t, s, "BEGIN READ ONLY")
 		is.Error(t, exec.ErrReadOnlyTx, queryErr(t, s, "INSERT INTO t VALUES (1)"))
+		mustExec(t, s, "ROLLBACK")
+		mustExec(t, s, "BEGIN READ ONLY")
 		is.Error(t, exec.ErrReadOnlyTx, queryErr(t, s, "UPDATE t SET id = 2"))
+		mustExec(t, s, "ROLLBACK")
+		mustExec(t, s, "BEGIN READ ONLY")
 		is.Error(t, exec.ErrReadOnlyTx, queryErr(t, s, "DELETE FROM t"))
-		is.Error(t, exec.ErrReadOnlyTx, queryErr(t, s, "CREATE TABLE u (id int PRIMARY KEY)"))
+		mustExec(t, s, "ROLLBACK")
+		mustExec(t, s, "BEGIN READ ONLY")
+		is.Error(t, exec.ErrReadOnlyTx, queryErr(t, s, "CREATE TABLE u (id bigint PRIMARY KEY)"))
+		mustExec(t, s, "ROLLBACK")
+		mustExec(t, s, "BEGIN READ ONLY")
 		is.Error(t, exec.ErrReadOnlyTx, queryErr(t, s, "DROP TABLE t"))
+		mustExec(t, s, "ROLLBACK")
+		mustExec(t, s, "BEGIN READ ONLY")
 		is.Equal(t, "", query(t, s, "SELECT * FROM t"))
 		mustExec(t, s, "COMMIT")
 	})
@@ -698,7 +896,7 @@ func TestSession_Transactions(t *testing.T) {
 		w := newWorld(t)
 		a, _ := w.session(exec.Options{})
 		b, _ := w.session(exec.Options{})
-		mustExec(t, a, "CREATE TABLE t (id int PRIMARY KEY, n int)")
+		mustExec(t, a, "CREATE TABLE t (id bigint PRIMARY KEY, n bigint)")
 		mustExec(t, a, "INSERT INTO t VALUES (1, 0)")
 
 		mustExec(t, a, "BEGIN")
@@ -729,7 +927,7 @@ func TestSession_Transactions(t *testing.T) {
 		w := newWorld(t)
 		a, _ := w.session(exec.Options{})
 		b, _ := w.session(exec.Options{})
-		mustExec(t, a, "CREATE TABLE t (id int PRIMARY KEY, n int)")
+		mustExec(t, a, "CREATE TABLE t (id bigint PRIMARY KEY, n bigint)")
 		mustExec(t, a, "INSERT INTO t VALUES (1, 0)")
 		// b commits between a's freshness check and a's manifest write: a's first PUT-conditional
 		// on the manifest fails with a real precondition failure, and a retries the statement.
@@ -753,7 +951,7 @@ func TestMutations(t *testing.T) {
 		verify.Covers(t, "with the mutant, an UPDATE that moves keys revisits rows it already moved", "MUT-UPDATE-SEES-OWN-WRITES")
 		w := newWorld(t)
 		s, _ := w.session(exec.Options{Mutations: exec.Mutations{UpdateSeesOwnWrites: true}})
-		mustExec(t, s, "CREATE TABLE h (id int PRIMARY KEY)")
+		mustExec(t, s, "CREATE TABLE h (id bigint PRIMARY KEY)")
 		mustExec(t, s, "INSERT INTO h VALUES (1), (2), (3)")
 		mustExec(t, s, "UPDATE h SET id = id + 10 WHERE id < 100")
 		is.Equal(t, "101\n102\n103", query(t, s, "SELECT id FROM h"), "the mutant moves every row until it leaves the range")
@@ -765,7 +963,7 @@ func TestMutations(t *testing.T) {
 			w := newWorld(t)
 			a, _ := w.session(exec.Options{Mutations: exec.Mutations{FreshSnapshotPerStatement: mutated}})
 			b, _ := w.session(exec.Options{})
-			mustExec(t, a, "CREATE TABLE t (id int PRIMARY KEY, n int)")
+			mustExec(t, a, "CREATE TABLE t (id bigint PRIMARY KEY, n bigint)")
 			mustExec(t, a, "INSERT INTO t VALUES (1, 0)")
 			mustExec(t, a, "BEGIN READ ONLY")
 			is.Equal(t, "0", query(t, a, "SELECT n FROM t"))
@@ -784,7 +982,7 @@ func TestMutations(t *testing.T) {
 		for _, mutated := range []bool{false, true} {
 			w := newWorld(t)
 			s, _ := w.session(exec.Options{Mutations: exec.Mutations{RetryAfterUnknownCommit: mutated}})
-			mustExec(t, s, "CREATE TABLE t (id int PRIMARY KEY, n int)")
+			mustExec(t, s, "CREATE TABLE t (id bigint PRIMARY KEY, n bigint)")
 			mustExec(t, s, "INSERT INTO t VALUES (1, 0)")
 			// The manifest write lands but its acknowledgement is lost, and then the store
 			// stops answering reads until the commit has given up resolving the outcome.

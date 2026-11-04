@@ -8,12 +8,17 @@ import (
 
 // Errors a statement can fail with. Each is wrapped with a message about the statement.
 var (
-	// ErrSyntax is a statement that does not parse.
+	// ErrSyntax is a statement that does not parse, and that Postgres rejects too.
 	ErrSyntax = parser.ErrSyntax
 	// ErrInvalid is a statement that cannot run: an unknown column or function, wrong arity, a
 	// missing parameter, and the like.
 	ErrInvalid = parser.ErrInvalid
-	// ErrType is a type mismatch. There is no implicit coercion.
+	// ErrUnsupported is a statement that Postgres accepts and maragudb rejects, with a message
+	// that says what is unsupported and, where possible, what to write instead. It is the only
+	// way maragudb is stricter than Postgres.
+	ErrUnsupported = parser.ErrUnsupported
+	// ErrType is a type mismatch: an operator or function that does not exist for the argument
+	// types, or a value of the wrong type where a type is required.
 	ErrType = errors.New("type mismatch")
 	// ErrNoTable is a reference to a table that does not exist.
 	ErrNoTable = errors.New("no such table")
@@ -25,15 +30,19 @@ var (
 	ErrNotNull = errors.New("null value violates not-null constraint")
 	// ErrDivisionByZero is a division or modulo by zero.
 	ErrDivisionByZero = errors.New("division by zero")
-	// ErrOutOfRange is an int overflow, a float overflow or underflow, or a cast out of range.
+	// ErrOutOfRange is an integer or bigint overflow, a float overflow or underflow, a cast out
+	// of range, or a timestamp out of range.
 	ErrOutOfRange = errors.New("value out of range")
-	// ErrCast is an invalid cast: between types that cannot be cast, or from a string that does
-	// not parse.
+	// ErrCast is an invalid cast: between types that cannot be cast, or from text that does not
+	// parse as the type.
 	ErrCast = errors.New("invalid cast")
 	// ErrReadOnlyTx is a write in a read-only transaction.
 	ErrReadOnlyTx = errors.New("cannot write in a read-only transaction")
-	// ErrNoTx is a COMMIT or ROLLBACK without a transaction.
+	// ErrTxAborted is a statement in a transaction in which an earlier statement failed, which
+	// Postgres ignores until the transaction is rolled back.
+	ErrTxAborted = errors.New("current transaction is aborted, commands ignored until end of transaction block")
+	// ErrNoTx is a commit or rollback through the driver without a transaction.
 	ErrNoTx = errors.New("there is no transaction in progress")
-	// ErrTxInProgress is a BEGIN inside a transaction.
+	// ErrTxInProgress is a BEGIN through the driver inside a transaction.
 	ErrTxInProgress = errors.New("there is already a transaction in progress")
 )

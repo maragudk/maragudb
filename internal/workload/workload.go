@@ -402,9 +402,9 @@ func (r *run) seed(ctx context.Context) error {
 			return err
 		}
 		defer func() { _ = tx.Rollback() }()
-		stmts := []string{"CREATE TABLE lists (k int, pos int, v int, PRIMARY KEY (k, pos))"}
+		stmts := []string{"CREATE TABLE lists (k bigint, pos bigint, v bigint, PRIMARY KEY (k, pos))"}
 		if r.cfg.Workload == sim.Bank {
-			stmts = []string{"CREATE TABLE accounts (id int PRIMARY KEY, balance int NOT NULL)"}
+			stmts = []string{"CREATE TABLE accounts (id bigint PRIMARY KEY, balance bigint NOT NULL)"}
 			for i := range r.cfg.Keys {
 				stmts = append(stmts, fmt.Sprintf("INSERT INTO accounts VALUES (%d, %d)", i, initialBalance))
 			}
@@ -435,7 +435,7 @@ func (r *run) seeded(ctx context.Context, p *process) (bool, error) {
 	if r.cfg.Workload == sim.Bank {
 		table = "accounts"
 	}
-	_, err := p.sql.ExecContext(ctx, "SELECT 1 FROM "+table+" LIMIT 1")
+	_, err := p.sql.ExecContext(ctx, "SELECT 1 FROM "+table+" WHERE FALSE")
 	switch {
 	case err == nil:
 		return true, nil

@@ -63,7 +63,7 @@ func (r *run) seedSQL() {
 		switch r.cfg.Workload {
 		case Bank:
 			r.total = int64(r.cfg.Keys) * initialBalance
-			if _, err := db.ExecContext(ctx, "CREATE TABLE accounts (id int PRIMARY KEY, balance int NOT NULL)"); err != nil {
+			if _, err := db.ExecContext(ctx, "CREATE TABLE accounts (id bigint PRIMARY KEY, balance bigint NOT NULL)"); err != nil {
 				panic(err)
 			}
 			for i := range r.cfg.Keys {
@@ -72,10 +72,10 @@ func (r *run) seedSQL() {
 				}
 			}
 		case ListAppend:
-			if _, err := db.ExecContext(ctx, "CREATE TABLE lists (k int, pos int, v int, PRIMARY KEY (k, pos))"); err != nil {
+			if _, err := db.ExecContext(ctx, "CREATE TABLE lists (k bigint, pos bigint, v bigint, PRIMARY KEY (k, pos))"); err != nil {
 				panic(err)
 			}
-			if _, err := db.ExecContext(ctx, "CREATE TABLE packed (k int PRIMARY KEY, vals string NOT NULL)"); err != nil {
+			if _, err := db.ExecContext(ctx, "CREATE TABLE packed (k bigint PRIMARY KEY, vals text NOT NULL)"); err != nil {
 				panic(err)
 			}
 			for k := range r.cfg.Keys {

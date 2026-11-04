@@ -12,7 +12,7 @@ import (
 	"maragu.dev/maragudb/internal/reach"
 )
 
-// Requirement with a stable ID in /docs/requirements.md or /docs/deviations.md.
+// Requirement with a stable ID in /docs/requirements.md or /docs/unsupported.md.
 type Requirement struct {
 	ID string
 	// Text of the requirement, as written next to its ID.
@@ -81,8 +81,8 @@ func (m KillMatrixMutant) Detected() bool {
 // KillMatrixPath relative to the module root.
 const KillMatrixPath = "internal/sim/testdata/kill-matrix.json"
 
-// Catalog of every ID that tests can declare: requirements, deviations, mutants, and reached
-// states.
+// Catalog of every ID that tests can declare: requirements, unsupported statements, remaining
+// differences from Postgres, mutants, and reached states.
 type Catalog struct {
 	Requirements []Requirement
 	KillMatrix   KillMatrix
@@ -125,7 +125,7 @@ func FindRoot() (string, error) {
 // LoadCatalog from the documents and the kill matrix under the module root.
 func LoadCatalog(root string) (Catalog, error) {
 	var c Catalog
-	for _, source := range []string{"docs/requirements.md", "docs/deviations.md"} {
+	for _, source := range []string{"docs/requirements.md", "docs/unsupported.md"} {
 		b, err := os.ReadFile(filepath.Join(root, source))
 		if err != nil {
 			return c, err
@@ -148,19 +148,20 @@ func LoadCatalog(root string) (Catalog, error) {
 }
 
 var (
-	idTag      = regexp.MustCompile("`((?:AC|INV|DEV)-[A-Z0-9][A-Z0-9.-]*)`")
+	idTag      = regexp.MustCompile("`((?:AC|INV|UNS|DEV)-[A-Z0-9][A-Z0-9.-]*)`")
 	listItem   = regexp.MustCompile(`^(?:-|\d+\.)\s+`)
 	boldTitle  = regexp.MustCompile(`^\s*(?:-|\d+\.)\s+\*\*(.+?)\*\*`)
 	firstBold  = regexp.MustCompile(`\*\*(.+?)\*\*`)
 	spaces     = regexp.MustCompile(`\s+`)
 	validIDFor = map[string]*regexp.Regexp{
 		"docs/requirements.md": regexp.MustCompile(`^(?:AC-\d+(?:\.\d+)?|INV-[A-Z][A-Z0-9-]*[A-Z0-9])$`),
-		"docs/deviations.md":   regexp.MustCompile(`^DEV-\d+$`),
+		"docs/unsupported.md":  regexp.MustCompile(`^(?:UNS-[A-Z][A-Z0-9-]*[A-Z0-9]|DEV-\d+)$`),
 	}
 )
 
 // ParseRequirements finds the ID tags in a document, written as code spans such as `AC-1.2`
-// after the text they name. In the deviations, the text is the bold title of the tag's line.
+// after the text they name. In the unsupported statements, the text is the bold title of the
+// tag's line.
 // In the requirements, it is the text between the previous tag on the line, or the start of the
 // line, and the tag, after the bold title of the enclosing top-level list item.
 func ParseRequirements(source, doc string) ([]Requirement, error) {
@@ -185,7 +186,7 @@ func ParseRequirements(source, doc string) ([]Requirement, error) {
 			}
 			seen[id] = true
 			var text string
-			if source == "docs/deviations.md" {
+			if source == "docs/unsupported.md" {
 				if m := firstBold.FindStringSubmatch(line); m != nil {
 					text = m[1]
 				}

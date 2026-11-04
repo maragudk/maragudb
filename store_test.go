@@ -102,7 +102,7 @@ func ExampleOptions() {
 	defer func() { _ = db.Close() }()
 
 	ctx := context.Background()
-	if _, err := db.ExecContext(ctx, "CREATE TABLE greetings (id int PRIMARY KEY, text string NOT NULL)"); err != nil {
+	if _, err := db.ExecContext(ctx, "CREATE TABLE greetings (id bigint PRIMARY KEY, text text NOT NULL)"); err != nil {
 		panic(err)
 	}
 	if _, err := db.ExecContext(ctx, "INSERT INTO greetings VALUES ($1, $2)", 1, "hello"); err != nil {
@@ -148,7 +148,7 @@ func TestOptions_Store(t *testing.T) {
 			return db
 		}
 		a, b := open(), open()
-		mustExec(t, a, "CREATE TABLE t (id int PRIMARY KEY, v string)")
+		mustExec(t, a, "CREATE TABLE t (id bigint PRIMARY KEY, v text)")
 		for i := range 300 {
 			mustExec(t, a, "INSERT INTO t VALUES ($1, $2)", i, strings.Repeat("x", 100))
 		}
@@ -180,7 +180,7 @@ func TestOptions_Store(t *testing.T) {
 		is.NotError(t, err)
 		db := sql.OpenDB(c)
 		defer func() { _ = db.Close() }()
-		mustExec(t, db, "CREATE TABLE t (id int PRIMARY KEY, v string)")
+		mustExec(t, db, "CREATE TABLE t (id bigint PRIMARY KEY, v text)")
 		tx, err := db.BeginTx(t.Context(), nil)
 		is.NotError(t, err)
 		for i := range 2000 {
@@ -214,7 +214,7 @@ func TestOptions_Store(t *testing.T) {
 		fake := s3fake.New()
 		db := sql.OpenDB(must(maragudb.NewConnector(maragudb.Options{Store: s3test.NewStore(fake), Maintenance: new(false)}, "s3://bucket/app")))
 		defer func() { _ = db.Close() }()
-		mustExec(t, db, "CREATE TABLE t (id int PRIMARY KEY)")
+		mustExec(t, db, "CREATE TABLE t (id bigint PRIMARY KEY)")
 		_, ok := fake.Body("app/manifest")
 		is.True(t, ok, "the manifest is under the DSN's prefix")
 		is.True(t, fake.Counts().Get+fake.Counts().GetConditional > 0, "the fake was used")

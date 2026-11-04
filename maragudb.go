@@ -60,12 +60,19 @@ var (
 	// ErrSnapshotExpired is returned by a transaction older than the GC grace period, and by
 	// [Compact] when it took longer than that.
 	ErrSnapshotExpired = engine.ErrSnapshotExpired
+	// ErrUnsupported is a statement that Postgres accepts and maragudb does not, such as one
+	// that uses a feature maragudb does not have, or one whose result in Postgres would depend
+	// on its query plan or on the physical order of rows. Its message says what is unsupported
+	// and, where possible, what to write instead. It corresponds to the Postgres SQLSTATE 0A000,
+	// feature_not_supported, and it is the only way in which maragudb is stricter than Postgres.
+	ErrUnsupported = exec.ErrUnsupported
 	// ErrSyntax is a statement that does not parse.
 	ErrSyntax = exec.ErrSyntax
 	// ErrInvalid is a statement that cannot run: an unknown column or function, wrong arity,
 	// a missing parameter, and the like.
 	ErrInvalid = exec.ErrInvalid
-	// ErrType is a type mismatch, including a parameter of the wrong type.
+	// ErrType is a type mismatch, including a parameter whose Go type cannot have the type that
+	// its context gives it.
 	ErrType = exec.ErrType
 	// ErrNoTable is a reference to a table that does not exist.
 	ErrNoTable = exec.ErrNoTable
@@ -77,12 +84,17 @@ var (
 	ErrNotNull = exec.ErrNotNull
 	// ErrDivisionByZero is a division or modulo by zero.
 	ErrDivisionByZero = exec.ErrDivisionByZero
-	// ErrOutOfRange is an int overflow, a float overflow or underflow, or a cast out of range.
+	// ErrOutOfRange is an integer or bigint overflow, a float overflow or underflow, or a cast
+	// or timestamp out of range.
 	ErrOutOfRange = exec.ErrOutOfRange
 	// ErrCast is an invalid cast.
 	ErrCast = exec.ErrCast
 	// ErrReadOnlyTx is a write in a read-only transaction.
 	ErrReadOnlyTx = exec.ErrReadOnlyTx
+	// ErrTxAborted is a statement in a transaction in which an earlier statement failed. As in
+	// Postgres, every statement fails with it until the transaction ends, and a COMMIT of such a
+	// transaction rolls it back.
+	ErrTxAborted = exec.ErrTxAborted
 	// ErrDSN is an invalid data source name.
 	ErrDSN = sqldriver.ErrDSN
 )

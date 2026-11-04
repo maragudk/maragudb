@@ -98,6 +98,7 @@ func Render(facts []Fact, c Catalog) string {
 	reached := map[string]int{}
 	reachedRecorded := false
 	var diff *Diff
+	var ratchet *Ratchet
 	var budgets []Fact
 	var latencies []Fact
 	var antithesis []Fact
@@ -150,6 +151,11 @@ func Render(facts []Fact, c Catalog) string {
 			diff.ClassMatches += f.Diff.ClassMatches
 			diff.Classes = max(diff.Classes, f.Diff.Classes)
 			diff.Ordered += f.Diff.Ordered
+			diff.Executed += f.Diff.Executed
+			diff.Rejected += f.Diff.Rejected
+			diff.Transactions += f.Diff.Transactions
+		case f.Ratchet != nil:
+			ratchet = f.Ratchet
 		case f.Budget != nil:
 			budgets = append(budgets, f)
 		case f.Latency != nil:
@@ -248,7 +254,13 @@ func Render(facts []Fact, c Catalog) string {
 	if diff == nil {
 		b.WriteString("| Differential | not run |\n")
 	} else {
-		fmt.Fprintf(&b, "| Differential | %d cases, %d statements: %d succeeded on both, %d failed on both, of which %d with the same error class, across %d class pairs |\n", diff.Cases, diff.Statements, diff.OK, diff.Errors, diff.ClassMatches, diff.Classes)
+		fmt.Fprintf(&b, "| Differential | %d cases, %d statements: %d executed on both sides (%s), %d rejected as unsupported (%s); of the executed, %d succeeded on both and %d failed on both, of which %d with the same error class, across %d class pairs; %d explicit transactions |\n",
+			diff.Cases, diff.Statements, diff.Executed, percent(diff.Executed, diff.Statements), diff.Rejected, percent(diff.Rejected, diff.Statements), diff.OK, diff.Errors, diff.ClassMatches, diff.Classes, diff.Transactions)
+	}
+	if ratchet == nil {
+		b.WriteString("| Differential ratchet | not run |\n")
+	} else {
+		fmt.Fprintf(&b, "| Differential ratchet | %d cases with a fixed seed: %d of %d statements executed (%s), baseline %d |\n", ratchet.Cases, ratchet.Executed, ratchet.Statements, percent(ratchet.Executed, ratchet.Statements), ratchet.Baseline)
 	}
 	if len(budgets) == 0 {
 		b.WriteString("| Request budgets | not run |\n")
@@ -426,4 +438,12 @@ func publishTo(summary, dir string, c Catalog) error {
 		return err
 	}
 	return os.WriteFile(summary, append(prefix, Render(facts, c)...), 0o644)
+}
+
+// percent of n in total, rounded to a whole number.
+func percent(n, total int) string {
+	if total == 0 {
+		return "0%"
+	}
+	return fmt.Sprintf("%.0f%%", 100*float64(n)/float64(total))
 }

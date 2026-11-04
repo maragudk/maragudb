@@ -416,7 +416,9 @@ func toValues(st *exec.Statement, args []driver.NamedValue) ([]value.Value, erro
 		case bool:
 			params[i] = value.NewBool(v)
 		case string:
-			params[i] = value.NewString(v)
+			// A string is text of no type yet, which takes the type the parameter's context
+			// infers, as a quoted literal does.
+			params[i] = value.NewUnknown(v)
 		case []byte:
 			if v == nil {
 				// A nil slice is NULL, as in the common Postgres drivers.
@@ -548,7 +550,7 @@ func toDriverValue(v value.Value) driver.Value {
 		return nil
 	}
 	switch v.Type {
-	case value.Int:
+	case value.Int, value.Int4:
 		return v.I
 	case value.Float:
 		return v.F
@@ -564,12 +566,10 @@ func toDriverValue(v value.Value) driver.Value {
 	return nil
 }
 
-// ColumnTypeDatabaseTypeName is the SQL type name in upper case, or empty for a NULL of unknown type.
+// ColumnTypeDatabaseTypeName is the Postgres type name in upper case, such as INT8 or
+// TIMESTAMPTZ, as the Postgres drivers report it.
 func (r *Rows) ColumnTypeDatabaseTypeName(i int) string {
-	if r.rows.Columns[i].Type == value.Unknown {
-		return ""
-	}
-	return strings.ToUpper(r.rows.Columns[i].Type.String())
+	return strings.ToUpper(r.rows.Columns[i].Type.OutputName())
 }
 
 // ColumnTypeNullable reports whether the column can be NULL.
@@ -580,7 +580,7 @@ func (r *Rows) ColumnTypeNullable(i int) (bool, bool) {
 // ColumnTypeScanType is the Go type the column scans into.
 func (r *Rows) ColumnTypeScanType(i int) reflect.Type {
 	switch r.rows.Columns[i].Type {
-	case value.Int:
+	case value.Int, value.Int4:
 		return reflect.TypeFor[int64]()
 	case value.Float:
 		return reflect.TypeFor[float64]()
