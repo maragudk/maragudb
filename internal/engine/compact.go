@@ -8,6 +8,8 @@ import (
 	"strings"
 
 	"github.com/antithesishq/antithesis-sdk-go/assert"
+
+	"maragu.dev/maragudb/internal/reach"
 )
 
 // Compact merges all segments into one, dropping tombstones and overwritten values. The old
@@ -140,6 +142,7 @@ func (db *DB) compact(ctx context.Context, progress func() error) (bool, error) 
 			return false, err
 		}
 		assert.Sometimes(true, "a compaction rebases on commits that only added segments", nil)
+		reach.Hit(ctx, reach.CompactionRebase)
 		db.compactionRebases.Add(1)
 		base, baseEtag = cur, curEtag
 	}
@@ -328,6 +331,7 @@ func (db *DB) gc(ctx context.Context, progress func() error) (int, bool, error) 
 			return deleted, deleted > 0, err
 		}
 		assert.Sometimes(true, "a GC pass rebases on commits that landed meanwhile", nil)
+		reach.Hit(ctx, reach.GCRebase)
 		base, baseEtag = cur, curEtag
 	}
 }

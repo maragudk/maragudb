@@ -8,8 +8,11 @@ import (
 	"math/rand/v2"
 	"time"
 
+	"github.com/antithesishq/antithesis-sdk-go/assert"
+
 	"maragu.dev/maragudb/internal/engine"
 	"maragu.dev/maragudb/internal/history"
+	"maragu.dev/maragudb/internal/reach"
 	"maragu.dev/maragudb/internal/sql/exec"
 	"maragu.dev/maragudb/internal/sqldriver"
 )
@@ -44,7 +47,7 @@ func (r *run) openSQL(ctx context.Context, opts engine.Options) (*sql.DB, *engin
 
 // seedSQL creates the tables, and the accounts, with a fault-free client before the clients start.
 func (r *run) seedSQL() {
-	r.sched.Go("seed", func(ctx context.Context) {
+	r.goTask("seed", func(ctx context.Context) {
 		db, _, err := r.openSQL(ctx, engine.Options{Client: r.fake.WithoutFaults(), Now: r.sched.Now, Sleep: r.sched.Sleep, Rand: rand.New(rand.NewPCG(r.cfg.Seed, 0x5eed))})
 		if err != nil {
 			panic(err)
@@ -75,7 +78,7 @@ func (r *run) readFinalSQL() (map[string][]int64, map[string]int64, error) {
 	var lists map[string][]int64
 	var balances map[string]int64
 	var err error
-	r.sched.Go("final", func(ctx context.Context) {
+	r.goTask("final", func(ctx context.Context) {
 		var db *sql.DB
 		db, _, err = r.openSQL(ctx, engine.Options{Client: r.fake.WithoutFaults(), Now: r.sched.Now, Sleep: r.sched.Sleep, MemoryCacheBytes: new(int64), Rand: rand.New(rand.NewPCG(r.cfg.Seed, 0xf1a1))})
 		if err != nil {
@@ -129,15 +132,19 @@ func (r *run) readFinalSQL() (map[string][]int64, map[string]int64, error) {
 
 // outcomeSQL classifies the error of a commit or an autocommit statement. Only
 // [engine.ErrCommitUnknown] is ambiguous; every other error means the statement was not applied.
-func (c *client) outcomeSQL(err error) history.Outcome {
-	return c.outcome(err)
+func (c *client) outcomeSQL(ctx context.Context, err error) history.Outcome {
+	return c.outcome(ctx, err)
 }
 
 // readErrorSQL is like [client.readError] for a transaction begun at startedAt.
-func (c *client) readErrorSQL(startedAt time.Time, err error) {
+func (c *client) readErrorSQL(ctx context.Context, startedAt time.Time, err error) {
 	c.run.stats.FailedReads++
 	if errors.Is(err, engine.ErrSnapshotExpired) {
 		age := c.run.sched.Now().Sub(startedAt)
+		assert.Sometimes(age >= c.run.cfg.GracePeriod, "a reader older than the grace period is told so", nil)
+		if age >= c.run.cfg.GracePeriod {
+			reach.Hit(ctx, reach.SnapshotExpiredRefused)
+		}
 		if age < c.run.cfg.GracePeriod {
 			c.run.anomaly("client %d: snapshot expired after %v, grace period is %v: %v", c.id, age, c.run.cfg.GracePeriod, err)
 		}
@@ -192,7 +199,7 @@ func (c *client) listAppendSQL(ctx context.Context) {
 		startedAt := c.run.sched.Now()
 		list, err := readList(ctx, c.sql, k)
 		if err != nil {
-			c.readErrorSQL(startedAt, err)
+			c.readErrorSQL(ctx, startedAt, err)
 			c.run.trace("client %d: read: %v", c.id, err)
 			return
 		}
@@ -206,7 +213,7 @@ func (c *client) listAppendSQL(ctx context.Context) {
 		_, err = c.sql.ExecContext(ctx, "INSERT INTO lists VALUES ($1, $2, $3)", k, len(list), value)
 		h.Complete = c.run.stamp()
 		h.Ops = []history.Op{{Kind: history.Append, Key: keyName(k), Value: value}}
-		h.Outcome = c.outcomeSQL(err)
+		h.Outcome = c.outcomeSQL(ctx, err)
 		if err != nil {
 			h.Err = err.Error()
 		}
@@ -225,7 +232,7 @@ func (c *client) listAppendSQL(ctx context.Context) {
 		c.pause(ctx)
 		list, err := readList(ctx, tx, p.key)
 		if err != nil {
-			c.readErrorSQL(startedAt, err)
+			c.readErrorSQL(ctx, startedAt, err)
 			c.run.trace("client %d: read: %v", c.id, err)
 			_ = tx.Rollback()
 			if len(h.Ops) > 0 {
@@ -260,7 +267,7 @@ func (c *client) listAppendSQL(ctx context.Context) {
 	if readOnly && err != nil {
 		h.Outcome = history.Failed
 	} else {
-		h.Outcome = c.outcomeSQL(err)
+		h.Outcome = c.outcomeSQL(ctx, err)
 	}
 	if err != nil {
 		h.Err = err.Error()
@@ -282,7 +289,7 @@ func (c *client) bankSQL(ctx context.Context) {
 			// One statement for every account.
 			rows, err := tx.QueryContext(ctx, "SELECT id, balance FROM accounts ORDER BY id")
 			if err != nil {
-				c.readErrorSQL(startedAt, err)
+				c.readErrorSQL(ctx, startedAt, err)
 				return
 			}
 			for rows.Next() {
@@ -296,7 +303,7 @@ func (c *client) bankSQL(ctx context.Context) {
 			}
 			_ = rows.Close()
 			if err := rows.Err(); err != nil {
-				c.readErrorSQL(startedAt, err)
+				c.readErrorSQL(ctx, startedAt, err)
 				return
 			}
 		} else {
@@ -310,7 +317,7 @@ func (c *client) bankSQL(ctx context.Context) {
 					return
 				}
 				if err != nil {
-					c.readErrorSQL(startedAt, err)
+					c.readErrorSQL(ctx, startedAt, err)
 					return
 				}
 				balances[keyName(i)] = balance
@@ -344,7 +351,7 @@ func (c *client) bankSQL(ctx context.Context) {
 			return 0, false
 		}
 		if err != nil {
-			c.readErrorSQL(startedAt, err)
+			c.readErrorSQL(ctx, startedAt, err)
 			return 0, false
 		}
 		return balance, true
@@ -382,7 +389,7 @@ func (c *client) bankSQL(ctx context.Context) {
 	}
 	err = tx.Commit()
 	h.Complete = c.run.stamp()
-	h.Outcome = c.outcomeSQL(err)
+	h.Outcome = c.outcomeSQL(ctx, err)
 	h.Ops = []history.Op{{Kind: history.Append, Key: keyName(from), Value: -amount}, {Kind: history.Append, Key: keyName(to), Value: amount}}
 	if err != nil {
 		h.Err = err.Error()

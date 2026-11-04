@@ -12,6 +12,7 @@ import (
 	"github.com/antithesishq/antithesis-sdk-go/assert"
 
 	"maragu.dev/maragudb/internal/engine"
+	"maragu.dev/maragudb/internal/reach"
 	"maragu.dev/maragudb/internal/sql/ast"
 	"maragu.dev/maragudb/internal/sql/parser"
 	"maragu.dev/maragudb/internal/sql/value"
@@ -265,6 +266,9 @@ func (s *Session) Execute(ctx context.Context, st *Statement, params []value.Val
 		}
 		if !retry || attempt == maxAttempts {
 			return nil, Result{}, err
+		}
+		if errors.Is(err, engine.ErrConflict) {
+			reach.Hit(ctx, reach.AutocommitRetry)
 		}
 		s.log.Debug("retrying statement after conflict", "attempt", attempt, "error", err)
 	}

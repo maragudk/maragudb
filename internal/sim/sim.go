@@ -18,6 +18,8 @@ import (
 	"maragu.dev/maragudb/internal/cache"
 	"maragu.dev/maragudb/internal/engine"
 	"maragu.dev/maragudb/internal/history"
+	"maragu.dev/maragudb/internal/reach"
+	"maragu.dev/maragudb/internal/s3"
 	"maragu.dev/maragudb/internal/s3fake"
 	"maragu.dev/maragudb/internal/sched"
 	"maragu.dev/maragudb/internal/sql/exec"
@@ -151,6 +153,8 @@ type Result struct {
 	Balances  map[string]int64
 	Anomalies []error
 	Stats     Stats
+	// Reached counts the interesting states the run reached. See [reach.Declarations].
+	Reached map[reach.State]int
 	// Digest summarizes the whole run; two runs with the same seed must have equal digests.
 	Digest string
 }
@@ -238,6 +242,19 @@ type run struct {
 	// lastStamp makes history timestamps strictly increasing in event order, even when virtual
 	// time did not advance between two events.
 	lastStamp time.Duration
+	// reached counts the interesting states of the run.
+	reached reach.Counter
+	// clients of the run, and whether two of their maintainers held the lease at once when last
+	// looked at.
+	clients     []*client
+	overlapping bool
+}
+
+// goTask starts a scheduled task whose context counts the states it reaches.
+func (r *run) goTask(name string, f func(ctx context.Context)) {
+	r.sched.Go(name, func(ctx context.Context) {
+		f(reach.WithCounter(ctx, &r.reached))
+	})
 }
 
 // stamp returns a timestamp for a history event that is at least the virtual time and later than every earlier stamp.
@@ -283,17 +300,18 @@ func Run(cfg Config) Result {
 	r.activeClients = cfg.Clients
 	for i := range cfg.Clients {
 		c := &client{run: r, id: i, rng: rand.New(rand.NewPCG(cfg.Seed, uint64(i)+1)), disk: cache.NewMemory(0)}
-		r.sched.Go(fmt.Sprint("client", i), c.loop)
+		r.clients = append(r.clients, c)
+		r.goTask(fmt.Sprint("client", i), c.loop)
 	}
 	for i := range cfg.Maintainers {
 		m := &maintainer{run: r, id: i, rng: rand.New(rand.NewPCG(cfg.Seed, 0xaaaa+uint64(i)))}
-		r.sched.Go(fmt.Sprint("maintainer", i), m.loop)
+		r.goTask(fmt.Sprint("maintainer", i), m.loop)
 	}
 	r.sched.Run()
 	r.stats.Elapsed = r.sched.Elapsed()
 	r.stats.Outages = r.fake.Outages()
 
-	res := Result{Config: cfg, History: r.txs, Audits: r.audits, Stats: r.stats}
+	res := Result{Config: cfg, History: r.txs, Audits: r.audits, Stats: r.stats, Reached: r.reached.Counts()}
 	var final map[string][]int64
 	var balances map[string]int64
 	var err error
@@ -366,7 +384,7 @@ func (r *run) anomaly(format string, args ...any) {
 func (r *run) engineOptions(id int, rng *rand.Rand, disk cache.Cache) engine.Options {
 	grace := r.cfg.GracePeriod
 	opts := engine.Options{
-		Client:        r.fake,
+		Client:        leaseWatch{Client: r.fake, run: r},
 		Prefix:        "db",
 		DiskCache:     disk,
 		GCGracePeriod: &grace,
@@ -408,7 +426,7 @@ func (r *run) maintenanceOptions(id int) (engine.MaintenanceOptions, bool) {
 // seedBank writes the initial balances with a fault-free client before the clients start.
 func (r *run) seedBank() {
 	r.total = int64(r.cfg.Keys) * initialBalance
-	r.sched.Go("seed", func(ctx context.Context) {
+	r.goTask("seed", func(ctx context.Context) {
 		db, err := engine.Open(ctx, engine.Options{Client: r.fake.WithoutFaults(), Prefix: "db", Now: r.sched.Now, Sleep: r.sched.Sleep, Rand: rand.New(rand.NewPCG(r.cfg.Seed, 0x5eed))})
 		if err != nil {
 			panic(err)
@@ -431,7 +449,7 @@ func (r *run) readFinal() (map[string][]int64, map[string]int64, error) {
 	var lists map[string][]int64
 	var balances map[string]int64
 	var err error
-	r.sched.Go("final", func(ctx context.Context) {
+	r.goTask("final", func(ctx context.Context) {
 		var db *engine.DB
 		db, err = engine.Open(ctx, engine.Options{Client: r.fake.WithoutFaults(), Prefix: "db", Now: r.sched.Now, Sleep: r.sched.Sleep, MemoryCacheBytes: new(int64), Rand: rand.New(rand.NewPCG(r.cfg.Seed, 0xf1a1))})
 		if err != nil {
@@ -504,6 +522,9 @@ type client struct {
 	// maint is the client's maintainer in the maintenance modes.
 	maint *engine.Maintainer
 	next  int64
+	// crashedInCommit is true from a crash during a commit's writes until the restarted client
+	// commits again.
+	crashedInCommit bool
 }
 
 func (c *client) loop(ctx context.Context) {
@@ -614,11 +635,14 @@ func (c *client) value() int64 {
 
 // readError handles an error from a read: it classifies snapshot expiry as an anomaly when the
 // transaction is younger than the grace period.
-func (c *client) readError(tx *engine.Tx, err error) {
+func (c *client) readError(ctx context.Context, tx *engine.Tx, err error) {
 	c.run.stats.FailedReads++
 	if errors.Is(err, engine.ErrSnapshotExpired) {
 		age := c.run.sched.Now().Sub(tx.StartedAt())
 		assert.Sometimes(age >= c.run.cfg.GracePeriod, "a reader older than the grace period is told so", nil)
+		if age >= c.run.cfg.GracePeriod {
+			reach.Hit(ctx, reach.SnapshotExpiredRefused)
+		}
 		if age < c.run.cfg.GracePeriod {
 			c.run.anomaly("client %d: snapshot expired after %v, grace period is %v: %v", c.id, age, c.run.cfg.GracePeriod, err)
 		}
@@ -633,19 +657,28 @@ func (c *client) record(tx history.Tx) {
 
 // outcome of a commit. Only [engine.ErrCommitUnknown] is ambiguous; every other error means
 // the transaction was not applied.
-func (c *client) outcome(err error) history.Outcome {
+func (c *client) outcome(ctx context.Context, err error) history.Outcome {
 	if errors.Is(err, s3fake.ErrUnavailable) {
 		c.run.stats.Unavailable++
+	}
+	crashed, step := c.proc.Crashed()
+	if crashed && strings.Contains(step, "PUT") {
+		c.crashedInCommit = true
 	}
 	switch {
 	case err == nil:
 		c.run.stats.Commits++
+		if c.crashedInCommit {
+			assert.Sometimes(true, "a client that crashed during a commit recovers and commits", nil)
+			reach.Hit(ctx, reach.CrashMidCommitRecovered)
+			c.crashedInCommit = false
+		}
 		return history.OK
 	case errors.Is(err, engine.ErrCommitUnknown):
 		c.run.stats.Unknown++
-		crashed, _ := c.proc.Crashed()
 		if !crashed {
 			c.run.stats.LiveUnknown++
+			reach.Hit(ctx, reach.LiveUnknown)
 		}
 		assert.Sometimes(!crashed, "a commit outcome is unknown in a process that keeps running", nil)
 		return history.Unknown
@@ -689,7 +722,7 @@ func (c *client) listAppendTx(ctx context.Context) {
 		c.pause(ctx)
 		v, _, err := tx.Get(ctx, []byte(p.key))
 		if err != nil {
-			c.readError(tx, err)
+			c.readError(ctx, tx, err)
 			c.run.trace("client %d: read: %v", c.id, err)
 			// The reads that completed are real observations; the transaction was never committed.
 			if len(h.Ops) > 0 {
@@ -717,7 +750,7 @@ func (c *client) listAppendTx(ctx context.Context) {
 		// not an unknown outcome.
 		h.Outcome = history.Failed
 	} else {
-		h.Outcome = c.outcome(err)
+		h.Outcome = c.outcome(ctx, err)
 	}
 	if err != nil {
 		h.Err = err.Error()
@@ -736,7 +769,7 @@ func (c *client) bankTx(ctx context.Context) {
 		for i := range c.run.cfg.Keys {
 			v, ok, err := tx.Get(ctx, []byte(keyName(i)))
 			if err != nil {
-				c.readError(tx, err)
+				c.readError(ctx, tx, err)
 				return
 			}
 			if !ok {
@@ -767,7 +800,7 @@ func (c *client) bankTx(ctx context.Context) {
 		c.pause(ctx)
 		v, ok, err := tx.Get(ctx, []byte(key))
 		if err != nil {
-			c.readError(tx, err)
+			c.readError(ctx, tx, err)
 			return 0, false
 		}
 		if !ok {
@@ -797,7 +830,7 @@ func (c *client) bankTx(ctx context.Context) {
 	_ = tx.Put([]byte(to), []byte(strconv.FormatInt(b+amount, 10)))
 	err = tx.Commit(ctx)
 	h.Complete = c.run.stamp()
-	h.Outcome = c.outcome(err)
+	h.Outcome = c.outcome(ctx, err)
 	h.Ops = []history.Op{{Kind: history.Append, Key: from, Value: -amount}, {Kind: history.Append, Key: to, Value: amount}}
 	if err != nil {
 		h.Err = err.Error()
@@ -845,11 +878,17 @@ func (m *maintainer) loop(ctx context.Context) {
 			}
 			m.run.trace("maintainer %d: compact: %v", m.id, err)
 			if crashed, _ := m.proc.Crashed(); crashed {
+				assert.Sometimes(true, "a process crashes during a compaction", nil)
+				reach.Hit(ctx, reach.CrashMidCompaction)
 				m.afterCrash()
 				continue
 			}
 		}
 		n, err := m.db.GC(pctx)
+		if crashed, _ := m.proc.Crashed(); crashed {
+			assert.Sometimes(true, "a process crashes during a GC pass", nil)
+			reach.Hit(ctx, reach.CrashMidGC)
+		}
 		if err == nil {
 			m.run.stats.GCs++
 			m.run.stats.Deleted += n
@@ -869,4 +908,50 @@ func (m *maintainer) afterCrash() {
 		m.db = nil
 		m.proc = nil
 	}
+}
+
+// leaseWatch is the store as the clients see it. Before every request it looks at whether two
+// clients' maintainers believe they hold the lease at the same time. Who holds the lease only
+// changes while a request of its holder is in flight, so looking before every request sees every
+// overlap.
+type leaseWatch struct {
+	s3.Client
+	run *run
+}
+
+func (w leaseWatch) Get(ctx context.Context, key string, opts s3.GetOptions) (s3.Object, error) {
+	w.run.watchLeases(ctx)
+	return w.Client.Get(ctx, key, opts)
+}
+
+func (w leaseWatch) Put(ctx context.Context, key string, body []byte, opts s3.PutOptions) (string, error) {
+	w.run.watchLeases(ctx)
+	return w.Client.Put(ctx, key, body, opts)
+}
+
+func (w leaseWatch) Delete(ctx context.Context, key string) error {
+	w.run.watchLeases(ctx)
+	return w.Client.Delete(ctx, key)
+}
+
+func (w leaseWatch) List(ctx context.Context, prefix string) ([]s3.ObjectInfo, error) {
+	w.run.watchLeases(ctx)
+	return w.Client.List(ctx, prefix)
+}
+
+// watchLeases counts the start of every stretch in which two or more maintainers believe they
+// hold the lease.
+func (r *run) watchLeases(ctx context.Context) {
+	holders := 0
+	for _, c := range r.clients {
+		if c.maint != nil && c.maint.Holds() {
+			holders++
+		}
+	}
+	overlapping := holders >= 2
+	if overlapping && !r.overlapping {
+		assert.Sometimes(true, "two maintainers believe they hold the lease at once", nil)
+		reach.Hit(ctx, reach.LeaseOverlap)
+	}
+	r.overlapping = overlapping
 }

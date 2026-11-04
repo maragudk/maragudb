@@ -14,6 +14,7 @@ import (
 
 	"maragu.dev/maragudb/internal/engine"
 	"maragu.dev/maragudb/internal/history"
+	"maragu.dev/maragudb/internal/reach"
 	"maragu.dev/maragudb/internal/sim"
 	"maragu.dev/maragudb/internal/sql/exec"
 )
@@ -93,6 +94,7 @@ func failReport(t *testing.T, res sim.Result) {
 func TestSimulator(t *testing.T) {
 	t.Run("corpus finds no anomalies", func(t *testing.T) {
 		var totals sim.Stats
+		reached := map[reach.State]int{}
 		start := time.Now()
 		for _, cfg := range corpus() {
 			res := sim.Run(cfg)
@@ -100,8 +102,15 @@ func TestSimulator(t *testing.T) {
 				failReport(t, res)
 			}
 			totals.Add(res.Stats)
+			for s, n := range res.Reached {
+				reached[s] += n
+			}
 		}
 		t.Logf("corpus of %d runs in %v: %+v", len(corpus()), time.Since(start).Round(time.Millisecond), totals)
+		for _, d := range reach.Declarations() {
+			t.Logf("reached %v %d times", d.State, reached[d.State])
+			is.True(t, reached[d.State] > 0, fmt.Sprintf("the corpus reaches %v: %s", d.State, d.Description))
+		}
 		// The corpus must exercise every interesting path, or passing means nothing.
 		is.True(t, totals.Commits > 1000, "commits")
 		is.True(t, totals.Conflicts > 100, "conflicts")

@@ -21,6 +21,7 @@ import (
 	"github.com/antithesishq/antithesis-sdk-go/assert"
 
 	"maragu.dev/maragudb/internal/cache"
+	"maragu.dev/maragudb/internal/reach"
 	"maragu.dev/maragudb/internal/s3"
 )
 
@@ -376,6 +377,8 @@ func (db *DB) casManifest(ctx context.Context, baseEtag string, next *manifest) 
 
 	const maxAttempts = 8
 	var lastErr error
+	// ambiguous is true once an attempt's answer was lost, so that how it is resolved is known.
+	ambiguous := false
 	for attempt := 0; attempt < maxAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
 			return "", fmt.Errorf("%w: %w", ErrCommitUnknown, err)
@@ -396,6 +399,7 @@ func (db *DB) casManifest(ctx context.Context, baseEtag string, next *manifest) 
 		definite := errors.Is(err, s3.ErrPreconditionFailed)
 		assert.Sometimes(definite, "a manifest write fails its precondition", nil)
 		assert.Sometimes(!definite, "a manifest write has an unknown outcome", nil)
+		ambiguous = ambiguous || !definite
 
 		cur, curEtag, rerr := db.readManifest(ctx)
 		if rerr != nil {
@@ -405,6 +409,7 @@ func (db *DB) casManifest(ctx context.Context, baseEtag string, next *manifest) 
 		switch {
 		case cur.Seq == next.Seq && cur.CommitID == next.CommitID:
 			assert.Sometimes(true, "a lost manifest write is found to have landed", nil)
+			reach.Hit(ctx, reach.LostAckLanded)
 			db.setManifest(cur, curEtag, true)
 			return curEtag, nil
 		case curEtag == baseEtag && !definite:
@@ -415,11 +420,17 @@ func (db *DB) casManifest(ctx context.Context, baseEtag string, next *manifest) 
 				return "", fmt.Errorf("%w: %d commits happened meanwhile", ErrCommitUnknown, cur.Seq-next.Seq)
 			}
 			if rec.ID == next.CommitID {
+				assert.Sometimes(true, "a lost manifest write is found to have landed", nil)
+				reach.Hit(ctx, reach.LostAckLanded)
 				db.setManifest(cur, curEtag, true)
 				return curEtag, nil
 			}
 			db.setManifest(cur, curEtag, true)
 			assert.Sometimes(true, "a commit loses to a concurrent commit", nil)
+			if ambiguous {
+				assert.Sometimes(true, "a lost manifest write is found to have lost to a concurrent commit", nil)
+				reach.Hit(ctx, reach.LostAckConflict)
+			}
 			return "", fmt.Errorf("%w: commit %d was taken by %s", ErrConflict, next.Seq, rec.ID)
 		default:
 			return "", fmt.Errorf("%w: manifest at %d after writing %d", ErrCommitUnknown, cur.Seq, next.Seq)

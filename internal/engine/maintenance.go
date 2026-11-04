@@ -9,6 +9,7 @@ import (
 
 	"github.com/antithesishq/antithesis-sdk-go/assert"
 
+	"maragu.dev/maragudb/internal/reach"
 	"maragu.dev/maragudb/internal/s3"
 )
 
@@ -193,6 +194,9 @@ func (m *Maintainer) Acquire(ctx context.Context) (bool, error) {
 	}
 	cur, err := m.db.client.Get(ctx, m.key, s3.GetOptions{Consistent: true})
 	var etag string
+	// takeover is true when the lease belongs to another holder that let it expire without
+	// releasing it.
+	takeover := false
 	switch {
 	case errors.Is(err, s3.ErrNotFound):
 		etag, err = m.db.client.Put(ctx, m.key, body, s3.PutOptions{IfNoneMatch: true})
@@ -200,10 +204,12 @@ func (m *Maintainer) Acquire(ctx context.Context) (bool, error) {
 		return false, fmt.Errorf("engine: reading lease: %w", err)
 	default:
 		var l lease
-		if err := json.Unmarshal(cur.Body, &l); err == nil && l.Holder != m.opts.Holder && now.Before(l.ExpiresAt) {
+		parsed := json.Unmarshal(cur.Body, &l) == nil
+		if parsed && l.Holder != m.opts.Holder && now.Before(l.ExpiresAt) {
 			assert.Sometimes(true, "a maintainer finds the lease held by another", nil)
 			return false, nil
 		}
+		takeover = parsed && l.Holder != m.opts.Holder && !l.ExpiresAt.IsZero()
 		etag, err = m.db.client.Put(ctx, m.key, body, s3.PutOptions{IfMatch: cur.ETag})
 	}
 	if err != nil {
@@ -217,6 +223,10 @@ func (m *Maintainer) Acquire(ctx context.Context) (bool, error) {
 			return true, nil
 		}
 		return false, fmt.Errorf("engine: acquiring lease: %w", err)
+	}
+	if takeover {
+		assert.Sometimes(true, "a maintainer takes over an expired lease", nil)
+		reach.Hit(ctx, reach.LeaseTakeover)
 	}
 	m.hold(etag, lease{ExpiresAt: now.Add(m.opts.LeaseDuration)})
 	return true, nil

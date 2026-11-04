@@ -8,6 +8,7 @@ import (
 
 	"github.com/antithesishq/antithesis-sdk-go/assert"
 
+	"maragu.dev/maragudb/internal/reach"
 	"maragu.dev/maragudb/internal/s3"
 )
 
@@ -73,6 +74,10 @@ func (db *DB) getBlock(ctx context.Context, objectKey string, ref blockRef) (s3.
 		res, err := db.client.Get(ctx, objectKey, s3.GetOptions{Range: byteRange})
 		if errors.Is(err, s3.ErrNotFound) {
 			res, err = db.client.Get(ctx, objectKey, s3.GetOptions{Range: byteRange, Consistent: true})
+		}
+		if err == nil && attempt > 0 {
+			assert.Sometimes(true, "a retried block read succeeds", nil)
+			reach.Hit(ctx, reach.BlockReadRetrySucceeded)
 		}
 		if err == nil || s3.Definite(err) || attempt == 3 || ctx.Err() != nil {
 			return res, err
