@@ -6,6 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/antithesishq/antithesis-sdk-go/assert"
@@ -18,8 +20,13 @@ import (
 )
 
 // The SQL workloads run the same transactions as the engine workloads, through the SQL layer and
-// the database/sql driver. Accounts are rows of `accounts`, and a list is the rows of `lists`
-// with one key, ordered by position.
+// the database/sql driver. Accounts are rows of `accounts`, which transfers update either
+// relative to the current balance or by overwriting it with the balance they read. A list with an
+// even key is the rows of `lists` with that key, ordered by position, so that an append inserts a
+// new row. A list with an odd key is one row of `packed`, whose `vals` holds the list as
+// comma-prefixed values, so that an append updates an existing row: in a transaction by
+// overwriting it with the list it read plus the new value, and as an autocommit statement by
+// concatenating the new value in the statement.
 
 // openSQL opens a database/sql handle for a process over the given engine options, and returns
 // the engine behind it. The driver's own maintenance loop stays off, because its timing would
@@ -68,6 +75,16 @@ func (r *run) seedSQL() {
 			if _, err := db.ExecContext(ctx, "CREATE TABLE lists (k int, pos int, v int, PRIMARY KEY (k, pos))"); err != nil {
 				panic(err)
 			}
+			if _, err := db.ExecContext(ctx, "CREATE TABLE packed (k int PRIMARY KEY, vals string NOT NULL)"); err != nil {
+				panic(err)
+			}
+			for k := range r.cfg.Keys {
+				if packed(k) {
+					if _, err := db.ExecContext(ctx, "INSERT INTO packed VALUES ($1, '')", k); err != nil {
+						panic(err)
+					}
+				}
+			}
 		}
 	})
 	r.sched.Run()
@@ -107,7 +124,30 @@ func (r *run) readFinalSQL() (map[string][]int64, map[string]int64, error) {
 				pos[k]++
 				lists[keyName(int(k))] = append(lists[keyName(int(k))], v)
 			}
-			err = rows.Err()
+			if err = rows.Err(); err != nil {
+				return
+			}
+			var packedRows *sql.Rows
+			packedRows, err = db.QueryContext(ctx, "SELECT k, vals FROM packed ORDER BY k")
+			if err != nil {
+				return
+			}
+			defer func() { _ = packedRows.Close() }()
+			for packedRows.Next() {
+				var k int64
+				var vals string
+				if err = packedRows.Scan(&k, &vals); err != nil {
+					return
+				}
+				var list []int64
+				if list, err = decodePacked(vals); err != nil {
+					return
+				}
+				if len(list) > 0 {
+					lists[keyName(int(k))] = list
+				}
+			}
+			err = packedRows.Err()
 		case Bank:
 			balances = map[string]int64{}
 			var rows *sql.Rows
@@ -151,10 +191,61 @@ func (c *client) readErrorSQL(ctx context.Context, startedAt time.Time, err erro
 	}
 }
 
-// readList reads a list in a transaction or on the database.
-func readList(ctx context.Context, q interface {
+// packed reports whether the list of key k is one row of `packed` rather than rows of `lists`.
+func packed(k int) bool {
+	return k%2 == 1
+}
+
+// errMissingList is returned by [readList] when the row of a packed list is gone, which no
+// transaction ever does.
+var errMissingList = errors.New("sim: the row of a packed list is missing")
+
+// decodePacked decodes the comma-prefixed values of a packed list.
+func decodePacked(vals string) ([]int64, error) {
+	list := []int64{}
+	if vals == "" {
+		return list, nil
+	}
+	if vals[0] != ',' {
+		return nil, fmt.Errorf("sim: corrupt packed list %q", vals)
+	}
+	for _, s := range strings.Split(vals[1:], ",") {
+		v, err := strconv.ParseInt(s, 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("sim: corrupt packed list %q", vals)
+		}
+		list = append(list, v)
+	}
+	return list, nil
+}
+
+// encodePacked is the inverse of [decodePacked].
+func encodePacked(list []int64) string {
+	var b strings.Builder
+	for _, v := range list {
+		fmt.Fprintf(&b, ",%d", v)
+	}
+	return b.String()
+}
+
+type querier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
-}, k int) ([]int64, error) {
+	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
+}
+
+// readList reads a list in a transaction or on the database.
+func readList(ctx context.Context, q querier, k int) ([]int64, error) {
+	if packed(k) {
+		var vals string
+		err := q.QueryRowContext(ctx, "SELECT vals FROM packed WHERE k = $1", k).Scan(&vals)
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, errMissingList
+		}
+		if err != nil {
+			return nil, err
+		}
+		return decodePacked(vals)
+	}
 	rows, err := q.QueryContext(ctx, "SELECT pos, v FROM lists WHERE k = $1 ORDER BY pos", k)
 	if err != nil {
 		return nil, err
@@ -199,8 +290,7 @@ func (c *client) listAppendSQL(ctx context.Context) {
 		startedAt := c.run.sched.Now()
 		list, err := readList(ctx, c.sql, k)
 		if err != nil {
-			c.readErrorSQL(ctx, startedAt, err)
-			c.run.trace("client %d: read: %v", c.id, err)
+			c.listReadError(ctx, startedAt, err)
 			return
 		}
 		h.Ops = []history.Op{{Kind: history.Read, Key: keyName(k), List: list}}
@@ -210,7 +300,17 @@ func (c *client) listAppendSQL(ctx context.Context) {
 
 		h = history.Tx{Client: c.id, Invoke: c.run.stamp()}
 		value := c.value()
-		_, err = c.sql.ExecContext(ctx, "INSERT INTO lists VALUES ($1, $2, $3)", k, len(list), value)
+		var res sql.Result
+		if packed(k) {
+			res, err = c.sql.ExecContext(ctx, "UPDATE packed SET vals = vals || $1 WHERE k = $2", encodePacked([]int64{value}), k)
+		} else {
+			res, err = c.sql.ExecContext(ctx, "INSERT INTO lists VALUES ($1, $2, $3)", k, len(list), value)
+		}
+		if err == nil {
+			if n, _ := res.RowsAffected(); n != 1 {
+				c.run.anomaly("client %d: append to %s affected %d rows", c.id, keyName(k), n)
+			}
+		}
 		h.Complete = c.run.stamp()
 		h.Ops = []history.Op{{Kind: history.Append, Key: keyName(k), Value: value}}
 		h.Outcome = c.outcomeSQL(ctx, err)
@@ -232,8 +332,7 @@ func (c *client) listAppendSQL(ctx context.Context) {
 		c.pause(ctx)
 		list, err := readList(ctx, tx, p.key)
 		if err != nil {
-			c.readErrorSQL(ctx, startedAt, err)
-			c.run.trace("client %d: read: %v", c.id, err)
+			c.listReadError(ctx, startedAt, err)
 			_ = tx.Rollback()
 			if len(h.Ops) > 0 {
 				h.Complete = c.run.stamp()
@@ -246,7 +345,13 @@ func (c *client) listAppendSQL(ctx context.Context) {
 		h.Ops = append(h.Ops, history.Op{Kind: history.Read, Key: keyName(p.key), List: list})
 		if p.append {
 			value := c.value()
-			res, err := tx.ExecContext(ctx, "INSERT INTO lists VALUES ($1, $2, $3)", p.key, len(list), value)
+			var res sql.Result
+			var err error
+			if packed(p.key) {
+				res, err = tx.ExecContext(ctx, "UPDATE packed SET vals = $1 WHERE k = $2", encodePacked(append(list, value)), p.key)
+			} else {
+				res, err = tx.ExecContext(ctx, "INSERT INTO lists VALUES ($1, $2, $3)", p.key, len(list), value)
+			}
 			if err != nil {
 				c.run.trace("client %d: insert: %v", c.id, err)
 				_ = tx.Rollback()
@@ -257,7 +362,7 @@ func (c *client) listAppendSQL(ctx context.Context) {
 				return
 			}
 			if n, _ := res.RowsAffected(); n != 1 {
-				c.run.anomaly("client %d: insert affected %d rows", c.id, n)
+				c.run.anomaly("client %d: append to %s affected %d rows", c.id, keyName(p.key), n)
 			}
 			h.Ops = append(h.Ops, history.Op{Kind: history.Append, Key: keyName(p.key), Value: value})
 		}
@@ -370,12 +475,19 @@ func (c *client) bankSQL(ctx context.Context) {
 		_ = tx.Rollback()
 		return
 	}
-	_ = b
+	// Half the transfers overwrite the balances they read, and half update them relative to the
+	// current balance.
+	overwrite := c.rng.IntN(2) == 0
 	for _, step := range []struct {
 		id    int
 		delta int64
-	}{{from, -amount}, {to, amount}} {
-		res, err := tx.ExecContext(ctx, "UPDATE accounts SET balance = balance + $1 WHERE id = $2", step.delta, step.id)
+		read  int64
+	}{{from, -amount, a}, {to, amount, b}} {
+		query, arg := "UPDATE accounts SET balance = balance + $1 WHERE id = $2", step.delta
+		if overwrite {
+			query, arg = "UPDATE accounts SET balance = $1 WHERE id = $2", step.read+step.delta
+		}
+		res, err := tx.ExecContext(ctx, query, arg, step.id)
 		if err != nil {
 			c.run.trace("client %d: update: %v", c.id, err)
 			_ = tx.Rollback()
@@ -395,4 +507,15 @@ func (c *client) bankSQL(ctx context.Context) {
 		h.Err = err.Error()
 	}
 	c.record(h)
+}
+
+// listReadError handles a failed read of a list: a missing packed list is an anomaly, and every
+// other error is a failed read.
+func (c *client) listReadError(ctx context.Context, startedAt time.Time, err error) {
+	c.run.trace("client %d: read: %v", c.id, err)
+	if errors.Is(err, errMissingList) {
+		c.run.anomaly("client %d: %v", c.id, err)
+		return
+	}
+	c.readErrorSQL(ctx, startedAt, err)
 }

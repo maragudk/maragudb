@@ -374,11 +374,11 @@ func TestMutants(t *testing.T) {
 		{name: "acking before the write is confirmed", mutations: engine.Mutations{AckBeforeConfirm: true}, workloads: []sim.Workload{sim.ListAppend}},
 		// A rebased compaction that shadows the commits it rebased on resurrects the old values of
 		// the keys it merged. The engine list-append workload rewrites a list under one key, so a
-		// resurrected list loses appends. The bank workload cannot see it, because the resurrected
-		// balances are a consistent older state that conserves money, and the SQL list-append
-		// workload cannot either, because it only inserts rows under new keys, which a compacted
-		// segment does not contain.
+		// resurrected list loses appends, and so does the SQL list-append workload, which updates
+		// the row of a packed list in place. The bank workload cannot see it, because the
+		// resurrected balances are a consistent older state that conserves money.
 		{name: "the compacted segment ahead of newer ones after a rebase", mutations: engine.Mutations{CompactedSegmentAhead: true}, workloads: []sim.Workload{sim.ListAppend}, maintainers: 2},
+		{name: "the compacted segment ahead of newer ones after a rebase", mutations: engine.Mutations{CompactedSegmentAhead: true}, workloads: []sim.Workload{sim.ListAppend}, sql: true, maintainers: 2},
 		// The engine mutants are also visible through SQL.
 		{name: "commit without CAS", mutations: engine.Mutations{CommitWithoutCAS: true}, workloads: []sim.Workload{sim.ListAppend}, sql: true},
 		{name: "GC ignoring the grace period", mutations: engine.Mutations{GCIgnoreGrace: true}, workloads: []sim.Workload{sim.ListAppend, sim.Bank}, sql: true, maintainers: 2, detectedBy: "grace period"},
