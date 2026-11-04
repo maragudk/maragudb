@@ -2,7 +2,7 @@
 
 ## What it is
 
-maragudb is an embedded Go SQL database. Its only durable state is in S3-compatible object storage. Many processes can read and write the same database at the same time, with strict serializable ACID transactions. Caches in memory and on local disk are allowed (in the style of turbopuffer), but correctness never depends on them: losing every cache never loses or corrupts data.
+maragudb is an embedded Go SQL database. Its only durable state is in S3-compatible object storage. `INV-S3-ONLY` Many processes can read and write the same database at the same time, with strict serializable ACID transactions. `INV-MULTI-WRITER` Caches in memory and on local disk are allowed (in the style of turbopuffer), but correctness never depends on them: losing every cache never loses or corrupts data. `INV-CACHE-LOSS`
 
 Target workload: small OLTP app databases (web app backends, point lookups, small transactions, MBs to a few GBs). Commit latency of tens of milliseconds is acceptable.
 
@@ -11,28 +11,28 @@ The project is not reviewed manually. Automated tests are the only quality gate,
 ## Fixed product decisions
 
 - **Form factor:** embedded Go library, module `maragu.dev/maragudb`, public on GitHub.
-- **API:** a `database/sql` driver, registered explicitly with `maragudb.RegisterDriver(maragudb.Options{...})`. There is no `init` registration. Options use pointer fields with opinionated defaults, as in <https://github.com/maragudk/sqlite/blob/main/sqlite.go>. The DSN identifies a bucket and a prefix, for example `s3://bucket/prefix`. Placeholders use the `$1` style. A small native API exposes `Stats()`, with S3 request counts by kind and cache hits and misses, and also exposes cache options.
-- **Concurrency:** multi-writer with optimistic concurrency. Commits are compare-and-swap writes through S3 conditional writes (`If-Match` / `If-None-Match`). No external lock service is used.
-- **Isolation:** strict serializable. A read transaction sees every commit that was acknowledged before the transaction started.
-  - In section 1, conflict detection is at database granularity: any concurrent write commit is a conflict. Finer granularity can come later.
-  - A single statement outside an explicit transaction retries automatically on conflict.
-  - An explicit transaction returns a typed, retryable serialization error, similar to Postgres SQLSTATE 40001. Callers detect it with `errors.Is` or `errors.As`.
-  - Read-only transactions never conflict.
-- **Durability:** a commit is acknowledged only after its S3 write is confirmed.
-- **SQL flavor:** our own. It follows Postgres semantics where it is sensible and has none of SQLite's quirks: no type affinity, no implicit coercion, and values are type-checked.
+- **API:** a `database/sql` driver, registered explicitly with `maragudb.RegisterDriver(maragudb.Options{...})`. There is no `init` registration. `INV-REGISTER` Options use pointer fields with opinionated defaults, as in <https://github.com/maragudk/sqlite/blob/main/sqlite.go>. `INV-OPTIONS` The DSN identifies a bucket and a prefix, for example `s3://bucket/prefix`. `INV-DSN` Placeholders use the `$1` style. `INV-PLACEHOLDERS` A small native API exposes `Stats()`, with S3 request counts by kind and cache hits and misses, and also exposes cache options. `INV-STATS`
+- **Concurrency:** multi-writer with optimistic concurrency. Commits are compare-and-swap writes through S3 conditional writes (`If-Match` / `If-None-Match`). No external lock service is used. `INV-CAS-COMMIT`
+- **Isolation:** strict serializable. A read transaction sees every commit that was acknowledged before the transaction started. `INV-STRICT-SERIALIZABLE`
+  - In section 1, conflict detection is at database granularity: any concurrent write commit is a conflict. `INV-DB-CONFLICTS` Finer granularity can come later.
+  - A single statement outside an explicit transaction retries automatically on conflict. `INV-AUTOCOMMIT-RETRY`
+  - An explicit transaction returns a typed, retryable serialization error, similar to Postgres SQLSTATE 40001. Callers detect it with `errors.Is` or `errors.As`. `INV-RETRYABLE-ERROR`
+  - Read-only transactions never conflict. `INV-READ-ONLY`
+- **Durability:** a commit is acknowledged only after its S3 write is confirmed. `INV-DURABLE-ACK`
+- **SQL flavor:** our own. It follows Postgres semantics where it is sensible and has none of SQLite's quirks: no type affinity, no implicit coercion, and values are type-checked. `INV-STRICT-TYPES`
 - **Types:**
 
   | Type | Meaning |
   |------|---------|
-  | `int` | int64. Overflow is an error. |
+  | `int` | int64. Overflow is an error. `INV-INT-OVERFLOW` |
   | `float` | float64 |
   | `bool` | boolean |
   | `string` | UTF-8 text |
   | `bytes` | binary data |
   | `time` | UTC instant with nanosecond precision |
 
-  NULL is supported.
-- **Telemetry:** an optional `*slog.Logger` in Options, plus `Stats()`. OpenTelemetry is out of scope for now.
+  NULL is supported. `INV-TYPES`
+- **Telemetry:** an optional `*slog.Logger` in Options, plus `Stats()`. `INV-LOGGER` OpenTelemetry is out of scope for now.
 - **Repo bootstrap:** copy LICENSE, `.editorconfig`, `.github`, `.gitignore`, AGENTS.md, CLAUDE.md, and the Makefile from <https://github.com/maragudk/template>, then adapt them. Do not copy `template.go`.
 - **Workflow:** no PRs. Commit directly to `main`.
 
@@ -75,31 +75,31 @@ The project is built in three sections. A section is done only when all of its a
 These apply to every section, for the SQL surface that exists at that point.
 
 1. **Serializability under faults.** A seeded deterministic simulation runs many concurrent clients against an in-process fake S3. The fake S3 injects these faults:
-   - errors
-   - latency
-   - lost acknowledgements, where the write succeeded but the response was lost
-   - client crashes at any step, including mid-commit and mid-compaction or mid-GC
+   - errors `AC-1.1`
+   - latency `AC-1.2`
+   - lost acknowledgements, where the write succeeded but the response was lost `AC-1.3`
+   - client crashes at any step, including mid-commit and mid-compaction or mid-GC `AC-1.4`
 
-   History checkers find zero anomalies across a fixed seed corpus (run in `make test`) and a longer soak run (a separate make target). At least two checkers are required:
-   - a bank workload, where the total balance is invariant
-   - an Elle-style list-append workload, which checks for strict serializability
+   History checkers find zero anomalies across a fixed seed corpus (run in `make test`) `AC-1.5` and a longer soak run (a separate make target). `AC-1.6` At least two checkers are required:
+   - a bank workload, where the total balance is invariant `AC-1.7`
+   - an Elle-style list-append workload, which checks for strict serializability `AC-1.8`
 
-   Each failure can be reproduced from its seed alone.
-2. **The checkers can fail.** Deliberately broken builds must be detected by criterion 1. Examples: commit without CAS, GC that deletes too early, a cache served without a freshness check. This proves that the tests are not vacuous.
-3. **Durability and atomicity.** Every acknowledged commit stays visible after any crash. An unacknowledged commit is either completely visible or completely invisible, never partial.
-4. **Differential testing against Postgres.** Hegel generates schemas, data, and queries as an AST. The AST is rendered both to maragudb SQL and to Postgres SQL, and the Postgres side runs in Docker. Comparison rules:
-   - When `ORDER BY` determines the order completely, results must match exactly. Otherwise they must match as multisets.
-   - Both systems must agree on whether a statement succeeds or fails.
-   - Intentional deviations are listed in `docs/deviations.md`, and each one has its own test.
+   Each failure can be reproduced from its seed alone. `AC-1.9`
+2. **The checkers can fail.** Deliberately broken builds must be detected by criterion 1. Examples: commit without CAS, GC that deletes too early, a cache served without a freshness check. This proves that the tests are not vacuous. `AC-2`
+3. **Durability and atomicity.** Every acknowledged commit stays visible after any crash. `AC-3.1` An unacknowledged commit is either completely visible or completely invisible, never partial. `AC-3.2`
+4. **Differential testing against Postgres.** Hegel generates schemas, data, and queries as an AST. The AST is rendered both to maragudb SQL and to Postgres SQL, and the Postgres side runs in Docker. `AC-4.1` Comparison rules:
+   - When `ORDER BY` determines the order completely, results must match exactly. Otherwise they must match as multisets. `AC-4.2`
+   - Both systems must agree on whether a statement succeeds or fails. `AC-4.3`
+   - Intentional deviations are listed in `docs/deviations.md`, and each one has its own test. `AC-4.4`
 5. **S3 request budgets.** These are deterministic and are checked against the fake S3 via `Stats()`:
-   - A commit uses O(1) PUTs, independent of database size.
-   - A transaction with a warm cache uses one conditional GET (or HEAD) for the freshness check, plus nothing else for cached data.
-   - A point lookup with a cold cache uses O(log n) GETs.
+   - A commit uses O(1) PUTs, independent of database size. `AC-5.1`
+   - A transaction with a warm cache uses one conditional GET (or HEAD) for the freshness check, plus nothing else for cached data. `AC-5.2`
+   - A point lookup with a cold cache uses O(log n) GETs. `AC-5.3`
 
-   Latency against Tigris is measured and reported, but it does not gate.
-6. **Bounded storage.** After compaction, the object count grows with data size, not with commit count. GC never deletes an object that a snapshot within the configured grace period still references. A reader older than the grace period gets a clear error, never wrong data.
-7. **Real S3-compatible storage.** An integration suite passes against Tigris. If the Tigris credentials are not in the environment or in a gitignored `.env` file, the suite fails and does not skip. The failure message names the missing variables.
-8. **Antithesis-ready.** Antithesis Go SDK assertions (Always, Sometimes, and Reachable) mark the key invariants. A docker-compose harness runs the simulator workloads as an Antithesis workload. Go cross-compiles to amd64.
+   Latency against Tigris is measured and reported, but it does not gate. `AC-5.4`
+6. **Bounded storage.** After compaction, the object count grows with data size, not with commit count. `AC-6.1` GC never deletes an object that a snapshot within the configured grace period still references. `AC-6.2` A reader older than the grace period gets a clear error, never wrong data. `AC-6.3`
+7. **Real S3-compatible storage.** An integration suite passes against Tigris. `AC-7.1` If the Tigris credentials are not in the environment or in a gitignored `.env` file, the suite fails and does not skip. The failure message names the missing variables. `AC-7.2`
+8. **Antithesis-ready.** Antithesis Go SDK assertions (Always, Sometimes, and Reachable) mark the key invariants. `AC-8.1` A docker-compose harness runs the simulator workloads as an Antithesis workload. `AC-8.2` Go cross-compiles to amd64. `AC-8.3`
 
 ## Out of scope for now
 
