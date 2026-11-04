@@ -47,6 +47,9 @@ type Config struct {
 	// GracePeriod for GC. A reader younger than it that loses its snapshot is an anomaly.
 	// Defaults to one hour.
 	GracePeriod time.Duration
+	// MaintenanceInterval between the background maintenance checks of each client, which
+	// compact and garbage collect under the lease. Defaults to 200 milliseconds.
+	MaintenanceInterval time.Duration
 	// Rand drives every decision. Required.
 	Rand *rand.Rand
 	// Log receives progress lines when non-nil.
@@ -65,14 +68,17 @@ type Result struct {
 
 // Stats of a run.
 type Stats struct {
-	Commits, Conflicts, Unknown, Failed, Restarts, Compactions int
+	Commits, Conflicts, Unknown, Failed, Restarts int
+	// Compactions and Deleted count what the clients' background maintenance did, and
+	// MaintenanceRuns, LeaseAcquisitions, and LeaseLosses how it was coordinated.
+	Compactions, Deleted, MaintenanceRuns, LeaseAcquisitions, LeaseLosses int
 }
 
 // Report of the run, for logs.
 func (r Result) Report() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "%d tx, %d commits, %d conflicts, %d unknown, %d other failures, %d restarts, %d compactions",
-		len(r.History), r.Stats.Commits, r.Stats.Conflicts, r.Stats.Unknown, r.Stats.Failed, r.Stats.Restarts, r.Stats.Compactions)
+	fmt.Fprintf(&b, "%d tx, %d commits, %d conflicts, %d unknown, %d other failures, %d restarts, %d compactions, %d deleted, %d maintenance runs (%d lease acquisitions, %d losses)",
+		len(r.History), r.Stats.Commits, r.Stats.Conflicts, r.Stats.Unknown, r.Stats.Failed, r.Stats.Restarts, r.Stats.Compactions, r.Stats.Deleted, r.Stats.MaintenanceRuns, r.Stats.LeaseAcquisitions, r.Stats.LeaseLosses)
 	for _, a := range r.Anomalies {
 		fmt.Fprintf(&b, "\nANOMALY: %v", a)
 	}
@@ -102,21 +108,19 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	if cfg.GracePeriod == 0 {
 		cfg.GracePeriod = time.Hour
 	}
+	if cfg.MaintenanceInterval == 0 {
+		cfg.MaintenanceInterval = 200 * time.Millisecond
+	}
 	r := &run{cfg: cfg, start: time.Now(), rng: cfg.Rand}
 	if err := r.seed(ctx); err != nil {
 		return Result{}, fmt.Errorf("workload: seeding: %w", err)
 	}
 
-	clientsCtx, stopMaintainer := context.WithCancel(ctx)
-	var maintainer sync.WaitGroup
-	maintainer.Go(func() { r.maintain(clientsCtx) })
 	var clients sync.WaitGroup
 	for i := range cfg.Clients {
 		clients.Go(func() { r.client(ctx, i) })
 	}
 	clients.Wait()
-	stopMaintainer()
-	maintainer.Wait()
 
 	// The clients may have stopped because ctx ended, and the history must still be checked, so
 	// the final read gets a deadline of its own.
@@ -145,6 +149,9 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	}
 	assert.Sometimes(r.stats.Unknown > 0, "a commit against a real object store has an unknown outcome", nil)
 	assert.Sometimes(r.stats.Conflicts > 0, "a commit against a real object store conflicts", nil)
+	assert.Sometimes(r.stats.Compactions > 0, "background maintenance compacts against a real object store", nil)
+	assert.Sometimes(r.stats.Deleted > 0, "background maintenance deletes garbage against a real object store", nil)
+	assert.Sometimes(r.stats.LeaseLosses > 0, "a maintenance lease is lost against a real object store", nil)
 	return Result{History: r.txs, Audits: r.audits, Anomalies: r.anoms, Stats: r.stats}, nil
 }
 
@@ -244,27 +251,71 @@ func (r *run) engineOptions(cache bool) engine.Options {
 	return opts
 }
 
-// process is one client's connection to the database: an engine, or a database/sql handle.
+// process is one client's connection to the database: an engine, or a database/sql handle,
+// each with background maintenance running: the driver's own loop for a handle, and a loop
+// here for an engine.
 type process struct {
-	db  *engine.DB
-	sql *sql.DB
+	run    *run
+	engine *engine.DB
+	db     *engine.DB
+	sql    *sql.DB
+	stop   context.CancelFunc
+	done   chan struct{}
 }
 
+// close the process and add its maintenance to the run's statistics.
 func (p *process) close() {
+	if p.stop != nil {
+		p.stop()
+		<-p.done
+	}
 	if p.sql != nil {
 		_ = p.sql.Close()
 	}
+	s := p.engine.Stats()
+	p.run.mu.Lock()
+	p.run.stats.Compactions += int(s.Compactions)
+	p.run.stats.Deleted += int(s.Deleted)
+	p.run.stats.MaintenanceRuns += int(s.MaintenanceRuns)
+	p.run.stats.LeaseAcquisitions += int(s.LeaseAcquisitions)
+	p.run.stats.LeaseLosses += int(s.LeaseLosses)
+	p.run.mu.Unlock()
 }
 
-func (r *run) open(ctx context.Context, cache bool) (*process, error) {
+// open a process. maintain says whether it runs background maintenance.
+func (r *run) open(ctx context.Context, cache, maintain bool) (*process, error) {
 	if !r.cfg.SQL {
 		db, err := engine.Open(ctx, r.engineOptions(cache))
 		if err != nil {
 			return nil, err
 		}
-		return &process{db: db}, nil
+		p := &process{run: r, engine: db, db: db}
+		if maintain {
+			m := db.NewMaintainer(engine.MaintenanceOptions{})
+			loopCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+			p.stop, p.done = cancel, make(chan struct{})
+			go func() {
+				defer close(p.done)
+				defer func() { _ = m.Close(context.WithoutCancel(ctx)) }()
+				for {
+					select {
+					case <-loopCtx.Done():
+						return
+					case <-time.After(r.cfg.MaintenanceInterval):
+					}
+					if _, err := m.Step(loopCtx); err != nil && loopCtx.Err() == nil {
+						r.log("maintenance: %v", err)
+					}
+				}
+			}()
+		}
+		return p, nil
 	}
-	d := sqldriver.New(sqldriver.Options{Engine: r.engineOptions(cache), Exec: exec.Options{}})
+	d := sqldriver.New(sqldriver.Options{
+		Engine:      r.engineOptions(cache),
+		Exec:        exec.Options{},
+		Maintenance: sqldriver.MaintenanceOptions{Disabled: !maintain, Interval: r.cfg.MaintenanceInterval},
+	})
 	c, err := sqldriver.NewConnector(d, "s3://workload/"+r.cfg.Prefix)
 	if err != nil {
 		return nil, err
@@ -275,7 +326,12 @@ func (r *run) open(ctx context.Context, cache bool) (*process, error) {
 		_ = db.Close()
 		return nil, err
 	}
-	return &process{sql: db}, nil
+	edb, err := c.DB(ctx)
+	if err != nil {
+		_ = db.Close()
+		return nil, err
+	}
+	return &process{run: r, engine: edb, sql: db}, nil
 }
 
 // GaveUpError is returned when the store did not answer before the context ended. Err is the
@@ -314,7 +370,7 @@ func retry(ctx context.Context, fn func() error) error {
 func (r *run) seed(ctx context.Context) error {
 	r.total = int64(r.cfg.Keys) * initialBalance
 	return retry(ctx, func() error {
-		p, err := r.open(ctx, false)
+		p, err := r.open(ctx, false, false)
 		if err != nil {
 			return err
 		}
@@ -383,8 +439,9 @@ func (r *run) seeded(ctx context.Context, p *process) (bool, error) {
 	return false, err
 }
 
-// client runs transactions. A transaction that runs out of time is like a crash in the middle
-// of it, after which the client starts over with a new engine and cold caches.
+// client runs transactions, with background maintenance. A transaction that runs out of time
+// is like a crash in the middle of it, after which the client starts over with a new engine and
+// cold caches.
 func (r *run) client(ctx context.Context, id int) {
 	var p *process
 	defer func() {
@@ -395,7 +452,7 @@ func (r *run) client(ctx context.Context, id int) {
 	for i := 0; i < r.cfg.TxPerClient && ctx.Err() == nil; i++ {
 		if p == nil {
 			var err error
-			if p, err = r.open(ctx, r.intN(2) == 0); err != nil {
+			if p, err = r.open(ctx, r.intN(2) == 0, true); err != nil {
 				r.log("client %d: open: %v", id, err)
 				time.Sleep(10 * time.Millisecond)
 				i--
@@ -425,39 +482,6 @@ func (r *run) client(ctx context.Context, id int) {
 			p.close()
 			p = nil
 		}
-	}
-}
-
-// maintain compacts and garbage collects now and then until ctx ends.
-func (r *run) maintain(ctx context.Context) {
-	var db *engine.DB
-	if err := retry(ctx, func() error {
-		var err error
-		db, err = engine.Open(ctx, r.engineOptions(false))
-		return err
-	}); err != nil {
-		return
-	}
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-time.After(time.Duration(50+r.intN(450)) * time.Millisecond):
-		}
-		// Compaction loses to every concurrent commit, so it tries a few times, and GC follows at
-		// once, so that a reader with an older snapshot may still need what GC considers.
-		for range 5 {
-			err := db.Compact(ctx)
-			if err == nil {
-				r.mu.Lock()
-				r.stats.Compactions++
-				r.mu.Unlock()
-			}
-			if !errors.Is(err, engine.ErrConflict) {
-				break
-			}
-		}
-		_, _ = db.GC(ctx)
 	}
 }
 
@@ -804,7 +828,7 @@ func (r *run) readFinal(ctx context.Context) (map[string][]int64, map[string]int
 	var lists map[string][]int64
 	var balances map[string]int64
 	err := retry(ctx, func() error {
-		p, err := r.open(ctx, false)
+		p, err := r.open(ctx, false, false)
 		if err != nil {
 			return err
 		}

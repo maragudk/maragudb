@@ -188,8 +188,10 @@ func store(ctx context.Context, w sim.Workload, useSQL bool) error {
 		Keys:        1 + rng.IntN(5),
 		MaxTimeout:  time.Duration(100+rng.IntN(5000)) * time.Millisecond,
 		GracePeriod: time.Duration(1+rng.IntN(10)) * time.Second,
-		Rand:        rng,
-		Log:         func(line string) { fmt.Println(line) },
+		// Short enough that compaction and GC run several times in a run of a few seconds.
+		MaintenanceInterval: time.Duration(100+rng.IntN(900)) * time.Millisecond,
+		Rand:                rng,
+		Log:                 func(line string) { fmt.Println(line) },
 	}
 	fmt.Printf("running %v (SQL %v) in %s with %d clients of %d transactions on %d keys\n", w, useSQL, cfg.Prefix, cfg.Clients, cfg.TxPerClient, cfg.Keys)
 	// The run gets a few minutes; a store that stays unreachable longer is not a finding.

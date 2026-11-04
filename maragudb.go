@@ -302,8 +302,9 @@ func Compact(ctx context.Context, db *sql.DB) error {
 }
 
 // GC deletes objects that no transaction within the grace period can reference, and returns how
-// many it deleted. It returns [ErrConflict] when a commit happened meanwhile, and can then be
-// retried.
+// many it deleted. Commits that happen meanwhile do not fail it; it returns [ErrConflict] only
+// when it kept losing to them, and can then be retried. Background maintenance runs it on its
+// own unless [Options.Maintenance] is off.
 func GC(ctx context.Context, db *sql.DB) (int, error) {
 	var n int
 	err := withConn(ctx, db, func(c *sqldriver.Conn) error {

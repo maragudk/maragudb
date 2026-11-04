@@ -99,10 +99,10 @@ type Stats struct {
 	Segments int
 	// Garbage objects awaiting their grace period.
 	Garbage int
-	// CompactionsStarted counts the compactions that began merging, and CompactionRebases the
-	// times a compaction reapplied its swap on top of commits that landed meanwhile instead of
-	// failing.
-	CompactionsStarted, CompactionRebases int64
+	// CompactionsStarted counts the compactions that began merging, Compactions the ones that
+	// landed, CompactionRebases the times a compaction reapplied its swap on top of commits that
+	// landed meanwhile instead of failing, and Deleted the objects garbage collection deleted.
+	CompactionsStarted, Compactions, CompactionRebases, Deleted int64
 	// MaintenanceRuns counts the [Maintainer] steps that changed the database, and
 	// LeaseAcquisitions and LeaseLosses the times a maintainer acquired the maintenance lease
 	// and lost it to another maintainer.
@@ -129,9 +129,9 @@ type DB struct {
 	manifest   *manifest
 	etag       string
 
-	memHits, memMisses, diskHits, diskMisses        atomic.Int64
-	compactionsStarted, compactionRebases           atomic.Int64
-	maintenanceRuns, leaseAcquisitions, leaseLosses atomic.Int64
+	memHits, memMisses, diskHits, diskMisses                    atomic.Int64
+	compactionsStarted, compactions, compactionRebases, deleted atomic.Int64
+	maintenanceRuns, leaseAcquisitions, leaseLosses             atomic.Int64
 }
 
 // Open a database, creating it when no manifest exists.
@@ -221,7 +221,9 @@ func (db *DB) Stats() Stats {
 		DiskCacheHits:      db.diskHits.Load(),
 		DiskCacheMisses:    db.diskMisses.Load(),
 		CompactionsStarted: db.compactionsStarted.Load(),
+		Compactions:        db.compactions.Load(),
 		CompactionRebases:  db.compactionRebases.Load(),
+		Deleted:            db.deleted.Load(),
 		MaintenanceRuns:    db.maintenanceRuns.Load(),
 		LeaseAcquisitions:  db.leaseAcquisitions.Load(),
 		LeaseLosses:        db.leaseLosses.Load(),

@@ -136,6 +136,7 @@ func (db *DB) compact(ctx context.Context, progress func() error) (bool, error) 
 		base, baseEtag = cur, curEtag
 	}
 	assert.Reachable("compaction succeeded", nil)
+	db.compactions.Add(1)
 	db.log.Info("compacted", "segments", len(m.Segments), "entries", count, "seq", db.Stats().Seq)
 	return true, nil
 }
@@ -257,6 +258,7 @@ func (db *DB) gc(ctx context.Context, progress func() error) (int, bool, error) 
 		}
 		gone[key] = true
 		deleted++
+		db.deleted.Add(1)
 	}
 
 	// The pass is reapplied on top of whatever manifest is current: deleted objects leave the

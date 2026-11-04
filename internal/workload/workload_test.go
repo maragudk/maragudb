@@ -47,10 +47,15 @@ func TestRun(t *testing.T) {
 					total.Commits += res.Stats.Commits
 					total.Conflicts += res.Stats.Conflicts
 					total.Failed += res.Stats.Failed
+					total.Compactions += res.Stats.Compactions
+					total.MaintenanceRuns += res.Stats.MaintenanceRuns
+					total.LeaseAcquisitions += res.Stats.LeaseAcquisitions
 				}
 				t.Logf("%+v", total)
 				is.True(t, total.Commits > 20, "commits")
 				is.True(t, total.Conflicts > 0, "conflicts")
+				is.True(t, total.Compactions > 0, "background compactions")
+				is.True(t, total.LeaseAcquisitions > 0, "lease acquisitions")
 			})
 		}
 	}

@@ -1151,6 +1151,51 @@ func TestDB_Tigris(t *testing.T) {
 		is.Equal(t, strconv.Itoa(writers*perWriter), v, "every increment landed exactly once")
 	})
 
+	t.Run("the maintenance lease is acquired, renewed, and taken over after it expires", func(t *testing.T) {
+		db1 := open(t, 60, engine.Options{})
+		db2 := open(t, 61, engine.Options{})
+		// A probe measures how long acquiring and releasing takes on this run's network, and
+		// the lease is sized from that, so that renewals and the takeover do not depend on a
+		// fixed latency. The probe also leaves an expired lease behind, as a closed process does.
+		probe := db1.NewMaintainer(engine.MaintenanceOptions{Holder: "probe", LeaseDuration: time.Hour})
+		start := time.Now()
+		ok, err := probe.Acquire(t.Context())
+		is.NotError(t, err)
+		is.True(t, ok, "acquired a lease that did not exist")
+		is.NotError(t, probe.Release(t.Context()))
+		roundTrip := time.Since(start)
+		lease := max(2*time.Second, 5*roundTrip)
+		t.Logf("acquire and release: %v, lease: %v", roundTrip.Round(time.Millisecond), lease.Round(time.Millisecond))
+
+		m1 := db1.NewMaintainer(engine.MaintenanceOptions{Holder: "one", LeaseDuration: lease})
+		m2 := db2.NewMaintainer(engine.MaintenanceOptions{Holder: "two", LeaseDuration: lease})
+		ok, err = m1.Acquire(t.Context())
+		is.NotError(t, err)
+		is.True(t, ok, "took over the expired lease")
+		ok, err = m2.Acquire(t.Context())
+		is.NotError(t, err)
+		is.True(t, !ok, "held by the other process")
+		is.NotError(t, m1.Renew(t.Context()))
+		ok, err = m2.Acquire(t.Context())
+		is.NotError(t, err)
+		is.True(t, !ok, "still held after the renewal")
+
+		// The renewal set the expiry a lease ahead of a clock reading before its request, so a
+		// lease after it returned has passed the expiry.
+		time.Sleep(lease)
+		ok, err = m2.Acquire(t.Context())
+		is.NotError(t, err)
+		is.True(t, ok, "taken over after expiry")
+		is.Error(t, engine.ErrLeaseLost, m1.Renew(t.Context()))
+		is.Equal(t, int64(1), db1.Stats().LeaseLosses)
+		is.Equal(t, int64(1), db2.Stats().LeaseAcquisitions)
+		is.NotError(t, m2.Release(t.Context()))
+		ok, err = m1.Acquire(t.Context())
+		is.NotError(t, err)
+		is.True(t, ok, "a released lease is free at once")
+		is.NotError(t, m1.Close(t.Context()))
+	})
+
 	t.Run("compaction and GC keep the data and bound the objects", func(t *testing.T) {
 		// Write with the default grace period and time each commit, so the grace period below is
 		// sized from this run's network latency instead of assumed.
