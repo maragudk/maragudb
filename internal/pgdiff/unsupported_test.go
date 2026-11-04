@@ -207,6 +207,7 @@ func TestUnsupported(t *testing.T) {
 			example{SQL: "SELECT 2 BETWEEN SYMMETRIC 3 AND 1"},
 			example{SQL: `SELECT 'a' COLLATE "C"`},
 			example{SQL: "SELECT '2024-01-01'::timestamptz AT TIME ZONE 'UTC'"},
+			example{SQL: "SELECT CAST('\\x0102'::bytea AS bigint)"},
 		)
 	})
 

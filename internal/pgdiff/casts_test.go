@@ -52,6 +52,35 @@ func TestCasts(t *testing.T) {
 			}
 		}, hegel.WithTestCases(castCases()))
 	})
+
+	t.Run("every value casts to every type the same as Postgres, or is rejected as unsupported", func(t *testing.T) {
+		verify.Covers(t, "hegel-drawn values of every supported type, and integer and numeric literals, cast to every supported type and back to text with the same result or error class as Postgres, unless maragudb rejects the cast as unsupported", "INV-PG-SUBSET", "INV-TYPES")
+		b := newBoth(t, "")
+		sources := []string{"0", "1", "-7", "2147483647", "9223372036854775807", "1.5", "-0.5", "1e400", "'NaN'::float8", "'-0'::float8", "2.5::float8", "1e308::float8", "TRUE", "FALSE", "'t'", "'abc'", "''",
+			"'\\x0102'::bytea", "'\\x'::bytea", "'\\x0102030405060708090a'::bytea", "'2024-01-02 03:04:05.5+00'::timestamptz", "NULL", "9223372036854775807::bigint", "'12'::text", "' 12 '"}
+		targets := []string{"bigint", "double precision", "boolean", "text", "bytea", "timestamptz", "integer", "numeric"}
+		hegel.Test(t, func(ht *hegel.T) {
+			query := fmt.Sprintf("SELECT CAST(CAST(%s AS %s) AS text)", hegel.Draw(ht, hegel.SampledFrom(sources)), hegel.Draw(ht, hegel.SampledFrom(targets)))
+			if hegel.Draw(ht, hegel.Booleans()) {
+				query = fmt.Sprintf("SELECT CAST(CAST(CAST(%s AS %s) AS %s) AS text)", hegel.Draw(ht, hegel.SampledFrom(sources)), hegel.Draw(ht, hegel.SampledFrom(targets)), hegel.Draw(ht, hegel.SampledFrom(targets)))
+			}
+			ht.Note(query)
+			var m, pg sql.NullString
+			mErr := b.m.QueryRowContext(t.Context(), query).Scan(&m)
+			if errors.Is(mErr, maragudb.ErrUnsupported) {
+				return
+			}
+			pgErr := b.pg.QueryRowContext(t.Context(), query).Scan(&pg)
+			switch {
+			case (mErr == nil) != (pgErr == nil):
+				ht.Fatalf("%s: maragudb %q, %v; postgres %q, %v", query, m.String, mErr, pg.String, pgErr)
+			case mErr != nil && !pgdiff.SameClass(mErr, pgErr):
+				ht.Fatalf("%s: maragudb %v; postgres SQLSTATE %s, %v", query, mErr, pgdiff.SQLState(pgErr), pgErr)
+			case m != pg:
+				ht.Fatalf("%s: maragudb %q, postgres %q", query, m.String, pg.String)
+			}
+		}, hegel.WithTestCases(castCases()))
+	})
 }
 
 func TestParameters(t *testing.T) {

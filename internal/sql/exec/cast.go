@@ -39,6 +39,10 @@ func (b *binder) cast(x *cexpr, t value.Type) (*cexpr, error) {
 			}
 			return value.NewInt(int64(r)), nil
 		}
+	case from == value.Int4 && t == value.Bool:
+		f = func(v value.Value) (value.Value, error) { return value.NewBool(v.I != 0), nil }
+	case (from == value.Int4 || from == value.Int) && t == value.Bytes, from == value.Bytes && t == value.Int:
+		return nil, fmt.Errorf("%w: casts between bytea and integers are not supported", ErrUnsupported)
 	case t == value.String:
 		f = func(v value.Value) (value.Value, error) { return value.NewString(value.Format(v)), nil }
 	case from == value.String:

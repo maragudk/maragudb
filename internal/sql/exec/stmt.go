@@ -338,26 +338,56 @@ func (s *Session) update(ctx context.Context, st *ast.Update, params []value.Val
 // of a row that the same statement moves away, whether the statement fails depends on that
 // order. Such a statement is rejected; every other outcome is the same in every order: a move
 // onto a key that stays is a duplicate, two rows moving onto one key are a duplicate, and
-// anything else succeeds.
+// anything else succeeds. When a row's new values fail, the statement fails in every order, and
+// the error is the one Postgres reports when it visits the rows in key order.
 func (s *Session) updateKeys(ctx context.Context, t *table, a access, f filter, assign func([]value.Value) ([]value.Value, error)) (Result, error) {
 	type move struct {
 		oldKey, newKey []byte
 		row            []value.Value
+		err            error
 	}
 	var moves []move
+	failed := false
 	err := s.scanRows(ctx, t, a, f, func(key []byte, old []value.Value) (bool, error) {
-		row, err := assign(old)
-		if err != nil {
-			return false, err
+		m := move{oldKey: append([]byte{}, key...)}
+		if m.row, m.err = assign(old); m.err == nil {
+			if m.err = t.checkRow(m.row); m.err == nil {
+				m.newKey = t.rowKey(m.row)
+			}
 		}
-		if err := t.checkRow(row); err != nil {
-			return false, err
-		}
-		moves = append(moves, move{oldKey: append([]byte{}, key...), newKey: t.rowKey(row), row: row})
+		failed = failed || m.err != nil
+		moves = append(moves, m)
 		return true, nil
 	})
-	if err != nil {
+	if err != nil && (!failed || !errors.Is(err, errOrderDependent)) {
 		return Result{}, err
+	}
+	if failed {
+		// Visit the rows in key order as Postgres would, checking each new key against the keys
+		// of the rows not visited yet and the new keys of those visited.
+		live, matched := map[string]bool{}, map[string]bool{}
+		for _, m := range moves {
+			live[string(m.oldKey)] = true
+			matched[string(m.oldKey)] = true
+		}
+		for _, m := range moves {
+			if m.err != nil {
+				return Result{}, m.err
+			}
+			k := string(m.newKey)
+			if k != string(m.oldKey) {
+				_, exists, err := s.kv.get(ctx, m.newKey)
+				if err != nil {
+					return Result{}, err
+				}
+				if live[k] || exists && !matched[k] {
+					return Result{}, fmt.Errorf("%w: table %q already has a row with key %s", ErrDuplicateKey, t.Name, keyDescription(t, m.row))
+				}
+				delete(live, string(m.oldKey))
+			}
+			live[k] = true
+		}
+		panic("exec: a failed UPDATE row went unreported")
 	}
 	vacated := map[string]bool{}
 	for _, m := range moves {
