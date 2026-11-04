@@ -13,7 +13,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - 29 acceptance criteria (`AC-`), 20 key invariants (`INV-`), 17 classes of unsupported statements (`UNS-`), and 0 remaining differences from Postgres (`DEV-`), each verified by at least one test.
 - 8 mutants (`MUT-`), deliberate bugs, of which 7 are detected by the simulator's checkers within 20 seeds.
 - 13 interesting states (`STATE-`) that the simulator's fixed corpus must reach.
-- 126 declarations of coverage in the tests.
+- 127 declarations of coverage in the tests.
 
 ## Acceptance criteria
 
@@ -623,6 +623,7 @@ Targeted tests:
 Targeted tests:
 
 - `internal/engine` `TestMutations/CompactedSegmentAhead_lets_a_rebased_compaction_hide_newer_commits`: with the mutant, a rebased compaction resurrects values that a newer commit deleted and changed
+- `internal/workload` `TestRun/finds_old_values_that_shadow_newer_ones_when_a_rebased_compaction_puts_its_segment_ahead,_through_the_packed_lists_of_SQL`: the real-store SQL list-append workload, whose packed lists update rows in place, finds the stale reads of the mutant
 
 ### `MUT-FRESH-SNAPSHOT`
 

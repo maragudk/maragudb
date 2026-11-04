@@ -103,6 +103,25 @@ func TestRun(t *testing.T) {
 		t.Fatal("not detected in 60 seeds")
 	})
 
+	t.Run("finds old values that shadow newer ones when a rebased compaction puts its segment ahead, through the packed lists of SQL", func(t *testing.T) {
+		verify.Covers(t, "the real-store SQL list-append workload, whose packed lists update rows in place, finds the stale reads of the mutant", "MUT-COMPACTED-AHEAD")
+		// The run is in wall-clock time, so the seed does not decide it, and detection varies.
+		for seed := range uint64(60) {
+			cfg := config(seed, sim.ListAppend, true, s3fake.Faults{})
+			cfg.Mutations = engine.Mutations{CompactedSegmentAhead: true}
+			res, err := workload.Run(t.Context(), cfg)
+			is.NotError(t, err)
+			for _, a := range res.Anomalies {
+				var anomaly *history.Anomaly
+				if errors.As(a, &anomaly) {
+					t.Logf("detected with seed %d: %v", seed, a)
+					return
+				}
+			}
+		}
+		t.Fatal("not detected in 60 seeds")
+	})
+
 	t.Run("checks the history even when the clients stopped because the context ended", func(t *testing.T) {
 		cfg := config(1, sim.ListAppend, false, s3fake.Faults{})
 		cfg.TxPerClient = 1 << 30

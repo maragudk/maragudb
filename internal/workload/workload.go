@@ -230,6 +230,16 @@ func (r *run) outcome(err error) history.Outcome {
 	return history.Failed
 }
 
+// listReadError records an anomaly for a missing or corrupt packed list, which no transaction
+// ever writes, and otherwise handles a failed read like [run.readError].
+func (r *run) listReadError(id int, startedAt time.Time, err error) {
+	if errors.Is(err, sim.ErrMissingList) || errors.Is(err, sim.ErrCorruptList) {
+		r.anomaly("client %d: %v", id, err)
+		return
+	}
+	r.readError(id, startedAt, err)
+}
+
 // readError records an anomaly when a reader younger than the grace period lost its snapshot.
 func (r *run) readError(id int, startedAt time.Time, err error) {
 	if !errors.Is(err, engine.ErrSnapshotExpired) {
@@ -402,7 +412,7 @@ func (r *run) seed(ctx context.Context) error {
 			return err
 		}
 		defer func() { _ = tx.Rollback() }()
-		stmts := []string{"CREATE TABLE lists (k bigint, pos bigint, v bigint, PRIMARY KEY (k, pos))"}
+		stmts := sim.ListTablesSQL(r.cfg.Keys)
 		if r.cfg.Workload == sim.Bank {
 			stmts = []string{"CREATE TABLE accounts (id bigint PRIMARY KEY, balance bigint NOT NULL)"}
 			for i := range r.cfg.Keys {
@@ -656,29 +666,6 @@ func (r *run) bankTx(ctx context.Context, p *process, id int) {
 	r.record(h)
 }
 
-// readList reads a list in a transaction or on the database.
-func readList(ctx context.Context, q interface {
-	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
-}, k int) ([]int64, error) {
-	rows, err := q.QueryContext(ctx, "SELECT pos, v FROM lists WHERE k = $1 ORDER BY pos", k)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = rows.Close() }()
-	list := []int64{}
-	for rows.Next() {
-		var pos, v int64
-		if err := rows.Scan(&pos, &v); err != nil {
-			return nil, err
-		}
-		if pos != int64(len(list)) {
-			return nil, fmt.Errorf("list %d has position %d at index %d", k, pos, len(list))
-		}
-		list = append(list, v)
-	}
-	return list, rows.Err()
-}
-
 func (r *run) listAppendSQL(ctx context.Context, p *process, id int) {
 	plans, readOnly := r.plans()
 	// A third of the operations, and every lone append, run as two autocommit statements: a read,
@@ -687,9 +674,9 @@ func (r *run) listAppendSQL(ctx context.Context, p *process, id int) {
 		k := plans[0].key
 		h := history.Tx{Client: id, Invoke: r.stamp()}
 		startedAt := time.Now()
-		list, err := readList(ctx, p.sql, k)
+		list, err := sim.ReadListSQL(ctx, p.sql, k)
 		if err != nil {
-			r.readError(id, startedAt, err)
+			r.listReadError(id, startedAt, err)
 			return
 		}
 		h.Ops = []history.Op{{Kind: history.Read, Key: keyName(k), List: list}}
@@ -698,7 +685,17 @@ func (r *run) listAppendSQL(ctx context.Context, p *process, id int) {
 
 		h = history.Tx{Client: id, Invoke: r.stamp()}
 		value := r.value(id)
-		_, err = p.sql.ExecContext(ctx, "INSERT INTO lists VALUES ($1, $2, $3)", k, len(list), value)
+		var res sql.Result
+		if sim.PackedList(k) {
+			res, err = p.sql.ExecContext(ctx, "UPDATE packed SET vals = vals || $1 WHERE k = $2", sim.EncodePacked([]int64{value}), k)
+		} else {
+			res, err = p.sql.ExecContext(ctx, "INSERT INTO lists VALUES ($1, $2, $3)", k, len(list), value)
+		}
+		if err == nil {
+			if n, _ := res.RowsAffected(); n != 1 {
+				r.anomaly("client %d: append to %s affected %d rows", id, keyName(k), n)
+			}
+		}
 		h.Complete = r.stamp()
 		h.Ops = []history.Op{{Kind: history.Append, Key: keyName(k), Value: value}}
 		h.Outcome = r.outcome(err)
@@ -724,18 +721,28 @@ func (r *run) listAppendSQL(ctx context.Context, p *process, id int) {
 	}
 	for _, pl := range plans {
 		r.pause()
-		list, err := readList(ctx, tx, pl.key)
+		list, err := sim.ReadListSQL(ctx, tx, pl.key)
 		if err != nil {
-			r.readError(id, startedAt, err)
+			r.listReadError(id, startedAt, err)
 			fail(err)
 			return
 		}
 		h.Ops = append(h.Ops, history.Op{Kind: history.Read, Key: keyName(pl.key), List: list})
 		if pl.append {
 			value := r.value(id)
-			if _, err := tx.ExecContext(ctx, "INSERT INTO lists VALUES ($1, $2, $3)", pl.key, len(list), value); err != nil {
+			var res sql.Result
+			var err error
+			if sim.PackedList(pl.key) {
+				res, err = tx.ExecContext(ctx, "UPDATE packed SET vals = $1 WHERE k = $2", sim.EncodePacked(append(list, value)), pl.key)
+			} else {
+				res, err = tx.ExecContext(ctx, "INSERT INTO lists VALUES ($1, $2, $3)", pl.key, len(list), value)
+			}
+			if err != nil {
 				fail(err)
 				return
+			}
+			if n, _ := res.RowsAffected(); n != 1 {
+				r.anomaly("client %d: append to %s affected %d rows", id, keyName(pl.key), n)
 			}
 			h.Ops = append(h.Ops, history.Op{Kind: history.Append, Key: keyName(pl.key), Value: value})
 		}
@@ -871,7 +878,30 @@ func (r *run) readFinal(ctx context.Context) (map[string][]int64, map[string]int
 				}
 				lists[keyName(int(k))] = append(lists[keyName(int(k))], v)
 			}
-			return rows.Err()
+			if err := rows.Err(); err != nil {
+				return err
+			}
+			packed, err := p.sql.QueryContext(ctx, "SELECT k, vals FROM packed ORDER BY k")
+			if err != nil {
+				return err
+			}
+			defer func() { _ = packed.Close() }()
+			for packed.Next() {
+				var k int64
+				var vals string
+				if err := packed.Scan(&k, &vals); err != nil {
+					return err
+				}
+				list, err := sim.DecodePacked(vals)
+				if err != nil {
+					r.anomaly("final read: %v", err)
+					continue
+				}
+				if len(list) > 0 {
+					lists[keyName(int(k))] = list
+				}
+			}
+			return packed.Err()
 		}
 		rows, err := p.sql.QueryContext(ctx, "SELECT id, balance FROM accounts")
 		if err != nil {

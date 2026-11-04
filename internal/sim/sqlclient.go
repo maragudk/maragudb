@@ -72,17 +72,9 @@ func (r *run) seedSQL() {
 				}
 			}
 		case ListAppend:
-			if _, err := db.ExecContext(ctx, "CREATE TABLE lists (k bigint, pos bigint, v bigint, PRIMARY KEY (k, pos))"); err != nil {
-				panic(err)
-			}
-			if _, err := db.ExecContext(ctx, "CREATE TABLE packed (k bigint PRIMARY KEY, vals text NOT NULL)"); err != nil {
-				panic(err)
-			}
-			for k := range r.cfg.Keys {
-				if packed(k) {
-					if _, err := db.ExecContext(ctx, "INSERT INTO packed VALUES ($1, '')", k); err != nil {
-						panic(err)
-					}
+			for _, q := range ListTablesSQL(r.cfg.Keys) {
+				if _, err := db.ExecContext(ctx, q); err != nil {
+					panic(err)
 				}
 			}
 		}
@@ -140,7 +132,7 @@ func (r *run) readFinalSQL() (map[string][]int64, map[string]int64, error) {
 					return
 				}
 				var list []int64
-				if list, err = decodePacked(vals); err != nil {
+				if list, err = DecodePacked(vals); err != nil {
 					return
 				}
 				if len(list) > 0 {
@@ -191,39 +183,55 @@ func (c *client) readErrorSQL(ctx context.Context, startedAt time.Time, err erro
 	}
 }
 
-// packed reports whether the list of key k is one row of `packed` rather than rows of `lists`.
-func packed(k int) bool {
+// ListTablesSQL are the statements that create the tables of the SQL list-append workload with
+// keys lists, all empty.
+func ListTablesSQL(keys int) []string {
+	stmts := []string{
+		"CREATE TABLE lists (k bigint, pos bigint, v bigint, PRIMARY KEY (k, pos))",
+		"CREATE TABLE packed (k bigint PRIMARY KEY, vals text NOT NULL)",
+	}
+	for k := range keys {
+		if PackedList(k) {
+			stmts = append(stmts, fmt.Sprintf("INSERT INTO packed VALUES (%d, '')", k))
+		}
+	}
+	return stmts
+}
+
+// PackedList reports whether the list of key k is one row of `packed` rather than rows of
+// `lists`.
+func PackedList(k int) bool {
 	return k%2 == 1
 }
 
-// errMissingList is returned by [readList] when the row of a packed list is gone, which no
+// ErrMissingList is returned by [ReadListSQL] when the row of a packed list is gone, which no
 // transaction ever does.
-var errMissingList = errors.New("sim: the row of a packed list is missing")
+var ErrMissingList = errors.New("sim: the row of a packed list is missing")
 
-// errCorruptList is returned by [decodePacked] for values that no transaction ever writes.
-var errCorruptList = errors.New("sim: corrupt packed list")
+// ErrCorruptList is returned by [DecodePacked] for values that no transaction ever writes.
+var ErrCorruptList = errors.New("sim: corrupt packed list")
 
-// decodePacked decodes the comma-prefixed values of a packed list.
-func decodePacked(vals string) ([]int64, error) {
+// DecodePacked decodes the comma-prefixed values of a packed list.
+func DecodePacked(vals string) ([]int64, error) {
 	list := []int64{}
 	if vals == "" {
 		return list, nil
 	}
 	if vals[0] != ',' {
-		return nil, fmt.Errorf("%w: %q", errCorruptList, vals)
+		return nil, fmt.Errorf("%w: %q", ErrCorruptList, vals)
 	}
 	for _, s := range strings.Split(vals[1:], ",") {
 		v, err := strconv.ParseInt(s, 10, 64)
 		if err != nil {
-			return nil, fmt.Errorf("%w: %q", errCorruptList, vals)
+			return nil, fmt.Errorf("%w: %q", ErrCorruptList, vals)
 		}
 		list = append(list, v)
 	}
 	return list, nil
 }
 
-// encodePacked is the inverse of [decodePacked].
-func encodePacked(list []int64) string {
+// EncodePacked is the inverse of [DecodePacked].
+func EncodePacked(list []int64) string {
 	var b strings.Builder
 	for _, v := range list {
 		fmt.Fprintf(&b, ",%d", v)
@@ -236,18 +244,18 @@ type querier interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
-// readList reads a list in a transaction or on the database.
-func readList(ctx context.Context, q querier, k int) ([]int64, error) {
-	if packed(k) {
+// ReadListSQL reads a list in a transaction or on the database.
+func ReadListSQL(ctx context.Context, q querier, k int) ([]int64, error) {
+	if PackedList(k) {
 		var vals string
 		err := q.QueryRowContext(ctx, "SELECT vals FROM packed WHERE k = $1", k).Scan(&vals)
 		if errors.Is(err, sql.ErrNoRows) {
-			return nil, errMissingList
+			return nil, ErrMissingList
 		}
 		if err != nil {
 			return nil, err
 		}
-		return decodePacked(vals)
+		return DecodePacked(vals)
 	}
 	rows, err := q.QueryContext(ctx, "SELECT pos, v FROM lists WHERE k = $1 ORDER BY pos", k)
 	if err != nil {
@@ -291,7 +299,7 @@ func (c *client) listAppendSQL(ctx context.Context) {
 		k := plans[0].key
 		h := history.Tx{Client: c.id, Invoke: c.run.stamp()}
 		startedAt := c.run.sched.Now()
-		list, err := readList(ctx, c.sql, k)
+		list, err := ReadListSQL(ctx, c.sql, k)
 		if err != nil {
 			c.listReadError(ctx, startedAt, err)
 			return
@@ -304,8 +312,8 @@ func (c *client) listAppendSQL(ctx context.Context) {
 		h = history.Tx{Client: c.id, Invoke: c.run.stamp()}
 		value := c.value()
 		var res sql.Result
-		if packed(k) {
-			res, err = c.sql.ExecContext(ctx, "UPDATE packed SET vals = vals || $1 WHERE k = $2", encodePacked([]int64{value}), k)
+		if PackedList(k) {
+			res, err = c.sql.ExecContext(ctx, "UPDATE packed SET vals = vals || $1 WHERE k = $2", EncodePacked([]int64{value}), k)
 		} else {
 			res, err = c.sql.ExecContext(ctx, "INSERT INTO lists VALUES ($1, $2, $3)", k, len(list), value)
 		}
@@ -333,7 +341,7 @@ func (c *client) listAppendSQL(ctx context.Context) {
 	}
 	for _, p := range plans {
 		c.pause(ctx)
-		list, err := readList(ctx, tx, p.key)
+		list, err := ReadListSQL(ctx, tx, p.key)
 		if err != nil {
 			c.listReadError(ctx, startedAt, err)
 			_ = tx.Rollback()
@@ -350,8 +358,8 @@ func (c *client) listAppendSQL(ctx context.Context) {
 			value := c.value()
 			var res sql.Result
 			var err error
-			if packed(p.key) {
-				res, err = tx.ExecContext(ctx, "UPDATE packed SET vals = $1 WHERE k = $2", encodePacked(append(list, value)), p.key)
+			if PackedList(p.key) {
+				res, err = tx.ExecContext(ctx, "UPDATE packed SET vals = $1 WHERE k = $2", EncodePacked(append(list, value)), p.key)
 			} else {
 				res, err = tx.ExecContext(ctx, "INSERT INTO lists VALUES ($1, $2, $3)", p.key, len(list), value)
 			}
@@ -516,7 +524,7 @@ func (c *client) bankSQL(ctx context.Context) {
 // and every other error is a failed read.
 func (c *client) listReadError(ctx context.Context, startedAt time.Time, err error) {
 	c.run.trace("client %d: read: %v", c.id, err)
-	if errors.Is(err, errMissingList) || errors.Is(err, errCorruptList) {
+	if errors.Is(err, ErrMissingList) || errors.Is(err, ErrCorruptList) {
 		c.run.anomaly(CheckerWorkload, "client %d: %v", c.id, err)
 		return
 	}
