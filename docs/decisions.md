@@ -182,3 +182,13 @@ Each test run records facts such as runs, anomalies, deliberate bugs caught, dif
 Every future change must keep this map complete. New requirements, deviations, deliberate bugs, and hard states get IDs and verifying tests in the same change.
 
 Alternative considered: a hand-maintained list of what is tested. Rejected because nothing would catch it going stale, and without that check the list would not be a trust signal.
+
+## 2026-11-04: Reject outcomes that depend on Postgres's plan, instead of emulating its planner
+
+Context: under the strict-subset decision, every accepted statement must give the same result as Postgres. Some Postgres outcomes depend on its planner or on the physical order of rows: the order in which it evaluates WHERE conditions, whether an index scan skips rows that would fail, which rows a LIMIT reads, the order in which an UPDATE checks moved keys, and whether it evaluates a stable expression while planning.
+
+Decision: maragudb does not reproduce Postgres's cost model or plan choice. It rejects such a statement with `ErrUnsupported`, statically where the shape decides it, such as a condition that can fail next to a primary key condition or under a LIMIT, and at run time where the data decides it, such as a condition that fails on a row that another condition rejects. A statement that fails in every order still fails with its own error. Parameters take their type from their context as in Postgres, and a Go value that drivers would convert in different ways is rejected too.
+
+Alternatives considered:
+- Emulating the planner's conjunct order by estimated cost and equivalence classes, as the first draft did. Rejected because it depends on cost constants and plan choices that change between Postgres versions and table statistics, so the emulation could silently diverge.
+- Evaluating every row in a full scan to decide plan dependence exactly. Rejected because it would turn point lookups into full scans whenever a condition can fail.
