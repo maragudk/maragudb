@@ -38,10 +38,14 @@ func newWorld(t *testing.T) *world {
 	return w
 }
 
-// open a database over the fake with sql.OpenDB.
+// open a database over the fake with sql.OpenDB. Background maintenance stays off unless the
+// test turns it on, so that its timing cannot add requests to what a test measures.
 func (w *world) open(opts maragudb.Options) *sql.DB {
 	w.t.Helper()
 	opts.Store = s3test.NewStore(w.fake)
+	if opts.Maintenance == nil {
+		opts.Maintenance = new(false)
+	}
 	c, err := maragudb.NewConnector(opts, "s3://bucket/app")
 	is.NotError(w.t, err)
 	db := sql.OpenDB(c)
@@ -405,10 +409,7 @@ func TestStats(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			w := newWorld(t)
 			grace := time.Minute
-			c, err := maragudb.NewConnector(maragudb.Options{Store: s3test.NewStore(w.fake), GCGracePeriod: &grace}, "s3://bucket/app")
-			is.NotError(t, err)
-			db := sql.OpenDB(c)
-			defer func() { _ = db.Close() }()
+			db := w.open(maragudb.Options{GCGracePeriod: &grace})
 			mustExec(t, db, "CREATE TABLE t (id int PRIMARY KEY)")
 			for i := range 10 {
 				mustExec(t, db, "INSERT INTO t VALUES ($1)", i)
@@ -439,6 +440,115 @@ func TestStats(t *testing.T) {
 	t.Run("fails on a database from another driver", func(t *testing.T) {
 		_, err := maragudb.Stats(t.Context(), sql.OpenDB(otherConnector{}))
 		is.True(t, err != nil)
+	})
+}
+
+func TestMaintenance(t *testing.T) {
+	t.Run("compacts and collects garbage in the background and reports it in the statistics", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			w := newWorld(t)
+			grace := time.Minute
+			interval := time.Second
+			db := w.open(maragudb.Options{Maintenance: new(true), MaintenanceInterval: &interval, CompactionThreshold: new(4), GCGracePeriod: &grace})
+			mustExec(t, db, "CREATE TABLE t (id int PRIMARY KEY)")
+			for i := range 3 {
+				mustExec(t, db, "INSERT INTO t VALUES ($1)", i)
+			}
+			s, err := maragudb.Stats(t.Context(), db)
+			is.NotError(t, err)
+			is.Equal(t, 4, s.Segments)
+			time.Sleep(2 * interval)
+			s, err = maragudb.Stats(t.Context(), db)
+			is.NotError(t, err)
+			is.Equal(t, 1, s.Segments, "compacted at the threshold")
+			is.Equal(t, 4, s.Garbage, "the old segments are stamped")
+			is.Equal(t, int64(1), s.MaintenanceRuns)
+			is.Equal(t, int64(1), s.LeaseAcquisitions)
+			is.Equal(t, int64(0), s.LeaseLosses)
+			time.Sleep(grace + 2*interval)
+			s, err = maragudb.Stats(t.Context(), db)
+			is.NotError(t, err)
+			is.Equal(t, 0, s.Garbage, "deleted after the grace period")
+			is.Equal(t, int64(2), s.MaintenanceRuns)
+			is.Equal(t, "0\n1\n2", queryRows(t, db, "SELECT * FROM t ORDER BY id"))
+		})
+	})
+
+	t.Run("keeps the commit and warm-read budgets in steady state", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			w := newWorld(t)
+			interval := time.Second
+			db := w.open(maragudb.Options{Maintenance: new(true), MaintenanceInterval: &interval, CompactionThreshold: new(4)})
+			mustExec(t, db, "CREATE TABLE t (id int PRIMARY KEY, name string)")
+			stats := func() maragudb.Statistics {
+				s, err := maragudb.Stats(t.Context(), db)
+				is.NotError(t, err)
+				return s
+			}
+			// A steady client: one insert and one lookup per interval, with maintenance running
+			// in between. The budget of each statement is unchanged, and the segments stay bounded.
+			var maintenance maragudb.Requests
+			for i := range 40 {
+				before := stats()
+				mustExec(t, db, "INSERT INTO t VALUES ($1, $2)", i, "n")
+				d := stats().Requests.Sub(before.Requests)
+				is.Equal(t, maragudb.Requests{GetConditional: 1, Put: 1, PutConditional: 1}, d, fmt.Sprint("insert ", i))
+
+				before = stats()
+				is.Equal(t, `"n"`, queryRows(t, db, "SELECT name FROM t WHERE id = $1", i))
+				d = stats().Requests.Sub(before.Requests)
+				is.Equal(t, maragudb.Requests{GetConditional: 1}, d, fmt.Sprint("select ", i))
+
+				before = stats()
+				time.Sleep(2 * interval)
+				maintenance = maintenance.Add(stats().Requests.Sub(before.Requests))
+				is.True(t, stats().Segments <= 4, fmt.Sprint("segments ", stats().Segments))
+			}
+			s := stats()
+			t.Logf("40 inserts: %d maintenance runs, %d lease acquisitions, maintenance requests %+v", s.MaintenanceRuns, s.LeaseAcquisitions, maintenance)
+			is.True(t, s.MaintenanceRuns >= 10, "a compaction every four commits")
+			is.Equal(t, s.LeaseAcquisitions, s.MaintenanceRuns, "one lease acquisition per run")
+			is.Equal(t, int64(0), s.LeaseLosses)
+			is.True(t, maintenance.Total() <= 12*s.MaintenanceRuns, fmt.Sprintf("%+v for %d runs", maintenance, s.MaintenanceRuns))
+		})
+	})
+
+	t.Run("an idle client makes no requests between runs", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			w := newWorld(t)
+			interval := time.Second
+			db := w.open(maragudb.Options{Maintenance: new(true), MaintenanceInterval: &interval, CompactionThreshold: new(4)})
+			mustExec(t, db, "CREATE TABLE t (id int PRIMARY KEY)")
+			for i := range 3 {
+				mustExec(t, db, "INSERT INTO t VALUES ($1)", i)
+			}
+			time.Sleep(2 * interval)
+			s, err := maragudb.Stats(t.Context(), db)
+			is.NotError(t, err)
+			is.Equal(t, int64(1), s.MaintenanceRuns)
+			before := s.Requests
+			time.Sleep(20 * interval)
+			s, err = maragudb.Stats(t.Context(), db)
+			is.NotError(t, err)
+			is.Equal(t, int64(0), s.Requests.Sub(before).Total(), "nothing to do within the grace period")
+		})
+	})
+
+	t.Run("is off when disabled", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			w := newWorld(t)
+			interval := time.Second
+			db := w.open(maragudb.Options{Maintenance: new(false), MaintenanceInterval: &interval, CompactionThreshold: new(2)})
+			mustExec(t, db, "CREATE TABLE t (id int PRIMARY KEY)")
+			for i := range 3 {
+				mustExec(t, db, "INSERT INTO t VALUES ($1)", i)
+			}
+			time.Sleep(10 * interval)
+			s, err := maragudb.Stats(t.Context(), db)
+			is.NotError(t, err)
+			is.Equal(t, 4, s.Segments)
+			is.Equal(t, int64(0), s.MaintenanceRuns)
+		})
 	})
 }
 

@@ -3,7 +3,10 @@ package sqldriver_test
 import (
 	"database/sql"
 	"database/sql/driver"
+	"strings"
 	"testing"
+	"testing/synctest"
+	"time"
 
 	"maragu.dev/is"
 
@@ -72,6 +75,43 @@ func TestConnector(t *testing.T) {
 		engineDB, err := c.DB(t.Context())
 		is.NotError(t, err)
 		is.Equal(t, uint64(4), engineDB.Stats().Seq, "every connection commits through the same engine")
+	})
+
+	t.Run("runs background maintenance until it is closed, and then releases the lease", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			fake := s3fake.New()
+			d := sqldriver.New(sqldriver.Options{
+				Engine:      engine.Options{Client: fake},
+				Maintenance: sqldriver.MaintenanceOptions{Interval: time.Second, Engine: engine.MaintenanceOptions{SegmentThreshold: 3}},
+			})
+			c, err := sqldriver.NewConnector(d, "s3://bucket/db")
+			is.NotError(t, err)
+			db := sql.OpenDB(c)
+			_, err = db.ExecContext(t.Context(), "CREATE TABLE t (id int PRIMARY KEY)")
+			is.NotError(t, err)
+			_, err = db.ExecContext(t.Context(), "INSERT INTO t VALUES (1)")
+			is.NotError(t, err)
+			engineDB, err := c.DB(t.Context())
+			is.NotError(t, err)
+			is.Equal(t, 2, engineDB.Stats().Segments)
+			time.Sleep(2 * time.Second)
+			is.Equal(t, 2, engineDB.Stats().Segments, "below the threshold")
+			_, err = db.ExecContext(t.Context(), "INSERT INTO t VALUES (2)")
+			is.NotError(t, err)
+			time.Sleep(2 * time.Second)
+			s := engineDB.Stats()
+			is.Equal(t, 1, s.Segments, "compacted in the background")
+			is.Equal(t, int64(1), s.MaintenanceRuns)
+			is.True(t, strings.Contains(strings.Join(fake.Keys(), ","), "db/maintenance-lease"))
+
+			is.NotError(t, db.Close())
+			before := fake.Counts()
+			time.Sleep(10 * time.Second)
+			is.Equal(t, int64(0), fake.Counts().Sub(before).Total(), "the loop stopped")
+			body, ok := fake.Body("db/maintenance-lease")
+			is.True(t, ok)
+			is.True(t, strings.Contains(string(body), `"expiresAt":"0001-01-01`), string(body))
+		})
 	})
 
 	t.Run("needs a client or a client factory", func(t *testing.T) {

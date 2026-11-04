@@ -721,6 +721,50 @@ func TestDB_GC(t *testing.T) {
 		is.Equal(t, "1", v)
 	})
 
+	t.Run("reapplies a pass on top of commits that landed meanwhile, without stamping their garbage", func(t *testing.T) {
+		w := newWorld(t)
+		db1 := w.open(1, engine.Options{GCGracePeriod: &grace})
+		db2 := w.open(2, engine.Options{GCGracePeriod: &grace})
+		put(t, db1, "a", "1")
+		put(t, db1, "b", "2")
+		is.NotError(t, db1.Compact(t.Context()))
+		is.Equal(t, 2, db1.Stats().Garbage)
+		interfered := 0
+		w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
+			// Before each of the first two manifest writes of the GC pass, another process commits
+			// and compacts, which adds garbage that this pass must not stamp with its older clock.
+			if kind == s3.KindPutConditional && strings.HasSuffix(key, "manifest") && interfered < 2 {
+				interfered++
+				decide := w.decide
+				w.decide = nil
+				put(t, db2, "c", fmt.Sprint(interfered))
+				is.NotError(t, db2.Compact(t.Context()))
+				w.decide = decide
+			}
+			return s3fake.OutcomeNormal
+		}
+		n, err := db1.GC(t.Context())
+		is.NotError(t, err)
+		is.Equal(t, 0, n)
+		is.Equal(t, 2, interfered)
+		w.decide = nil
+		is.Equal(t, 6, db1.Stats().Garbage, "the two merged first plus two per later compaction")
+
+		w.clock.Sleep(t.Context(), grace)
+		n, err = db1.GC(t.Context())
+		is.NotError(t, err)
+		is.Equal(t, 2, n, "only the garbage stamped by the rebased pass has expired")
+		is.Equal(t, 4, db1.Stats().Garbage)
+		w.clock.Sleep(t.Context(), grace)
+		n, err = db1.GC(t.Context())
+		is.NotError(t, err)
+		is.Equal(t, 4, n)
+		v, ok := get(t, db2, "c")
+		is.True(t, ok)
+		is.Equal(t, "2", v)
+		is.Equal(t, 2, len(w.fake.Keys()), "manifest and one segment")
+	})
+
 	t.Run("a reader older than the grace period gets ErrSnapshotExpired before reading anything", func(t *testing.T) {
 		w := newWorld(t)
 		db := w.open(1, engine.Options{GCGracePeriod: &grace})

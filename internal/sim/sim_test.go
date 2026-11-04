@@ -50,6 +50,16 @@ func corpus() []sim.Config {
 		cfg.Maintainers = 2
 		cfgs = append(cfgs, cfg)
 	}
+	// Background maintenance in the clients, coordinated by the lease, without it, and with
+	// leases forced to overlap, through the engine and through SQL.
+	for seed := uint64(400); seed < 424; seed++ {
+		cfg := sim.DefaultConfig(seed)
+		cfg.Workload = sim.Workload(seed % 2)
+		cfg.SQL = seed%4 >= 2
+		cfg.Maintenance = sim.MaintenanceMode(1 + (seed/4)%3)
+		cfg.Maintainers = int(seed / 12 % 2)
+		cfgs = append(cfgs, cfg)
+	}
 	// The same through the SQL layer and the database/sql driver.
 	for seed := uint64(300); seed < 330; seed++ {
 		for _, w := range []sim.Workload{sim.ListAppend, sim.Bank} {
@@ -124,6 +134,68 @@ func TestSimulator(t *testing.T) {
 		is.True(t, totals.CompactionRebases > totals.CompactionAttempts/4, "most successes needed a rebase")
 	})
 
+	t.Run("every checker passes with the lease working, disabled, and overlapping", func(t *testing.T) {
+		for _, mode := range []sim.MaintenanceMode{sim.MaintenanceLease, sim.MaintenanceNoLease, sim.MaintenanceOverlap} {
+			var totals sim.Stats
+			for seed := uint64(1); seed <= 12; seed++ {
+				for _, useSQL := range []bool{false, true} {
+					cfg := sim.DefaultConfig(seed)
+					cfg.Workload = sim.Workload(seed % 2)
+					cfg.SQL = useSQL
+					cfg.Maintenance = mode
+					cfg.Maintainers = 0
+					res := sim.Run(cfg)
+					if res.Failed() {
+						failReport(t, res)
+					}
+					totals.Add(res.Stats)
+				}
+			}
+			t.Logf("maintenance %v: %+v", mode, totals)
+			is.True(t, totals.Compactions > 20, "compactions")
+			is.True(t, totals.Deleted > 20, "deleted objects")
+			is.True(t, totals.MaintenanceRuns > 20, "maintenance runs")
+			is.True(t, totals.CompactionRebases > 0, "rebases")
+			switch mode {
+			case sim.MaintenanceLease:
+				is.True(t, totals.LeaseAcquisitions > 20, "lease acquisitions")
+				is.True(t, totals.LeaseLosses < totals.LeaseAcquisitions/4, "leases are rarely lost when renewed")
+			case sim.MaintenanceNoLease:
+				is.Equal(t, 0, totals.LeaseAcquisitions)
+				is.Equal(t, 0, totals.LeaseLosses)
+			case sim.MaintenanceOverlap:
+				is.True(t, totals.LeaseLosses > 10, "overlapping leases are taken over while held")
+			}
+		}
+	})
+
+	t.Run("the lease makes the work of a trigger happen about once instead of once per client", func(t *testing.T) {
+		run := func(mode sim.MaintenanceMode) sim.Stats {
+			var totals sim.Stats
+			for seed := uint64(1); seed <= 20; seed++ {
+				cfg := sim.DefaultConfig(seed)
+				cfg.ErrorRate, cfg.LostAckRate, cfg.CrashRate, cfg.OutageRate = 0, 0, 0, 0
+				cfg.Clients = 8
+				cfg.TxPerClient = 40
+				cfg.Maintainers = 0
+				cfg.Maintenance = mode
+				res := sim.Run(cfg)
+				if res.Failed() {
+					failReport(t, res)
+				}
+				totals.Add(res.Stats)
+			}
+			t.Logf("8 clients, maintenance %v: %d merges started for %d compactions, %d GC runs, %d deletes, %d attempts", mode, totals.MergesStarted, totals.Compactions, totals.GCs, totals.Deleted, totals.MaintenanceAttempts)
+			return totals
+		}
+		lease, none := run(sim.MaintenanceLease), run(sim.MaintenanceNoLease)
+		is.True(t, lease.Compactions > 50, "compactions")
+		is.True(t, lease.MergesStarted <= lease.Compactions*11/10, "with the lease, almost every merge that starts is the one that lands")
+		is.True(t, none.MergesStarted >= 2*lease.MergesStarted, "without the lease, clients merge the same segments concurrently")
+		is.True(t, none.Deleted >= 3*lease.Deleted, "without the lease, clients delete the same objects over and over")
+		is.True(t, none.MaintenanceAttempts >= 3*lease.MaintenanceAttempts, "without the lease, every client attempts the work")
+	})
+
 	t.Run("the same seed produces the same history", func(t *testing.T) {
 		for _, useSQL := range []bool{false, true} {
 			for _, w := range []sim.Workload{sim.ListAppend, sim.Bank} {
@@ -131,6 +203,7 @@ func TestSimulator(t *testing.T) {
 				cfg.Workload = w
 				cfg.SQL = useSQL
 				cfg.Maintainers = 2
+				cfg.Maintenance = sim.MaintenanceLease
 				first := sim.Run(cfg)
 				for range 3 {
 					again := sim.Run(cfg)
@@ -182,6 +255,14 @@ func TestSimulator(t *testing.T) {
 		}
 		cfg.SQL = os.Getenv("MARAGUDB_API") == "sql"
 		cfg.Maintainers = 2
+		switch os.Getenv("MARAGUDB_MAINTENANCE") {
+		case "lease":
+			cfg.Maintenance = sim.MaintenanceLease
+		case "none":
+			cfg.Maintenance = sim.MaintenanceNoLease
+		case "overlap":
+			cfg.Maintenance = sim.MaintenanceOverlap
+		}
 		switch os.Getenv("MARAGUDB_MUTATION") {
 		case "cas":
 			cfg.Mutations.CommitWithoutCAS = true
@@ -230,6 +311,7 @@ func TestSimulator(t *testing.T) {
 			cfg.TxPerClient = 10 + rng.IntN(60)
 			cfg.Keys = 1 + rng.IntN(6)
 			cfg.Maintainers = rng.IntN(3)
+			cfg.Maintenance = sim.MaintenanceMode(rng.IntN(4))
 			cfg.ErrorRate = rng.Float64() * 0.3
 			cfg.LostAckRate = rng.Float64() * 0.3
 			cfg.CrashRate = rng.Float64() * 0.05

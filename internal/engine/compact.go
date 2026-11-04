@@ -16,20 +16,22 @@ import (
 // merged is no longer live, because another compaction won, and [ErrSnapshotExpired] when it took
 // longer than the GC grace period, after which its output may have been collected as an orphan.
 func (db *DB) Compact(ctx context.Context) error {
-	return db.compact(ctx, nil)
+	_, err := db.compact(ctx, nil)
+	return err
 }
 
 // compact with an optional progress hook, called now and then during long work. An error from it
-// aborts the compaction.
-func (db *DB) compact(ctx context.Context, progress func() error) error {
+// aborts the compaction. It reports whether segments were merged.
+func (db *DB) compact(ctx context.Context, progress func() error) (bool, error) {
 	startedAt := db.now()
 	m, etag, err := db.refreshManifest(ctx)
 	if err != nil {
-		return fmt.Errorf("engine: compacting: %w", err)
+		return false, fmt.Errorf("engine: compacting: %w", err)
 	}
 	if len(m.Segments) < 2 {
-		return nil
+		return false, nil
 	}
+	db.compactionsStarted.Add(1)
 	if progress == nil {
 		progress = func() error { return nil }
 	}
@@ -45,17 +47,17 @@ func (db *DB) compact(ctx context.Context, progress func() error) error {
 	var count int
 	for it.Next() {
 		if err := b.add(it.Key(), it.Value(), false); err != nil {
-			return err
+			return false, err
 		}
 		count++
 		if count%1024 == 0 {
 			if err := progress(); err != nil {
-				return err
+				return false, err
 			}
 		}
 	}
 	if err := it.Err(); err != nil {
-		return fmt.Errorf("engine: compacting: %w", err)
+		return false, fmt.Errorf("engine: compacting: %w", err)
 	}
 
 	id := db.newID()
@@ -63,14 +65,25 @@ func (db *DB) compact(ctx context.Context, progress func() error) error {
 	if count > 0 {
 		body, meta, err := b.finish()
 		if err != nil {
-			return err
+			return false, err
 		}
 		meta.Key = db.key(segmentKey(m.Seq, id))
 		if err := progress(); err != nil {
-			return err
+			return false, err
 		}
 		if err := db.putObject(ctx, meta.Key, body); err != nil {
-			return err
+			return false, err
+		}
+		// The whole segment is in memory, so the caches are primed with every block, and reads in
+		// this process stay warm across the compaction.
+		for _, ref := range b.blocks {
+			block := body[ref.Offset : ref.Offset+ref.Length]
+			if db.mem != nil {
+				db.mem.Put(blockCacheKey(meta.Key, ref), block)
+			}
+			if db.disk != nil {
+				db.disk.Put(blockCacheKey(meta.Key, ref), block)
+			}
 		}
 		compacted = []segmentMeta{meta}
 	}
@@ -82,10 +95,10 @@ func (db *DB) compact(ctx context.Context, progress func() error) error {
 	for attempt := 0; ; attempt++ {
 		if age := db.now().Sub(startedAt); age >= db.grace {
 			// GC may have collected the compacted segment as an orphan by now.
-			return fmt.Errorf("%w: compaction is %v old", ErrSnapshotExpired, age)
+			return false, fmt.Errorf("%w: compaction is %v old", ErrSnapshotExpired, age)
 		}
 		if err := progress(); err != nil {
-			return err
+			return false, err
 		}
 		newer := base.Segments[len(m.Segments):]
 		next := base.next(id, db.now())
@@ -110,13 +123,13 @@ func (db *DB) compact(ctx context.Context, progress func() error) error {
 		}
 		if !errors.Is(err, ErrConflict) {
 			db.log.Debug("compaction failed", "error", err)
-			return err
+			return false, err
 		}
 		cur, curEtag := db.cachedManifest()
 		if attempt == 8 || cur.Seq <= base.Seq || !cur.extends(m) {
 			assert.Sometimes(true, "a compaction loses to another compaction", nil)
 			db.log.Debug("compaction failed", "error", err)
-			return err
+			return false, err
 		}
 		assert.Sometimes(true, "a compaction rebases on commits that only added segments", nil)
 		db.compactionRebases.Add(1)
@@ -124,7 +137,7 @@ func (db *DB) compact(ctx context.Context, progress func() error) error {
 	}
 	assert.Reachable("compaction succeeded", nil)
 	db.log.Info("compacted", "segments", len(m.Segments), "entries", count, "seq", db.Stats().Seq)
-	return nil
+	return true, nil
 }
 
 // extends reports whether m's segments are all still live in cur, unchanged and in the same
@@ -147,12 +160,23 @@ func (cur *manifest) extends(m *manifest) bool {
 // the manifest, because the commit or compaction that wrote them failed or crashed, enter the
 // garbage list stamped once the manifest has moved past the sequence number they were written
 // against, because a compaction that rebases may still reference its output until it is older
-// than the grace period.
-// It returns [ErrConflict] when a commit happened meanwhile; a retry is safe.
+// than the grace period. When the manifest write loses to a commit, the pass reapplies its
+// changes on top of the new manifest, so steady writers do not starve it.
+// It returns [ErrConflict] when it kept losing; a retry is safe.
 func (db *DB) GC(ctx context.Context) (int, error) {
+	deleted, _, err := db.gc(ctx, nil)
+	return deleted, err
+}
+
+// gc is [DB.GC] with an optional progress hook, called now and then during long work, whose
+// error aborts the pass. It also reports whether the pass changed the manifest or deleted anything.
+func (db *DB) gc(ctx context.Context, progress func() error) (int, bool, error) {
+	if progress == nil {
+		progress = func() error { return nil }
+	}
 	m, etag, err := db.refreshManifest(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("engine: garbage collecting: %w", err)
+		return 0, false, fmt.Errorf("engine: garbage collecting: %w", err)
 	}
 	now := db.now()
 
@@ -164,29 +188,26 @@ func (db *DB) GC(ctx context.Context) (int, error) {
 		referenced[g.Key] = true
 	}
 
-	var toDelete []string
-	var keep []garbageEntry
-	changed := false
+	// stamp holds the garbage that left the manifest before this pass read it, which the stamp
+	// taken then is safe for. expired holds the garbage whose stamp is older than the grace period.
+	stamp := map[string]bool{}
+	expired := map[string]bool{}
 	for _, g := range m.Garbage {
 		switch {
 		case db.mutations.GCIgnoreGrace:
-			toDelete = append(toDelete, g.Key)
+			expired[g.Key] = true
 		case g.UnreferencedAt.IsZero():
-			g.UnreferencedAt = now
-			keep = append(keep, g)
-			changed = true
+			stamp[g.Key] = true
 		case now.Sub(g.UnreferencedAt) >= db.grace:
-			toDelete = append(toDelete, g.Key)
-		default:
-			keep = append(keep, g)
+			expired[g.Key] = true
 		}
 	}
 
 	infos, err := db.client.List(ctx, db.key(segmentKeyPrefix))
 	if err != nil {
-		return 0, fmt.Errorf("engine: garbage collecting: listing: %w", err)
+		return 0, false, fmt.Errorf("engine: garbage collecting: listing: %w", err)
 	}
-	var orphans []string
+	orphans := map[string]bool{}
 	for _, info := range infos {
 		if referenced[info.Key] {
 			continue
@@ -196,42 +217,101 @@ func (db *DB) GC(ctx context.Context) (int, error) {
 			continue
 		}
 		if baseSeq < m.Seq {
-			orphans = append(orphans, info.Key)
+			orphans[info.Key] = true
 		}
 	}
 	assert.Sometimes(len(orphans) > 0, "GC finds an orphaned object", nil)
-	assert.Sometimes(len(toDelete) > 0, "GC finds an expired object", nil)
+	assert.Sometimes(len(expired) > 0, "GC finds an expired object", nil)
 	if db.mutations.GCIgnoreGrace {
-		toDelete = append(toDelete, orphans...)
-	} else {
-		for _, key := range orphans {
-			keep = append(keep, garbageEntry{Key: key, UnreferencedAt: now})
-			changed = true
+		for key := range orphans {
+			expired[key] = true
 		}
+		orphans = map[string]bool{}
 	}
 
+	// Deletes follow the manifest's order, so that a run is reproducible.
+	var toDelete []string
+	for _, g := range m.Garbage {
+		if expired[g.Key] {
+			toDelete = append(toDelete, g.Key)
+		}
+	}
+	for _, info := range infos {
+		if expired[info.Key] && !referenced[info.Key] {
+			toDelete = append(toDelete, info.Key)
+		}
+	}
 	deleted := 0
-	var failed []garbageEntry
-	for _, key := range toDelete {
+	gone := map[string]bool{}
+	failed := map[string]bool{}
+	for i, key := range toDelete {
+		if i%16 == 15 {
+			if err := progress(); err != nil {
+				return deleted, deleted > 0, err
+			}
+		}
 		if err := db.client.Delete(ctx, key); err != nil {
 			db.log.Warn("deleting expired object", "key", key, "error", err)
-			failed = append(failed, garbageEntry{Key: key, UnreferencedAt: now.Add(-db.grace)})
+			failed[key] = true
 			continue
 		}
+		gone[key] = true
 		deleted++
 	}
 
-	if !changed && len(toDelete) == 0 {
-		return deleted, nil
-	}
-	next := m.next(db.newID(), now)
-	next.Garbage = append(keep, failed...)
-	if _, err := db.casManifest(ctx, etag, next); err != nil {
-		if errors.Is(err, ErrConflict) {
-			return deleted, err
+	// The pass is reapplied on top of whatever manifest is current: deleted objects leave the
+	// garbage list, failed deletes stay expired, the garbage this pass found unstamped gets this
+	// pass's stamp, and orphans that nothing references yet enter the list. Garbage that entered
+	// the list after this pass began is left for the next pass to stamp.
+	base, baseEtag := m, etag
+	for attempt := 0; ; attempt++ {
+		if err := progress(); err != nil {
+			return deleted, deleted > 0, err
 		}
-		return deleted, fmt.Errorf("engine: garbage collecting: %w", err)
+		next := base.next(db.newID(), now)
+		next.Garbage = nil
+		changed := false
+		live := map[string]bool{}
+		for _, seg := range base.Segments {
+			live[seg.Key] = true
+		}
+		for _, g := range base.Garbage {
+			switch {
+			case gone[g.Key]:
+				changed = true
+				continue
+			case failed[g.Key] && now.Sub(g.UnreferencedAt) < db.grace:
+				g.UnreferencedAt = now.Add(-db.grace)
+				changed = true
+			case stamp[g.Key] && g.UnreferencedAt.IsZero():
+				g.UnreferencedAt = now
+				changed = true
+			}
+			live[g.Key] = true
+			next.Garbage = append(next.Garbage, g)
+		}
+		for _, info := range infos {
+			if orphans[info.Key] && !live[info.Key] {
+				next.Garbage = append(next.Garbage, garbageEntry{Key: info.Key, UnreferencedAt: now})
+				changed = true
+			}
+		}
+		if !changed {
+			return deleted, deleted > 0, nil
+		}
+		_, err := db.casManifest(ctx, baseEtag, next)
+		if err == nil {
+			db.log.Info("garbage collected", "deleted", deleted, "remaining", len(next.Garbage), "seq", next.Seq)
+			return deleted, true, nil
+		}
+		if !errors.Is(err, ErrConflict) {
+			return deleted, deleted > 0, fmt.Errorf("engine: garbage collecting: %w", err)
+		}
+		cur, curEtag := db.cachedManifest()
+		if attempt == 8 || cur.Seq <= base.Seq {
+			return deleted, deleted > 0, err
+		}
+		assert.Sometimes(true, "a GC pass rebases on commits that landed meanwhile", nil)
+		base, baseEtag = cur, curEtag
 	}
-	db.log.Info("garbage collected", "deleted", deleted, "remaining", len(next.Garbage), "seq", next.Seq)
-	return deleted, nil
 }

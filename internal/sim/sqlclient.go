@@ -18,27 +18,34 @@ import (
 // the database/sql driver. Accounts are rows of `accounts`, and a list is the rows of `lists`
 // with one key, ordered by position.
 
-// openSQL opens a database/sql handle for a process over the given engine options.
-func (r *run) openSQL(ctx context.Context, opts engine.Options) (*sql.DB, error) {
-	d := sqldriver.New(sqldriver.Options{Engine: opts, Exec: exec.Options{Mutations: r.cfg.SQLMutations}})
+// openSQL opens a database/sql handle for a process over the given engine options, and returns
+// the engine behind it. The driver's own maintenance loop stays off, because its timing would
+// not be deterministic; the clients drive maintenance steps themselves.
+func (r *run) openSQL(ctx context.Context, opts engine.Options) (*sql.DB, *engine.DB, error) {
+	d := sqldriver.New(sqldriver.Options{Engine: opts, Exec: exec.Options{Mutations: r.cfg.SQLMutations}, Maintenance: sqldriver.MaintenanceOptions{Disabled: true}})
 	c, err := sqldriver.NewConnector(d, "s3://sim/db")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	db := sql.OpenDB(c)
 	db.SetMaxOpenConns(1)
 	db.SetMaxIdleConns(1)
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
-		return nil, err
+		return nil, nil, err
 	}
-	return db, nil
+	edb, err := c.DB(ctx)
+	if err != nil {
+		_ = db.Close()
+		return nil, nil, err
+	}
+	return db, edb, nil
 }
 
 // seedSQL creates the tables, and the accounts, with a fault-free client before the clients start.
 func (r *run) seedSQL() {
 	r.sched.Go("seed", func(ctx context.Context) {
-		db, err := r.openSQL(ctx, engine.Options{Client: r.fake.WithoutFaults(), Now: r.sched.Now, Sleep: r.sched.Sleep, Rand: rand.New(rand.NewPCG(r.cfg.Seed, 0x5eed))})
+		db, _, err := r.openSQL(ctx, engine.Options{Client: r.fake.WithoutFaults(), Now: r.sched.Now, Sleep: r.sched.Sleep, Rand: rand.New(rand.NewPCG(r.cfg.Seed, 0x5eed))})
 		if err != nil {
 			panic(err)
 		}
@@ -70,7 +77,7 @@ func (r *run) readFinalSQL() (map[string][]int64, map[string]int64, error) {
 	var err error
 	r.sched.Go("final", func(ctx context.Context) {
 		var db *sql.DB
-		db, err = r.openSQL(ctx, engine.Options{Client: r.fake.WithoutFaults(), Now: r.sched.Now, Sleep: r.sched.Sleep, MemoryCacheBytes: new(int64), Rand: rand.New(rand.NewPCG(r.cfg.Seed, 0xf1a1))})
+		db, _, err = r.openSQL(ctx, engine.Options{Client: r.fake.WithoutFaults(), Now: r.sched.Now, Sleep: r.sched.Sleep, MemoryCacheBytes: new(int64), Rand: rand.New(rand.NewPCG(r.cfg.Seed, 0xf1a1))})
 		if err != nil {
 			return
 		}

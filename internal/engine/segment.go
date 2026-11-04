@@ -49,10 +49,12 @@ type segmentBuilder struct {
 	blockN     int
 	blockFirst []byte
 	leaves     []indexEntry
-	count      int
-	lastKey    []byte
-	minKey     []byte
-	maxKey     []byte
+	// blocks written so far, in object order, for priming caches.
+	blocks  []blockRef
+	count   int
+	lastKey []byte
+	minKey  []byte
+	maxKey  []byte
 }
 
 func newSegmentBuilder(blockSize int) *segmentBuilder {
@@ -100,7 +102,9 @@ func (b *segmentBuilder) writeBlock(kind byte, n int, body []byte) blockRef {
 	b.buf.WriteByte(kind)
 	b.buf.Write(binary.AppendUvarint(nil, uint64(n)))
 	b.buf.Write(body)
-	return blockRef{Offset: offset, Length: int64(b.buf.Len()) - offset}
+	ref := blockRef{Offset: offset, Length: int64(b.buf.Len()) - offset}
+	b.blocks = append(b.blocks, ref)
+	return ref
 }
 
 // finish the segment and return its bytes and metadata. The metadata has no key yet.

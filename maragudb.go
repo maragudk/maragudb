@@ -103,6 +103,21 @@ type Options struct {
 	// measured on the clocks of the processes that run transactions and garbage collection, so
 	// the clock skew between processes must be much smaller than it.
 	GCGracePeriod *time.Duration
+	// Maintenance runs compaction and garbage collection in the background, for every database
+	// opened through the driver, whenever there is work: at least CompactionThreshold segments,
+	// or garbage to stamp or to delete. Defaults to true. The processes that share a database
+	// coordinate through a lease object at <prefix>/maintenance-lease, so that the work of one
+	// trigger is done once rather than once per process. The lease only saves work; correctness
+	// never depends on it. A process checks for work on the manifest it already has, so an idle
+	// process makes no requests. With it off, call [Compact] and [GC] now and then instead.
+	Maintenance *bool
+	// MaintenanceInterval is the time between two checks for maintenance work, with a jitter of
+	// half the interval either way. Defaults to 10 seconds.
+	MaintenanceInterval *time.Duration
+	// CompactionThreshold is the number of segments, which every commit adds one of, at which
+	// background maintenance compacts the database into one. Defaults to 8. A lower threshold
+	// keeps reads cheaper, and a higher one rewrites the database less often.
+	CompactionThreshold *int
 	// Store is the object store for every DSN, in place of the default AWS SDK client for the
 	// DSN's bucket. The DSN's bucket is then ignored and its prefix still applies. Any value with
 	// these methods can be set:
@@ -136,6 +151,15 @@ func (o Options) withDefaults() Options {
 	if o.DiskCacheDir == nil {
 		o.DiskCacheDir = new("")
 	}
+	if o.Maintenance == nil {
+		o.Maintenance = new(true)
+	}
+	if o.MaintenanceInterval == nil {
+		o.MaintenanceInterval = new(10 * time.Second)
+	}
+	if o.CompactionThreshold == nil {
+		o.CompactionThreshold = new(8)
+	}
 	return o
 }
 
@@ -154,7 +178,12 @@ func newDriver(opts Options) *sqldriver.Driver {
 		},
 		Exec:         exec.Options{Logger: opts.Logger},
 		DiskCacheDir: *opts.DiskCacheDir,
-		Logger:       opts.Logger,
+		Maintenance: sqldriver.MaintenanceOptions{
+			Disabled: !*opts.Maintenance,
+			Interval: *opts.MaintenanceInterval,
+			Engine:   engine.MaintenanceOptions{SegmentThreshold: *opts.CompactionThreshold},
+		},
+		Logger: opts.Logger,
 		NewClient: func(ctx context.Context, bucket string) (s3.Client, error) {
 			return s3.NewAWSClient(ctx, s3.AWSOptions{Bucket: bucket})
 		},
@@ -186,6 +215,10 @@ type Statistics struct {
 	Segments int
 	// Garbage objects awaiting their grace period.
 	Garbage int
+	// MaintenanceRuns counts the background maintenance steps that compacted or collected
+	// garbage, LeaseAcquisitions the times this process acquired the maintenance lease, and
+	// LeaseLosses the times another process took it over after it expired.
+	MaintenanceRuns, LeaseAcquisitions, LeaseLosses int64
 }
 
 // Requests to the object store, by kind. Conditional reads are freshness checks, and
@@ -199,6 +232,15 @@ type Requests struct {
 // Total requests.
 func (r Requests) Total() int64 {
 	return r.Get + r.GetConditional + r.Put + r.PutConditional + r.Delete + r.List
+}
+
+// Add returns r plus o.
+func (r Requests) Add(o Requests) Requests {
+	return Requests{
+		Get: r.Get + o.Get, GetConditional: r.GetConditional + o.GetConditional,
+		Put: r.Put + o.Put, PutConditional: r.PutConditional + o.PutConditional,
+		Delete: r.Delete + o.Delete, List: r.List + o.List,
+	}
 }
 
 // Sub returns r minus o, for measuring an operation.
@@ -225,6 +267,7 @@ func Stats(ctx context.Context, db *sql.DB) (Statistics, error) {
 			MemoryCacheHits: es.MemoryCacheHits, MemoryCacheMisses: es.MemoryCacheMisses,
 			DiskCacheHits: es.DiskCacheHits, DiskCacheMisses: es.DiskCacheMisses,
 			Seq: es.Seq, Segments: es.Segments, Garbage: es.Garbage,
+			MaintenanceRuns: es.MaintenanceRuns, LeaseAcquisitions: es.LeaseAcquisitions, LeaseLosses: es.LeaseLosses,
 		}
 		return nil
 	})
@@ -248,8 +291,10 @@ func withConn(ctx context.Context, db *sql.DB, fn func(c *sqldriver.Conn) error)
 }
 
 // Compact the database behind db: every segment object is merged into one, and the old ones
-// become garbage for [GC]. It returns [ErrConflict] when a commit happened meanwhile, and can
-// then be retried. It is safe to run while other processes use the database.
+// become garbage for [GC]. Commits that happen meanwhile are kept ahead of the merged segment,
+// and only a competing compaction makes it return [ErrConflict], after which it can be retried.
+// It is safe to run while other processes use the database, and background maintenance does it
+// on its own unless [Options.Maintenance] is off.
 func Compact(ctx context.Context, db *sql.DB) error {
 	return withConn(ctx, db, func(c *sqldriver.Conn) error {
 		return c.DB().Compact(ctx)

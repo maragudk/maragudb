@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net/url"
 	"path/filepath"
 	"reflect"
@@ -41,7 +42,21 @@ type Options struct {
 	NewClient func(ctx context.Context, bucket string) (s3.Client, error)
 	// DiskCacheDir holds a disk cache per DSN when set.
 	DiskCacheDir string
-	Logger       *slog.Logger
+	// Maintenance in the background for every database.
+	Maintenance MaintenanceOptions
+	Logger      *slog.Logger
+}
+
+// MaintenanceOptions for the background loop that compacts and garbage collects a database.
+type MaintenanceOptions struct {
+	// Disabled turns the loop off.
+	Disabled bool
+	// Interval between checks for work. Each wait is drawn uniformly from the half-open interval
+	// [Interval/2, 3*Interval/2), so that the clients of one database do not check in lockstep.
+	// Defaults to 10 seconds.
+	Interval time.Duration
+	// Engine options of the maintainer: the thresholds and the lease.
+	Engine engine.MaintenanceOptions
 }
 
 // Driver implements [driver.Driver] and [driver.DriverContext].
@@ -89,6 +104,10 @@ type Connector struct {
 
 	mu sync.Mutex
 	db *engine.DB
+	// maintainer and the loop that drives it, when maintenance is on.
+	maintainer *engine.Maintainer
+	stop       context.CancelFunc
+	stopped    chan struct{}
 }
 
 // NewConnector for a DSN.
@@ -135,7 +154,36 @@ func (c *Connector) DB(ctx context.Context) (*engine.DB, error) {
 		return nil, err
 	}
 	c.db = db
+	if !c.d.opts.Maintenance.Disabled {
+		c.maintainer = db.NewMaintainer(c.d.opts.Maintenance.Engine)
+		loopCtx, cancel := context.WithCancel(context.Background())
+		c.stop = cancel
+		c.stopped = make(chan struct{})
+		go c.maintain(loopCtx)
+	}
 	return db, nil
+}
+
+// maintain runs maintenance steps at jittered intervals until ctx ends.
+func (c *Connector) maintain(ctx context.Context) {
+	defer close(c.stopped)
+	interval := c.d.opts.Maintenance.Interval
+	if interval <= 0 {
+		interval = 10 * time.Second
+	}
+	for {
+		wait := interval/2 + rand.N(interval)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(wait):
+		}
+		if res, err := c.maintainer.Step(ctx); err != nil && ctx.Err() == nil {
+			c.d.opts.Logger.Warn("background maintenance failed", "dsn", c.dsn, "error", err)
+		} else if res.Ran {
+			c.d.opts.Logger.Debug("background maintenance ran", "dsn", c.dsn, "compacted", res.Compacted, "deleted", res.Deleted)
+		}
+	}
 }
 
 // Connect opens a connection.
@@ -152,16 +200,28 @@ func (c *Connector) Driver() driver.Driver {
 	return c.d
 }
 
-// Close the connector.
+// Close the connector. It stops background maintenance, waiting for a running step to notice,
+// and releases the maintenance lease if it is held.
 func (c *Connector) Close() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.db != nil {
-		err := c.db.Close()
-		c.db = nil
-		return err
+	if c.db == nil {
+		return nil
 	}
-	return nil
+	var err error
+	if c.maintainer != nil {
+		c.stop()
+		<-c.stopped
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		err = c.maintainer.Close(ctx)
+		cancel()
+		c.maintainer = nil
+	}
+	if cerr := c.db.Close(); cerr != nil && err == nil {
+		err = cerr
+	}
+	c.db = nil
+	return err
 }
 
 var _ io.Closer = (*Connector)(nil)

@@ -41,12 +41,45 @@ func (w Workload) String() string {
 	return "list-append"
 }
 
-// Name of the configuration's workload, with its API.
+// Name of the configuration's workload, with its API and maintenance mode.
 func (c Config) Name() string {
+	name := c.Workload.String()
 	if c.SQL {
-		return c.Workload.String() + " through SQL"
+		name += " through SQL"
 	}
-	return c.Workload.String()
+	if c.Maintenance != MaintenanceOff {
+		name += " with maintenance " + c.Maintenance.String()
+	}
+	return name
+}
+
+// MaintenanceMode selects how the clients run background maintenance, which the clients drive
+// deterministically between their transactions through the engine's step function.
+type MaintenanceMode int
+
+// Maintenance modes.
+const (
+	// MaintenanceOff runs no maintenance in the clients; only [Config.Maintainers] compact.
+	MaintenanceOff MaintenanceMode = iota
+	// MaintenanceLease coordinates the clients' maintenance through the lease.
+	MaintenanceLease
+	// MaintenanceNoLease runs maintenance in every client without the lease.
+	MaintenanceNoLease
+	// MaintenanceOverlap forces overlapping leases: every lease expires at once and no client
+	// renews or notices, so that several clients believe they hold it at the same time.
+	MaintenanceOverlap
+)
+
+func (m MaintenanceMode) String() string {
+	switch m {
+	case MaintenanceLease:
+		return "lease"
+	case MaintenanceNoLease:
+		return "no lease"
+	case MaintenanceOverlap:
+		return "overlapping leases"
+	}
+	return "off"
 }
 
 // Config of a simulation run.
@@ -61,6 +94,8 @@ type Config struct {
 	Keys int
 	// Maintainers is the number of processes that compact and garbage collect.
 	Maintainers int
+	// Maintenance mode of the clients.
+	Maintenance MaintenanceMode
 	// Faults rates. See [s3fake.Faults].
 	ErrorRate   float64
 	LostAckRate float64
@@ -138,7 +173,13 @@ type Stats struct {
 	Unavailable int
 	// FailedReads counts reads in client transactions that failed for any reason.
 	FailedReads int
-	Elapsed     time.Duration
+	// MaintenanceSteps counts the clients' maintenance steps, MaintenanceAttempts the ones that
+	// found work and got past the lease, MaintenanceRuns the ones that changed the database,
+	// and MergesStarted the compactions that began merging in those steps. LeaseAcquisitions
+	// and LeaseLosses count the lease handovers.
+	MaintenanceSteps, MaintenanceAttempts, MaintenanceRuns, MergesStarted int
+	LeaseAcquisitions, LeaseLosses                                        int
+	Elapsed                                                               time.Duration
 }
 
 // Add the counts of o, for totals over several runs.
@@ -157,6 +198,12 @@ func (s *Stats) Add(o Stats) {
 	s.LiveUnknown += o.LiveUnknown
 	s.Unavailable += o.Unavailable
 	s.FailedReads += o.FailedReads
+	s.MaintenanceSteps += o.MaintenanceSteps
+	s.MaintenanceAttempts += o.MaintenanceAttempts
+	s.MaintenanceRuns += o.MaintenanceRuns
+	s.MergesStarted += o.MergesStarted
+	s.LeaseAcquisitions += o.LeaseAcquisitions
+	s.LeaseLosses += o.LeaseLosses
 	s.Elapsed += o.Elapsed
 }
 
@@ -168,8 +215,8 @@ func (r Result) Failed() bool {
 // Report of the run for test output.
 func (r Result) Report() string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "seed %d (%v): %d tx, %d commits, %d conflicts, %d unknown (%d without a crash), %d crashes, %d outages (%d operations failed), %d compactions, %d GCs (%d deleted), %v virtual time",
-		r.Config.Seed, r.Config.Name(), len(r.History), r.Stats.Commits, r.Stats.Conflicts, r.Stats.Unknown, r.Stats.LiveUnknown, r.Stats.Crashes, r.Stats.Outages, r.Stats.Unavailable, r.Stats.Compactions, r.Stats.GCs, r.Stats.Deleted, r.Stats.Elapsed)
+	fmt.Fprintf(&b, "seed %d (%v): %d tx, %d commits, %d conflicts, %d unknown (%d without a crash), %d crashes, %d outages (%d operations failed), %d compactions, %d GCs (%d deleted), %d maintenance runs (%d lease acquisitions, %d losses), %v virtual time",
+		r.Config.Seed, r.Config.Name(), len(r.History), r.Stats.Commits, r.Stats.Conflicts, r.Stats.Unknown, r.Stats.LiveUnknown, r.Stats.Crashes, r.Stats.Outages, r.Stats.Unavailable, r.Stats.Compactions, r.Stats.GCs, r.Stats.Deleted, r.Stats.MaintenanceRuns, r.Stats.LeaseAcquisitions, r.Stats.LeaseLosses, r.Stats.Elapsed)
 	for _, a := range r.Anomalies {
 		fmt.Fprintf(&b, "\nANOMALY: %v", a)
 	}
@@ -343,6 +390,21 @@ func (r *run) open(ctx context.Context, id int, rng *rand.Rand, disk cache.Cache
 	return engine.Open(ctx, r.engineOptions(id, rng, disk))
 }
 
+// maintenanceOptions for a client in the configured mode, or false in [MaintenanceOff].
+func (r *run) maintenanceOptions(id int) (engine.MaintenanceOptions, bool) {
+	opts := engine.MaintenanceOptions{Holder: fmt.Sprint("client", id), SegmentThreshold: 8, LeaseDuration: 400 * time.Millisecond}
+	switch r.cfg.Maintenance {
+	case MaintenanceOff:
+		return opts, false
+	case MaintenanceNoLease:
+		opts.DisableLease = true
+	case MaintenanceOverlap:
+		opts.LeaseDuration = time.Millisecond
+		opts.IgnoreLeaseExpiry = true
+	}
+	return opts, true
+}
+
 // seedBank writes the initial balances with a fault-free client before the clients start.
 func (r *run) seedBank() {
 	r.total = int64(r.cfg.Keys) * initialBalance
@@ -438,8 +500,10 @@ type client struct {
 	proc *s3fake.Process
 	db   *engine.DB
 	// sql is the database/sql handle when the run goes through SQL.
-	sql  *sql.DB
-	next int64
+	sql *sql.DB
+	// maint is the client's maintainer in the maintenance modes.
+	maint *engine.Maintainer
+	next  int64
 }
 
 func (c *client) loop(ctx context.Context) {
@@ -451,10 +515,12 @@ func (c *client) loop(ctx context.Context) {
 			c.proc = &s3fake.Process{Name: fmt.Sprint("client", c.id)}
 			pctx := s3fake.WithProcess(ctx, c.proc)
 			var err error
+			var db *engine.DB
 			if c.run.cfg.SQL {
-				c.sql, err = c.run.openSQL(pctx, c.run.engineOptions(c.id, c.rng, c.disk))
+				c.sql, db, err = c.run.openSQL(pctx, c.run.engineOptions(c.id, c.rng, c.disk))
 			} else {
 				c.db, err = c.run.open(pctx, c.id, c.rng, c.disk)
+				db = c.db
 			}
 			if err != nil {
 				c.run.trace("client %d: open: %v", c.id, err)
@@ -462,6 +528,9 @@ func (c *client) loop(ctx context.Context) {
 				c.run.sched.Sleep(ctx, time.Duration(c.rng.Int64N(int64(10*time.Millisecond))))
 				i--
 				continue
+			}
+			if opts, ok := c.run.maintenanceOptions(c.id); ok {
+				c.maint = db.NewMaintainer(opts)
 			}
 		}
 		pctx := s3fake.WithProcess(ctx, c.proc)
@@ -476,7 +545,40 @@ func (c *client) loop(ctx context.Context) {
 			c.bankTx(pctx)
 		}
 		c.afterCrash()
+		if c.maint != nil && c.rng.IntN(3) == 0 {
+			c.step(pctx)
+			c.afterCrash()
+		}
 		c.run.sched.Sleep(ctx, time.Duration(c.rng.Int64N(int64(5*time.Millisecond))))
+	}
+}
+
+// step runs one maintenance step of the client and records what it did.
+func (c *client) step(ctx context.Context) {
+	before := c.maint.DB().Stats()
+	res, err := c.maint.Step(ctx)
+	after := c.maint.DB().Stats()
+	s := &c.run.stats
+	s.MaintenanceSteps++
+	if res.Attempted {
+		s.MaintenanceAttempts++
+	}
+	if res.Ran {
+		s.MaintenanceRuns++
+	}
+	if res.Compacted {
+		s.Compactions++
+	}
+	if res.Ran && !res.Compacted {
+		s.GCs++
+	}
+	s.Deleted += res.Deleted
+	s.MergesStarted += int(after.CompactionsStarted - before.CompactionsStarted)
+	s.CompactionRebases += int(after.CompactionRebases - before.CompactionRebases)
+	s.LeaseAcquisitions += int(after.LeaseAcquisitions - before.LeaseAcquisitions)
+	s.LeaseLosses += int(after.LeaseLosses - before.LeaseLosses)
+	if res.Attempted || err != nil {
+		c.run.trace("client %d: maintenance: %+v, %v", c.id, res, err)
 	}
 }
 
@@ -488,6 +590,7 @@ func (c *client) afterCrash() {
 		c.run.trace("client %d: crashed at %s, restarting", c.id, step)
 		c.run.stats.Crashes++
 		c.db = nil
+		c.maint = nil
 		if c.sql != nil {
 			_ = c.sql.Close()
 			c.sql = nil

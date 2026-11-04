@@ -19,10 +19,10 @@ test:
 	go test -coverprofile cover.out -shuffle on ./...
 
 # Replay one simulator seed with a full trace. Optional: WORKLOAD=bank, API=sql,
-# MUTATION=cas|gc|freshness|ack|retry-unknown|fresh-snapshot.
+# MAINTENANCE=lease|none|overlap, MUTATION=cas|gc|freshness|ack|retry-unknown|fresh-snapshot.
 .PHONY: replay
 replay:
-	MARAGUDB_SEED=$(SEED) MARAGUDB_WORKLOAD=$(WORKLOAD) MARAGUDB_API=$(API) MARAGUDB_MUTATION=$(MUTATION) go test ./internal/sim -run 'TestSimulator/replay' -count 1 -v
+	MARAGUDB_SEED=$(SEED) MARAGUDB_WORKLOAD=$(WORKLOAD) MARAGUDB_API=$(API) MARAGUDB_MAINTENANCE=$(MAINTENANCE) MARAGUDB_MUTATION=$(MUTATION) go test ./internal/sim -run 'TestSimulator/replay' -count 1 -v
 
 # Run the simulator with random seeds and configurations for SOAK_DURATION (default 5m).
 SOAK_DURATION ?= 5m

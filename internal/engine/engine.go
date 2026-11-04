@@ -99,9 +99,14 @@ type Stats struct {
 	Segments int
 	// Garbage objects awaiting their grace period.
 	Garbage int
-	// CompactionRebases counts the times a compaction reapplied its swap on top of commits that
-	// landed meanwhile instead of failing.
-	CompactionRebases int64
+	// CompactionsStarted counts the compactions that began merging, and CompactionRebases the
+	// times a compaction reapplied its swap on top of commits that landed meanwhile instead of
+	// failing.
+	CompactionsStarted, CompactionRebases int64
+	// MaintenanceRuns counts the [Maintainer] steps that changed the database, and
+	// LeaseAcquisitions and LeaseLosses the times a maintainer acquired the maintenance lease
+	// and lost it to another maintainer.
+	MaintenanceRuns, LeaseAcquisitions, LeaseLosses int64
 }
 
 // DB is an open database. It is safe for concurrent use.
@@ -124,8 +129,9 @@ type DB struct {
 	manifest   *manifest
 	etag       string
 
-	memHits, memMisses, diskHits, diskMisses atomic.Int64
-	compactionRebases                        atomic.Int64
+	memHits, memMisses, diskHits, diskMisses        atomic.Int64
+	compactionsStarted, compactionRebases           atomic.Int64
+	maintenanceRuns, leaseAcquisitions, leaseLosses atomic.Int64
 }
 
 // Open a database, creating it when no manifest exists.
@@ -209,12 +215,16 @@ func (db *DB) Stats() Stats {
 	m := db.manifest
 	db.manifestMu.Unlock()
 	s := Stats{
-		S3:                db.client.Counter.Counts(),
-		MemoryCacheHits:   db.memHits.Load(),
-		MemoryCacheMisses: db.memMisses.Load(),
-		DiskCacheHits:     db.diskHits.Load(),
-		DiskCacheMisses:   db.diskMisses.Load(),
-		CompactionRebases: db.compactionRebases.Load(),
+		S3:                 db.client.Counter.Counts(),
+		MemoryCacheHits:    db.memHits.Load(),
+		MemoryCacheMisses:  db.memMisses.Load(),
+		DiskCacheHits:      db.diskHits.Load(),
+		DiskCacheMisses:    db.diskMisses.Load(),
+		CompactionsStarted: db.compactionsStarted.Load(),
+		CompactionRebases:  db.compactionRebases.Load(),
+		MaintenanceRuns:    db.maintenanceRuns.Load(),
+		LeaseAcquisitions:  db.leaseAcquisitions.Load(),
+		LeaseLosses:        db.leaseLosses.Load(),
 	}
 	if m != nil {
 		s.Seq = m.Seq
