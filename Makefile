@@ -49,6 +49,13 @@ SOAK_DURATION ?= 5m
 soak:
 	MARAGUDB_SOAK=1 MARAGUDB_SOAK_DURATION=$(SOAK_DURATION) go test ./internal/sim -run 'TestSimulator/soak' -count 1 -v -timeout 0
 
+# Rewrite the ratchet baseline in /internal/pgdiff/testdata/ratchet.json: the number of
+# statements that a fixed-seed differential run executes on both sides. Commit a higher count;
+# the test fails when the count drops.
+.PHONY: ratchet
+ratchet:
+	go test ./internal/pgdiff -run 'TestDifferential/the_generator' -count 1 -args -update
+
 # Run the Postgres differential harness with many more cases (default 3000).
 PGDIFF_CASES ?= 3000
 .PHONY: pgdiff
