@@ -120,3 +120,84 @@ func TestStoreClient(t *testing.T) {
 		}, hegel.WithTestCases(300))
 	})
 }
+
+// scriptedStore answers every request with the given values.
+type scriptedStore struct {
+	body      []byte
+	etag      string
+	deleteErr error
+	keys      []string
+}
+
+func (s *scriptedStore) Get(context.Context, string, GetOptions) ([]byte, string, error) {
+	return s.body, s.etag, nil
+}
+
+func (s *scriptedStore) Put(context.Context, string, []byte, PutOptions) (string, error) {
+	return s.etag, nil
+}
+
+func (s *scriptedStore) Delete(context.Context, string) error {
+	return s.deleteErr
+}
+
+func (s *scriptedStore) List(context.Context, string) ([]string, error) {
+	return s.keys, nil
+}
+
+func TestStoreClient_misbehavingStores(t *testing.T) {
+	t.Run("rejects an empty ETag, which would turn every conditional write unconditional", func(t *testing.T) {
+		c := storeClient{store: &scriptedStore{body: []byte("v")}}
+		_, err := c.Get(t.Context(), "k", s3.GetOptions{})
+		if err == nil {
+			t.Fatal("Get accepted an empty ETag")
+		}
+		_, err = c.Put(t.Context(), "k", []byte("v"), s3.PutOptions{})
+		if err == nil {
+			t.Fatal("Put accepted an empty ETag")
+		}
+	})
+
+	t.Run("rejects a byte range longer than asked for, as from a store that ignores ranges", func(t *testing.T) {
+		c := storeClient{store: &scriptedStore{body: []byte("0123456789"), etag: `"e"`}}
+		_, err := c.Get(t.Context(), "k", s3.GetOptions{Range: &s3.ByteRange{Offset: 2, Length: 3}})
+		if err == nil {
+			t.Fatal("accepted 10 bytes for a range of 3")
+		}
+		o, err := c.Get(t.Context(), "k", s3.GetOptions{Range: &s3.ByteRange{Offset: 2, Length: 10}})
+		if err != nil || len(o.Body) != 10 {
+			t.Fatalf("a range that ends past the end may be short or exact, got %d bytes, %v", len(o.Body), err)
+		}
+	})
+
+	t.Run("copies the body it returns, so the store's buffer can change afterwards", func(t *testing.T) {
+		s := &scriptedStore{body: []byte("v"), etag: `"e"`}
+		c := storeClient{store: s}
+		o, err := c.Get(t.Context(), "k", s3.GetOptions{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		s.body[0] = 'x'
+		if string(o.Body) != "v" {
+			t.Fatalf("body changed to %q", o.Body)
+		}
+	})
+
+	t.Run("treats a missing object on delete as deleted, as S3 does", func(t *testing.T) {
+		c := storeClient{store: &scriptedStore{deleteErr: fmt.Errorf("gone: %w", ErrObjectNotFound)}}
+		if err := c.Delete(t.Context(), "k"); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("sorts a copy of the keys, leaving the store's slice alone", func(t *testing.T) {
+		s := &scriptedStore{keys: []string{"b", "a"}}
+		infos, err := storeClient{store: s}.List(t.Context(), "")
+		if err != nil || len(infos) != 2 || infos[0].Key != "a" {
+			t.Fatalf("got %v, %v", infos, err)
+		}
+		if s.keys[0] != "b" {
+			t.Fatalf("the store's slice was sorted in place: %v", s.keys)
+		}
+	})
+}

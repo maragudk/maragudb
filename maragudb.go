@@ -120,8 +120,8 @@ type Options struct {
 	// The store must be safe for concurrent use and return [ErrObjectNotFound],
 	// [ErrPreconditionFailed], and [ErrNotModified], possibly wrapped, for those outcomes. Any
 	// other error means the request failed, and a failed write may or may not have been applied.
-	// An ETag identifies the content of one version of an object: Put returns the ETag that a
-	// later Get of that version returns. A read with [GetOptions.Consistent] must see every
+	// An ETag is never empty and identifies the content of one version of an object: Put returns
+	// the ETag that a later Get of that version returns. A read with [GetOptions.Consistent] must see every
 	// write that completed before it started. Correctness depends on all of this.
 	Store objectStore
 }

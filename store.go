@@ -1,8 +1,11 @@
 package maragudb
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"slices"
 	"sort"
 
 	"maragu.dev/maragudb/internal/s3"
@@ -57,7 +60,11 @@ type PutOptions struct {
 	IfMatch string
 }
 
-// storeClient adapts an [objectStore] to the engine's client.
+// storeClient adapts an [objectStore] to the engine's client. It refuses answers that would
+// silently break the engine: an empty ETag, which would make every conditional write
+// unconditional, and a byte range longer than asked for, as from a store that ignores ranges. It
+// copies bodies in both directions, so the store may reuse its buffers. Listings carry keys only,
+// without sizes or modification times.
 type storeClient struct {
 	store objectStore
 }
@@ -74,15 +81,32 @@ func (c storeClient) Get(ctx context.Context, key string, opts s3.GetOptions) (s
 	if err != nil {
 		return s3.Object{}, err
 	}
-	return s3.Object{Body: body, ETag: etag}, nil
+	if etag == "" {
+		return s3.Object{}, fmt.Errorf("maragudb: the store answered a read of %q without an ETag", key)
+	}
+	if o.Length > 0 && int64(len(body)) > o.Length {
+		return s3.Object{}, fmt.Errorf("maragudb: the store answered a read of %d bytes of %q with %d bytes", o.Length, key, len(body))
+	}
+	return s3.Object{Body: bytes.Clone(body), ETag: etag}, nil
 }
 
 func (c storeClient) Put(ctx context.Context, key string, body []byte, opts s3.PutOptions) (string, error) {
-	return c.store.Put(ctx, key, body, PutOptions{IfNoneMatch: opts.IfNoneMatch, IfMatch: opts.IfMatch})
+	etag, err := c.store.Put(ctx, key, bytes.Clone(body), PutOptions{IfNoneMatch: opts.IfNoneMatch, IfMatch: opts.IfMatch})
+	if err != nil {
+		return "", err
+	}
+	if etag == "" {
+		// The write may have landed, so this is not a definite failure.
+		return "", fmt.Errorf("maragudb: the store answered a write of %q without an ETag", key)
+	}
+	return etag, nil
 }
 
 func (c storeClient) Delete(ctx context.Context, key string) error {
-	return c.store.Delete(ctx, key)
+	if err := c.store.Delete(ctx, key); err != nil && !errors.Is(err, ErrObjectNotFound) {
+		return err
+	}
+	return nil
 }
 
 func (c storeClient) List(ctx context.Context, prefix string) ([]s3.ObjectInfo, error) {
@@ -90,6 +114,7 @@ func (c storeClient) List(ctx context.Context, prefix string) ([]s3.ObjectInfo, 
 	if err != nil {
 		return nil, err
 	}
+	keys = slices.Clone(keys)
 	sort.Strings(keys)
 	infos := make([]s3.ObjectInfo, len(keys))
 	for i, k := range keys {
