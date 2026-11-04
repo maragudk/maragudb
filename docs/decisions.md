@@ -97,3 +97,16 @@ Context: acceptance criterion 4 asks for differential testing against Postgres, 
 Decision: hegel generates a schema, rows, and statements as the `ast` package's syntax tree, which renders to both dialects; the harness in `/internal/pgdiff` runs each statement on both and compares results, exactly when `ORDER BY` determines the order and as multisets otherwise. Postgres 18 runs in a Docker container locally and as the shared workflow's service in CI, with a database created from `template0` with the `C` locale so that strings compare by byte order on both sides. The harness fails rather than skips when neither is available. `pgx` is the test dependency for the Postgres side. Every intentional difference is listed in `/docs/deviations.md` with its own test that asserts the difference on both databases, so the list cannot drift from the behavior.
 
 Alternative considered: comparing against SQLite, which the requirements interview rejected because the dialect must not inherit SQLite's quirks.
+
+## 2026-11-03: Automatic maintenance coordinated by an S3 lease that only saves work
+
+The driver runs compaction and GC in the background. Maintenance is on by default and can be turned off. Clients coordinate through a lease object in S3, with a timeout. A client acquires the lease with `If-None-Match: *` and renews it or takes it over with `If-Match`.
+
+The lease is only an efficiency optimization, and correctness never depends on it. Compaction is a conditional commit like any other, and GC needs no coordination, because a delete can safely happen twice. If two clients both believe they hold the lease, they duplicate work and nothing else. This is why the lease needs no fencing tokens and no assumption about clock sync. The simulator must show that correctness holds with the lease disabled and with leases that overlap.
+
+Compaction also rebases on a conflict. When the commits that won against it only added segments, it reapplies its swap on top of them instead of redoing the merge. This means steady write traffic no longer starves compaction, which is a problem the lease cannot solve.
+
+Alternatives considered:
+- Manual `Compact` and `GC` only. This is easy to forget, and the database slowly degrades.
+- Every client maintaining on its own, with no lease. This is safe but wastes requests and work when there are many clients.
+- A lease that correctness depends on. This would need fencing, and it would make clock skew a safety issue.
