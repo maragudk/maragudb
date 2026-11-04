@@ -97,6 +97,16 @@ func Prepare(sql string) (*Statement, error) {
 	return st, nil
 }
 
+// Prepare parses sql in the session. As in Postgres, a statement that does not parse, or that
+// maragudb rejects as unsupported while parsing, aborts an explicit transaction.
+func (s *Session) Prepare(sql string) (*Statement, error) {
+	st, err := Prepare(sql)
+	if err != nil {
+		s.aborted = s.explicit
+	}
+	return st, err
+}
+
 // exprs of a statement, for walking.
 func exprs(s ast.Statement) []ast.Expr {
 	var out []ast.Expr
@@ -325,6 +335,9 @@ func (s *Session) run(ctx context.Context, st *Statement, params []value.Value) 
 	}
 	wrote := len(s.kv.pending) > 0
 	if err := s.kv.apply(); err != nil {
+		// Some of the statement's writes may have reached the transaction, which therefore
+		// cannot commit.
+		s.aborted = s.explicit
 		return nil, Result{}, err
 	}
 	s.wrote = s.wrote || wrote

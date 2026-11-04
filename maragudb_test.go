@@ -332,6 +332,23 @@ func TestTx(t *testing.T) {
 		is.Equal(t, "11", queryRows(t, b, "SELECT n FROM t"))
 	})
 
+	t.Run("a statement that does not parse aborts the transaction, as in Postgres", func(t *testing.T) {
+		verify.Covers(t, "a syntax error or an unsupported statement in an explicit transaction aborts it, so a later commit rolls everything back", "INV-PG-SUBSET")
+		for _, bad := range []string{"SELEC 1", "SELECT 1.5"} {
+			db := newDB(t)
+			mustExec(t, db, "CREATE TABLE t (id bigint PRIMARY KEY)")
+			tx, err := db.BeginTx(t.Context(), nil)
+			is.NotError(t, err)
+			mustExec(t, tx, "INSERT INTO t VALUES (1)")
+			_, err = tx.ExecContext(t.Context(), bad)
+			is.True(t, err != nil, bad)
+			_, err = tx.ExecContext(t.Context(), "INSERT INTO t VALUES (2)")
+			is.Error(t, maragudb.ErrTxAborted, err, bad)
+			is.Error(t, maragudb.ErrTxAborted, tx.Commit(), bad)
+			is.Equal(t, "", queryRows(t, db, "SELECT id FROM t"), "nothing was committed")
+		}
+	})
+
 	t.Run("a read-only transaction never conflicts and rejects writes", func(t *testing.T) {
 		verify.Covers(t, "a read-only transaction commits despite a concurrent commit and rejects writes", "INV-READ-ONLY")
 		w := newWorld(t)

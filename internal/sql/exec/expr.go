@@ -29,6 +29,10 @@ type cexpr struct {
 	// text. Postgres does not fold such an expression, so it is evaluated when the statement
 	// runs, even when it reads no columns.
 	stable bool
+	// pruned reports that the expression was bound in a branch that is never evaluated, so that
+	// a conversion applied to it later, when it is unified with the live branches, does not
+	// report a folding error either.
+	pruned bool
 	// param is the number of the parameter the expression is, when it is a parameter of a Go
 	// type other than string, which has type [value.Unknown] until its context gives it one.
 	// Its value is in val, typed by its Go type.
@@ -125,7 +129,11 @@ func (b *binder) fold(e *cexpr, children ...*cexpr) (*cexpr, error) {
 func (b *binder) bindPruned(e ast.Expr) (*cexpr, error) {
 	b.pruned++
 	defer func() { b.pruned-- }()
-	return b.bind(e)
+	ce, err := b.bind(e)
+	if ce != nil {
+		ce.pruned = true
+	}
+	return ce, err
 }
 
 // castError maps a text input error of the value package to the statement error it is.
@@ -212,6 +220,10 @@ func goTypeFor(t value.Type) string {
 // that it folds like any other, so a conversion that fails is a folding error, which a pruned
 // branch does not report.
 func (b *binder) numericTo(e *cexpr, t value.Type) (*cexpr, error) {
+	if e.pruned {
+		b.pruned++
+		defer func() { b.pruned-- }()
+	}
 	var conv func(s string) (value.Value, error)
 	switch t {
 	case value.Float:
@@ -486,9 +498,6 @@ func (b *binder) unary(e *ast.Unary) (*cexpr, error) {
 		case value.Unknown:
 			// Postgres has unary minus and plus for several types, so an unknown operand is
 			// ambiguous.
-			if x.val.Null {
-				return nil, fmt.Errorf("%w: operator is not unique: %s unknown", ErrType, sym)
-			}
 			return nil, fmt.Errorf("%w: operator is not unique: %s unknown", ErrType, sym)
 		case value.Numeric:
 			return nil, fmt.Errorf("%w: the numeric type is not supported, write the sign as part of the literal or cast the literal to double precision or bigint", ErrUnsupported)

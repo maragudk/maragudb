@@ -21,7 +21,7 @@ import (
 // castInputs are the characters of the text that the cast property reads, chosen so that most
 // draws are close to a valid value of some type.
 var castInputs = []string{"0", "1", "5", "9", "-", "+", ".", "e", "E", " ", "x", "X", "0x", "0o", "0b", "_", "\\", "\\x", "a", "f", "t", "rue", "alse", "on", "off", "yes", "no",
-	"nan", "NaN", "inf", "Infinity", "2024", "-01", "-02", "-29", "-31", "-13", " 03", "T", ":04", ":05", ".123456", "789", "Z", "+02", "-0130", "+14:59", "24:00:00", "1e308", "1e-320", "9223372036854775807", "9223372036854775808"}
+	"nan", "NaN", "inf", "Infinity", "2024", "-01", "-02", "-29", "-31", "-13", " 03", "T", ":04", ":05", ".123456", "789", "Z", "+02", "-0130", "+14:59", ":60", ":99", "24:00:00", "1e308", "1e-320", "9223372036854775807", "9223372036854775808"}
 
 func TestCasts(t *testing.T) {
 	t.Run("text casts to every type, and back to text, the same as Postgres, or are rejected as unsupported", func(t *testing.T) {

@@ -260,7 +260,7 @@ func (c *Conn) Prepare(query string) (driver.Stmt, error) {
 
 // PrepareContext parses the statement.
 func (c *Conn) PrepareContext(_ context.Context, query string) (driver.Stmt, error) {
-	st, err := exec.Prepare(query)
+	st, err := c.session.Prepare(query)
 	if err != nil {
 		return nil, err
 	}
@@ -302,7 +302,7 @@ func (c *Conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, e
 
 // ExecContext runs a statement without preparing it separately.
 func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
-	st, err := exec.Prepare(query)
+	st, err := c.session.Prepare(query)
 	if err != nil {
 		return nil, err
 	}
@@ -311,7 +311,7 @@ func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.Name
 
 // QueryContext runs a query without preparing it separately.
 func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
-	st, err := exec.Prepare(query)
+	st, err := c.session.Prepare(query)
 	if err != nil {
 		return nil, err
 	}

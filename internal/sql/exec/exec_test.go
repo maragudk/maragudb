@@ -294,6 +294,7 @@ func TestSession_Select(t *testing.T) {
 			{"SELECT 1 LIMIT '1'", "1"},
 			{"SELECT 1.5::text, 1e5 || 'x', 01.50::text, .5::text, (-0.0)::text, 1.5e1::text, 1e-3 || '', 1.::text, 000.0::text, 1.0e-2::text, 'a' || 9223372036854775808, 1.5E+2::text", `"1.5" "100000x" "1.50" "0.5" "0.0" "15" "0.001" "1" "0.0" "0.010" "a9223372036854775808" "150"`},
 			{"SELECT CASE WHEN FALSE THEN 1e400::float8 END, CASE WHEN FALSE THEN 9223372036854775808::bigint END", "NULL NULL"},
+			{"SELECT CASE WHEN TRUE THEN 1.5::float8 ELSE 1e400 END, CASE WHEN FALSE THEN 1e400 ELSE 1.5::float8 END, coalesce(1.5::float8, 1e400)", "1.5 1.5 1.5"},
 		}
 		for _, test := range tests {
 			t.Run(test.sql, func(t *testing.T) {

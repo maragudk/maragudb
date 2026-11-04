@@ -405,7 +405,7 @@ func ParseTime(s string) (time.Time, error) {
 	t := time.Date(year, time.Month(month), day, hour, minute, sec, usec*1000, time.UTC)
 	if m[9] != "" {
 		offset := field(10)*3600 + field(11)*60
-		if offset > 15*3600+59*60 {
+		if field(11) > 59 || offset > 15*3600+59*60 {
 			return time.Time{}, fmt.Errorf("%w: time zone displacement out of range: %q", ErrInvalidInput, s)
 		}
 		if m[9] == "+" {

@@ -13,7 +13,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - 29 acceptance criteria (`AC-`), 20 key invariants (`INV-`), 17 classes of unsupported statements (`UNS-`), and 0 remaining differences from Postgres (`DEV-`), each verified by at least one test.
 - 8 mutants (`MUT-`), deliberate bugs, of which 7 are detected by the simulator's checkers within 20 seeds.
 - 13 interesting states (`STATE-`) that the simulator's fixed corpus must reach.
-- 132 declarations of coverage in the tests.
+- 133 declarations of coverage in the tests.
 
 ## Acceptance criteria
 
@@ -370,6 +370,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 > SQL flavor: a strict subset of Postgres 18. The same SQL text runs on both, and for every statement that maragudb accepts, the result is identical to Postgres: rows, values, column names, affected-row counts, and transaction state. When Postgres fails a statement, maragudb fails it too, with the same error class wherever the error does not depend on evaluation order or physical row order.
 
+- `.` `TestTx/a_statement_that_does_not_parse_aborts_the_transaction,_as_in_Postgres`: a syntax error or an unsupported statement in an explicit transaction aborts it, so a later commit rolls everything back
 - `internal/pgdiff` `TestCasts/text_casts_to_every_type,_and_back_to_text,_the_same_as_Postgres,_or_are_rejected_as_unsupported`: hegel-drawn text near valid input for bigint, double precision, boolean, bytea, and timestamptz casts to the type and back to text with the same result or the same error class as Postgres, unless maragudb rejects it as unsupported
 - `internal/pgdiff` `TestParameters/a_parameter_of_every_Go_type_in_every_context_gives_the_same_result_as_Postgres_with_pgx,_or_is_rejected_as_unsupported`: hegel-drawn Go values bound as parameters in contexts that infer different types give the same result or error class as Postgres with pgx, or fail on both when pgx refuses to encode them, unless maragudb rejects them as unsupported
 - `internal/sql/exec` `TestSession_Insert/applies_Postgres's_assignment_casts`: an INSERT applies the assignment casts Postgres has: a quoted literal as the column's type, numeric and float literals rounded into bigint, integers widened to double precision, and any value written into text

@@ -264,14 +264,22 @@ func (p *parser) transactionWord() error {
 	return err
 }
 
+// begin parses BEGIN [WORK | TRANSACTION] or START TRANSACTION, with transaction modes that
+// may be separated by commas.
 func (p *parser) begin() (ast.Statement, error) {
+	start := p.isWord("start")
 	if err := p.advance(); err != nil {
 		return nil, err
 	}
-	if err := p.transactionWord(); err != nil {
+	if start {
+		if err := p.expectWord("transaction"); err != nil {
+			return nil, err
+		}
+	} else if err := p.transactionWord(); err != nil {
 		return nil, err
 	}
 	s := &ast.Begin{}
+	afterComma := false
 	for {
 		switch {
 		case p.isWord("read"):
@@ -311,10 +319,13 @@ func (p *parser) begin() (ast.Statement, error) {
 			}
 		case p.isKeyword("deferrable"):
 			return nil, p.unsupportedf("DEFERRABLE transactions are not supported")
+		case afterComma:
+			return nil, p.errorf("expected a transaction mode, got %v", p.tok)
 		default:
 			return s, nil
 		}
-		if p.isOp(",") {
+		afterComma = p.isOp(",")
+		if afterComma {
 			if err := p.advance(); err != nil {
 				return nil, err
 			}
@@ -1310,6 +1321,15 @@ func negateLiteral(lit *ast.Literal) (*ast.Literal, bool) {
 	return nil, false
 }
 
+// typeFuncNameKeywords are the keywords of Postgres's type_func_name class, which are reserved
+// as column names but can name a function or a type.
+var typeFuncNameKeywords = map[string]bool{
+	"authorization": true, "binary": true, "collation": true, "concurrently": true, "cross": true, "current_schema": true,
+	"freeze": true, "full": true, "ilike": true, "inner": true, "is": true, "isnull": true, "join": true, "left": true,
+	"like": true, "natural": true, "notnull": true, "outer": true, "overlaps": true, "right": true, "similar": true,
+	"tablesample": true, "verbose": true,
+}
+
 // supportedFunctions, which the executor binds.
 var supportedFunctions = map[string]bool{"length": true, "lower": true, "upper": true, "abs": true, "coalesce": true}
 
@@ -1348,6 +1368,10 @@ func (p *parser) primary() (ast.Expr, error) {
 			return nil, p.unsupportedf("subqueries are not supported")
 		case "any", "all", "some":
 			return nil, p.unsupportedf("%s is not supported, write IN or several comparisons", strings.ToUpper(tok.text))
+		}
+		// Postgres's type_func_name keywords can name a function, such as left(s, 1).
+		if typeFuncNameKeywords[tok.text] && p.peek().kind == tokOp && p.peek().text == "(" {
+			return nil, p.unsupportedf("function %s is not supported", tok.text)
 		}
 	case tokIdent:
 		if tok.quoted {
@@ -1432,6 +1456,11 @@ func (p *parser) call(name string, quoted bool) (ast.Expr, error) {
 	// rather than a function that does not exist.
 	if !supportedFunctions[name] {
 		return nil, p.unsupportedf("function %s is not supported", name)
+	}
+	if quoted && name == "coalesce" {
+		// COALESCE is a construct of the grammar, so a quoted name is an ordinary function, which
+		// Postgres does not have.
+		return nil, fmt.Errorf("%w at position %d: function \"coalesce\" does not exist", ErrInvalid, p.tok.pos+1)
 	}
 	var args []ast.Expr
 	if !p.isOp(")") {

@@ -186,6 +186,9 @@ func TestParse(t *testing.T) {
 			{"-1.5", value.NewNumeric("-1.5")},
 			{"1e3", value.NewNumeric("1e3")},
 			{"0x7fffffff", value.NewInt4(math.MaxInt32)},
+			{"0x_1F", value.NewInt4(31)},
+			{"0o_1_7", value.NewInt4(15)},
+			{"0b_101", value.NewInt4(5)},
 			{"0x80000000", value.NewInt(math.MaxInt32 + 1)},
 			{"0xffffffffffffffffff", value.NewNumeric("4722366482869645213695")},
 			{"-(5)", value.NewInt4(-5)},
@@ -243,6 +246,11 @@ func TestParse(t *testing.T) {
 			{"select a from t limit 1 limit 2", "syntax error at position 31: multiple LIMIT clauses not allowed"},
 			{"select 1 2 3", "syntax error at position 10: unexpected \"2\""},
 			{"select a:b", "syntax error at position 9: unexpected character ':'"},
+			{"begin read only,", "syntax error at position 17: expected a transaction mode, got end of statement"},
+			{"start", "syntax error at position 6: expected TRANSACTION, got end of statement"},
+			{"start work", "syntax error at position 7: expected TRANSACTION, got \"work\""},
+			{"select 1_", "syntax error at position 8: trailing junk after numeric literal"},
+			{`select "coalesce"(1)`, `invalid statement at position 19: function "coalesce" does not exist`},
 		}
 		for _, test := range tests {
 			t.Run(test.sql, func(t *testing.T) {
@@ -363,6 +371,9 @@ func TestParse(t *testing.T) {
 			{"select a from public.t", "qualified names such as table.column are not supported, name the column alone"},
 			{"(select 1)", "a parenthesized statement is not supported"},
 			{"select row(1, 2)", "row constructors are not supported"},
+			{"select left('abc', 1)", "function left is not supported"},
+			{"select 'a' -- c\n'b'", "string constants continued on the next line are not supported, write one string"},
+			{"select 'a' \v\n 'b'", "string constants continued on the next line are not supported, write one string"},
 			{"select (1, 2)", "row constructors are not supported"},
 			{"select nullif(a, b) from t", "function nullif is not supported"},
 			{"select a from t where a = default", "DEFAULT is not supported"},

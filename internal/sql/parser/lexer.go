@@ -62,7 +62,7 @@ func (l *lexer) skipSpace() error {
 	for l.pos < len(l.src) {
 		c := l.src[l.pos]
 		switch {
-		case c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f':
+		case c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f' || c == '\v':
 			l.pos++
 		case strings.HasPrefix(l.src[l.pos:], "--"):
 			for l.pos < len(l.src) && l.src[l.pos] != '\n' {
@@ -231,14 +231,26 @@ func (l *lexer) string() (string, error) {
 	return s, nil
 }
 
-// checkContinuation rejects two string constants separated only by whitespace with a newline,
-// which Postgres joins into one.
+// checkContinuation rejects two string constants separated only by whitespace and -- comments
+// that include a newline, which Postgres joins into one.
 func (l *lexer) checkContinuation(start int) error {
 	i := l.pos
 	newline := false
-	for i < len(l.src) && (l.src[i] == ' ' || l.src[i] == '\t' || l.src[i] == '\n' || l.src[i] == '\r') {
-		newline = newline || l.src[i] == '\n' || l.src[i] == '\r'
-		i++
+scan:
+	for i < len(l.src) {
+		switch c := l.src[i]; {
+		case c == ' ' || c == '\t' || c == '\f' || c == '\v':
+			i++
+		case c == '\n' || c == '\r':
+			newline = true
+			i++
+		case strings.HasPrefix(l.src[i:], "--"):
+			for i < len(l.src) && l.src[i] != '\n' && l.src[i] != '\r' {
+				i++
+			}
+		default:
+			break scan
+		}
 	}
 	if newline && i < len(l.src) && l.src[i] == '\'' {
 		return l.unsupportedf(start, "string constants continued on the next line are not supported, write one string")
@@ -280,11 +292,13 @@ func (l *lexer) quotedIdent() (token, error) {
 // exponent, or an integer with a 0x, 0o, or 0b prefix, with single underscores between digits.
 func (l *lexer) number() (token, error) {
 	start := l.pos
-	digits := func(valid func(byte) bool) bool {
+	// digits scans digits with single underscores between them. After a base prefix, an
+	// underscore may also come first, as in 0x_1F.
+	digits := func(valid func(byte) bool, prefixed bool) bool {
 		n := 0
 		for l.pos < len(l.src) {
 			c := l.src[l.pos]
-			if c == '_' && n > 0 && l.pos+1 < len(l.src) && valid(l.src[l.pos+1]) {
+			if c == '_' && (n > 0 || prefixed) && l.pos+1 < len(l.src) && valid(l.src[l.pos+1]) {
 				l.pos++
 				continue
 			}
@@ -308,7 +322,7 @@ func (l *lexer) number() (token, error) {
 		}
 		if valid != nil {
 			l.pos += 2
-			if !digits(valid) {
+			if !digits(valid, true) {
 				return token{}, l.errorf(start, "invalid number")
 			}
 			if l.pos < len(l.src) && (isIdentStart(l.src[l.pos]) || isDigit(l.src[l.pos])) {
@@ -317,17 +331,17 @@ func (l *lexer) number() (token, error) {
 			return token{kind: tokNumber, text: l.src[start:l.pos], pos: start}, nil
 		}
 	}
-	digits(isDigit)
+	digits(isDigit, false)
 	if l.pos < len(l.src) && l.src[l.pos] == '.' {
 		l.pos++
-		digits(isDigit)
+		digits(isDigit, false)
 	}
 	if l.pos < len(l.src) && (l.src[l.pos] == 'e' || l.src[l.pos] == 'E') {
 		l.pos++
 		if l.pos < len(l.src) && (l.src[l.pos] == '+' || l.src[l.pos] == '-') {
 			l.pos++
 		}
-		if !digits(isDigit) {
+		if !digits(isDigit, false) {
 			return token{}, l.errorf(start, "trailing junk after numeric literal")
 		}
 	}
