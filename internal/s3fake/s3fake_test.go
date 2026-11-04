@@ -1,6 +1,7 @@
 package s3fake_test
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -347,6 +348,79 @@ func TestClient_Unavailable(t *testing.T) {
 		}
 		body, _ := c.Body("k")
 		is.Equal(t, "v1", string(body))
+	})
+}
+
+// hookClock runs a hook on every sleep, standing in for another request of the same process
+// that runs meanwhile.
+type hookClock struct {
+	*s3fake.VirtualClock
+	hook func()
+}
+
+func (c hookClock) Sleep(ctx context.Context, d time.Duration) {
+	c.VirtualClock.Sleep(ctx, d)
+	c.hook()
+}
+
+func TestClient_crashDuringRequest(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		faults s3fake.Faults
+		before func(c *s3fake.Client)
+	}{
+		{name: "a process that crashes while a request waits out its latency does not apply it", faults: s3fake.Faults{MaxLatency: time.Second}},
+		{name: "a process that crashes while a request times out in an outage does not apply it", faults: s3fake.Faults{OutageTimeout: time.Second}, before: func(c *s3fake.Client) {
+			c.Unavailable("", c.Now().Add(time.Hour))
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			for seed := range uint64(20) {
+				p := &s3fake.Process{Name: "p"}
+				clock := hookClock{VirtualClock: s3fake.NewVirtualClock(time.Unix(0, 0)), hook: func() { p.Crash("another request") }}
+				faults := test.faults
+				faults.Rand = rand.New(rand.NewPCG(seed, 1))
+				c := s3fake.New(s3fake.WithClock(clock), s3fake.WithFaults(faults))
+				if test.before != nil {
+					test.before(c)
+				}
+				_, err := c.Put(s3fake.WithProcess(t.Context(), p), "k", []byte("v"), s3.PutOptions{})
+				is.True(t, err != nil)
+				_, ok := c.Body("k")
+				is.True(t, !ok, "nothing is applied after a crash")
+			}
+		})
+	}
+}
+
+func TestNew(t *testing.T) {
+	t.Run("panics on an outage rate without a maximum outage length", func(t *testing.T) {
+		defer func() {
+			is.True(t, recover() != nil)
+		}()
+		s3fake.New(s3fake.WithFaults(s3fake.Faults{Rand: rand.New(rand.NewPCG(1, 1)), OutageRate: 0.5}))
+	})
+}
+
+func TestClient_OutageRate(t *testing.T) {
+	t.Run("a process without a name is never partitioned on its own, so its outages reach everyone", func(t *testing.T) {
+		c := s3fake.New(s3fake.WithFaults(s3fake.Faults{Rand: rand.New(rand.NewPCG(1, 1)), OutageRate: 1, MaxOutage: time.Hour}))
+		_, err := c.Put(s3fake.WithProcess(t.Context(), &s3fake.Process{}), "k", []byte("v"), s3.PutOptions{})
+		is.Error(t, s3fake.ErrUnavailable, err)
+		is.Equal(t, 1, c.Outages())
+		_, err = c.Put(s3fake.WithProcess(t.Context(), &s3fake.Process{Name: "q"}), "k", []byte("v"), s3.PutOptions{})
+		is.Error(t, s3fake.ErrUnavailable, err)
+	})
+
+	t.Run("starts partitions and outages that fail the request that started them", func(t *testing.T) {
+		c := s3fake.New(s3fake.WithFaults(s3fake.Faults{Rand: rand.New(rand.NewPCG(1, 1)), OutageRate: 0.1, MaxOutage: 50 * time.Millisecond, MaxLatency: 100 * time.Millisecond}))
+		for i := range 200 {
+			_, err := c.Put(s3fake.WithProcess(t.Context(), &s3fake.Process{Name: fmt.Sprint("p", i%4)}), fmt.Sprint("k", i), []byte("v"), s3.PutOptions{})
+			if err != nil {
+				is.Error(t, s3fake.ErrUnavailable, err)
+			}
+		}
+		is.True(t, c.Outages() > 5, fmt.Sprint(c.Outages(), " outages"))
 	})
 }
 

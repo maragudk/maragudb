@@ -83,8 +83,8 @@ const (
 type Faults struct {
 	// Rand drives all random fault decisions. Required when any rate is non-zero.
 	Rand *rand.Rand
-	// Decide scripts the outcome of each request instead of the rates when non-nil.
-	// Latency still follows MaxLatency.
+	// Decide scripts the outcome of each request instead of the error, lost acknowledgement, and
+	// crash rates when non-nil. Latency still follows MaxLatency, and outages OutageRate.
 	Decide func(kind s3.Kind, key string) Outcome
 	// ErrorRate is the probability that a request fails before it is applied.
 	ErrorRate float64
@@ -101,7 +101,8 @@ type Faults struct {
 	// three are partitions of the calling [Process], and the rest, as well as those started by a
 	// request without a process, make the store unreachable for everyone. See [Client.Unavailable].
 	OutageRate float64
-	// MaxOutage bounds the uniformly drawn length of an outage started by OutageRate.
+	// MaxOutage bounds the uniformly drawn length of an outage started by OutageRate. Required
+	// when OutageRate is non-zero.
 	MaxOutage time.Duration
 	// OutageTimeout is how long a request that times out during an outage takes, in virtual
 	// time. Zero makes every request in an outage fail at once.
@@ -201,12 +202,16 @@ func New(opts ...Option) *Client {
 	if c.faults.Rand == nil && (c.faults.ErrorRate > 0 || c.faults.LostAckRate > 0 || c.faults.CrashRate > 0 || c.faults.MaxLatency > 0 || c.faults.OutageTimeout > 0 || c.faults.OutageRate > 0) {
 		panic("s3fake: faults require a Rand")
 	}
+	if c.faults.OutageRate > 0 && c.faults.MaxOutage <= 0 {
+		panic("s3fake: an outage rate requires MaxOutage")
+	}
 	return c
 }
 
 // Unavailable makes the store unreachable until the given time on the fake's clock: for the
-// requests of the [Process] with the given name, which is a partition, or for every request when
-// the name is empty, which is an outage. A later call for the same name replaces the end time.
+// requests of every [Process] with the given name, which is a partition, or for every request when
+// the name is empty, which is an outage. A process restarted under the same name stays
+// partitioned. A later call for the same name replaces the end time.
 //
 // A request during an outage fails with [ErrUnavailable] and the process keeps running. Without
 // [Faults.OutageTimeout] it fails at once and is not applied, like a refused connection. With
@@ -236,7 +241,7 @@ func (c *Client) startOutage(p *Process, step string) bool {
 	}
 	c.randMu.Lock()
 	start := f.Rand.Float64() < f.OutageRate
-	partition := p != nil && f.Rand.IntN(3) != 0
+	partition := p != nil && f.Rand.IntN(3) != 0 && p.Name != ""
 	d := 1 + time.Duration(f.Rand.Int64N(int64(f.MaxOutage)))
 	c.randMu.Unlock()
 	if !start {
@@ -333,9 +338,13 @@ func (c *Client) request(ctx context.Context, kind s3.Kind, key string, write bo
 	f := c.faults
 	if f.Rand != nil && f.MaxLatency > 0 {
 		c.clock.Sleep(ctx, c.latency())
+		// Another request of the process may have crashed it meanwhile.
+		if crashed(p) {
+			return ErrCrashed
+		}
 	}
 	if c.unavailable(p) || c.startOutage(p, step) {
-		return c.outage(ctx, step, write, apply)
+		return c.outage(ctx, p, step, write, apply)
 	}
 	outcome := OutcomeNormal
 	switch {
@@ -388,8 +397,17 @@ func (c *Client) request(ctx context.Context, kind s3.Kind, key string, write bo
 	return err
 }
 
+// crashed reports whether p is a process that has crashed.
+func crashed(p *Process) bool {
+	if p == nil {
+		return false
+	}
+	crashed, _ := p.Crashed()
+	return crashed
+}
+
 // outage fails a request during an outage or partition, as described at [Client.Unavailable].
-func (c *Client) outage(ctx context.Context, step string, write bool, apply func() error) error {
+func (c *Client) outage(ctx context.Context, p *Process, step string, write bool, apply func() error) error {
 	timeout, applied := false, false
 	if c.faults.Rand != nil && c.faults.OutageTimeout > 0 {
 		c.randMu.Lock()
@@ -402,6 +420,9 @@ func (c *Client) outage(ctx context.Context, step string, write bool, apply func
 		return fmt.Errorf("%w: %s refused", ErrUnavailable, step)
 	}
 	c.clock.Sleep(ctx, c.faults.OutageTimeout)
+	if crashed(p) {
+		return ErrCrashed
+	}
 	if applied {
 		err := apply()
 		c.log("%s: unavailable, timed out after apply (%v)", step, err)
