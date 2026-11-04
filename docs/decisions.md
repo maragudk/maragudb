@@ -192,3 +192,17 @@ Decision: maragudb does not reproduce Postgres's cost model or plan choice. It r
 Alternatives considered:
 - Emulating the planner's conjunct order by estimated cost and equivalence classes, as the first draft did. Rejected because it depends on cost constants and plan choices that change between Postgres versions and table statistics, so the emulation could silently diverge.
 - Evaluating every row in a full scan to decide plan dependence exactly. Rejected because it would turn point lookups into full scans whenever a condition can fail.
+
+## 2026-11-04: A primary-key condition fixes the plan to an index scan
+
+Context: the previous decision rejects a condition that can fail when it sits next to a primary-key condition. That rejects natural OLTP statements such as `UPDATE acct SET b = b - $1 WHERE id = $2 AND b - $1 >= 0`. With an index scan, Postgres evaluates `b - $1` only on the row that the key selects. With a sequential scan, it can raise an overflow error on another row.
+
+Decision: maragudb accepts these statements and behaves as Postgres does with the primary-key index. It evaluates the other conditions only on the rows that the key condition selects. The rules for WHERE order and LIMIT stay as they are. The differential harness runs Postgres with `enable_seqscan = off`, so Postgres uses the same plan and the comparison stays deterministic. Postgres in its default configuration can choose a sequential scan, for example on a small table, and then fail on a row that the key does not select. In that case maragudb is more lenient than Postgres. This is a documented `DEV-` difference with its own test.
+
+Alternatives considered:
+- Keep rejecting. Rejected because it refuses the statements that small OLTP apps write most.
+- Evaluate the conditions on every row, as a sequential scan does. Rejected because every point update would cost O(table).
+
+Also decided: `integer` stays a type for literals only. It is not a column type for now, so the column types stay a small set to test.
+
+Markus left both choices to the lead.
