@@ -595,13 +595,15 @@ func (c *client) listAppendTx(ctx context.Context) {
 	}
 	err = tx.Commit(ctx)
 	h.Complete = c.run.stamp()
-	h.Outcome = c.outcome(err)
+	if readOnly && err != nil {
+		// A read-only commit does nothing, so an error means the reads never completed, and is
+		// not an unknown outcome.
+		h.Outcome = history.Failed
+	} else {
+		h.Outcome = c.outcome(err)
+	}
 	if err != nil {
 		h.Err = err.Error()
-	}
-	if readOnly && err != nil {
-		// A read-only commit does nothing, so an error means the reads never completed.
-		h.Outcome = history.Failed
 	}
 	c.record(h)
 }

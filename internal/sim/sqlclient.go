@@ -181,8 +181,10 @@ func (c *client) listAppendSQL(ctx context.Context) {
 	if c.rng.IntN(3) == 0 || len(plans) == 1 && plans[0].append {
 		k := plans[0].key
 		h := history.Tx{Client: c.id, Invoke: c.run.stamp()}
+		startedAt := c.run.sched.Now()
 		list, err := readList(ctx, c.sql, k)
 		if err != nil {
+			c.readErrorSQL(startedAt, err)
 			c.run.trace("client %d: read: %v", c.id, err)
 			return
 		}
@@ -247,12 +249,13 @@ func (c *client) listAppendSQL(ctx context.Context) {
 	}
 	err = tx.Commit()
 	h.Complete = c.run.stamp()
-	h.Outcome = c.outcomeSQL(err)
-	if err != nil {
-		h.Err = err.Error()
-	}
 	if readOnly && err != nil {
 		h.Outcome = history.Failed
+	} else {
+		h.Outcome = c.outcomeSQL(err)
+	}
+	if err != nil {
+		h.Err = err.Error()
 	}
 	c.record(h)
 }
