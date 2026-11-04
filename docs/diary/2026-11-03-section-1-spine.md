@@ -240,3 +240,98 @@ Hegel also created an example database at `/internal/pgdiff/.hegel/`, which the 
 - The Antithesis docker-compose harness, which this step did not cover.
 - `maragudb.Compact` and `maragudb.GC` are the only maintenance; a background maintainer or guidance on scheduling them belongs in a later section.
 - The disk cache never evicts and compaction rewrites everything in memory, as before.
+
+## Step 4: Closing the section 1 gaps: store injection, outages, error classes, and the Antithesis harness
+
+**Author:** spine-gaps
+
+### Prompt Context
+
+**Verbatim prompt:** You are closing the remaining gaps in section 1 of maragudb [...] ## The four gaps ### 1. Object-store injection via an unexported call-site interface [...] ### 2. S3 outages without crashes in the simulator [...] Show that the simulator now detects `RetryAfterUnknownCommit` through the bank or list-append workload, and include that in the mutant test. [...] ### 3. Compare error classes against Postgres [...] Then assert agreement on the mapped class. Where the two legitimately differ [...] document it as a deviation with a test, or relax the check in a documented, narrow way. Fix real mismatches in the executor. ### 4. The Antithesis docker-compose harness (acceptance criterion 8) [...] Decide whether the workload should run against an S3-compatible container such as versitygw or MinIO, or against the in-process fake, and say why in the diary. [...] Do NOT launch an Antithesis run; there is no account.
+
+Mid-run message from the lead, after a terminal crash: run the self-review over the gap commits, fix and commit anything consensus or serious, write this step, confirm `make test`, `go test -race ./...`, `make lint`, and the compose target are green, and clean up stale `maragudb-*` containers.
+
+**Interpretation:** Make the object store pluggable from outside the module, give the fake outages that leave processes running so that unknown commit outcomes reach live clients, make the Postgres harness compare why statements fail and not only whether, and build a runnable, validated Antithesis harness.
+
+**Inferred intent:** Every acceptance criterion of section 1 should be backed by a check that can fail, including the ones that were silently vacuous: a mutant nobody could detect, an error comparison that never happened, and a harness that did not exist.
+
+### What I did
+
+Gap 1. `/store.go` defines the unexported `objectStore` interface, the exported `GetOptions` and `PutOptions`, and the sentinel errors `ErrObjectNotFound`, `ErrPreconditionFailed`, and `ErrNotModified`, which alias the internal ones so that `errors.Is` works through the engine. `Options.Store` replaces the `Client` alias, and `storeClient` adapts the store to `s3.Client`. `/internal/s3test` adapts the internal fake back to the public shape for the external tests in `/maragudb_test.go` and `/internal/pgdiff`. `ExampleOptions` in `/store_test.go` is a complete store in memory, written as outside code would write it. A hegel property in `/store_internal_test.go` checks that the adapter over the fake answers every request sequence exactly like the fake.
+
+Gap 2. `s3fake.Faults` gained `OutageRate`, `MaxOutage`, and `OutageTimeout`, and `Client.Unavailable` makes the store unreachable for one named process (a partition) or for everyone (an outage) until a time on the virtual clock. A request in an outage fails with `ErrUnavailable` at once, or after the timeout, and a timed-out write lands with probability one half. The simulator's `DefaultConfig` turns outages on, `Stats` counts outages, unknown outcomes in processes that did not crash, and operations that failed on an unreachable store, and the corpus test asserts all three. The SQL list-append workload now runs a third of its operations as autocommit statements.
+
+Gap 3. `/internal/pgdiff/classes.go` maps every exported statement error to SQLSTATE codes, `Runner.compare` fails when both sides fail with different classes, and `TestErrorClasses` exercises every class and every code it maps to, including syntax, missing table, and read-only transaction errors that the generator never produces. The mapping then exposed executor differences, which I fixed in `/internal/sql/exec`: folding errors are deferred until the whole statement is checked and reported in Postgres's order (output and ORDER BY expressions, then WHERE, OFFSET, LIMIT); INSERT evaluates every row before writing any; BETWEEN and IN are rewritten to the comparisons Postgres uses; a deciding constant on the right of AND or OR decides it; a NULL WHERE conjunct reads no rows; a non-integer ORDER BY constant is a syntax error, including integer literals outside 32 bits; and two primary keys are `ErrInvalid` (the parser now owns that sentinel). Deviations 17 (a string literal where another type is expected), 18 (LIKE on a key column), and 19 (WHERE conjunct order) are documented with tests, and deviation 13 now covers errors that depend on which row fails first, for which the harness reruns the statement on Postgres with the rows stored in key order.
+
+Gap 4. `/antithesis` holds the harness: `/antithesis/Dockerfile` cross-compiles `/antithesis/workload` to linux/amd64 with cgo and `antithesis-go-toolexec`, `/antithesis/config/docker-compose.yaml` runs versitygw v1.10.0 and the workload, and `/antithesis/test/maragudb` holds five `parallel_driver_` commands that become hard links to the workload binary, which dispatches on its name. `/internal/workload` runs the bank and list-append workloads against any `s3.Client` with concurrent clients that each own an engine, records the history in wall-clock time, and checks it with the simulator's checkers plus the GC grace period. `make antithesis-build`, `make antithesis`, and `make antithesis-validate` build, run locally, and validate. The scratchbook in `/antithesis/scratchbook` records the SUT analysis, the topology, and the property catalog. A writer added the README paragraphs on custom stores and the harness. I added two entries to `/docs/decisions.md`.
+
+### Why
+
+The store choice for the harness: I run the workloads against versitygw and keep the in-process fake as a second test command. Antithesis injects its faults on the network and into containers, so against a fake in the same process it could only pick simulator seeds; against a real store, a partition in the middle of a manifest write is a real lost answer, and the AWS client, its retries, and its error mapping are in the path. The simulator command stays because it covers crash points (mid-commit, mid-compaction, mid-GC) that the network cannot inject on demand. versitygw over MinIO because MinIO's images are gone from Docker Hub (`pull access denied for minio/minio, repository does not exist or may require 'docker login'`). Before choosing it, I checked versitygw's conditional writes with a throwaway test against the AWS client (If-None-Match, stale and current If-Match, 304, ranges, If-Match on a missing key giving 404) and stressed atomicity with 16 concurrent conditional writers per object over 50 rounds: one winner every time.
+
+Outages start at a request, with a per-request probability, rather than on a timer. A timer-driven outage task almost never began between a commit's segment write and its manifest write, so unknown outcomes in live processes stayed rare and the mutant went undetected.
+
+### What worked
+
+- The mutant `RetryAfterUnknownCommit` is detected by the SQL list-append workload with seed 1 in about 2 ms: the retry fails on the duplicate key or on the outage, so the statement reports a definite failure for a write that is in the database (`failed write applied`, `read of failed write`). The bank workload cannot see it, because its writes are all explicit transactions and a doubled transfer conserves money. Every other mutant is still detected by seed 11 or earlier.
+- The corpus of 190 runs takes about 0.6 s with outages on: 846 outages, 148 unknown outcomes without a crash, and 508 operations failed by an unreachable store. A 3-minute soak with random outage settings ran 24,869 configurations without anomalies.
+- The error-class check found real executor differences within the first run, and after the fixes, three consecutive 8,000-case runs passed (about 36,000 statements each, with 4,000 failing on both sides, compared by class across 8 class and SQLSTATE pairs).
+- `make antithesis` passes locally in about 25 s, and `snouty validate antithesis/config` (snouty 0.8.0, a release binary I downloaded and checked against its published SHA-256) reports "Setup-complete event detected. Found 0 first, 5 driver, 0 anytime, 0 eventually, 0 finally test commands. Setup validation successful."
+
+### What didn't work
+
+- With outages on a timer (`OutageInterval` 400 ms, `MaxOutage` 600 ms), the mutant test failed: `mutant "retrying an autocommit statement after an unknown commit outcome" not detected in 20 seeds`. A 40-seed experiment detected it in 3 of 40 at best. Two changes fixed it: outages start at a request, and the SQL list-append workload runs more autocommit appends (detection then rose to 9 of 40, first seed 1).
+- The first strict error-class run failed on `SELECT c0 FROM t ORDER BY FALSE` with `both failed, for different reasons: postgres SQLSTATE 42601, maragudb invalid`. The next failures were `invalid/22025` for LIKE escapes, `out of range/42601`, where Postgres reported an ORDER BY mistake before a folding error in WHERE, and `ORDER BY 9223372036854775807`, which Postgres calls a non-integer constant.
+- Deferring folding errors first panicked: `panic: value: encoding unknown` from `value.EncodeKey` in `binder.plan`, because the planner used an unfolded constant's zero value. The plan is now built after the folding check.
+- Fresh random differential runs then failed on pre-existing differences unrelated to error classes: `UPDATE t SET c1 = NULL WHERE c1 + c1 = c1 AND NULL` (Postgres gates on the NULL conjunct), `abs(c0) IN (NULL)`, `c1 LIKE '\' OR TRUE`, `abs(c0) BETWEEN NULL AND NULL`, `'NaN' NOT BETWEEN c0 / c0 AND 'Infinity'`, and `c0 NOT IN (NULL, abs(c0))`. These are the folding fixes listed above. `DELETE FROM t WHERE c2 = '0' AND c0 LIKE '\'` and `DELETE FROM t WHERE c0 = abs(c0) AND c0 = 9223372036854775807` come from Postgres reordering conjuncts (EXPLAIN showed `Filter: ((c0 ~~ '\'::text) AND (c2 = '0'::text))`), which is deviation 19, so the generator now only combines conjuncts that cannot fail.
+- An old unit test claimed `SELECT NULL IN (id, -id) FROM e` fails with out of range. Postgres 18 returns NULL, so I corrected the test.
+- The workload test for the engine took 81 s and then hung, because the final read touched about 150 segments with a 5% error rate on each GET (`engine: reading block of "db/seg/...": s3fake: injected error before GET ...`). The final read now compacts first, and the test injects read errors at a tenth of the write rate.
+- `snouty validate` first failed with `stat .../scripts/workload-d7ab624e2513/maragudb/parallel_driver_s3_bank_sql: No such file or directory (os error 2)`, because the test commands were absolute symlinks that dangle once copied out of the image. The Dockerfile turns them into hard links.
+- `golangci-lint` rejected `random.GetRandom` as deprecated (SA1019), and `random.Source()` returns a `math/rand` source, so the workload adapts its `Source64` to `math/rand/v2`.
+- A shell command of mine waited on standard input (`cat > /tmp/x_test.go` without input) and was moved to the background after two minutes. I stopped it. Another heredoc that appended to the Makefile was refused by a safety check, so I made the edit with the editor instead.
+
+### Self-review
+
+I ran the code-review skill at high effort over the gap commits, and an adversarial property reviewer over the store adapter and the outage model. The reviewer saw the implementations and contracts but not my tests.
+
+The property reviewer confirmed the most serious finding with a probe: a store that returns empty ETags turns every conditional write into an unconditional one, and two concurrent increments both committed. The adapter now refuses empty ETags and ranges longer than requested, copies bodies in both directions, treats a missing object on delete as deleted, and sorts a copy of the listed keys. In the fake, a process that crashed while a request waited out its latency or timeout no longer has that request applied, a process without a name is never partitioned alone, and `OutageRate` without `MaxOutage` panics. The `Decide` documentation now says that outages still apply.
+
+The code reviewer found two serious issues in the harness. Both could make an Antithesis run pass without ever checking its history. First, the final read-back shared the clients' context, so a run whose clients ran out of time skipped the check. It now gets a deadline of its own. Second, any setup failure counted as "the store was unreachable". `workload.GaveUpError` now carries the last error, and only network, timeout, and 5xx errors pass. The reviewer also found that the real-store workload never checked the GC grace period. It does now, and `GCIgnoreGrace` is detected, usually by seed 0 or 1. The rest of the fixes:
+
+- the maintainer retries its open;
+- read-only commits no longer count as unknown outcomes, in both the workload and the simulator;
+- the simulator's autocommit reads are now checked for early snapshot expiry;
+- the generator counts NOT IN and NOT (a OR b) as several conjuncts;
+- a deviation number in a comment is corrected.
+
+I did not change:
+
+- The duplication between `/internal/workload` and `/internal/sim`. Their client loops differ in clock and locking, so I left them as two copies.
+- `ObjectInfo.Size` and `LastModified`, which the adapter does not carry. Nothing reads them today.
+
+### What I learned
+
+- Postgres raises every analysis error before any folding error. It then folds the target list, with the ORDER BY expressions as hidden targets, before WHERE, and folds OFFSET before LIMIT. A strict function with a constant NULL argument folds to NULL even when its other arguments read columns.
+- An IN list is an array only when at least two of its elements read no columns. Otherwise it is a chain of `=` comparisons in written order, after any array.
+- At the top level of WHERE, the planner orders conjuncts by cost, puts equalities with a constant last through equivalence classes, and runs conjuncts without columns once, before reading any rows.
+- The Antithesis SDK's `random.Source` is meant to be drawn from at each decision. Seeding a PRNG from it is the pattern the docs warn against. The simulator does it anyway, because its seed is the whole point. The real-store workload draws every decision from the SDK.
+
+### What was tricky
+
+- Deciding which differential failures were bugs and which were deviations. Folding and strictness are documented Postgres semantics, so I mirrored them. Conjunct order and index-driven LIKE depend on the planner, so I documented them and kept the generator away from them.
+- Keeping the folding deferral from changing types. A constant subexpression that fails to fold must still adapt like a literal, or `1 / 0 + 1.5` would turn into a type error.
+- A wall-clock workload is not reproducible from a seed, so its mutant tests need enough runs to be reliable. The mid-transaction pauses made the GC mutant visible within a seed or two.
+
+### What warrants review
+
+- `/internal/sql/exec/expr.go`: `binder.fold`, `binder.folding`, `desugar`, and the AND and OR rule in `logical`. `/internal/sql/exec/stmt.go`: the phase order in `selectStmt` and the NULL-conjunct rule in `binder.where`.
+- `/internal/pgdiff/run.go`: `Runner.inKeyOrder`, the one relaxation of the class check.
+- `/internal/workload/workload.go`: the outcome classification under timeouts, and `readFinal`.
+- Run `make test`, `make lint`, `go test -race ./...`, `make pgdiff PGDIFF_CASES=10000` (several times, deleting `/internal/pgdiff/.hegel` first), `make soak SOAK_DURATION=2m`, `make antithesis`, and `make antithesis-validate` with snouty on PATH.
+
+### Future work
+
+- The engine does not retry failed block reads. A read that touches many segments fails if any single GET fails.
+- Under database-granularity conflicts, compaction rarely wins against steady clients. The local real-store runs had zero or one compaction each, which the rebase in the automatic maintenance decision should help.
+- An `ObjectInfo` with sizes and modification times on the public store contract, if the lease or size-based compaction needs them.
+- Launching a first Antithesis run once there is an account, and then triaging which reach claims fire.
