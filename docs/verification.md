@@ -13,7 +13,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - 29 acceptance criteria (`AC-`), 20 key invariants (`INV-`), 17 classes of unsupported statements (`UNS-`), and 0 remaining differences from Postgres (`DEV-`), each verified by at least one test.
 - 8 mutants (`MUT-`), deliberate bugs, of which 7 are detected by the simulator's checkers within 20 seeds.
 - 13 interesting states (`STATE-`) that the simulator's fixed corpus must reach.
-- 127 declarations of coverage in the tests.
+- 132 declarations of coverage in the tests.
 
 ## Acceptance criteria
 
@@ -300,7 +300,9 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 - `.` `TestDB/gives_a_parameter_the_type_of_its_context,_as_Postgres_does`: a string parameter is read like a quoted literal of the type its context gives it, an int64 converts to a double precision, and a conversion that a Postgres driver might make differently is ErrUnsupported
 - `.` `TestDB/round_trips_every_type_through_parameters_and_Scan`: every type and NULL round-trips through $1-style parameters and Scan
+- `internal/pgdiff` `TestParameters/a_parameter_of_every_Go_type_in_every_context_gives_the_same_result_as_Postgres_with_pgx,_or_is_rejected_as_unsupported`: hegel-drawn Go values bound as parameters in contexts that infer different types give the same result or error class as Postgres with pgx, or fail on both when pgx refuses to encode them, unless maragudb rejects them as unsupported
 - `internal/sql/exec` `TestSession_Insert/binds_parameters_of_every_type`: every type binds through a parameter, and a timestamptz keeps microseconds
+- `internal/sql/exec` `TestSession_Select/gives_parameters_the_type_of_their_context`: a parameter of a Go type other than string converts to the type its context infers, overflows like an integer in an integer context, and is ErrUnsupported where it cannot convert
 
 ### `INV-STATS`
 
@@ -368,9 +370,13 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 > SQL flavor: a strict subset of Postgres 18. The same SQL text runs on both, and for every statement that maragudb accepts, the result is identical to Postgres: rows, values, column names, affected-row counts, and transaction state. When Postgres fails a statement, maragudb fails it too, with the same error class wherever the error does not depend on evaluation order or physical row order.
 
+- `internal/pgdiff` `TestCasts/text_casts_to_every_type,_and_back_to_text,_the_same_as_Postgres,_or_are_rejected_as_unsupported`: hegel-drawn text near valid input for bigint, double precision, boolean, bytea, and timestamptz casts to the type and back to text with the same result or the same error class as Postgres, unless maragudb rejects it as unsupported
+- `internal/pgdiff` `TestParameters/a_parameter_of_every_Go_type_in_every_context_gives_the_same_result_as_Postgres_with_pgx,_or_is_rejected_as_unsupported`: hegel-drawn Go values bound as parameters in contexts that infer different types give the same result or error class as Postgres with pgx, or fail on both when pgx refuses to encode them, unless maragudb rejects them as unsupported
 - `internal/sql/exec` `TestSession_Insert/applies_Postgres's_assignment_casts`: an INSERT applies the assignment casts Postgres has: a quoted literal as the column's type, numeric and float literals rounded into bigint, integers widened to double precision, and any value written into text
 - `internal/sql/exec` `TestSession_Select/accepts_a_WHERE_clause_only_when_its_outcome_is_the_same_in_every_order_and_plan_Postgres_could_pick`: a WHERE clause whose outcome on a row depends on the order Postgres evaluates its conditions in, including the equalities its equivalence classes imply, is ErrUnsupported, and so is a condition that can fail next to a primary key condition that an index scan could use; every other WHERE clause fails exactly when Postgres fails in every order
+- `internal/sql/exec` `TestSession_Select/does_not_fold_the_stable_conversions_between_timestamptz_and_text,_as_Postgres_does_not,_and_rejects_one_that_can_fail`: a conversion between timestamptz and text is evaluated when the statement runs, so a CASE does not prune on it and a WHERE condition on it is evaluated once before rows are read, and one without columns that can fail is ErrUnsupported
 - `internal/sql/exec` `TestSession_Select/evaluates_expressions_like_Postgres`: expressions evaluate as in Postgres: integer literals are 32-bit, numeric literals adapt to double precision, quoted literals take the type their context demands, || writes any type next to text, and casts use Postgres's text formats
+- `internal/sql/exec` `TestSession_Select/follows_Postgres_in_the_details_of_analysis`: an IN whose constant elements have no common type compares them one at a time, a CASE operand of unknown type is text, +1 in ORDER BY is no position, ORDER BY a name is ambiguous only between different expressions, and a read-only transaction reports analysis errors before it refuses a write
 - `internal/sql/exec` `TestSession_Transactions/a_failed_statement_aborts_the_transaction_until_it_ends,_as_in_Postgres`: after a failed statement every statement of the transaction fails with ErrTxAborted, COMMIT rolls it back, and ROLLBACK ends it
 - `internal/sql/exec` `TestSession_Update/moves_rows_when_the_primary_key_changes,_and_rejects_a_move_whose_outcome_depends_on_row_order`: an UPDATE of primary key columns succeeds or fails as in Postgres in every row order, and a row that moves onto a key another row moves away from is ErrUnsupported
 
@@ -392,6 +398,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 > Types: As in Postgres, an integer literal that fits in 32 bits has type integer, and arithmetic on it overflows at 32 bits; integer itself is not a column type. NULL is supported.
 
 - `.` `TestDB/round_trips_every_type_through_parameters_and_Scan`: every type and NULL round-trips through $1-style parameters and Scan
+- `internal/pgdiff` `TestCasts/text_casts_to_every_type,_and_back_to_text,_the_same_as_Postgres,_or_are_rejected_as_unsupported`: hegel-drawn text near valid input for bigint, double precision, boolean, bytea, and timestamptz casts to the type and back to text with the same result or the same error class as Postgres, unless maragudb rejects it as unsupported
 - `internal/sql/exec` `TestSession_Insert/applies_Postgres's_assignment_casts`: an INSERT applies the assignment casts Postgres has: a quoted literal as the column's type, numeric and float literals rounded into bigint, integers widened to double precision, and any value written into text
 - `internal/sql/exec` `TestSession_Insert/binds_parameters_of_every_type`: every type binds through a parameter, and a timestamptz keeps microseconds
 - `internal/sql/exec` `TestSession_Select/evaluates_expressions_like_Postgres`: expressions evaluate as in Postgres: integer literals are 32-bit, numeric literals adapt to double precision, quoted literals take the type their context demands, || writes any type next to text, and casts use Postgres's text formats
@@ -471,6 +478,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 - `.` `TestDB/gives_a_parameter_the_type_of_its_context,_as_Postgres_does`: a string parameter is read like a quoted literal of the type its context gives it, an int64 converts to a double precision, and a conversion that a Postgres driver might make differently is ErrUnsupported
 - `internal/pgdiff` `TestUnsupported/UNS-PARAMETERS_parameters_whose_Go_value_needs_a_conversion`: a parameter whose Go value would have to be converted to the type its context infers, such as a float64 used as a bigint, is rejected, and Postgres with pgx accepts it
+- `internal/sql/exec` `TestSession_Select/gives_parameters_the_type_of_their_context`: a parameter of a Go type other than string converts to the type its context infers, overflows like an integer in an integer context, and is ErrUnsupported where it cannot convert
 
 ### `UNS-LIMIT-ORDER`
 
@@ -505,6 +513,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 > A conversion between text and timestamptz that reads no columns and can fail.
 
 - `internal/pgdiff` `TestUnsupported/UNS-STABLE-CONSTANT_a_conversion_between_text_and_timestamptz_that_reads_no_columns_and_can_fail`: a conversion between text and timestamptz without columns that can fail is rejected, because whether Postgres evaluates it while planning depends on the plan, and Postgres accepts it when it does not fail
+- `internal/sql/exec` `TestSession_Select/does_not_fold_the_stable_conversions_between_timestamptz_and_text,_as_Postgres_does_not,_and_rejects_one_that_can_fail`: a conversion between timestamptz and text is evaluated when the statement runs, so a CASE does not prune on it and a WHERE condition on it is evaluated once before rows are read, and one without columns that can fail is ErrUnsupported
 
 ### `UNS-KEY-UPDATE-ORDER`
 

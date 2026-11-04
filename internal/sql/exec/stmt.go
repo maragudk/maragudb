@@ -558,7 +558,7 @@ func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value
 			matches := -1
 			for i, c := range columns {
 				if c.Name == e.Name {
-					if matches >= 0 && ast.RenderExpr(itemExprs[matches]) != ast.RenderExpr(itemExprs[i]) {
+					if matches >= 0 && b.canonical(itemExprs[matches]) != b.canonical(itemExprs[i]) {
 						return nil, fmt.Errorf("%w: ORDER BY %q is ambiguous", ErrInvalid, e.Name)
 					}
 					if matches < 0 {
@@ -849,4 +849,20 @@ func outputNameStrength(e ast.Expr) (string, int) {
 		return e.Type.OutputName(), 1
 	}
 	return "?column?", 0
+}
+
+// canonical text of an expression, for telling whether two expressions are the same one as
+// Postgres's analysis sees them: casts are written in one style, and a cast to the type the
+// expression already has is dropped, because Postgres drops it too.
+func (b *binder) canonical(e ast.Expr) string {
+	return ast.RenderExpr(ast.Map(e, func(x ast.Expr) ast.Expr {
+		c, ok := x.(*ast.Cast)
+		if !ok {
+			return x
+		}
+		if inner, err := b.bindPruned(c.Expr); err == nil && inner.typ == c.Type {
+			return c.Expr
+		}
+		return &ast.Cast{Expr: c.Expr, Type: c.Type}
+	}))
 }

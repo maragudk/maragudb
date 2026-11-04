@@ -20,7 +20,7 @@ type ErrorClass struct {
 // ErrorClasses maps every exported maragudb statement error to SQLSTATE codes. Where a kind has
 // several codes, Postgres splits it more finely: [maragudb.ErrType] covers both a mismatch in a known
 // context (42804) and an operator or function with no variant for the argument types (42883),
-// [maragudb.ErrCast] covers both a value that does not parse (22P02, 22007, 22008, 22023) and a pair of types that cannot
+// [maragudb.ErrCast] covers both a value that does not parse (22P02, 22007, 22008, 22009, 22023) and a pair of types that cannot
 // be cast (42846), and [maragudb.ErrInvalid] covers every reference that does not resolve.
 var ErrorClasses = []ErrorClass{
 	{Name: "division by zero", Err: maragudb.ErrDivisionByZero, Codes: []string{"22012"}},
@@ -35,9 +35,10 @@ var ErrorClasses = []ErrorClass{
 	// operator without a variant for its operand types.
 	{Name: "type", Err: maragudb.ErrType, Codes: []string{"42804", "42883"}},
 	// 22P02 is invalid_text_representation, 22007 invalid_datetime_format, 22008
-	// datetime_field_overflow, 22023 invalid_parameter_value, which Postgres reports for bytea
-	// text in hex format that is not hex, and 42846 cannot_coerce.
-	{Name: "cast", Err: maragudb.ErrCast, Codes: []string{"22P02", "22007", "22008", "22023", "42846"}},
+	// datetime_field_overflow, 22009 invalid_time_zone_displacement_value, 22023
+	// invalid_parameter_value, which Postgres reports for bytea text in hex format that is not
+	// hex, and 42846 cannot_coerce.
+	{Name: "cast", Err: maragudb.ErrCast, Codes: []string{"22P02", "22007", "22008", "22009", "22023", "42846"}},
 	// 42703 is undefined_column, 42883 undefined_function, 42P10 invalid_column_reference, 42701
 	// duplicate_column, 42702 ambiguous_column, and 42P16 invalid_table_definition. It also covers
 	// arguments that are invalid in themselves, which Postgres classes as data exceptions: 22025

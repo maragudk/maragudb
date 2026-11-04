@@ -60,6 +60,9 @@ type binder struct {
 	// foldErr is the folding error to report, from the lowest phase, and the first in it.
 	foldErr   error
 	foldPhase int
+	// stableErr rejects an expression that [binder.fold] cannot fold because it is stable and
+	// that can fail.
+	stableErr error
 }
 
 // Phases of a statement, in the order in which Postgres folds their constants: the output
@@ -77,7 +80,10 @@ const (
 // folding errors instead of returning them, and the statement reports one only once it has bound
 // everything.
 func (b *binder) folding() error {
-	return b.foldErr
+	if b.foldErr != nil {
+		return b.foldErr
+	}
+	return b.stableErr
 }
 
 // fold a node whose children are all constants by evaluating it now, which also reports errors
@@ -97,8 +103,10 @@ func (b *binder) fold(e *cexpr, children ...*cexpr) (*cexpr, error) {
 		// also while it plans, to estimate how many rows a condition matches, depending on where
 		// the expression is. When it can fail, whether the statement fails then depends on the
 		// plan.
-		if e.fallible && b.pruned == 0 {
-			return nil, fmt.Errorf("%w: a conversion between text and timestamptz that reads no columns and can fail is not supported, because whether Postgres evaluates it depends on its plan; write the timestamptz as a quoted literal, such as '2024-01-02 03:04:05+00'", ErrUnsupported)
+		// It is reported after the statement is bound and folded, so that an error that
+		// Postgres reports for certain comes first.
+		if e.fallible && b.pruned == 0 && b.stableErr == nil {
+			b.stableErr = fmt.Errorf("%w: a conversion between text and timestamptz that reads no columns and can fail is not supported, because whether Postgres evaluates it depends on its plan; write the timestamptz as a quoted literal, such as '2024-01-02 03:04:05+00'", ErrUnsupported)
 		}
 		return e, nil
 	}
@@ -161,8 +169,8 @@ func resolve(e *cexpr, t value.Type) (*cexpr, error) {
 // resolveParam converts a parameter of a Go type other than string to the type t that its
 // context infers for it, the way a Postgres client library encodes the value for a parameter of
 // that type: an int64 is a bigint, an integer if it fits, or a double precision, and every Go
-// type is its own SQL type. A conversion that a client library might make in some other way, such
-// as an int64 into text, is not supported.
+// type is its own SQL type. Any other conversion, which client libraries make in different ways,
+// is not supported.
 func resolveParam(n int, v value.Value, t value.Type) (value.Value, error) {
 	if t == value.Unknown {
 		t = value.String
@@ -177,10 +185,10 @@ func resolveParam(n int, v value.Value, t value.Type) (value.Value, error) {
 		return value.NewInt4(int32(v.I)), nil
 	case v.Type == value.Int && t == value.Float:
 		return value.NewFloat(float64(v.I)), nil
-	case t == value.String || numeric(v.Type) && numeric(t):
-		return value.Value{}, fmt.Errorf("%w: parameter $%d is of type %v here, and a Go %s is not converted to it; pass a %s, or cast the parameter, such as $%d::%v", ErrUnsupported, n, t, goTypeName(v.Type), goTypeFor(t), n, v.Type)
 	}
-	return value.Value{}, fmt.Errorf("%w: parameter $%d is of type %v here, which a Go %s cannot be", ErrType, n, t, goTypeName(v.Type))
+	// Postgres drivers differ in what they do with such a value: one refuses it, another sends
+	// it as text that the server then reads as the type.
+	return value.Value{}, fmt.Errorf("%w: parameter $%d is of type %v here, and a Go %s is not converted to it; pass a %s, or cast the parameter, such as $%d::%v", ErrUnsupported, n, t, goTypeName(v.Type), goTypeFor(t), n, v.Type)
 }
 
 // goTypeName is the Go type of a parameter of SQL type t.

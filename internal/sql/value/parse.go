@@ -28,13 +28,10 @@ var (
 func Parse(s string, t Type) (Value, error) {
 	switch t {
 	case Int:
-		i, err := parseInt(s)
+		i, err := parseInt(s, 64)
 		return NewInt(i), err
 	case Int4:
-		i, err := parseInt(s)
-		if err == nil && (i < math.MinInt32 || i > math.MaxInt32) {
-			return Value{}, fmt.Errorf("%w: value %q is out of range for type integer", ErrOutOfRange, s)
-		}
+		i, err := parseInt(s, 32)
 		return Value{Type: Int4, I: i}, err
 	case Float:
 		f, err := parseFloat(s)
@@ -57,88 +54,231 @@ func Parse(s string, t Type) (Value, error) {
 	panic(fmt.Sprintf("value: parsing %v", t))
 }
 
-var (
-	decimalInt = regexp.MustCompile(`^[+-]?[0-9]+(_[0-9]+)*$`)
-	hexInt     = regexp.MustCompile(`^[+-]?0[xX][0-9a-fA-F]+(_[0-9a-fA-F]+)*$`)
-	octInt     = regexp.MustCompile(`^[+-]?0[oO][0-7]+(_[0-7]+)*$`)
-	binInt     = regexp.MustCompile(`^[+-]?0[bB][01]+(_[01]+)*$`)
-)
-
-// parseInt as Postgres's int8in does: decimal, or hexadecimal, octal, and binary with a 0x, 0o,
-// or 0b prefix, with single underscores between digits, and surrounding whitespace.
-func parseInt(s string) (int64, error) {
-	trimmed := strings.TrimSpace(s)
-	base := 10
-	switch {
-	case decimalInt.MatchString(trimmed):
-	case hexInt.MatchString(trimmed):
-		base = 16
-	case octInt.MatchString(trimmed):
-		base = 8
-	case binInt.MatchString(trimmed):
-		base = 2
-	default:
-		return 0, fmt.Errorf("%w for type bigint: %q", ErrInvalidInput, s)
+// parseInt as Postgres's int8in does, and with bits 32 as int4in does: surrounding whitespace, a
+// sign, and digits in decimal, or in hexadecimal, octal, or binary after a 0x, 0o, or 0b prefix,
+// with single underscores between digits. Like Postgres, it scans from the left and reports an
+// overflow as soon as the digits so far overflow, even when invalid text follows.
+func parseInt(s string, bits int) (int64, error) {
+	name := "bigint"
+	if bits == 32 {
+		name = "integer"
 	}
-	digits := strings.ReplaceAll(trimmed, "_", "")
+	invalid := fmt.Errorf("%w for type %s: %q", ErrInvalidInput, name, s)
+	outOfRange := fmt.Errorf("%w: value %q is out of range for type %s", ErrOutOfRange, s, name)
+	limit := uint64(1)<<(bits-1) - 1
+	i := 0
+	for i < len(s) && isSpace(s[i]) {
+		i++
+	}
 	neg := false
-	if digits[0] == '+' || digits[0] == '-' {
-		neg = digits[0] == '-'
-		digits = digits[1:]
+	if i < len(s) && (s[i] == '-' || s[i] == '+') {
+		neg = s[i] == '-'
+		i++
 	}
-	if base != 10 {
-		digits = digits[2:]
+	base := uint64(10)
+	if i+1 < len(s) && s[i] == '0' {
+		switch s[i+1] {
+		case 'x', 'X':
+			base = 16
+		case 'o', 'O':
+			base = 8
+		case 'b', 'B':
+			base = 2
+		}
+		if base != 10 {
+			i += 2
+		}
 	}
-	u, err := strconv.ParseUint(digits, base, 64)
-	limit := uint64(math.MaxInt64)
+	digit := func(c byte) (uint64, bool) {
+		var d uint64
+		switch {
+		case c >= '0' && c <= '9':
+			d = uint64(c - '0')
+		case c >= 'a' && c <= 'f':
+			d = uint64(c-'a') + 10
+		case c >= 'A' && c <= 'F':
+			d = uint64(c-'A') + 10
+		default:
+			return 0, false
+		}
+		return d, d < base
+	}
+	first := i
+	var n uint64
+	for i < len(s) {
+		if d, ok := digit(s[i]); ok {
+			// Postgres checks against the limit before it multiplies, with room for the one more
+			// value that a negative number has.
+			if n > (limit+1)/base {
+				return 0, outOfRange
+			}
+			n = n*base + d
+			i++
+			continue
+		}
+		if s[i] == '_' {
+			// An underscore must be followed by a digit, and in decimal it cannot come first.
+			if base == 10 && i == first {
+				return 0, invalid
+			}
+			i++
+			if i == len(s) {
+				return 0, invalid
+			}
+			if _, ok := digit(s[i]); !ok {
+				return 0, invalid
+			}
+			continue
+		}
+		break
+	}
+	if i == first {
+		return 0, invalid
+	}
+	for i < len(s) && isSpace(s[i]) {
+		i++
+	}
+	if i < len(s) {
+		return 0, invalid
+	}
 	if neg {
-		limit++
+		if n > limit+1 {
+			return 0, outOfRange
+		}
+		return -int64(n), nil
 	}
-	if err != nil || u > limit {
-		return 0, fmt.Errorf("%w: value %q is out of range for type bigint", ErrOutOfRange, s)
+	if n > limit {
+		return 0, outOfRange
 	}
-	if neg {
-		return int64(-u), nil
-	}
-	return int64(u), nil
+	return int64(n), nil
 }
 
-var (
-	decimalFloat = regexp.MustCompile(`^[+-]?([0-9]+\.?[0-9]*|\.[0-9]+)([eE][+-]?[0-9]+)?$`)
-	hexFloat     = regexp.MustCompile(`^[+-]?0[xX]([0-9a-fA-F]+\.?[0-9a-fA-F]*|\.[0-9a-fA-F]+)([pP][+-]?[0-9]+)?$`)
-)
+// isSpace is C's isspace in the C locale, which Postgres's input functions skip.
+func isSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\v' || c == '\f' || c == '\r'
+}
 
-// parseFloat as Postgres's float8in does, which is strtod plus a check that nothing but
-// whitespace follows: decimal and hexadecimal notation, NaN, Infinity, and inf, ignoring case.
-// Overflow and underflow to zero are out of range; a subnormal result is not.
+// parseFloat as Postgres's float8in does with glibc's strtod: after leading whitespace, the
+// longest prefix that is a decimal or hexadecimal float, an infinity, or a NaN is the value, an
+// overflow or an underflow to zero of that prefix is out of range, and then only whitespace may
+// follow. A subnormal result is not out of range.
 func parseFloat(s string) (float64, error) {
-	trimmed := strings.TrimSpace(s)
-	switch strings.ToLower(trimmed) {
-	case "nan", "+nan", "-nan":
-		return math.NaN(), nil
-	case "infinity", "inf", "+infinity", "+inf":
-		return math.Inf(1), nil
-	case "-infinity", "-inf":
-		return math.Inf(-1), nil
+	invalid := fmt.Errorf("%w for type double precision: %q", ErrInvalidInput, s)
+	i := 0
+	for i < len(s) && isSpace(s[i]) {
+		i++
 	}
-	text := trimmed
+	n := floatPrefix(s[i:])
+	if n == 0 {
+		return 0, invalid
+	}
+	prefix := s[i : i+n]
+	var f float64
+	lower := strings.ToLower(strings.TrimLeft(prefix, "+-"))
 	switch {
-	case decimalFloat.MatchString(trimmed):
-	case hexFloat.MatchString(trimmed):
-		if !strings.ContainsAny(trimmed, "pP") {
-			text += "p0"
+	case strings.HasPrefix(lower, "nan"):
+		f = math.NaN()
+	case strings.HasPrefix(lower, "inf"):
+		f = math.Inf(1)
+		if prefix[0] == '-' {
+			f = math.Inf(-1)
 		}
 	default:
-		return 0, fmt.Errorf("%w for type double precision: %q", ErrInvalidInput, s)
+		text := prefix
+		if strings.HasPrefix(lower, "0x") && !strings.ContainsAny(lower, "p") {
+			text += "p0"
+		}
+		var err error
+		f, err = strconv.ParseFloat(text, 64)
+		if err != nil && !errors.Is(err, strconv.ErrRange) {
+			return 0, invalid
+		}
+		if math.IsInf(f, 0) || f == 0 && hasNonZeroDigit(prefix) {
+			return 0, fmt.Errorf("%w: %q is out of range for type double precision", ErrOutOfRange, prefix)
+		}
 	}
-	f, err := strconv.ParseFloat(text, 64)
-	if err != nil && !errors.Is(err, strconv.ErrRange) {
-		return 0, fmt.Errorf("%w for type double precision: %q", ErrInvalidInput, s)
+	for i += n; i < len(s) && isSpace(s[i]); i++ {
 	}
-	if math.IsInf(f, 0) || (f == 0 && hasNonZeroDigit(trimmed)) {
-		return 0, fmt.Errorf("%w: %q is out of range for type double precision", ErrOutOfRange, s)
+	if i < len(s) {
+		return 0, invalid
 	}
 	return f, nil
+}
+
+// floatPrefix is the length of the longest prefix of s that glibc's strtod reads as a float, or 0.
+func floatPrefix(s string) int {
+	i := 0
+	if i < len(s) && (s[i] == '+' || s[i] == '-') {
+		i++
+	}
+	lower := strings.ToLower(s[i:])
+	switch {
+	case strings.HasPrefix(lower, "infinity"):
+		return i + 8
+	case strings.HasPrefix(lower, "inf"):
+		return i + 3
+	case strings.HasPrefix(lower, "nan"):
+		j := i + 3
+		// A NaN may have a sequence of letters, digits, and underscores in parentheses.
+		if j < len(s) && s[j] == '(' {
+			k := j + 1
+			for k < len(s) && (isAlnum(s[k]) || s[k] == '_') {
+				k++
+			}
+			if k < len(s) && s[k] == ')' {
+				return k + 1
+			}
+		}
+		return j
+	}
+	digits := func(j int, hex bool) int {
+		for j < len(s) && (s[j] >= '0' && s[j] <= '9' || hex && isHex(s[j])) {
+			j++
+		}
+		return j
+	}
+	exponent := func(j int, marks string) int {
+		if j < len(s) && strings.IndexByte(marks, s[j]) >= 0 {
+			k := j + 1
+			if k < len(s) && (s[k] == '+' || s[k] == '-') {
+				k++
+			}
+			if e := digits(k, false); e > k {
+				return e
+			}
+		}
+		return j
+	}
+	hex := strings.HasPrefix(lower, "0x")
+	start := i
+	if hex {
+		start = i + 2
+	}
+	j := digits(start, hex)
+	n := j - start
+	if j < len(s) && s[j] == '.' {
+		k := digits(j+1, hex)
+		n += k - j - 1
+		j = k
+	}
+	switch {
+	case n == 0 && hex:
+		// 0x without hexadecimal digits is the number 0, followed by the x.
+		return i + 1
+	case n == 0:
+		return 0
+	case hex:
+		return exponent(j, "pP")
+	}
+	return exponent(j, "eE")
+}
+
+func isHex(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F'
+}
+
+func isAlnum(c byte) bool {
+	return c >= '0' && c <= '9' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
 }
 
 // hasNonZeroDigit reports whether the mantissa of a numeric text has a digit other than zero,
@@ -234,15 +374,14 @@ var (
 // is UTC. The result is in the range from 0001-01-01 to the end of 294276. Other forms that
 // Postgres accepts, such as month names, BC dates, or named zones, are [ErrUnsupportedInput].
 func ParseTime(s string) (time.Time, error) {
-	trimmed := strings.TrimSpace(s)
+	trimmed := strings.TrimFunc(s, func(r rune) bool { return r < 0x80 && isSpace(byte(r)) })
 	m := isoTimestamp.FindStringSubmatch(trimmed)
 	if m == nil {
-		if trimmed == "" || isoLike.MatchString(trimmed) && !shortYear.MatchString(trimmed) {
+		if trimmed == "" {
 			return time.Time{}, fmt.Errorf("%w for type timestamp with time zone: %q", ErrInvalidInput, s)
 		}
-		// Letters that no ISO 8601 timestamp has, digits without separators, or a year of fewer
-		// than four digits: Postgres may read them as a date word, a month name, a named zone,
-		// or a date in another style.
+		// Postgres reads far more than ISO 8601, such as date words, month names, named zones,
+		// and dates in other styles, so text in any other form may be valid there.
 		return time.Time{}, fmt.Errorf("%w: timestamp %q is not in the ISO 8601 form 2006-01-02 15:04:05.999999+00", ErrUnsupportedInput, s)
 	}
 	field := func(i int) int {
@@ -282,15 +421,6 @@ func ParseTime(s string) (time.Time, error) {
 	}
 	return t, nil
 }
-
-// isoLike matches text made of the characters an ISO 8601 timestamp uses, with a dash, so that
-// a malformed one such as "2024-13-45" or "2024-01-02 03" is invalid input rather than
-// unsupported; shortYear matches a year of fewer than four digits, which Postgres reads in
-// another style.
-var (
-	isoLike   = regexp.MustCompile(`^[0-9 :.+TZz-]*-[0-9 :.+TZz-]*$`)
-	shortYear = regexp.MustCompile(`^\d{1,3}-`)
-)
 
 // roundFraction rounds a string of fractional second digits to microseconds, half to even, and
 // returns the microseconds and the seconds carried out when it rounds up to a whole second.

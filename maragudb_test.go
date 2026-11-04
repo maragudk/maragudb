@@ -189,7 +189,7 @@ func TestDB(t *testing.T) {
 		_, err = db.ExecContext(t.Context(), "INSERT INTO t VALUES ($1, $2, $3)", 2.0, 1.5, "x")
 		is.Error(t, maragudb.ErrUnsupported, err, "a float64 for a bigint column")
 		_, err = db.ExecContext(t.Context(), "INSERT INTO t VALUES ($1, $2, $3)", 2, true, "x")
-		is.Error(t, maragudb.ErrType, err, "a bool for a double precision column")
+		is.Error(t, maragudb.ErrUnsupported, err, "a bool for a double precision column")
 		_, err = db.ExecContext(t.Context(), "SELECT $1 + 2147483647", 1)
 		is.Error(t, maragudb.ErrOutOfRange, err, "an integer context makes the parameter an integer, which overflows as in Postgres")
 		_, err = db.ExecContext(t.Context(), "INSERT INTO t VALUES ($1, $2, $3)", int32(1), 1.5, "x")

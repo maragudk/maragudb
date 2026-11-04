@@ -24,9 +24,18 @@
 // [ErrPreconditionFailed], and [ErrNotModified] for those outcomes. [Options.Store] documents the
 // whole contract, and the example for [Options] is a complete store in memory.
 //
+// The SQL is a strict subset of Postgres 18: the same text runs on both, and every statement
+// that maragudb accepts gives the same result as on Postgres. The types are bigint, double
+// precision, boolean, text, bytea, and timestamptz, with microsecond precision. A statement
+// that Postgres accepts and maragudb does not, or whose result on Postgres would depend on its
+// plan, fails with [ErrUnsupported]. As in Postgres, a failed statement in a transaction aborts
+// it: later statements fail with [ErrTxAborted], and a commit rolls it back.
+//
 // Placeholders are $1, $2, and so on. Parameters are int64 and int, float64, bool, string,
-// []byte, time.Time, and nil. A nil []byte is NULL. A parameter of the wrong type for its column
-// is an error and is never converted.
+// []byte, time.Time, and nil, and a nil []byte is NULL. A parameter takes its type from its
+// context, as in Postgres: a string is read like a quoted literal of that type, an int64
+// converts to an integer or a double precision, and the other Go types are their own SQL type.
+// Other conversions, which Postgres drivers make in different ways, fail with [ErrUnsupported].
 //
 // Transactions are strict serializable. A statement outside a transaction retries on conflict by
 // itself. An explicit transaction whose commit loses to a concurrent commit fails with
@@ -71,8 +80,8 @@ var (
 	// ErrInvalid is a statement that cannot run: an unknown column or function, wrong arity,
 	// a missing parameter, and the like.
 	ErrInvalid = exec.ErrInvalid
-	// ErrType is a type mismatch, including a parameter whose Go type cannot have the type that
-	// its context gives it.
+	// ErrType is a type mismatch, such as an operator or function that does not exist for its
+	// argument types.
 	ErrType = exec.ErrType
 	// ErrNoTable is a reference to a table that does not exist.
 	ErrNoTable = exec.ErrNoTable

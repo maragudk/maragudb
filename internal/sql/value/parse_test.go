@@ -55,7 +55,7 @@ func TestParse(t *testing.T) {
 			is.NotError(t, err, in)
 			is.True(t, math.IsNaN(got.F), in)
 		}
-		for _, in := range []string{"0x", "1e", ".", "nan(", "1.5e", "1_000", "", "x", "0x1p", "nan(1)"} {
+		for _, in := range []string{"0x", "1e", ".", "nan(", "1.5e", "1_000", "", "x", "0x1p", "nan(", "infinityx"} {
 			_, err := value.Parse(in, value.Float)
 			is.Error(t, value.ErrInvalidInput, err, in)
 		}
@@ -157,11 +157,11 @@ func TestParse(t *testing.T) {
 			is.NotError(t, err, test.in)
 			is.True(t, got.T.Equal(test.want), test.in+" gave "+got.T.String())
 		}
-		for _, in := range []string{"2024-13-01", "0000-01-01", "2024-02-30", "2024-01-02 03", "2024-01-02 03:04:05-16", "", "2024-01-02 25:00", "2024-01-02 24:00:01", "2024-01-02 03:60", "2024-01-02 03:04:61", "2024-01-02T", "2024-01-02 03:04:05+"} {
+		for _, in := range []string{"2024-13-01", "0000-01-01", "2024-02-30", "2024-01-02 03:04:05-16", "", "2024-01-02 25:00", "2024-01-02 24:00:01", "2024-01-02 03:60", "2024-01-02 03:04:61"} {
 			_, err := value.Parse(in, value.Time)
 			is.Error(t, value.ErrInvalidInput, err, in)
 		}
-		for _, in := range []string{"January 2, 2024", "now", "epoch", "infinity", "4714-11-24 00:00:00+00 BC", "2024-01-02 03:04:05 UTC", "20240102", "99-01-01", "1-01-01", "2024-01-02 03:04:05 PM", "today"} {
+		for _, in := range []string{"January 2, 2024", "now", "epoch", "infinity", "4714-11-24 00:00:00+00 BC", "2024-01-02 03:04:05 UTC", "20240102", "99-01-01", "1-01-01", "2024-01-02 03:04:05 PM", "today", "2024-01-02 03", "2024-01-02T", "2024-01-02 03:04:05+", "-29", "2024-01"} {
 			_, err := value.Parse(in, value.Time)
 			is.Error(t, value.ErrUnsupportedInput, err, in)
 			is.True(t, !errors.Is(err, value.ErrInvalidInput), in)

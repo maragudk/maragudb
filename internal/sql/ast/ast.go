@@ -311,3 +311,47 @@ func Walk(e Expr, fn func(Expr) bool) {
 		Walk(e.Expr, fn)
 	}
 }
+
+// Map rebuilds e bottom up, replacing every subexpression x, after its own subexpressions, with
+// fn(x). It does not change e.
+func Map(e Expr, fn func(Expr) Expr) Expr {
+	if e == nil {
+		return nil
+	}
+	m := func(x Expr) Expr { return Map(x, fn) }
+	list := func(xs []Expr) []Expr {
+		if xs == nil {
+			return nil
+		}
+		out := make([]Expr, len(xs))
+		for i, x := range xs {
+			out[i] = m(x)
+		}
+		return out
+	}
+	switch e := e.(type) {
+	case *Unary:
+		return fn(&Unary{Op: e.Op, Expr: m(e.Expr)})
+	case *Binary:
+		return fn(&Binary{Op: e.Op, Left: m(e.Left), Right: m(e.Right)})
+	case *IsNull:
+		return fn(&IsNull{Expr: m(e.Expr), Not: e.Not})
+	case *Between:
+		return fn(&Between{Expr: m(e.Expr), Low: m(e.Low), High: m(e.High), Not: e.Not})
+	case *In:
+		return fn(&In{Expr: m(e.Expr), List: list(e.List), Not: e.Not})
+	case *Like:
+		return fn(&Like{Expr: m(e.Expr), Pattern: m(e.Pattern), Not: e.Not})
+	case *Case:
+		c := &Case{Operand: m(e.Operand), Else: m(e.Else)}
+		for _, w := range e.Whens {
+			c.Whens = append(c.Whens, When{Cond: m(w.Cond), Result: m(w.Result)})
+		}
+		return fn(c)
+	case *Call:
+		return fn(&Call{Name: e.Name, Args: list(e.Args)})
+	case *Cast:
+		return fn(&Cast{Expr: m(e.Expr), Type: e.Type, Style: e.Style})
+	}
+	return fn(e)
+}

@@ -225,7 +225,7 @@ func TestSession_Insert(t *testing.T) {
 		is.Error(t, exec.ErrOutOfRange, queryErr(t, s, "INSERT INTO t (id, name) VALUES (1e30::float8, 'x')"))
 		is.Error(t, exec.ErrOutOfRange, queryErr(t, s, "INSERT INTO t (id, name) VALUES (99999999999999999999, 'x')"))
 		is.Error(t, exec.ErrType, queryErr(t, s, "INSERT INTO t (id, name, f) VALUES (15, 'x', TRUE)"))
-		is.Error(t, exec.ErrType, queryErr(t, s, "INSERT INTO t (id, name, f) VALUES (15, 'x', $1)", true))
+		is.Error(t, exec.ErrUnsupported, queryErr(t, s, "INSERT INTO t (id, name, f) VALUES (15, 'x', $1)", true))
 		is.Error(t, exec.ErrCast, queryErr(t, s, "INSERT INTO t (id, name, f) VALUES (15, 'x', $1)", "x"), "a string parameter is read like a quoted literal")
 		mustExec(t, s, "INSERT INTO t (id, name, f) VALUES (15, 'x', $1)", "1.5")
 		is.Equal(t, "1.5", query(t, s, "SELECT f FROM t WHERE id = 15"))
@@ -551,6 +551,73 @@ func TestSession_Select(t *testing.T) {
 		is.Error(t, exec.ErrInvalid, queryErr(t, s, "SELECT nope FROM w WHERE id = 1 AND 1 / m = 1"), "and so does a mistake")
 		is.Equal(t, int64(0), mustExec(t, s, "DELETE FROM w WHERE n = 2 AND 1 / m = 1 AND FALSE").RowsAffected, "a known false conjunct reads no rows")
 		is.Equal(t, "1\n2\n3", query(t, s, "SELECT id FROM w"), "nothing was deleted or updated")
+	})
+
+	t.Run("does not fold the stable conversions between timestamptz and text, as Postgres does not, and rejects one that can fail", func(t *testing.T) {
+		verify.Covers(t, "a conversion between timestamptz and text is evaluated when the statement runs, so a CASE does not prune on it and a WHERE condition on it is evaluated once before rows are read, and one without columns that can fail is ErrUnsupported", "INV-PG-SUBSET", "UNS-STABLE-CONSTANT")
+		s := newSession(t)
+		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT CASE WHEN CAST('2024-01-01'::timestamptz AS text) = 'x' THEN 1 ELSE 1 / 0 END"), "the WHEN is not known, so the ELSE is folded")
+		is.Equal(t, "1", query(t, s, "SELECT CASE WHEN CAST(1 AS text) = '1' THEN 1 ELSE 1 / 0 END"), "other conversions to text fold")
+		is.Equal(t, "1", query(t, s, "SELECT CASE WHEN 'a' || 1 = 'a1' THEN 1 ELSE 1 / 0 END"), "and so does || with them")
+		is.Equal(t, `"2024-01-01 00:00:00+00true"`, query(t, s, "SELECT CAST('2024-01-01'::timestamptz AS text) || CAST(TRUE AS text)"))
+		is.Equal(t, "NULL", query(t, s, "SELECT CASE WHEN FALSE THEN CAST(CAST('x' AS text) AS timestamptz) END"), "a pruned conversion is never evaluated")
+		for _, sql := range []string{
+			"SELECT CAST(CAST('2024-01-02' AS text) AS timestamptz)",
+			"SELECT CAST(CAST('2024-01-02'::timestamptz AS text) AS bigint)",
+			"SELECT CAST('2024-01-02'::timestamptz AS text) LIKE 'a\\'",
+		} {
+			is.Error(t, exec.ErrUnsupported, queryErr(t, s, sql), sql)
+		}
+		mustExec(t, s, "CREATE TABLE e (id bigint PRIMARY KEY, s text)")
+		is.Equal(t, "", query(t, s, "SELECT id FROM e WHERE CAST('2024-01-01'::timestamptz AS text) = '2024-01-01 00:00:00+00'"))
+		mustExec(t, s, "INSERT INTO e VALUES (2, '2024-01-01'), (1, '2024-13-01')")
+		is.Equal(t, "1\n2", query(t, s, "SELECT id FROM e WHERE CAST('2024-01-01'::timestamptz AS text) = '2024-01-01 00:00:00+00'"))
+		is.Equal(t, "", query(t, s, "SELECT id FROM e WHERE CAST('2024-01-01'::timestamptz AS text) = 'x'"))
+		is.Error(t, exec.ErrCast, queryErr(t, s, "SELECT CAST(s AS timestamptz) FROM e"), "a conversion that reads columns is evaluated on every row")
+		is.Equal(t, "", query(t, s, "SELECT id FROM e ORDER BY id LIMIT 0"), "LIMIT 0 reads no rows")
+	})
+
+	t.Run("follows Postgres in the details of analysis", func(t *testing.T) {
+		verify.Covers(t, "an IN whose constant elements have no common type compares them one at a time, a CASE operand of unknown type is text, +1 in ORDER BY is no position, ORDER BY a name is ambiguous only between different expressions, and a read-only transaction reports analysis errors before it refuses a write", "INV-PG-SUBSET")
+		s := newSession(t)
+		is.Equal(t, "true", query(t, s, "SELECT '2024-01-01 00:00:00+00' IN (coalesce('x'), CAST('2024-01-01 00:00:00+00' AS timestamptz))"))
+		is.Error(t, exec.ErrType, queryErr(t, s, "SELECT CASE 'x' WHEN '\\x'::bytea THEN 1 END"))
+		mustExec(t, s, "CREATE TABLE e (id bigint PRIMARY KEY, b boolean, c text)")
+		mustExec(t, s, "INSERT INTO e VALUES (2, TRUE, 'b'), (1, FALSE, 'a')")
+		is.Equal(t, "2\n1", query(t, s, "SELECT id FROM e ORDER BY +1, id DESC"))
+		is.Equal(t, `"a" "a"`+"\n"+`"b" "b"`, query(t, s, "SELECT CAST(c AS text), c FROM e ORDER BY c"), "a cast to the column's own type is the column")
+		is.Error(t, exec.ErrInvalid, queryErr(t, s, "SELECT lower(c) AS c, c FROM e ORDER BY c"))
+		mustExec(t, s, "BEGIN READ ONLY")
+		is.Error(t, exec.ErrType, queryErr(t, s, "UPDATE e SET b = 1"))
+		mustExec(t, s, "ROLLBACK")
+		mustExec(t, s, "BEGIN READ ONLY")
+		is.Error(t, exec.ErrNoTable, queryErr(t, s, "DELETE FROM nope"))
+		mustExec(t, s, "ROLLBACK")
+		mustExec(t, s, "BEGIN READ ONLY")
+		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "INSERT INTO e VALUES (1 / 0, TRUE, 'x')"))
+		mustExec(t, s, "ROLLBACK")
+		mustExec(t, s, "BEGIN READ ONLY")
+		is.Error(t, exec.ErrReadOnlyTx, queryErr(t, s, "UPDATE e SET b = TRUE"))
+		mustExec(t, s, "ROLLBACK")
+		mustExec(t, s, "BEGIN READ ONLY")
+		is.Error(t, exec.ErrReadOnlyTx, queryErr(t, s, "CREATE TABLE e (id bigint PRIMARY KEY)"), "DDL is refused before it is analyzed")
+		mustExec(t, s, "ROLLBACK")
+	})
+
+	t.Run("gives parameters the type of their context", func(t *testing.T) {
+		verify.Covers(t, "a parameter of a Go type other than string converts to the type its context infers, overflows like an integer in an integer context, and is ErrUnsupported where it cannot convert", "INV-PLACEHOLDERS", "UNS-PARAMETERS")
+		s := newSession(t)
+		is.Error(t, exec.ErrOutOfRange, queryErr(t, s, "SELECT $1 + 2147483647", 1))
+		is.Equal(t, "2147483648", query(t, s, "SELECT $1::bigint + 2147483647", 1))
+		is.Equal(t, "2.5", query(t, s, "SELECT $1 + 0.5::float8", 2))
+		is.Equal(t, `"5x"`, query(t, s, "SELECT $1 || 'x'", "5"))
+		is.Equal(t, "6", query(t, s, "SELECT $1 + 1", "5"), "a string is read like a quoted literal")
+		is.Error(t, exec.ErrOutOfRange, queryErr(t, s, "SELECT $1 + 1", int64(1)<<40))
+		is.Error(t, exec.ErrUnsupported, queryErr(t, s, "SELECT $1", 1), "an int64 with no context would be text")
+		is.Error(t, exec.ErrUnsupported, queryErr(t, s, "SELECT $1 + 1", 1.5))
+		is.Error(t, exec.ErrUnsupported, queryErr(t, s, "SELECT $1 AND TRUE", 1))
+		is.Equal(t, "true", query(t, s, "SELECT $1 AND TRUE", true))
+		is.Equal(t, "NULL", query(t, s, "SELECT $1 + 1", nil))
 	})
 
 	t.Run("reports a mistake anywhere in the statement before a folding error, and folding errors in Postgres's order", func(t *testing.T) {
