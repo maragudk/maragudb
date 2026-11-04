@@ -483,16 +483,89 @@ func TestDB_Compact(t *testing.T) {
 		is.True(t, !ok)
 	})
 
-	t.Run("conflicts with a concurrent commit and can be retried", func(t *testing.T) {
+	t.Run("rebases on commits that only added segments, which keep shadowing the compacted one", func(t *testing.T) {
 		w := newWorld(t)
 		db1 := w.open(1, engine.Options{})
 		db2 := w.open(2, engine.Options{})
 		put(t, db1, "a", "1")
 		put(t, db1, "b", "2")
 		w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
-			// db2 has read the manifest and is writing the merged segment. Another process commits first.
+			// db2 has read the manifest and is writing the merged segment. Another process commits
+			// twice first, deleting a key the merge kept and overwriting another.
 			if kind == s3.KindPut {
 				w.decide = nil
+				tx, err := db1.Begin(t.Context())
+				is.NotError(t, err)
+				is.NotError(t, tx.Delete([]byte("a")))
+				is.NotError(t, tx.Commit(t.Context()))
+				put(t, db1, "b", "3", "c", "3")
+			}
+			return s3fake.OutcomeNormal
+		}
+		before := db2.Stats().S3
+		is.NotError(t, db2.Compact(t.Context()))
+		d := db2.Stats().S3.Sub(before)
+		is.Equal(t, int64(1), d.Put, "the merged segment is written once")
+		is.Equal(t, int64(1), db2.Stats().CompactionRebases)
+		is.Equal(t, 3, db2.Stats().Segments, "the compacted segment and the two newer ones")
+		is.Equal(t, 2, db2.Stats().Garbage)
+		for _, db := range []*engine.DB{db1, db2} {
+			tx, err := db.BeginReadOnly(t.Context())
+			is.NotError(t, err)
+			equalMap(t, map[string]string{"b": "3", "c": "3"}, scan(t, tx, "", ""))
+			_, ok := get(t, db, "a")
+			is.True(t, !ok, "the newer tombstone hides the compacted value")
+		}
+		is.NotError(t, db2.Compact(t.Context()))
+		is.Equal(t, 1, db2.Stats().Segments)
+		tx, err := db2.BeginReadOnly(t.Context())
+		is.NotError(t, err)
+		equalMap(t, map[string]string{"b": "3", "c": "3"}, scan(t, tx, "", ""))
+	})
+
+	t.Run("rebases again when a commit lands during the rebase", func(t *testing.T) {
+		w := newWorld(t)
+		db1 := w.open(1, engine.Options{})
+		db2 := w.open(2, engine.Options{})
+		put(t, db1, "a", "1")
+		put(t, db1, "b", "2")
+		phase := 0
+		w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
+			switch {
+			case kind == s3.KindPut && phase == 0:
+				phase = 1
+				put(t, db1, "c", "3")
+				phase = 2
+			case kind == s3.KindPutConditional && phase == 2:
+				// db2's first manifest write is about to fail. Another commit lands before its rebase.
+				phase = 3
+				put(t, db1, "d", "4")
+				phase = 4
+			case kind == s3.KindPutConditional && phase == 4:
+				phase = 5
+				put(t, db1, "e", "5")
+				phase = 6
+			}
+			return s3fake.OutcomeNormal
+		}
+		is.NotError(t, db2.Compact(t.Context()))
+		is.Equal(t, 6, phase)
+		is.Equal(t, 4, db2.Stats().Segments, "the compacted segment and three newer ones")
+		tx, err := db2.BeginReadOnly(t.Context())
+		is.NotError(t, err)
+		equalMap(t, map[string]string{"a": "1", "b": "2", "c": "3", "d": "4", "e": "5"}, scan(t, tx, "", ""))
+	})
+
+	t.Run("fails with ErrConflict when another compaction won, and can be retried", func(t *testing.T) {
+		w := newWorld(t)
+		db1 := w.open(1, engine.Options{})
+		db2 := w.open(2, engine.Options{})
+		put(t, db1, "a", "1")
+		put(t, db1, "b", "2")
+		w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
+			if kind == s3.KindPut {
+				w.decide = nil
+				is.NotError(t, db1.Compact(t.Context()))
 				put(t, db1, "c", "3")
 			}
 			return s3fake.OutcomeNormal
@@ -504,6 +577,29 @@ func TestDB_Compact(t *testing.T) {
 		tx, err := db2.BeginReadOnly(t.Context())
 		is.NotError(t, err)
 		equalMap(t, map[string]string{"a": "1", "b": "2", "c": "3"}, scan(t, tx, "", ""))
+	})
+
+	t.Run("gives up instead of rebasing once it is older than the grace period", func(t *testing.T) {
+		grace := 10 * time.Minute
+		w := newWorld(t)
+		db1 := w.open(1, engine.Options{GCGracePeriod: &grace})
+		db2 := w.open(2, engine.Options{GCGracePeriod: &grace})
+		put(t, db1, "a", "1")
+		put(t, db1, "b", "2")
+		w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
+			if kind == s3.KindPut {
+				w.decide = nil
+				put(t, db1, "c", "3")
+				// Its output may have been collected as an orphan by now.
+				w.clock.Sleep(t.Context(), grace)
+			}
+			return s3fake.OutcomeNormal
+		}
+		err := db2.Compact(t.Context())
+		is.Error(t, engine.ErrSnapshotExpired, err)
+		_, ok := get(t, db1, "c")
+		is.True(t, ok)
+		is.Equal(t, 3, db1.Stats().Segments, "nothing was compacted")
 	})
 }
 
@@ -547,7 +643,7 @@ func TestDB_GC(t *testing.T) {
 		is.Equal(t, "2", v2)
 	})
 
-	t.Run("deletes orphans from failed commits once the manifest has moved on", func(t *testing.T) {
+	t.Run("stamps orphans from failed commits once the manifest has moved on and deletes them after the grace period", func(t *testing.T) {
 		crash := false
 		w := newWorld(t)
 		db := w.open(1, engine.Options{GCGracePeriod: &grace})
@@ -572,13 +668,57 @@ func TestDB_GC(t *testing.T) {
 		n, err := db.GC(t.Context())
 		is.NotError(t, err)
 		is.Equal(t, 0, n, "the orphan may belong to a commit in flight")
+		is.Equal(t, 0, db.Stats().Garbage)
 		put(t, db, "b", "2")
 		n, err = db.GC(t.Context())
 		is.NotError(t, err)
+		is.Equal(t, 0, n, "the orphan may belong to a compaction that is about to rebase, so it is only stamped")
+		is.Equal(t, 1, db.Stats().Garbage)
+		is.Equal(t, 3, len(w.fake.Keys()), "manifest, the live segment, and the orphan")
+		w.clock.Sleep(t.Context(), grace)
+		n, err = db.GC(t.Context())
+		is.NotError(t, err)
 		is.Equal(t, 1, n)
+		is.Equal(t, 0, db.Stats().Garbage)
 		is.Equal(t, 2, len(w.fake.Keys()), "manifest and the live segment")
 		_, ok := get(t, db, "a")
 		is.True(t, !ok)
+	})
+
+	t.Run("never deletes the output of a compaction that rebases within the grace period", func(t *testing.T) {
+		w := newWorld(t)
+		db1 := w.open(1, engine.Options{GCGracePeriod: &grace, MemoryCacheBytes: new(int64)})
+		db2 := w.open(2, engine.Options{GCGracePeriod: &grace, MemoryCacheBytes: new(int64)})
+		put(t, db1, "a", "1")
+		put(t, db1, "b", "2")
+		w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
+			if kind == s3.KindPut {
+				w.decide = nil
+				// db2's merged segment is written. Before its manifest write, a commit lands and
+				// GC runs twice almost a grace period apart, which is the most GC may delete.
+				put(t, db1, "c", "3")
+				_, err := db1.GC(t.Context())
+				is.NotError(t, err)
+				w.clock.Sleep(t.Context(), grace-time.Second)
+				_, err = db1.GC(t.Context())
+				is.NotError(t, err)
+			}
+			return s3fake.OutcomeNormal
+		}
+		is.NotError(t, db2.Compact(t.Context()))
+		is.Equal(t, 2, db2.Stats().Segments)
+		tx, err := db2.BeginReadOnly(t.Context())
+		is.NotError(t, err)
+		equalMap(t, map[string]string{"a": "1", "b": "2", "c": "3"}, scan(t, tx, "", ""))
+		// A GC pass after the rebase sees the output as live and the stamp from before is dropped.
+		_, err = db1.GC(t.Context())
+		is.NotError(t, err)
+		w.clock.Sleep(t.Context(), grace)
+		_, err = db1.GC(t.Context())
+		is.NotError(t, err)
+		v, ok := get(t, db1, "a")
+		is.True(t, ok)
+		is.Equal(t, "1", v)
 	})
 
 	t.Run("a reader older than the grace period gets ErrSnapshotExpired before reading anything", func(t *testing.T) {
@@ -736,6 +876,29 @@ func TestMutations(t *testing.T) {
 		is.NotError(t, tx1.Commit(t.Context()), "the mutant does not notice the conflict")
 		_, ok := get(t, db2, "b")
 		is.True(t, !ok, "the mutant lost db2's commit")
+	})
+
+	t.Run("CompactedSegmentAhead lets a rebased compaction hide newer commits", func(t *testing.T) {
+		w := newWorld(t)
+		db1 := w.open(1, engine.Options{})
+		db2 := w.open(2, engine.Options{Mutations: engine.Mutations{CompactedSegmentAhead: true}})
+		put(t, db1, "a", "1")
+		put(t, db1, "b", "2")
+		w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
+			if kind == s3.KindPut {
+				w.decide = nil
+				tx, err := db1.Begin(t.Context())
+				is.NotError(t, err)
+				is.NotError(t, tx.Delete([]byte("a")))
+				is.NotError(t, tx.Put([]byte("b"), []byte("3")))
+				is.NotError(t, tx.Commit(t.Context()))
+			}
+			return s3fake.OutcomeNormal
+		}
+		is.NotError(t, db2.Compact(t.Context()))
+		tx, err := db1.BeginReadOnly(t.Context())
+		is.NotError(t, err)
+		equalMap(t, map[string]string{"a": "1", "b": "2"}, scan(t, tx, "", "")) // the mutant resurrected the old values
 	})
 
 	t.Run("AckBeforeConfirm reports success for a write that never happened", func(t *testing.T) {

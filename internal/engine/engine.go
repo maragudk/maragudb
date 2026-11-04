@@ -78,6 +78,9 @@ type Mutations struct {
 	SkipFreshnessCheck bool
 	// AckBeforeConfirm reports a commit as successful without waiting for the store's answer.
 	AckBeforeConfirm bool
+	// CompactedSegmentAhead puts the compacted segment ahead of the segments that were committed
+	// during the compaction when it rebases, so that the merged values shadow the newer ones.
+	CompactedSegmentAhead bool
 }
 
 // Stats about store requests and cache effectiveness.
@@ -93,6 +96,9 @@ type Stats struct {
 	Segments int
 	// Garbage objects awaiting their grace period.
 	Garbage int
+	// CompactionRebases counts the times a compaction reapplied its swap on top of commits that
+	// landed meanwhile instead of failing.
+	CompactionRebases int64
 }
 
 // DB is an open database. It is safe for concurrent use.
@@ -115,6 +121,7 @@ type DB struct {
 	etag       string
 
 	memHits, memMisses, diskHits, diskMisses atomic.Int64
+	compactionRebases                        atomic.Int64
 }
 
 // Open a database, creating it when no manifest exists.
@@ -194,6 +201,7 @@ func (db *DB) Stats() Stats {
 		MemoryCacheMisses: db.memMisses.Load(),
 		DiskCacheHits:     db.diskHits.Load(),
 		DiskCacheMisses:   db.diskMisses.Load(),
+		CompactionRebases: db.compactionRebases.Load(),
 	}
 	if m != nil {
 		s.Seq = m.Seq

@@ -104,6 +104,26 @@ func TestSimulator(t *testing.T) {
 		is.True(t, totals.Deleted > 50, "deleted objects")
 	})
 
+	t.Run("compaction succeeds against steady writers by rebasing on their commits", func(t *testing.T) {
+		var totals sim.Stats
+		for seed := uint64(1); seed <= 40; seed++ {
+			cfg := sim.DefaultConfig(seed)
+			cfg.ErrorRate, cfg.LostAckRate, cfg.CrashRate, cfg.OutageRate = 0, 0, 0, 0
+			cfg.Clients = 8
+			cfg.TxPerClient = 40
+			res := sim.Run(cfg)
+			if res.Failed() {
+				failReport(t, res)
+			}
+			totals.Add(res.Stats)
+		}
+		rate := float64(totals.Compactions) / float64(totals.CompactionAttempts)
+		t.Logf("fault-free steady writers: %d of %d compactions succeeded (%.0f%%), %d rebased", totals.Compactions, totals.CompactionAttempts, 100*rate, totals.CompactionRebases)
+		is.True(t, totals.CompactionAttempts > 100, "compactions attempted")
+		is.True(t, rate >= 0.9, fmt.Sprintf("success rate %.2f", rate))
+		is.True(t, totals.CompactionRebases > totals.CompactionAttempts/4, "most successes needed a rebase")
+	})
+
 	t.Run("the same seed produces the same history", func(t *testing.T) {
 		for _, useSQL := range []bool{false, true} {
 			for _, w := range []sim.Workload{sim.ListAppend, sim.Bank} {
@@ -255,12 +275,19 @@ func TestMutants(t *testing.T) {
 		detectedBy string
 	}{
 		// Without CAS a stale manifest write drops whole commits, which conserves money, so the bank
-		// checker alone cannot see it; the list-append checker and the GC invariant can.
+		// checker cannot see it; the list-append checker can.
 		{name: "commit without CAS", mutations: engine.Mutations{CommitWithoutCAS: true}, workloads: []sim.Workload{sim.ListAppend}},
-		{name: "commit without CAS", mutations: engine.Mutations{CommitWithoutCAS: true}, workloads: []sim.Workload{sim.ListAppend, sim.Bank}, maintainers: 2},
+		{name: "commit without CAS", mutations: engine.Mutations{CommitWithoutCAS: true}, workloads: []sim.Workload{sim.ListAppend}, maintainers: 2},
 		{name: "GC ignoring the grace period", mutations: engine.Mutations{GCIgnoreGrace: true}, workloads: []sim.Workload{sim.ListAppend, sim.Bank}, maintainers: 2, detectedBy: "grace period"},
 		{name: "serving the cache without a freshness check", mutations: engine.Mutations{SkipFreshnessCheck: true}, workloads: []sim.Workload{sim.ListAppend}, detectedBy: "cycle"},
 		{name: "acking before the write is confirmed", mutations: engine.Mutations{AckBeforeConfirm: true}, workloads: []sim.Workload{sim.ListAppend}},
+		// A rebased compaction that shadows the commits it rebased on resurrects the old values of
+		// the keys it merged. The engine list-append workload rewrites a list under one key, so a
+		// resurrected list loses appends. The bank workload cannot see it, because the resurrected
+		// balances are a consistent older state that conserves money, and the SQL list-append
+		// workload cannot either, because it only inserts rows under new keys, which a compacted
+		// segment does not contain.
+		{name: "the compacted segment ahead of newer ones after a rebase", mutations: engine.Mutations{CompactedSegmentAhead: true}, workloads: []sim.Workload{sim.ListAppend}, maintainers: 2},
 		// The engine mutants are also visible through SQL.
 		{name: "commit without CAS", mutations: engine.Mutations{CommitWithoutCAS: true}, workloads: []sim.Workload{sim.ListAppend}, sql: true},
 		{name: "GC ignoring the grace period", mutations: engine.Mutations{GCIgnoreGrace: true}, workloads: []sim.Workload{sim.ListAppend, sim.Bank}, sql: true, maintainers: 2, detectedBy: "grace period"},

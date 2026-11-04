@@ -123,6 +123,12 @@ type Result struct {
 // Stats of a run.
 type Stats struct {
 	Commits, Conflicts, Unknown, Crashes, Compactions, GCs, Deleted int
+	// CompactionAttempts counts every compaction call, succeeded or not, and CompactionConflicts
+	// the ones that lost to another compaction, so that the success rate under concurrent
+	// writers can be reported.
+	CompactionAttempts, CompactionConflicts int
+	// CompactionRebases counts the compactions that reapplied their swap on top of newer commits.
+	CompactionRebases int
 	// Outages and partitions injected.
 	Outages int
 	// LiveUnknown counts the unknown commit outcomes in processes that did not crash, which only
@@ -140,6 +146,9 @@ func (s *Stats) Add(o Stats) {
 	s.Unknown += o.Unknown
 	s.Crashes += o.Crashes
 	s.Compactions += o.Compactions
+	s.CompactionAttempts += o.CompactionAttempts
+	s.CompactionConflicts += o.CompactionConflicts
+	s.CompactionRebases += o.CompactionRebases
 	s.GCs += o.GCs
 	s.Deleted += o.Deleted
 	s.Outages += o.Outages
@@ -714,10 +723,14 @@ func (m *maintainer) loop(ctx context.Context) {
 			// Compaction loses to concurrent commits, so retry a few times.
 			var err error
 			for range 5 {
+				rebases := m.db.Stats().CompactionRebases
 				err = m.db.Compact(pctx)
+				m.run.stats.CompactionAttempts++
+				m.run.stats.CompactionRebases += int(m.db.Stats().CompactionRebases - rebases)
 				if !errors.Is(err, engine.ErrConflict) {
 					break
 				}
+				m.run.stats.CompactionConflicts++
 			}
 			if err == nil {
 				m.run.stats.Compactions++
