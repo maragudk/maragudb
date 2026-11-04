@@ -44,6 +44,9 @@ type Config struct {
 	// MaxTimeout bounds the drawn timeout of each transaction. A transaction cut off by its
 	// timeout is like a client that crashed mid-request, and the client then restarts its engine.
 	MaxTimeout time.Duration
+	// GracePeriod for GC. A reader younger than it that loses its snapshot is an anomaly.
+	// Defaults to one hour.
+	GracePeriod time.Duration
 	// Rand drives every decision. Required.
 	Rand *rand.Rand
 	// Log receives progress lines when non-nil.
@@ -96,6 +99,9 @@ type run struct {
 // Run the workload. It returns an error only when the store cannot be set up or read back at
 // all before ctx ends; anomalies are in the result.
 func Run(ctx context.Context, cfg Config) (Result, error) {
+	if cfg.GracePeriod == 0 {
+		cfg.GracePeriod = time.Hour
+	}
 	r := &run{cfg: cfg, start: time.Now(), rng: cfg.Rand}
 	if err := r.seed(ctx); err != nil {
 		return Result{}, fmt.Errorf("workload: seeding: %w", err)
@@ -112,7 +118,11 @@ func Run(ctx context.Context, cfg Config) (Result, error) {
 	stopMaintainer()
 	maintainer.Wait()
 
-	final, balances, err := r.readFinal(ctx)
+	// The clients may have stopped because ctx ended, and the history must still be checked, so
+	// the final read gets a deadline of its own.
+	finalCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Minute)
+	defer cancel()
+	final, balances, err := r.readFinal(finalCtx)
 	if err != nil {
 		return Result{}, fmt.Errorf("workload: reading the final state: %w", err)
 	}
@@ -211,12 +221,23 @@ func (r *run) outcome(err error) history.Outcome {
 	return history.Failed
 }
 
+// readError records an anomaly when a reader younger than the grace period lost its snapshot.
+func (r *run) readError(id int, startedAt time.Time, err error) {
+	if !errors.Is(err, engine.ErrSnapshotExpired) {
+		return
+	}
+	if age := time.Since(startedAt); age < r.cfg.GracePeriod {
+		r.anomaly("client %d: snapshot expired after %v, grace period is %v: %v", id, age, r.cfg.GracePeriod, err)
+	}
+}
+
 func keyName(i int) string {
 	return fmt.Sprintf("k%02d", i)
 }
 
 func (r *run) engineOptions(cache bool) engine.Options {
-	opts := engine.Options{Client: r.cfg.Client, Prefix: r.cfg.Prefix, Mutations: r.cfg.Mutations}
+	grace := r.cfg.GracePeriod
+	opts := engine.Options{Client: r.cfg.Client, Prefix: r.cfg.Prefix, Mutations: r.cfg.Mutations, GCGracePeriod: &grace}
 	if !cache {
 		opts.MemoryCacheBytes = new(int64)
 	}
@@ -257,6 +278,20 @@ func (r *run) open(ctx context.Context, cache bool) (*process, error) {
 	return &process{sql: db}, nil
 }
 
+// GaveUpError is returned when the store did not answer before the context ended. Err is the
+// last error, which says whether the store was unreachable or something else failed.
+type GaveUpError struct {
+	Err error
+}
+
+func (e *GaveUpError) Error() string {
+	return "gave up retrying: " + e.Err.Error()
+}
+
+func (e *GaveUpError) Unwrap() error {
+	return e.Err
+}
+
 // retry fn until it succeeds or ctx ends, backing off between attempts.
 func retry(ctx context.Context, fn func() error) error {
 	wait := 10 * time.Millisecond
@@ -267,7 +302,7 @@ func retry(ctx context.Context, fn func() error) error {
 		}
 		select {
 		case <-ctx.Done():
-			return fmt.Errorf("%w: last error: %w", ctx.Err(), err)
+			return &GaveUpError{Err: err}
 		case <-time.After(wait):
 		}
 		wait = min(2*wait, time.Second)
@@ -381,6 +416,8 @@ func (r *run) client(ctx context.Context, id int) {
 		}
 		expired := txCtx.Err() != nil
 		cancel()
+		// A short pause between transactions, as an application has, leaves room for compaction.
+		time.Sleep(time.Duration(r.intN(int(5 * time.Millisecond))))
 		if expired {
 			r.mu.Lock()
 			r.stats.Restarts++
@@ -393,8 +430,12 @@ func (r *run) client(ctx context.Context, id int) {
 
 // maintain compacts and garbage collects now and then until ctx ends.
 func (r *run) maintain(ctx context.Context) {
-	db, err := engine.Open(ctx, r.engineOptions(false))
-	if err != nil {
+	var db *engine.DB
+	if err := retry(ctx, func() error {
+		var err error
+		db, err = engine.Open(ctx, r.engineOptions(false))
+		return err
+	}); err != nil {
 		return
 	}
 	for {
@@ -403,12 +444,28 @@ func (r *run) maintain(ctx context.Context) {
 			return
 		case <-time.After(time.Duration(50+r.intN(450)) * time.Millisecond):
 		}
-		if err := db.Compact(ctx); err == nil {
-			r.mu.Lock()
-			r.stats.Compactions++
-			r.mu.Unlock()
+		// Compaction loses to every concurrent commit, so it tries a few times, and GC follows at
+		// once, so that a reader with an older snapshot may still need what GC considers.
+		for range 5 {
+			err := db.Compact(ctx)
+			if err == nil {
+				r.mu.Lock()
+				r.stats.Compactions++
+				r.mu.Unlock()
+			}
+			if !errors.Is(err, engine.ErrConflict) {
+				break
+			}
 		}
 		_, _ = db.GC(ctx)
+	}
+}
+
+// pause in the middle of a transaction now and then, like a stalled process, so that snapshots
+// outlive compactions.
+func (r *run) pause() {
+	if r.intN(5) == 0 {
+		time.Sleep(time.Duration(r.intN(int(20 * time.Millisecond))))
 	}
 }
 
@@ -463,8 +520,10 @@ func (r *run) listAppendTx(ctx context.Context, p *process, id int) {
 		return
 	}
 	for _, pl := range plans {
+		r.pause()
 		v, _, err := tx.Get(ctx, []byte(keyName(pl.key)))
 		if err != nil {
+			r.readError(id, tx.StartedAt(), err)
 			// The reads that completed are real observations of a transaction that never committed.
 			if len(h.Ops) > 0 {
 				h.Complete, h.Outcome, h.Err = r.stamp(), history.Failed, err.Error()
@@ -482,12 +541,15 @@ func (r *run) listAppendTx(ctx context.Context, p *process, id int) {
 	}
 	err = tx.Commit(ctx)
 	h.Complete = r.stamp()
-	h.Outcome = r.outcome(err)
+	if readOnly && err != nil {
+		// A read-only commit does nothing, so an error means the reads never completed, and is
+		// not an unknown outcome.
+		h.Outcome = history.Failed
+	} else {
+		h.Outcome = r.outcome(err)
+	}
 	if err != nil {
 		h.Err = err.Error()
-		if readOnly {
-			h.Outcome = history.Failed
-		}
 	}
 	r.record(h)
 }
@@ -503,6 +565,7 @@ func (r *run) bankTx(ctx context.Context, p *process, id int) {
 		for i := range r.cfg.Keys {
 			v, ok, err := tx.Get(ctx, []byte(keyName(i)))
 			if err != nil {
+				r.readError(id, tx.StartedAt(), err)
 				return
 			}
 			if !ok {
@@ -525,8 +588,10 @@ func (r *run) bankTx(ctx context.Context, p *process, id int) {
 		return
 	}
 	read := func(key string) (int64, bool) {
+		r.pause()
 		v, ok, err := tx.Get(ctx, []byte(key))
 		if err != nil {
+			r.readError(id, tx.StartedAt(), err)
 			return 0, false
 		}
 		if !ok {
@@ -591,8 +656,10 @@ func (r *run) listAppendSQL(ctx context.Context, p *process, id int) {
 	if r.intN(3) == 0 || len(plans) == 1 && plans[0].append {
 		k := plans[0].key
 		h := history.Tx{Client: id, Invoke: r.stamp()}
+		startedAt := time.Now()
 		list, err := readList(ctx, p.sql, k)
 		if err != nil {
+			r.readError(id, startedAt, err)
 			return
 		}
 		h.Ops = []history.Op{{Kind: history.Read, Key: keyName(k), List: list}}
@@ -613,6 +680,7 @@ func (r *run) listAppendSQL(ctx context.Context, p *process, id int) {
 	}
 
 	h := history.Tx{Client: id, Invoke: r.stamp()}
+	startedAt := time.Now()
 	tx, err := p.sql.BeginTx(ctx, &sql.TxOptions{ReadOnly: readOnly})
 	if err != nil {
 		return
@@ -625,8 +693,10 @@ func (r *run) listAppendSQL(ctx context.Context, p *process, id int) {
 		}
 	}
 	for _, pl := range plans {
+		r.pause()
 		list, err := readList(ctx, tx, pl.key)
 		if err != nil {
+			r.readError(id, startedAt, err)
 			fail(err)
 			return
 		}
@@ -642,18 +712,22 @@ func (r *run) listAppendSQL(ctx context.Context, p *process, id int) {
 	}
 	err = tx.Commit()
 	h.Complete = r.stamp()
-	h.Outcome = r.outcome(err)
+	if readOnly && err != nil {
+		// A read-only commit does nothing, so an error means the reads never completed, and is
+		// not an unknown outcome.
+		h.Outcome = history.Failed
+	} else {
+		h.Outcome = r.outcome(err)
+	}
 	if err != nil {
 		h.Err = err.Error()
-		if readOnly {
-			h.Outcome = history.Failed
-		}
 	}
 	r.record(h)
 }
 
 func (r *run) bankSQL(ctx context.Context, p *process, id int) {
 	h := history.Tx{Client: id, Invoke: r.stamp()}
+	startedAt := time.Now()
 	if r.intN(3) == 0 {
 		tx, err := p.sql.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
 		if err != nil {
@@ -662,6 +736,7 @@ func (r *run) bankSQL(ctx context.Context, p *process, id int) {
 		defer func() { _ = tx.Rollback() }()
 		rows, err := tx.QueryContext(ctx, "SELECT id, balance FROM accounts ORDER BY id")
 		if err != nil {
+			r.readError(id, startedAt, err)
 			return
 		}
 		balances := map[string]int64{}
@@ -697,6 +772,7 @@ func (r *run) bankSQL(ctx context.Context, p *process, id int) {
 	defer func() { _ = tx.Rollback() }()
 	var balance int64
 	if err := tx.QueryRowContext(ctx, "SELECT balance FROM accounts WHERE id = $1", from).Scan(&balance); err != nil || balance < amount {
+		r.readError(id, startedAt, err)
 		return
 	}
 	for _, step := range []struct {

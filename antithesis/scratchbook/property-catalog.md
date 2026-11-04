@@ -9,6 +9,8 @@ updated: 2026-11-03
 |----------|-----------|-------|--------|
 | The workload reaches the store at startup (bootstrap) | `Reachable("the workload reaches the object store at startup")` | `/antithesis/workload/main.go` | implemented |
 | No anomalies against a real store: bank total conserved, list-append strict serializable, acknowledged writes durable, failed writes invisible | `Always("the history against a real object store has no anomalies")` | `/internal/workload` | implemented |
+| A reader against a real store younger than the GC grace period never loses its snapshot | anomaly in the history check above | `/internal/workload` | implemented |
+| A run against a real store reaches its verdict | `Sometimes(...)` reach claim | `/antithesis/workload/main.go` | implemented |
 | A commit against a real store sometimes has an unknown outcome | `Sometimes(...)` reach claim | `/internal/workload` | implemented |
 | A commit against a real store sometimes conflicts | `Sometimes(...)` reach claim | `/internal/workload` | implemented |
 | No anomalies in a simulated history | `Always("the simulated history has no anomalies")` | `/internal/sim` | implemented |
@@ -17,4 +19,4 @@ updated: 2026-11-03
 | Lost manifest writes are resolved, conflicts happen, GC finds orphans and expired objects | `Sometimes` / `Reachable` | `/internal/engine` | implemented |
 | Autocommit retries after a conflict, and reports an unknown outcome instead of retrying | `Sometimes(...)` | `/internal/sql/exec/session.go` | implemented |
 
-Each `parallel_driver_s3_*` run checks its own history at the end, in a database prefix of its own, so no `finally_` command is needed. A run whose store stays unreachable for its whole five-minute budget exits cleanly without a verdict.
+Each `parallel_driver_s3_*` run checks its own history at the end, in a database prefix of its own, so no `finally_` command is needed. A run whose store stays unreachable for its whole five-minute budget exits cleanly without a verdict; any other failure to set up or read back the database fails the command. The final read-back has a deadline of its own, so the history is checked even when the clients ran out of time.

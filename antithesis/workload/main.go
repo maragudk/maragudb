@@ -13,9 +13,11 @@ package main
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	mathrand "math/rand"
 	"math/rand/v2"
+	"net"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -136,6 +138,20 @@ func simulate() error {
 	return nil
 }
 
+// unreachable reports whether err means that the store did not answer: a network error, a
+// timeout, or a server error.
+func unreachable(err error) bool {
+	var netErr net.Error
+	var status interface{ HTTPStatusCode() int }
+	switch {
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled), errors.As(err, &netErr):
+		return true
+	case errors.As(err, &status):
+		return status.HTTPStatusCode() >= 500
+	}
+	return false
+}
+
 // sdkSource draws every number from the Antithesis SDK at the moment it is needed, so that
 // Antithesis controls each decision of the workload. It adapts the SDK's [mathrand.Source64] to
 // [rand.Source].
@@ -171,6 +187,7 @@ func store(ctx context.Context, w sim.Workload, useSQL bool) error {
 		TxPerClient: 10 + rng.IntN(30),
 		Keys:        1 + rng.IntN(5),
 		MaxTimeout:  time.Duration(100+rng.IntN(5000)) * time.Millisecond,
+		GracePeriod: time.Duration(1+rng.IntN(10)) * time.Second,
 		Rand:        rng,
 		Log:         func(line string) { fmt.Println(line) },
 	}
@@ -179,9 +196,16 @@ func store(ctx context.Context, w sim.Workload, useSQL bool) error {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
 	defer cancel()
 	res, err := workload.Run(ctx, cfg)
+	assert.Sometimes(err == nil, "a run against a real object store reaches its verdict", nil)
 	if err != nil {
-		fmt.Println("the store was unreachable:", err)
-		return nil
+		// Only a store that stopped answering is not a finding. Any other failure to set up or
+		// read back the database is.
+		var gaveUp *workload.GaveUpError
+		if errors.As(err, &gaveUp) && unreachable(gaveUp.Err) {
+			fmt.Println("the store was unreachable:", err)
+			return nil
+		}
+		return err
 	}
 	fmt.Println(res.Report())
 	if len(res.Anomalies) > 0 {

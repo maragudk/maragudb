@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -94,11 +95,43 @@ func TestRun(t *testing.T) {
 		t.Fatal("not detected in 10 seeds")
 	})
 
-	t.Run("fails when the store never answers", func(t *testing.T) {
+	t.Run("finds snapshots lost before the grace period ends, when GC ignores it", func(t *testing.T) {
+		// The run is in wall-clock time, so the seed does not decide it, and detection varies.
+		for seed := range uint64(60) {
+			cfg := config(seed, sim.ListAppend, seed%2 == 0, s3fake.Faults{})
+			cfg.Mutations = engine.Mutations{GCIgnoreGrace: true}
+			cfg.GracePeriod = time.Minute
+			res, err := workload.Run(t.Context(), cfg)
+			is.NotError(t, err)
+			for _, a := range res.Anomalies {
+				if strings.Contains(a.Error(), "grace period") {
+					t.Logf("detected with seed %d: %v", seed, a)
+					return
+				}
+			}
+		}
+		t.Fatal("not detected in 60 seeds")
+	})
+
+	t.Run("checks the history even when the clients stopped because the context ended", func(t *testing.T) {
+		cfg := config(1, sim.ListAppend, false, s3fake.Faults{})
+		cfg.TxPerClient = 1 << 30
+		ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+		defer cancel()
+		res, err := workload.Run(ctx, cfg)
+		is.NotError(t, err)
+		is.True(t, len(res.History) > 0)
+		is.Equal(t, 0, len(res.Anomalies))
+	})
+
+	t.Run("reports that it gave up, with the last error, when the store never answers", func(t *testing.T) {
 		cfg := config(1, sim.Bank, true, s3fake.Faults{ErrorRate: 1})
 		ctx, cancel := context.WithTimeout(t.Context(), 200*time.Millisecond)
 		defer cancel()
 		_, err := workload.Run(ctx, cfg)
-		is.True(t, err != nil, "an error")
+		var gaveUp *workload.GaveUpError
+		is.True(t, errors.As(err, &gaveUp), fmt.Sprint(err))
+		is.Error(t, s3fake.ErrInjected, gaveUp.Err)
 	})
+
 }
