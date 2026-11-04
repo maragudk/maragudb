@@ -110,3 +110,19 @@ Alternatives considered:
 - Manual `Compact` and `GC` only. This is easy to forget, and the database slowly degrades.
 - Every client maintaining on its own, with no lease. This is safe but wastes requests and work when there are many clients.
 - A lease that correctness depends on. This would need fencing, and it would make clock skew a safety issue.
+
+## 2026-11-04: Custom object stores through an unexported interface on `Options.Store`
+
+`Options.Store` accepts any value with four methods, `Get`, `Put`, `Delete`, and `List`, whose signatures use only exported types from the `maragudb` package (`GetOptions`, `PutOptions`) and builtin types. The interface itself is unexported, following the pattern of private interfaces on the consuming side. The exported sentinel errors `ErrObjectNotFound`, `ErrPreconditionFailed`, and `ErrNotModified` are part of the contract. An adapter inside the package translates to the engine's internal client and refuses answers that would silently break correctness, such as an empty ETag.
+
+Alternatives considered:
+- Exporting the internal client interface and its types. This would make the internal storage contract public and hard to change.
+- An exported interface type. It adds surface without letting callers do anything more.
+
+## 2026-11-04: The Antithesis harness runs against a real S3-compatible store and the in-process simulator
+
+The docker-compose harness in `/antithesis` has two containers: versitygw as the S3-compatible store, and an instrumented workload. Test commands run the bank and list-append workloads through the engine and through SQL against versitygw over the network, so that Antithesis's own faults (partitions, resets, pauses, killed containers) reach the real AWS client and the commit protocol. Another test command runs the deterministic simulator against the in-process fake, with seeds from the Antithesis SDK, to cover crash points that the network cannot inject on demand.
+
+Alternatives considered:
+- The in-process fake only. Antithesis's network faults would not reach a store in the same process, so the run would only explore simulator seeds.
+- MinIO. Its images are no longer published on Docker Hub.
