@@ -158,3 +158,27 @@ Some Postgres features will deliberately never be supported, because they are co
 Alternatives considered:
 - Keep our own flavor with documented deviations. Rejected because every deviation is something a reader must trust separately, and because the second renderer is extra code that itself needs verification.
 - Postgres semantics with Go-like aliases for the type names. Rejected because it breaks the guarantee that the same text runs on both systems.
+
+## 2026-11-04: A machine-checked map from requirements to tests, and a report for every run
+
+The code is never reviewed, so trust rests on whether the verification is complete. The goal of this mechanism is that a reader can judge that completeness from the docs and the CI output alone.
+
+Every claim gets a stable ID:
+- `AC-` for acceptance criteria
+- `INV-` for key invariants
+- `DEV-` for documented differences from Postgres
+- `MUT-` for deliberate bugs
+- `STATE-` for hard states that the simulator must reach, such as a lost acknowledgement or a lease takeover
+
+A test declares which IDs it verifies with `verify.Covers`, using string literals only, so that the declarations can be parsed statically. A meta-test fails when any of these hold:
+- an ID has no verifying test
+- a test names an unknown ID
+- a deliberate bug is detected by nothing
+- a declared state goes unreached in the fixed corpus
+- the generated `docs/verification.md`, together with its table of which checkers catch which bug, is out of date
+
+Each test run records facts such as runs, anomalies, deliberate bugs caught, differential statements, request budgets, and latencies. The run renders them as a report: `make report` locally, and in the GitHub Actions job summary in CI.
+
+Every future change must keep this map complete. New requirements, deviations, deliberate bugs, and hard states get IDs and verifying tests in the same change.
+
+Alternative considered: a hand-maintained list of what is tested. Rejected because nothing would catch it going stale, and without that check the list would not be a trust signal.
