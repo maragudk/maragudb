@@ -136,3 +136,25 @@ Decision: an unreferenced object is no longer deleted at once. The first GC pass
 Alternatives considered:
 - Writing the compacted segment again under the new base sequence on every rebase. This keeps the old orphan rule but costs a write of the whole database per rebase, several times under steady writers.
 - Deleting orphans at once unless they come from a compaction, told apart by their key. This keeps crashed commits' orphans short-lived but adds a second rule for the same question; one rule is easier to show correct.
+
+## 2026-11-04: A strict subset of Postgres instead of our own SQL flavor
+
+This replaces "Own SQL flavor with Postgres semantics and Go-like types" from 2026-11-03.
+
+maragudb accepts a subset of Postgres SQL, and the same SQL text runs on both systems. For every statement that maragudb accepts, the result must be identical to Postgres. When Postgres fails a statement, maragudb fails it too, and with the same error class wherever the error does not depend on evaluation order. The planner may differ, because only results are compared.
+
+maragudb may be stricter than Postgres. It can reject statements that Postgres accepts, such as those that depend on implicit casts, as long as it rejects them with a clear error. A stricter rejection never changes what an accepted statement returns. Unsupported features are listed as unsupported. They are not semantic deviations.
+
+Consequences:
+- Type names are Postgres names: `bigint`, `double precision`, `boolean`, `text`, `bytea`, `timestamptz`. The Go-like names are dropped.
+- `timestamptz` has microsecond precision, as in Postgres.
+- The rest of the behavior must also match Postgres exactly. For example, a failed statement aborts the transaction until rollback, and `lower` and `upper` follow the C locale.
+- The differential harness runs one SQL string on both sides, so there is no second renderer.
+- External Postgres-syntax test corpora become usable as additional oracles.
+- sqlc's PostgreSQL engine and existing Postgres knowledge carry over.
+
+Some Postgres features will deliberately never be supported, because they are common antipatterns. The `money` type is one example. That list is decided later.
+
+Alternatives considered:
+- Keep our own flavor with documented deviations. Rejected because every deviation is something a reader must trust separately, and because the second renderer is extra code that itself needs verification.
+- Postgres semantics with Go-like aliases for the type names. Rejected because it breaks the guarantee that the same text runs on both systems.
