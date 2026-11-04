@@ -50,7 +50,7 @@ func TestParseDSN(t *testing.T) {
 func TestConnector(t *testing.T) {
 	t.Run("shares one engine between connections and opens it on first connect", func(t *testing.T) {
 		fake := s3fake.New()
-		d := sqldriver.New(sqldriver.Options{Engine: engine.Options{Client: fake}})
+		d := sqldriver.New(sqldriver.Options{Engine: engine.Options{Client: fake}, Maintenance: sqldriver.MaintenanceOptions{Disabled: true}})
 		c, err := sqldriver.NewConnector(d, "s3://bucket/db")
 		is.NotError(t, err)
 		is.Equal(t, 0, len(fake.Keys()), "nothing is opened yet")
@@ -114,6 +114,21 @@ func TestConnector(t *testing.T) {
 		})
 	})
 
+	t.Run("a connection from Driver.Open closes its connector and the maintenance with it", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			fake := s3fake.New()
+			d := sqldriver.New(sqldriver.Options{Engine: engine.Options{Client: fake}, Maintenance: sqldriver.MaintenanceOptions{Interval: time.Second}})
+			conn, err := d.Open("s3://bucket/db")
+			is.NotError(t, err)
+			_, err = conn.(driver.ExecerContext).ExecContext(t.Context(), "CREATE TABLE t (id int PRIMARY KEY)", nil)
+			is.NotError(t, err)
+			is.NotError(t, conn.Close())
+			before := fake.Counts()
+			time.Sleep(10 * time.Second)
+			is.Equal(t, int64(0), fake.Counts().Sub(before).Total(), "the loop stopped with the connection")
+		})
+	})
+
 	t.Run("needs a client or a client factory", func(t *testing.T) {
 		d := sqldriver.New(sqldriver.Options{})
 		c, err := sqldriver.NewConnector(d, "s3://bucket/db")
@@ -124,7 +139,7 @@ func TestConnector(t *testing.T) {
 
 	t.Run("uses a disk cache directory per DSN", func(t *testing.T) {
 		fake := s3fake.New()
-		d := sqldriver.New(sqldriver.Options{Engine: engine.Options{Client: fake, MemoryCacheBytes: new(int64)}, DiskCacheDir: t.TempDir()})
+		d := sqldriver.New(sqldriver.Options{Engine: engine.Options{Client: fake, MemoryCacheBytes: new(int64)}, DiskCacheDir: t.TempDir(), Maintenance: sqldriver.MaintenanceOptions{Disabled: true}})
 		c, err := sqldriver.NewConnector(d, "s3://bucket/db")
 		is.NotError(t, err)
 		db := sql.OpenDB(c)
@@ -144,7 +159,7 @@ func TestConnector(t *testing.T) {
 func TestConn(t *testing.T) {
 	t.Run("rejects named parameters and unsupported types before running anything", func(t *testing.T) {
 		fake := s3fake.New()
-		d := sqldriver.New(sqldriver.Options{Engine: engine.Options{Client: fake}})
+		d := sqldriver.New(sqldriver.Options{Engine: engine.Options{Client: fake}, Maintenance: sqldriver.MaintenanceOptions{Disabled: true}})
 		c, err := sqldriver.NewConnector(d, "s3://bucket/db")
 		is.NotError(t, err)
 		db := sql.OpenDB(c)
@@ -162,7 +177,7 @@ func TestConn(t *testing.T) {
 
 	t.Run("implements the optional driver interfaces", func(t *testing.T) {
 		fake := s3fake.New()
-		d := sqldriver.New(sqldriver.Options{Engine: engine.Options{Client: fake}})
+		d := sqldriver.New(sqldriver.Options{Engine: engine.Options{Client: fake}, Maintenance: sqldriver.MaintenanceOptions{Disabled: true}})
 		c, err := sqldriver.NewConnector(d, "s3://bucket/db")
 		is.NotError(t, err)
 		conn, err := c.Connect(t.Context())

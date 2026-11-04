@@ -69,13 +69,12 @@ func (db *DB) readBlock(ctx context.Context, snapshotAt time.Time, objectKey str
 // not show a fresh object yet, and is then reported as [s3.ErrNotFound].
 func (db *DB) getBlock(ctx context.Context, objectKey string, ref blockRef) (s3.Object, error) {
 	byteRange := &s3.ByteRange{Offset: ref.Offset, Length: ref.Length}
-	const maxAttempts = 4
 	for attempt := 0; ; attempt++ {
 		res, err := db.client.Get(ctx, objectKey, s3.GetOptions{Range: byteRange})
 		if errors.Is(err, s3.ErrNotFound) {
 			res, err = db.client.Get(ctx, objectKey, s3.GetOptions{Range: byteRange, Consistent: true})
 		}
-		if err == nil || !transient(err) || attempt == maxAttempts-1 || ctx.Err() != nil {
+		if err == nil || s3.Definite(err) || attempt == 3 || ctx.Err() != nil {
 			return res, err
 		}
 		assert.Sometimes(true, "a failed block read is retried", nil)
@@ -89,23 +88,6 @@ func (db *DB) getBlock(ctx context.Context, objectKey string, ref blockRef) (s3.
 			return s3.Object{}, err
 		}
 	}
-}
-
-// transient reports whether a failed request may succeed when repeated: everything except a
-// definite answer from the store, such as a missing object, a failed precondition, or any other
-// client error, and a context that has ended.
-func transient(err error) bool {
-	if errors.Is(err, s3.ErrNotFound) || errors.Is(err, s3.ErrPreconditionFailed) || errors.Is(err, s3.ErrNotModified) {
-		return false
-	}
-	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-		return false
-	}
-	var status interface{ HTTPStatusCode() int }
-	if errors.As(err, &status) && status.HTTPStatusCode() < 500 {
-		return false
-	}
-	return true
 }
 
 // fetcher for a segment within a snapshot.

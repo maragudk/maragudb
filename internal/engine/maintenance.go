@@ -12,15 +12,16 @@ import (
 	"maragu.dev/maragudb/internal/s3"
 )
 
-// ErrLeaseLost is returned by maintenance that stopped because another maintainer took over
-// the lease, which only happens after the lease expired without renewal.
+// ErrLeaseLost is returned by maintenance that stopped because it no longer holds the lease:
+// another maintainer took it over after it expired without renewal.
 var ErrLeaseLost = errors.New("engine: maintenance lease lost")
 
 // MaintenanceOptions for [DB.NewMaintainer].
 type MaintenanceOptions struct {
 	// Holder identifies the maintainer in the lease. Defaults to a random ID.
 	Holder string
-	// SegmentThreshold is the segment count at which compaction is due. Defaults to 8.
+	// SegmentThreshold is the segment count at which compaction is due. Defaults to 8, and is
+	// at least 2, because one segment cannot be compacted.
 	SegmentThreshold int
 	// LeaseDuration is how long an acquired lease lasts without renewal. Defaults to one minute.
 	// During long work the lease is renewed once half of it has passed.
@@ -29,7 +30,7 @@ type MaintenanceOptions struct {
 	DisableLease bool
 	// IgnoreLeaseExpiry makes the maintainer neither renew its lease nor stop when it expires,
 	// as a stalled process would, so that other maintainers take the lease over while this one
-	// still believes it holds it. For tests of overlapping leases.
+	// still believes it holds it, and the leases overlap.
 	IgnoreLeaseExpiry bool
 }
 
@@ -61,6 +62,7 @@ func (db *DB) NewMaintainer(opts MaintenanceOptions) *Maintainer {
 	if opts.SegmentThreshold <= 0 {
 		opts.SegmentThreshold = 8
 	}
+	opts.SegmentThreshold = max(opts.SegmentThreshold, 2)
 	if opts.LeaseDuration <= 0 {
 		opts.LeaseDuration = time.Minute
 	}
@@ -152,15 +154,30 @@ func (m *Maintainer) maintain(ctx context.Context, res *StepResult) error {
 	return err
 }
 
-// progress renews the lease during long work once half of its duration has passed.
+// progress renews the lease during long work once half of its duration has passed. A renewal
+// that fails for a passing reason is tried again at the next call, as long as the lease has
+// not expired; work stops when ctx ends or the lease is lost.
 func (m *Maintainer) progress(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if !m.held || m.opts.IgnoreLeaseExpiry {
 		return nil
 	}
-	if m.db.now().Sub(m.acquiredAt) < m.opts.LeaseDuration/2 {
+	age := m.db.now().Sub(m.acquiredAt)
+	if age < m.opts.LeaseDuration/2 {
 		return nil
 	}
-	return m.Renew(ctx)
+	err := m.Renew(ctx)
+	if err != nil && !errors.Is(err, ErrLeaseLost) && age < m.opts.LeaseDuration {
+		m.db.log.Debug("renewing maintenance lease failed, trying again later", "holder", m.opts.Holder, "error", err)
+		return nil
+	}
+	if err != nil && !errors.Is(err, ErrLeaseLost) {
+		m.lost(err)
+		return fmt.Errorf("%w: expired after a renewal failed: %w", ErrLeaseLost, err)
+	}
+	return err
 }
 
 // Acquire the lease, or take over an expired one, and report whether it is now held. A lease
@@ -194,13 +211,38 @@ func (m *Maintainer) Acquire(ctx context.Context) (bool, error) {
 			// Another maintainer got there first.
 			return false, nil
 		}
+		// The write may have landed and only its answer been lost.
+		if l, etag, ok := m.reclaim(ctx); ok {
+			m.hold(etag, l)
+			return true, nil
+		}
 		return false, fmt.Errorf("engine: acquiring lease: %w", err)
 	}
+	m.hold(etag, lease{ExpiresAt: now.Add(m.opts.LeaseDuration)})
+	return true, nil
+}
+
+// hold records the lease as held under etag, with its expiry.
+func (m *Maintainer) hold(etag string, l lease) {
 	assert.Sometimes(true, "a maintainer acquires the lease", nil)
-	m.held, m.etag, m.acquiredAt = true, etag, now
+	m.held, m.etag, m.acquiredAt = true, etag, l.ExpiresAt.Add(-m.opts.LeaseDuration)
 	m.db.leaseAcquisitions.Add(1)
 	m.db.log.Debug("acquired maintenance lease", "holder", m.opts.Holder)
-	return true, nil
+}
+
+// reclaim reads the lease back and reports whether it is under this holder's name, which
+// means a write whose answer was lost did land, with the lease and its current ETag.
+func (m *Maintainer) reclaim(ctx context.Context) (lease, string, bool) {
+	cur, err := m.db.client.Get(ctx, m.key, s3.GetOptions{Consistent: true})
+	if err != nil {
+		return lease{}, "", false
+	}
+	var l lease
+	if err := json.Unmarshal(cur.Body, &l); err != nil || l.Holder != m.opts.Holder {
+		return lease{}, "", false
+	}
+	assert.Sometimes(true, "a maintainer reclaims a lease write whose answer was lost", nil)
+	return l, cur.ETag, true
 }
 
 // Renew the held lease for another LeaseDuration. It returns [ErrLeaseLost] when another
@@ -216,6 +258,13 @@ func (m *Maintainer) Renew(ctx context.Context) error {
 	}
 	etag, err := m.db.client.Put(ctx, m.key, body, s3.PutOptions{IfMatch: m.etag})
 	if err != nil {
+		// The precondition fails after another maintainer took over, and also when an earlier
+		// renewal of this maintainer's own landed with its answer lost. Reading the lease back
+		// tells the two apart.
+		if l, curEtag, ok := m.reclaim(ctx); ok && l.ExpiresAt.After(now) {
+			m.etag, m.acquiredAt = curEtag, l.ExpiresAt.Add(-m.opts.LeaseDuration)
+			return nil
+		}
 		if m.lost(err) {
 			return fmt.Errorf("%w: renewal failed: %w", ErrLeaseLost, err)
 		}
@@ -226,7 +275,8 @@ func (m *Maintainer) Renew(ctx context.Context) error {
 }
 
 // Release the lease by marking it expired, so that any maintainer can take it over at once.
-// It is a no-op when the lease is not held.
+// It is a no-op when the lease is not held. After it, the lease is not held whatever happened,
+// because an unreleased lease expires on its own.
 func (m *Maintainer) Release(ctx context.Context) error {
 	if !m.held {
 		return nil
@@ -237,19 +287,31 @@ func (m *Maintainer) Release(ctx context.Context) error {
 	}
 	_, err = m.db.client.Put(ctx, m.key, body, s3.PutOptions{IfMatch: m.etag})
 	if err != nil {
-		if m.lost(err) {
+		// A write of this maintainer's own may have landed with its answer lost: a renewal,
+		// after which the release is tried once more, or this release itself.
+		l, curEtag, ok := m.reclaim(ctx)
+		switch {
+		case ok && l.ExpiresAt.After(m.db.now()):
+			_, err = m.db.client.Put(ctx, m.key, body, s3.PutOptions{IfMatch: curEtag})
+		case ok:
+			err = nil
+		case errors.Is(err, s3.ErrPreconditionFailed), errors.Is(err, s3.ErrNotFound):
+			m.lost(err)
 			return nil
 		}
-		return fmt.Errorf("engine: releasing lease: %w", err)
 	}
 	m.held, m.etag = false, ""
+	if err != nil {
+		return fmt.Errorf("engine: releasing lease: %w", err)
+	}
 	m.db.log.Debug("released maintenance lease", "holder", m.opts.Holder)
 	return nil
 }
 
-// lost records that the lease is gone when err says another maintainer replaced it.
+// lost records that the lease is gone when err says another maintainer replaced it, or when
+// the lease expired while a renewal kept failing.
 func (m *Maintainer) lost(err error) bool {
-	if !errors.Is(err, s3.ErrPreconditionFailed) && !errors.Is(err, s3.ErrNotFound) {
+	if !errors.Is(err, s3.ErrPreconditionFailed) && !errors.Is(err, s3.ErrNotFound) && m.db.now().Sub(m.acquiredAt) < m.opts.LeaseDuration {
 		return false
 	}
 	assert.Sometimes(true, "a maintainer loses the lease to another", nil)

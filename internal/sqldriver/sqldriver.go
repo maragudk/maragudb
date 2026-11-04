@@ -72,13 +72,20 @@ func New(opts Options) *Driver {
 	return &Driver{opts: opts}
 }
 
-// Open a connection, for [driver.Driver].
+// Open a connection, for [driver.Driver]. The connection owns its connector and closes it,
+// with the connector's background maintenance, when it is closed.
 func (d *Driver) Open(dsn string) (driver.Conn, error) {
-	c, err := d.OpenConnector(dsn)
+	c, err := NewConnector(d, dsn)
 	if err != nil {
 		return nil, err
 	}
-	return c.Connect(context.Background())
+	conn, err := c.Connect(context.Background())
+	if err != nil {
+		_ = c.Close()
+		return nil, err
+	}
+	conn.(*Conn).owner = c
+	return conn, nil
 }
 
 // OpenConnector for a DSN, for [driver.DriverContext].
@@ -178,9 +185,15 @@ func (c *Connector) maintain(ctx context.Context) {
 			return
 		case <-time.After(wait):
 		}
-		if res, err := c.maintainer.Step(ctx); err != nil && ctx.Err() == nil {
+		res, err := c.maintainer.Step(ctx)
+		switch {
+		case err != nil && ctx.Err() != nil:
+		case errors.Is(err, engine.ErrConflict), errors.Is(err, engine.ErrSnapshotExpired), errors.Is(err, engine.ErrLeaseLost):
+			// Another process did the work, or is doing it; the next step sees the result.
+			c.d.opts.Logger.Debug("background maintenance yielded", "dsn", c.dsn, "error", err)
+		case err != nil:
 			c.d.opts.Logger.Warn("background maintenance failed", "dsn", c.dsn, "error", err)
-		} else if res.Ran {
+		case res.Ran:
 			c.d.opts.Logger.Debug("background maintenance ran", "dsn", c.dsn, "compacted", res.Compacted, "deleted", res.Deleted)
 		}
 	}
@@ -230,6 +243,9 @@ var _ io.Closer = (*Connector)(nil)
 type Conn struct {
 	db      *engine.DB
 	session *exec.Session
+	// owner is the connector to close with the connection, when the connection was opened
+	// without one.
+	owner *Connector
 }
 
 // DB is the storage engine the connection belongs to.
@@ -253,10 +269,16 @@ func (c *Conn) PrepareContext(_ context.Context, query string) (driver.Stmt, err
 
 // Close the connection.
 func (c *Conn) Close() error {
+	var err error
 	if c.session.InTx() {
-		return c.session.Rollback()
+		err = c.session.Rollback()
 	}
-	return nil
+	if c.owner != nil {
+		if cerr := c.owner.Close(); cerr != nil && err == nil {
+			err = cerr
+		}
+	}
+	return err
 }
 
 // Begin a transaction, for [driver.Conn].

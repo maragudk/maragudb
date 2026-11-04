@@ -48,6 +48,7 @@ func (w *world) open(seed uint64, opts engine.Options) *engine.DB {
 	opts.Client = w.fake
 	opts.Prefix = "db"
 	opts.Now = w.clock.Now
+	opts.Sleep = w.clock.Sleep
 	opts.Rand = rand.New(rand.NewPCG(seed, seed))
 	db, err := engine.Open(w.t.Context(), opts)
 	is.NotError(w.t, err)
@@ -579,7 +580,7 @@ func TestDB_Compact(t *testing.T) {
 		equalMap(t, map[string]string{"a": "1", "b": "2", "c": "3"}, scan(t, tx, "", ""))
 	})
 
-	t.Run("gives up instead of rebasing once it is older than the grace period", func(t *testing.T) {
+	t.Run("gives up instead of rebasing once it is older than half the grace period, and its output is collected", func(t *testing.T) {
 		grace := 10 * time.Minute
 		w := newWorld(t)
 		db1 := w.open(1, engine.Options{GCGracePeriod: &grace})
@@ -590,8 +591,7 @@ func TestDB_Compact(t *testing.T) {
 			if kind == s3.KindPut {
 				w.decide = nil
 				put(t, db1, "c", "3")
-				// Its output may have been collected as an orphan by now.
-				w.clock.Sleep(t.Context(), grace)
+				w.clock.Sleep(t.Context(), grace/2)
 			}
 			return s3fake.OutcomeNormal
 		}
@@ -600,6 +600,14 @@ func TestDB_Compact(t *testing.T) {
 		_, ok := get(t, db1, "c")
 		is.True(t, ok)
 		is.Equal(t, 3, db1.Stats().Segments, "nothing was compacted")
+		is.Equal(t, 5, len(w.fake.Keys()), "manifest, three segments, and the orphan")
+		_, err = db1.GC(t.Context())
+		is.NotError(t, err)
+		w.clock.Sleep(t.Context(), grace)
+		n, err := db1.GC(t.Context())
+		is.NotError(t, err)
+		is.Equal(t, 1, n, "the orphan is collected after the grace period")
+		is.Equal(t, 4, len(w.fake.Keys()))
 	})
 }
 
@@ -695,11 +703,12 @@ func TestDB_GC(t *testing.T) {
 			if kind == s3.KindPut {
 				w.decide = nil
 				// db2's merged segment is written. Before its manifest write, a commit lands and
-				// GC runs twice almost a grace period apart, which is the most GC may delete.
+				// GC runs twice almost half a grace period apart, the most a compaction that still
+				// writes its manifest can be delayed.
 				put(t, db1, "c", "3")
 				_, err := db1.GC(t.Context())
 				is.NotError(t, err)
-				w.clock.Sleep(t.Context(), grace-time.Second)
+				w.clock.Sleep(t.Context(), grace/2-time.Second)
 				_, err = db1.GC(t.Context())
 				is.NotError(t, err)
 			}

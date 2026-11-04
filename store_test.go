@@ -141,7 +141,7 @@ func TestOptions_Store(t *testing.T) {
 	t.Run("runs a database over a store written outside the module, shared by two connectors", func(t *testing.T) {
 		store := newMemStore()
 		open := func() *sql.DB {
-			c, err := maragudb.NewConnector(maragudb.Options{Store: store, MemoryCacheBytes: new(int64)}, "s3://bucket/app")
+			c, err := maragudb.NewConnector(maragudb.Options{Store: store, MemoryCacheBytes: new(int64), Maintenance: new(false)}, "s3://bucket/app")
 			is.NotError(t, err)
 			db := sql.OpenDB(c)
 			t.Cleanup(func() { _ = db.Close() })
@@ -176,7 +176,7 @@ func TestOptions_Store(t *testing.T) {
 
 	t.Run("reads a byte range of a large segment instead of the whole object", func(t *testing.T) {
 		store := newMemStore()
-		c, err := maragudb.NewConnector(maragudb.Options{Store: store, MemoryCacheBytes: new(int64)}, "s3://bucket/app")
+		c, err := maragudb.NewConnector(maragudb.Options{Store: store, MemoryCacheBytes: new(int64), Maintenance: new(false)}, "s3://bucket/app")
 		is.NotError(t, err)
 		db := sql.OpenDB(c)
 		defer func() { _ = db.Close() }()
@@ -203,7 +203,7 @@ func TestOptions_Store(t *testing.T) {
 
 	t.Run("passes the store's errors through, so callers can tell what failed", func(t *testing.T) {
 		outage := errors.New("store is down")
-		c, err := maragudb.NewConnector(maragudb.Options{Store: failingStore{err: outage}}, "s3://bucket/app")
+		c, err := maragudb.NewConnector(maragudb.Options{Store: failingStore{err: outage}, Maintenance: new(false)}, "s3://bucket/app")
 		is.NotError(t, err)
 		db := sql.OpenDB(c)
 		defer func() { _ = db.Close() }()
@@ -212,7 +212,7 @@ func TestOptions_Store(t *testing.T) {
 
 	t.Run("is satisfied by the internal fake through the test adapter", func(t *testing.T) {
 		fake := s3fake.New()
-		db := sql.OpenDB(must(maragudb.NewConnector(maragudb.Options{Store: s3test.NewStore(fake)}, "s3://bucket/app")))
+		db := sql.OpenDB(must(maragudb.NewConnector(maragudb.Options{Store: s3test.NewStore(fake), Maintenance: new(false)}, "s3://bucket/app")))
 		defer func() { _ = db.Close() }()
 		mustExec(t, db, "CREATE TABLE t (id int PRIMARY KEY)")
 		_, ok := fake.Body("app/manifest")

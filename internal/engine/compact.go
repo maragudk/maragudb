@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -14,7 +15,8 @@ import (
 // process: when commits land meanwhile, the merged segment is placed behind their segments, which
 // keep shadowing it, so the merge is not redone. It returns [ErrConflict] only when a segment it
 // merged is no longer live, because another compaction won, and [ErrSnapshotExpired] when it took
-// longer than the GC grace period, after which its output may have been collected as an orphan.
+// longer than half the GC grace period, because its output is collected as an orphan after a
+// whole one.
 func (db *DB) Compact(ctx context.Context) error {
 	_, err := db.compact(ctx, nil)
 	return err
@@ -40,8 +42,14 @@ func (db *DB) compact(ctx context.Context, progress func() error) (bool, error) 
 	// whose values a tombstone would have to keep hiding.
 	it := &Iterator{}
 	for i := len(m.Segments) - 1; i >= 0; i-- {
-		seg := m.Segments[i]
-		it.sources = append(it.sources, newSegmentIterator(seg.Root, nil, db.fetcher(ctx, startedAt, seg)))
+		fetch := db.fetcher(ctx, startedAt, m.Segments[i])
+		// Block reads are the slow part of the merge, so progress is reported before each.
+		it.sources = append(it.sources, newSegmentIterator(m.Segments[i].Root, nil, func(ref blockRef) (*decodedBlock, error) {
+			if err := progress(); err != nil {
+				return nil, err
+			}
+			return fetch(ref)
+		}))
 	}
 	b := newSegmentBuilder(db.blockSize)
 	var count int
@@ -50,11 +58,6 @@ func (db *DB) compact(ctx context.Context, progress func() error) (bool, error) 
 			return false, err
 		}
 		count++
-		if count%1024 == 0 {
-			if err := progress(); err != nil {
-				return false, err
-			}
-		}
 	}
 	if err := it.Err(); err != nil {
 		return false, fmt.Errorf("engine: compacting: %w", err)
@@ -74,15 +77,13 @@ func (db *DB) compact(ctx context.Context, progress func() error) (bool, error) 
 		if err := db.putObject(ctx, meta.Key, body); err != nil {
 			return false, err
 		}
-		// The whole segment is in memory, so the caches are primed with every block, and reads in
-		// this process stay warm across the compaction.
-		for _, ref := range b.blocks {
-			block := body[ref.Offset : ref.Offset+ref.Length]
-			if db.mem != nil {
-				db.mem.Put(blockCacheKey(meta.Key, ref), block)
-			}
-			if db.disk != nil {
-				db.disk.Put(blockCacheKey(meta.Key, ref), block)
+		// The whole segment is in memory, so the memory cache is primed with every block when the
+		// segment leaves room for other blocks, and reads in this process stay warm across the
+		// compaction. The disk cache is left to fill with the blocks that are read.
+		if db.mem != nil && int64(len(body)) <= db.memBytes/2 {
+			for _, ref := range b.blocks {
+				// A copy per block, so that a cached block does not pin the whole segment.
+				db.mem.Put(blockCacheKey(meta.Key, ref), bytes.Clone(body[ref.Offset:ref.Offset+ref.Length]))
 			}
 		}
 		compacted = []segmentMeta{meta}
@@ -93,8 +94,10 @@ func (db *DB) compact(ctx context.Context, progress func() error) (bool, error) 
 	// with the newer segments ahead of the compacted one.
 	base, baseEtag := m, etag
 	for attempt := 0; ; attempt++ {
-		if age := db.now().Sub(startedAt); age >= db.grace {
-			// GC may have collected the compacted segment as an orphan by now.
+		if age := db.now().Sub(startedAt); age >= db.grace/2 {
+			// GC may delete the compacted segment as an orphan once the compaction is a grace
+			// period old, and a manifest write that lands after that would reference a missing
+			// object for good, so the write is not even started past half of it.
 			return false, fmt.Errorf("%w: compaction is %v old", ErrSnapshotExpired, age)
 		}
 		if err := progress(); err != nil {
@@ -126,7 +129,12 @@ func (db *DB) compact(ctx context.Context, progress func() error) (bool, error) 
 			return false, err
 		}
 		cur, curEtag := db.cachedManifest()
-		if attempt == 8 || cur.Seq <= base.Seq || !cur.extends(m) {
+		if attempt == 8 || cur.Seq <= base.Seq {
+			assert.Sometimes(true, "a compaction gives up rebasing", nil)
+			db.log.Debug("compaction failed", "error", err)
+			return false, err
+		}
+		if !cur.extends(m) {
 			assert.Sometimes(true, "a compaction loses to another compaction", nil)
 			db.log.Debug("compaction failed", "error", err)
 			return false, err
@@ -141,14 +149,14 @@ func (db *DB) compact(ctx context.Context, progress func() error) (bool, error) 
 	return true, nil
 }
 
-// extends reports whether m's segments are all still live in cur, unchanged and in the same
-// order, so that cur differs from m only by segments added after it.
-func (cur *manifest) extends(m *manifest) bool {
-	if len(cur.Segments) < len(m.Segments) {
+// extends reports whether base's segments are all still live in m, unchanged and in the same
+// order, so that m differs from base only by segments added after it.
+func (m *manifest) extends(base *manifest) bool {
+	if len(m.Segments) < len(base.Segments) {
 		return false
 	}
-	for i, seg := range m.Segments {
-		if cur.Segments[i].Key != seg.Key {
+	for i, seg := range base.Segments {
+		if m.Segments[i].Key != seg.Key {
 			return false
 		}
 	}
@@ -276,6 +284,12 @@ func (db *DB) gc(ctx context.Context, progress func() error) (int, bool, error) 
 		live := map[string]bool{}
 		for _, seg := range base.Segments {
 			live[seg.Key] = true
+			// A deleted object can only be live when a compaction rebased on it after the grace
+			// period, which it must never do. The manifest is not written then.
+			assert.Always(!gone[seg.Key], "GC never deletes an object a compaction then references", map[string]any{"key": seg.Key})
+			if gone[seg.Key] {
+				return deleted, true, fmt.Errorf("engine: garbage collecting: deleted %q is referenced by the manifest at %d", seg.Key, base.Seq)
+			}
 		}
 		for _, g := range base.Garbage {
 			switch {

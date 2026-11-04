@@ -17,6 +17,23 @@ var (
 	ErrNotModified = errors.New("s3: not modified")
 )
 
+// Definite reports whether err is a definite answer from the store, which repeating the request
+// cannot change: a missing object, a failed precondition, an unmodified object, or any other
+// error the store blamed on the request rather than on itself. Everything else, such as a
+// network error, a timeout, or a server error, may succeed when repeated.
+func Definite(err error) bool {
+	if errors.Is(err, ErrNotFound) || errors.Is(err, ErrPreconditionFailed) || errors.Is(err, ErrNotModified) {
+		return true
+	}
+	var status interface{ HTTPStatusCode() int }
+	if !errors.As(err, &status) {
+		return false
+	}
+	code := status.HTTPStatusCode()
+	// A request timeout or a rate limit asks for a retry.
+	return code != 408 && code != 429 && code < 500
+}
+
 // Object is an object body, or a byte range of it, with its ETag.
 type Object struct {
 	Body []byte

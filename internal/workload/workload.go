@@ -298,7 +298,11 @@ func (r *run) open(ctx context.Context, cache, maintain bool) (*process, error) 
 			p.stop, p.done = cancel, make(chan struct{})
 			go func() {
 				defer close(p.done)
-				defer func() { _ = m.Close(context.WithoutCancel(ctx)) }()
+				defer func() {
+					closeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+					defer cancel()
+					_ = m.Close(closeCtx)
+				}()
 				for {
 					select {
 					case <-loopCtx.Done():

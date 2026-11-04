@@ -163,12 +163,21 @@ func TestMaintainer_Step(t *testing.T) {
 		for i := range 4 {
 			put(t, db1, fmt.Sprint("k", i), "v")
 		}
-		// Every block read takes most of a lease, so the compaction must renew between reads.
-		renewals := 0
+		// Every block read takes most of a lease, so the compaction must renew before each read
+		// or the lease would expire during the merge. The other maintainer tries to take the
+		// lease over before every read and must never succeed.
+		reads, renewals := 0, 0
 		w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
 			switch {
 			case kind == s3.KindGet && strings.HasPrefix(key, "db/seg/"):
+				reads++
 				w.clock.Sleep(t.Context(), lease*3/4)
+				decide := w.decide
+				w.decide = nil
+				ok, err := m2.Acquire(t.Context())
+				is.NotError(t, err)
+				is.True(t, !ok, "the lease was renewed in time")
+				w.decide = decide
 			case kind == s3.KindPutConditional && strings.HasSuffix(key, "maintenance-lease"):
 				renewals++
 			}
@@ -177,8 +186,12 @@ func TestMaintainer_Step(t *testing.T) {
 		res, err := m1.Step(t.Context())
 		is.NotError(t, err)
 		is.True(t, res.Compacted)
-		is.True(t, renewals >= 3, fmt.Sprint("renewals ", renewals))
+		is.True(t, reads >= 4, fmt.Sprint("reads ", reads))
+		// The acquisition, a renewal before every read but the first, the renewal before the
+		// manifest write, and the release.
+		is.True(t, renewals >= reads+2, fmt.Sprint("lease writes ", renewals, " for ", reads, " reads"))
 		is.Equal(t, int64(0), db1.Stats().LeaseLosses)
+		w.decide = nil
 
 		// Now the holder stalls past its expiry while reading, and the other maintainer takes over.
 		for i := range 4 {
@@ -231,6 +244,12 @@ func TestMaintainer_Step(t *testing.T) {
 		is.Error(t, engine.ErrConflict, err, "the overlapping compaction loses its conditional write")
 		is.True(t, res.Attempted && !res.Compacted)
 		is.Equal(t, int64(1), db1.Stats().LeaseLosses, "noticed at release")
+		is.True(t, !m1.Holds())
+		is.True(t, !m2.Holds(), "the other maintainer released its own lease after its step")
+		ok, err := m2.Acquire(t.Context())
+		is.NotError(t, err)
+		is.True(t, ok, "the stale release did not clobber the lease: it is free for the taking")
+		is.NotError(t, m2.Release(t.Context()))
 		for _, db := range []*engine.DB{db1, db2} {
 			for i := range 4 {
 				v, ok := get(t, db, fmt.Sprint("k", i))
@@ -321,26 +340,47 @@ func TestMaintainer_Lease(t *testing.T) {
 		is.True(t, m2.Holds() && !m1.Holds())
 	})
 
-	t.Run("a lost acknowledgement on acquisition is resolved by the next step", func(t *testing.T) {
+	t.Run("a lost acknowledgement on acquisition, renewal, or release is resolved by reading the lease back", func(t *testing.T) {
 		w := newWorld(t)
-		db := w.open(1, engine.Options{})
-		m := db.NewMaintainer(engine.MaintenanceOptions{Holder: "one", SegmentThreshold: 2})
-		put(t, db, "a", "1")
-		put(t, db, "b", "2")
-		lost := false
+		db1 := w.open(1, engine.Options{})
+		db2 := w.open(2, engine.Options{})
+		lease := time.Minute
+		m1 := db1.NewMaintainer(engine.MaintenanceOptions{Holder: "one", LeaseDuration: lease})
+		m2 := db2.NewMaintainer(engine.MaintenanceOptions{Holder: "two", LeaseDuration: lease})
+		loseNext := false
 		w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
-			if kind == s3.KindPutConditional && strings.HasSuffix(key, "maintenance-lease") && !lost {
-				lost = true
+			if kind == s3.KindPutConditional && strings.HasSuffix(key, "maintenance-lease") && loseNext {
+				loseNext = false
 				return s3fake.OutcomeLostAck
 			}
 			return s3fake.OutcomeNormal
 		}
-		_, err := m.Step(t.Context())
-		is.True(t, err != nil, "the acquisition failed")
-		is.True(t, !m.Holds())
-		// The lease landed under this holder, so the next step takes it over by holder name.
-		res, err := m.Step(t.Context())
+		loseNext = true
+		ok, err := m1.Acquire(t.Context())
 		is.NotError(t, err)
-		is.True(t, res.Compacted)
+		is.True(t, ok, "the acquisition landed, and the read-back found it under this holder")
+		is.True(t, m1.Holds())
+		ok, err = m2.Acquire(t.Context())
+		is.NotError(t, err)
+		is.True(t, !ok)
+
+		w.clock.Sleep(t.Context(), lease/2)
+		loseNext = true
+		is.NotError(t, m1.Renew(t.Context()), "the renewal landed and is reclaimed")
+		is.Equal(t, int64(0), db1.Stats().LeaseLosses)
+		w.clock.Sleep(t.Context(), lease*3/4)
+		ok, err = m2.Acquire(t.Context())
+		is.NotError(t, err)
+		is.True(t, !ok, "the reclaimed renewal counts")
+		is.NotError(t, m1.Renew(t.Context()), "the ETag of the reclaimed renewal is the current one")
+
+		loseNext = true
+		is.NotError(t, m1.Release(t.Context()), "the release landed and is reclaimed")
+		is.True(t, !m1.Holds(), "not held after a release, whatever happened")
+		is.Equal(t, int64(0), db1.Stats().LeaseLosses)
+		ok, err = m2.Acquire(t.Context())
+		is.NotError(t, err)
+		is.True(t, ok, "the release landed")
+		is.NotError(t, m2.Release(t.Context()))
 	})
 }

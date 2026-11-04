@@ -57,7 +57,8 @@ var (
 	// ErrCommitUnknown is returned when the outcome of a commit could not be determined because
 	// the store stopped answering. The commit may or may not have been applied.
 	ErrCommitUnknown = engine.ErrCommitUnknown
-	// ErrSnapshotExpired is returned by a transaction older than the GC grace period.
+	// ErrSnapshotExpired is returned by a transaction older than the GC grace period, and by
+	// [Compact] when it took longer than that.
 	ErrSnapshotExpired = engine.ErrSnapshotExpired
 	// ErrSyntax is a statement that does not parse.
 	ErrSyntax = exec.ErrSyntax
@@ -105,18 +106,20 @@ type Options struct {
 	GCGracePeriod *time.Duration
 	// Maintenance runs compaction and garbage collection in the background, for every database
 	// opened through the driver, whenever there is work: at least CompactionThreshold segments,
-	// or garbage to stamp or to delete. Defaults to true. The processes that share a database
+	// or garbage that is new or older than the grace period. Defaults to true. The processes that share a database
 	// coordinate through a lease object at <prefix>/maintenance-lease, so that the work of one
-	// trigger is done once rather than once per process. The lease only saves work; correctness
-	// never depends on it. A process checks for work on the manifest it already has, so an idle
-	// process makes no requests. With it off, call [Compact] and [GC] now and then instead.
+	// trigger is done about once rather than once per process. The lease only saves work;
+	// correctness never depends on it. A process checks for work on the manifest it already
+	// has, so an idle process makes no requests. Closing the sql.DB stops the loop, waits for
+	// a running step to stop, and releases the lease, which is one write to the store. With it
+	// off, call [Compact] and [GC] now and then instead.
 	Maintenance *bool
 	// MaintenanceInterval is the time between two checks for maintenance work, with a jitter of
 	// half the interval either way. Defaults to 10 seconds.
 	MaintenanceInterval *time.Duration
 	// CompactionThreshold is the number of segments, which every commit adds one of, at which
-	// background maintenance compacts the database into one. Defaults to 8. A lower threshold
-	// keeps reads cheaper, and a higher one rewrites the database less often.
+	// background maintenance compacts the database into one. Defaults to 8, and is at least 2.
+	// A lower threshold keeps reads cheaper, and a higher one rewrites the database less often.
 	CompactionThreshold *int
 	// Store is the object store for every DSN, in place of the default AWS SDK client for the
 	// DSN's bucket. The DSN's bucket is then ignored and its prefix still applies. Any value with
@@ -293,8 +296,9 @@ func withConn(ctx context.Context, db *sql.DB, fn func(c *sqldriver.Conn) error)
 // Compact the database behind db: every segment object is merged into one, and the old ones
 // become garbage for [GC]. Commits that happen meanwhile are kept ahead of the merged segment,
 // and only a competing compaction makes it return [ErrConflict], after which it can be retried.
-// It is safe to run while other processes use the database, and background maintenance does it
-// on its own unless [Options.Maintenance] is off.
+// It returns [ErrSnapshotExpired] when it took longer than the grace period. It is safe to run
+// while other processes use the database, and background maintenance does it on its own unless
+// [Options.Maintenance] is off.
 func Compact(ctx context.Context, db *sql.DB) error {
 	return withConn(ctx, db, func(c *sqldriver.Conn) error {
 		return c.DB().Compact(ctx)

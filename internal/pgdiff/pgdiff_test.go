@@ -20,7 +20,9 @@ import (
 func newRunner(t *testing.T) *pgdiff.Runner {
 	t.Helper()
 	return &pgdiff.Runner{PG: pgdiff.Postgres(t), New: func() (*sql.DB, error) {
-		c, err := maragudb.NewConnector(maragudb.Options{Store: s3test.NewStore(s3fake.New())}, "s3://bucket/diff")
+		// Maintenance stays off, so that a background compaction cannot land at a wall-clock
+		// moment and make a case harder to replay.
+		c, err := maragudb.NewConnector(maragudb.Options{Store: s3test.NewStore(s3fake.New()), Maintenance: new(false)}, "s3://bucket/diff")
 		if err != nil {
 			return nil, err
 		}

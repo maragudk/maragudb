@@ -203,7 +203,7 @@ func TestSimulator(t *testing.T) {
 				cfg.Workload = w
 				cfg.SQL = useSQL
 				cfg.Maintainers = 2
-				cfg.Maintenance = sim.MaintenanceLease
+				cfg.Maintenance = sim.MaintenanceMode(1 + int(w) + 2*len(fmt.Sprint(useSQL))%3)
 				first := sim.Run(cfg)
 				for range 3 {
 					again := sim.Run(cfg)

@@ -117,6 +117,7 @@ type DB struct {
 	mem       *cache.Memory
 	disk      cache.Cache
 	blockSize int
+	memBytes  int64
 	grace     time.Duration
 	now       func() time.Time
 	sleep     func(ctx context.Context, d time.Duration)
@@ -163,6 +164,7 @@ func Open(ctx context.Context, opts Options) (*DB, error) {
 	}
 	if memBytes > 0 {
 		db.mem = cache.NewMemory(memBytes)
+		db.memBytes = memBytes
 	}
 	if opts.BlockSize != nil {
 		if *opts.BlockSize <= 0 {
