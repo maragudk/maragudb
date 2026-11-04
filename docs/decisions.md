@@ -126,3 +126,13 @@ The docker-compose harness in `/antithesis` has two containers: versitygw as the
 Alternatives considered:
 - The in-process fake only. Antithesis's network faults would not reach a store in the same process, so the run would only explore simulator seeds.
 - MinIO. Its images are no longer published on Docker Hub.
+
+## 2026-11-04: Orphans are stamped like other garbage, because compaction rebases
+
+Context: the garbage collection decision of 2026-11-03 deleted an object that no manifest referenced as soon as the manifest sequence had moved past the object's base sequence, because the conditional write that would have referenced it could no longer succeed. The compaction rebase in the automatic maintenance decision breaks that reasoning: when its manifest write loses to commits that only added segments, compaction reapplies its swap on top of the newer manifest, so its output can still enter the manifest after the sequence has moved past its base.
+
+Decision: an unreferenced object is no longer deleted at once. The first GC pass that sees it adds it to the garbage list with a stamp, and a later pass deletes it after the grace period, exactly like an object that left the segment list. A compaction gives up instead of rebasing once it is older than the grace period, and a rebased manifest drops the stamp on its own output. The stamp is taken after the pass read a manifest newer than the one the compaction read, so it is later than the compaction's start, and the compaction's last conditional write comes before the deletion by the same margin that protects readers. GC reapplies its pass on top of commits that landed meanwhile for the same reason compaction does: under steady writers a pass whose write always lost would delete the same expired objects on every run and never shrink the garbage list. Only the garbage it found unstamped gets its stamp; garbage that entered the list after the pass began waits for the next pass.
+
+Alternatives considered:
+- Writing the compacted segment again under the new base sequence on every rebase. This keeps the old orphan rule but costs a write of the whole database per rebase, several times under steady writers.
+- Deleting orphans at once unless they come from a compaction, told apart by their key. This keeps crashed commits' orphans short-lived but adds a second rule for the same question; one rule is easier to show correct.

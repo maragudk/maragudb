@@ -117,6 +117,7 @@ func simulate() error {
 		cfg.TxPerClient = 10 + rng.IntN(40)
 		cfg.Keys = 1 + rng.IntN(6)
 		cfg.Maintainers = rng.IntN(3)
+		cfg.Maintenance = sim.MaintenanceMode(rng.IntN(4))
 		cfg.ErrorRate = rng.Float64() * 0.3
 		cfg.LostAckRate = rng.Float64() * 0.3
 		cfg.CrashRate = rng.Float64() * 0.05
@@ -189,7 +190,8 @@ func store(ctx context.Context, w sim.Workload, useSQL bool) error {
 		MaxTimeout:  time.Duration(100+rng.IntN(5000)) * time.Millisecond,
 		GracePeriod: time.Duration(1+rng.IntN(10)) * time.Second,
 		// Short enough that compaction and GC run several times in a run of a few seconds.
-		MaintenanceInterval: time.Duration(100+rng.IntN(900)) * time.Millisecond,
+		MaintenanceInterval: time.Duration(10+rng.IntN(190)) * time.Millisecond,
+		CompactionThreshold: 2 + rng.IntN(7),
 		Rand:                rng,
 		Log:                 func(line string) { fmt.Println(line) },
 	}

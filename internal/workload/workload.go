@@ -50,6 +50,8 @@ type Config struct {
 	// MaintenanceInterval between the background maintenance checks of each client, which
 	// compact and garbage collect under the lease. Defaults to 200 milliseconds.
 	MaintenanceInterval time.Duration
+	// CompactionThreshold is the segment count at which maintenance compacts. Defaults to 8.
+	CompactionThreshold int
 	// Rand drives every decision. Required.
 	Rand *rand.Rand
 	// Log receives progress lines when non-nil.
@@ -291,7 +293,7 @@ func (r *run) open(ctx context.Context, cache, maintain bool) (*process, error) 
 		}
 		p := &process{run: r, engine: db, db: db}
 		if maintain {
-			m := db.NewMaintainer(engine.MaintenanceOptions{})
+			m := db.NewMaintainer(engine.MaintenanceOptions{SegmentThreshold: r.cfg.CompactionThreshold})
 			loopCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 			p.stop, p.done = cancel, make(chan struct{})
 			go func() {
@@ -314,7 +316,7 @@ func (r *run) open(ctx context.Context, cache, maintain bool) (*process, error) 
 	d := sqldriver.New(sqldriver.Options{
 		Engine:      r.engineOptions(cache),
 		Exec:        exec.Options{},
-		Maintenance: sqldriver.MaintenanceOptions{Disabled: !maintain, Interval: r.cfg.MaintenanceInterval},
+		Maintenance: sqldriver.MaintenanceOptions{Disabled: !maintain, Interval: r.cfg.MaintenanceInterval, Engine: engine.MaintenanceOptions{SegmentThreshold: r.cfg.CompactionThreshold}},
 	})
 	c, err := sqldriver.NewConnector(d, "s3://workload/"+r.cfg.Prefix)
 	if err != nil {
