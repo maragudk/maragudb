@@ -386,3 +386,90 @@ The sleep must start after the first GC pass returns, not before it starts. The 
 ### Future work
 
 - With several seconds of latency per request, the whole Tigris suite takes about two minutes, almost all of it in requests. Nothing here needs fixing, but it limits how far from Tigris CI can run before `go test`'s default ten-minute timeout matters.
+
+## Step 6: Automatic maintenance, compaction rebase, and block read retries
+
+**Author:** auto-maintenance
+
+### Prompt Context
+
+**Verbatim prompt:** You are adding automatic background maintenance to maragudb, an embedded Go SQL database whose only durable state is in S3. [...] ### 1. Compaction rebase: Today compaction loses the manifest CAS against steady writers under database-granularity conflicts, so it rarely wins. Change that. When compaction's CAS fails, read the new manifest. If every commit since compaction's base only added segments, [...] re-apply the swap on top [...] Do not redo the merge. [...] ### 2. Automatic maintenance in the driver, coordinated by a lease: The engine still starts no goroutines, which keeps determinism. The background loop lives in the driver layer. Add a step function that the simulator can drive deterministically. [...] The lease is an object, for example `<prefix>/maintenance-lease`, holding a holder ID and an expiry. [...] Correctness never depends on the lease. Run the simulator in three modes [...] Show that the lease actually saves work. [...] Commit and read request budgets must not change. [...] Expose maintenance activity in `Stats()`. ### 3. Retry failed block reads in the engine [...] ### 4. Keep the real-network paths covered: Extend the Tigris suite with a short test of the lease on real Tigris [...] Extend the Antithesis harness workload so that background maintenance runs during the workload. [...] `make test`, `go vet ./...`, `make lint`, `go test -race ./...`, and `make antithesis` must all pass.
+
+**Interpretation:** Make compaction and GC win against steady writers, run both automatically from the driver under a lease that only saves work, make reads survive transient store failures, and prove all of it in the simulator, on Tigris, and in the harness.
+
+**Inferred intent:** A database that nobody has to remember to compact, whose correctness is still proven by machine in every mode the coordination can be in, including broken.
+
+### What I did
+
+Compaction rebase, in `/internal/engine/compact.go`. When the manifest write of a compaction loses, `compact` takes the current manifest that `casManifest` cached, checks with `manifest.extends` that the merged segments are all still live in the same order, and writes the swap again on top: the compacted segment first, the newer segments after it, up to eight times. The compacted segment is written once. Only another compaction, which changes the merged set, gives `ErrConflict`. This forced a change to GC's orphan rule, recorded in `/docs/decisions.md`: an unreferenced object used to be deleted as soon as the manifest moved past its base sequence number, because the write that would reference it could no longer succeed. A rebased compaction can. So orphans now enter the garbage list stamped and are deleted after the grace period like everything else, a rebased manifest drops the stamp on its own output, and a compaction gives up at half the grace period. The `engine.Mutations.CompactedSegmentAhead` mutant puts the compacted segment ahead of the newer ones.
+
+GC rebase, same file. Under steady writers a GC pass whose write always lost deleted the same expired objects on every run and never shrank the garbage list; the simulator showed 99,523 deletes for 3,500 commits. `gc` now re-derives its manifest change from the current manifest on a conflict: deleted objects leave the list, failed deletes stay expired, the garbage it found unstamped gets its stamp, orphans that nothing references yet enter the list, and garbage that entered after the pass began is left for the next pass, because this pass's clock is older than that garbage. An `assert.Always` refuses to write a manifest that references an object the pass deleted.
+
+Block read retries, in `/internal/engine/blocks.go`. `getBlock` retries a failed GET up to four times with exponential backoff and jitter from the engine's random source, sleeping through the new `engine.Options.Sleep`, which the simulator sets to the scheduler. `s3.Definite` in `/internal/s3/s3.go` says which errors a retry cannot change: the three sentinels and client errors other than 408 and 429.
+
+The maintainer, in `/internal/engine/maintenance.go`. `engine.Maintainer.Step` looks at the cached manifest, and only when there is work, at least `SegmentThreshold` segments or garbage that is unstamped or expired, acquires the lease, compacts, collects garbage, and releases. The lease at `<prefix>/maintenance-lease` is JSON with a holder and an expiry. `Acquire` reads it, then writes with `If-None-Match: *` when it is missing or with `If-Match` on the observed ETag when it is expired or its own, and leaves a live lease of another holder alone. `Renew` writes with `If-Match` and is called by a progress hook before every block read of the merge, before the segment write, before every manifest write, and every sixteen deletes, once half the lease has passed. `Release` writes an expired lease with `If-Match`, so it never clobbers a takeover. A lost acknowledgement on any of the three is resolved by reading the lease back: a lease under this holder's name means the write landed. `DB.Stats` carries `MaintenanceRuns`, `LeaseAcquisitions`, `LeaseLosses`, `CompactionsStarted`, `Compactions`, `CompactionRebases`, and `Deleted`.
+
+The driver loop, in `/internal/sqldriver/sqldriver.go`. `Connector.DB` starts one goroutine per database that sleeps a jittered interval and calls `Step`; `Connector.Close` cancels it, waits, releases the lease with a ten second timeout, and closes the engine. `Driver.Open` connections own their connector and close it. In `/maragudb.go`, `Options.Maintenance` (default on), `MaintenanceInterval` (default ten seconds, jitter of half either way), and `CompactionThreshold` (default 8, at least 2) configure it, and `Statistics` reports the three counters.
+
+The simulator, in `/internal/sim`. `Config.Maintenance` selects `MaintenanceLease`, `MaintenanceNoLease`, or `MaintenanceOverlap`, in which every lease expires after a millisecond and nobody renews or notices. Each client owns a maintainer and steps it after a third of its transactions, through the engine or through the connector's engine with the driver's loop off. The corpus gained 24 runs across the three modes, and `TestSimulator` gained three subtests: the compaction success rate against fault-free steady writers, every checker in every mode, and the duplicate-work measurement with eight clients. `make replay` takes `MAINTENANCE=lease|none|overlap`.
+
+Real paths. `TestDB_Tigris` acquires, renews, and takes over the lease with two clients, sizing the lease from a measured acquire-and-release round trip. `/internal/workload` runs each client's background maintenance in place of its one explicit maintainer, and `/antithesis/workload/main.go` draws a short interval, a threshold, and a simulator maintenance mode. A writer updated the README.
+
+### Why
+
+The rebase is what makes automatic maintenance possible at all: without it, 78 percent of compactions lost to steady writers, and no lease could fix that. Stamping orphans instead of deleting them was the price of the rebase, and I chose it over writing the compacted segment again under a new base sequence on every rebase, which would cost a write of the whole database several times under load. The lease lives in the engine package so that its requests are counted in the engine's statistics and the step function stays synchronous and deterministic; only the goroutine lives in the driver, as the decision says. Deciding from the cached manifest is what makes an idle process free: a process that does no transactions never learns of work, and never needs to, because the processes that write have a fresh manifest.
+
+### What worked
+
+- Compaction against fault-free steady writers: 113 of 500 succeeded before the rebase (22.6 percent), 242 of 242 after (100 percent), with 269 rebases. In the corpus with every fault on: 285 of 1729 before (16.5 percent), 473 of 1455 after (32.5 percent), and the remaining failures are injected errors, crashes, outages, and expired grace periods, with only 5 real conflicts.
+- Every checker passes in all three lease modes, over 12 seeds, both workloads, both APIs, each; and over the 24 corpus runs.
+- The lease saves work. Eight fault-free clients over 20 seeds: 132 merges started for 132 compactions with the lease, 417 merges started for 196 compactions without it; 4,404 deletes with the lease against 23,577 without; 171 maintenance attempts against 1,256.
+- An idle maintainer makes zero requests per interval once its garbage is stamped and within the grace period, asserted in `TestMaintainer_Step` over ten steps and in `TestMaintenance` over twenty intervals; a maintenance run with the lease costs nine requests.
+- Failed reads in the corpus: 4,262 before the retries, 2,693 after, in histories that differ because retries change timing.
+- The shadowing mutant is detected by the engine list-append workload with seed 1 in about 2 ms. The `GCIgnoreGrace` mutant is still detected under the automatic maintainers in the workload (seed 0).
+- The Tigris lease subtest: a 576 ms round trip, a 2.88 s lease, pass. The harness: 3 to 13 compactions per real-store command where there were 0 or 1, and snouty 0.8.0 (downloaded into the session scratch directory and checked against its published SHA-256) reports "Found 0 first, 5 driver, 0 anytime, 0 eventually, 0 finally test commands. Setup validation successful."
+
+### What didn't work
+
+- The shadowing mutant is not detected by the bank workload or by the SQL list-append workload. The bank checker only checks totals, and a compacted segment that shadows newer transfers is a consistent older state that conserves money; the SQL list-append workload only inserts rows under new keys, which a compacted segment does not contain. Both are recorded in the mutant table. The bank workload also lost its detection of "commit without CAS" through the GC invariant, because orphans now wait a grace period: `mutant "commit without CAS" not detected in 20 seeds`. The list-append workload still detects it with seed 1.
+- My first GC rebase iterated a Go map when deleting, which would have made the simulator's request order random; the deletes now follow the manifest's order. I caught it before running the determinism test.
+- `TestMaintenance/keeps the commit and warm-read budgets` failed on the insert after the first background compaction with `Expected "{0 1 1 1 0 0}", but got "{1 1 1 1 0 0}"`: the duplicate-key lookup read the compacted segment from the store. Compaction now primes the memory cache with every block of the compacted segment, with a copy per block and only when the segment fits in half the cache.
+- The first harness run reported 0 compactions in every real-store command although the maintenance was on: against a local store a run finishes in well under a second, shorter than the drawn interval. The harness now draws 10 to 200 ms and a threshold of 2 to 8.
+- A `zsh` quirk cost two attempts: `C="docker compose ..."; $C up` fails with `no such file or directory: docker compose -f ...` because zsh does not split the variable.
+- Two of my own tests were wrong after review fixes: the renewal test kept its hook armed into its second phase, so a later read let the other maintainer take a released lease (`the lease was renewed in time`), and the GC-overlap test slept almost a whole grace period although compaction now gives up at half.
+- The final `go test -race ./...` overlapped with a `make test` that had been moved to the background, both driving the same Postgres container, and `TestDifferential` failed in both with an empty error list, the `make test` one after 310 s. Alone, after deleting the `.hegel` directories that the failures left behind, `go test ./internal/pgdiff` and `go test -race ./internal/pgdiff` pass in 4 s and 5 s. Do not run two suites against the harness at once.
+
+### Self-review
+
+I ran the code-review skill with two competing reviewers over the whole diff. Consensus findings, all fixed: compaction primed the caches with subslices of the whole segment body, so every cached block pinned the whole database (now a copy per block, memory only, and only when the segment fits); a release that failed left the lease believed held (now never held after a release); tests opened connectors with the loop on by default (off in the store, pgdiff, and driver tests, and the engine test world now wires `Sleep` to its clock); a single-use constant; comments that named the tests as the purpose of an option; and `Compact`'s doc omitting `ErrSnapshotExpired`.
+
+One reviewer alone found two serious problems, both fixed. Compaction gave up at the grace period, the same bound as a reader, but the stamp on its output can be only moments after its start, so a manifest write that started just under the bound and landed after the deletion would reference a missing object for good; it now gives up at half the grace period, and the decision entry says why. And my renewal test passed without any renewal during the merge: the progress hook ran every 1024 entries, never during the block reads that are the slow part, and the test counted the acquisition and release as renewals; the hook now runs before every block read, and the test has the other maintainer try to take the lease over before every read. The same reviewer flagged 429 and 408 as retryable, a threshold of 1 that would churn forever, a transient renewal failure aborting a whole merge, and an unbounded context in the workload's lease release; all fixed. The other alone found that `transient` reached behind the `s3.Client` contract for HTTP status codes (now `s3.Definite` in the package that owns the mapping), that a renewal whose acknowledgement was lost was counted as a loss and blocked others for a lease (now reclaimed by reading back), that `Driver.Open` leaked the loop (its connections now own the connector), that a GC pass could write a manifest referencing an object it deleted without noticing (now an assertion and a refusal), and that only one mode was in the determinism test (now all three).
+
+Not changed: the bank workload cannot see the shadowing mutant, as above; `gc` returns a bare `ErrConflict` as before.
+
+### What I learned
+
+- Under database-granularity conflicts, every manifest writer that reads, works, and writes needs a rebase, not only compaction. GC's was invisible until the delete counts of the automatic maintainers exposed it.
+- An orphan rule that depends on "this write can never succeed" is fragile the moment any writer retries against a newer base. The stamp-and-wait rule is uniform and its timing argument is the one the readers already rely on, with a margin chosen for the cost of being wrong.
+- A lease protocol with content ETags needs the same lost-acknowledgement resolution as the commit protocol: read it back and look for your own name.
+- `synctest` makes the driver's real-time loop testable to the request: time only advances while every goroutine is blocked, so a statement's requests can be measured without the loop interfering.
+
+### What was tricky
+
+- Which clock stamps what. A rebased GC pass must stamp only the garbage that left the manifest before its own clock reading, or a reader that saw the newer garbage could lose it early. The test with two interfering compactions fails with the naive rebase.
+- Measuring duplicate work. Sequential steps hide it, because every step refreshes the manifest before working; only the simulator's interleaving shows several clients merging the same segments at once.
+- Keeping the simulator deterministic through all of this: no map iteration in request order, no randomness in `NewMaintainer`, and the driver's loop off in the simulated connectors.
+
+### What warrants review
+
+- `/internal/engine/compact.go`: the rebase loop in `compact`, the `extends` check, and the rebase in `gc`, in particular which entries get the stamp.
+- `/internal/engine/maintenance.go`: `Acquire`, `Renew`, `Release`, and `reclaim`; the `progress` hook's tolerance of transient failures.
+- `/docs/decisions.md`, the last entry: the timing argument for orphan stamping and the half-grace bound.
+- Run `make test`, `make lint`, `go test -race ./...`, `make antithesis`, `make antithesis-validate` with snouty on PATH, and `make soak SOAK_DURATION=2m`, which now draws maintenance modes.
+
+### Future work
+
+- Tiered compaction, so a few-GB database does not rewrite one segment at every threshold.
+- A periodic GC sweep for orphans of crashed commits in a database that never reaches the compaction threshold; today they wait for the next compaction's GC.
+- `Deleted` in the simulator still shows a few duplicate deletes with the lease, from lease losses; a renewal in `Release`'s path is not worth it yet.
+- The disk cache never evicts, and compaction no longer primes it.
