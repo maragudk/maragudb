@@ -32,6 +32,8 @@ const (
 	CrashMidGC              State = "STATE-CRASH-MID-GC"
 	UniqueAfterConflict     State = "STATE-UNIQUE-AFTER-CONFLICT"
 	UniqueValueReused       State = "STATE-UNIQUE-VALUE-REUSED"
+	ForeignKeyAfterConflict State = "STATE-FK-AFTER-CONFLICT"
+	ForeignKeyCascadeTables State = "STATE-FK-CASCADE-TABLES"
 )
 
 // Declared state, with what it means and the message of the Antithesis assertion that marks it.

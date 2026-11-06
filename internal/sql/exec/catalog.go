@@ -37,6 +37,11 @@ type table struct {
 	IndexOf string `json:"indexOf,omitempty"`
 	// Checks are the CHECK constraints of the table, in the order they were created.
 	Checks []check `json:"checks,omitempty"`
+	// ForeignKeys of the table, in the order they were created.
+	ForeignKeys []foreignKey `json:"foreignKeys,omitempty"`
+	// ReferencedBy are the foreign keys that reference the table, its own among them, in the order
+	// they were created.
+	ReferencedBy []reference `json:"referencedBy,omitempty"`
 	// Constraints are the names of every constraint of the table, NOT NULL constraints among
 	// them, as Postgres names those. Each is also at `k/<name>\x00<table>`, because the
 	// constraints of all tables share the namespace in which Postgres chooses their names.

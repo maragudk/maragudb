@@ -780,6 +780,71 @@ func TestRequestBudgets_Indexes(t *testing.T) {
 	})
 }
 
+func TestRequestBudgets_ForeignKeys(t *testing.T) {
+	sizes := []int{100, 1_000, 10_000, 100_000}
+	// load parents, and a child table that references them.
+	load := func(t *testing.T, db *sql.DB, n int) {
+		t.Helper()
+		mustExec(t, db, "CREATE TABLE p (id bigint PRIMARY KEY, name text)")
+		mustExec(t, db, "CREATE TABLE c (id bigint PRIMARY KEY, pid bigint REFERENCES p)")
+		const batch = 1000
+		for i := 0; i < n; i += batch {
+			var b strings.Builder
+			b.WriteString("INSERT INTO p VALUES ")
+			for j := i; j < min(i+batch, n); j++ {
+				if j > i {
+					b.WriteString(", ")
+				}
+				fmt.Fprintf(&b, "(%d, 'name-%d')", j, j)
+			}
+			mustExec(t, db, b.String())
+		}
+		is.NotError(t, maragudb.Compact(t.Context(), db))
+	}
+	stats := func(t *testing.T, db *sql.DB) maragudb.Requests {
+		t.Helper()
+		s, err := maragudb.Stats(t.Context(), db)
+		is.NotError(t, err)
+		return s.Requests
+	}
+	maxDepth := func(n int) int {
+		// Blocks of 16 KiB hold at least 64 of these rows, so the depth is at most 1 + log64(n).
+		depth := 1
+		for m := n; m > 1; m = (m + 63) / 64 {
+			depth++
+		}
+		return depth
+	}
+
+	t.Run("an insert of a row with a foreign key adds no request with a warm cache, and a logarithmic number of GETs with a cold one", func(t *testing.T) {
+		verify.Covers(t, "an autocommit INSERT of a row that references a parent makes one conditional GET and two PUTs with a warm cache at every database size, and with a cold cache one descent of the tree each for the table definitions, the duplicate key check, and the lookup of the parent", "AC-5.7", "AC-5.1")
+		for _, n := range sizes {
+			w := newWorld(t)
+			db := w.open(maragudb.Options{})
+			load(t, db, n)
+			// Warm the cache with a child of the same parent.
+			mustExec(t, db, "INSERT INTO c VALUES ($1, $2)", 1, n/2)
+			before := stats(t, db)
+			mustExec(t, db, "INSERT INTO c VALUES ($1, $2)", 2, n/2)
+			d := stats(t, db).Sub(before)
+			t.Logf("n=%d warm insert of a child: %+v", n, d)
+			verify.CheckBudget(t, "SQL autocommit INSERT with a foreign key, warm: requests", n, d.Total(), 3)
+			is.Equal(t, maragudb.Requests{GetConditional: 1, Put: 1, PutConditional: 1}, d)
+
+			cold := w.open(maragudb.Options{MemoryCacheBytes: new(int64)})
+			before = stats(t, cold)
+			mustExec(t, cold, "INSERT INTO c VALUES ($1, $2)", 3, n/3)
+			d = stats(t, cold).Sub(before)
+			t.Logf("n=%d cold insert of a child: %+v", n, d)
+			// The table definitions, the duplicate key in the small child table, and the parent.
+			limit := int64(3*maxDepth(n) + 2)
+			verify.CheckBudget(t, "SQL autocommit INSERT with a foreign key, cold: GETs", n, d.Get, limit)
+			is.True(t, d.Get <= limit, fmt.Sprintf("n=%d: %d GETs, max %d", n, d.Get, limit))
+			is.Equal(t, maragudb.Requests{Get: d.Get, GetConditional: 1, Put: 1, PutConditional: 1}, d)
+		}
+	})
+}
+
 // nullableValuer is a Valuer with a value receiver, so a nil pointer to it must be NULL.
 type nullableValuer struct{}
 

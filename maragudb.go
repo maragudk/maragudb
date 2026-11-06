@@ -106,6 +106,15 @@ var (
 	ErrCheck = exec.ErrCheck
 	// ErrDuplicateObject is a constraint whose name another constraint of its table has.
 	ErrDuplicateObject = exec.ErrDuplicateObject
+	// ErrForeignKey is an insert or update of a row whose foreign key has no row in the
+	// referenced table, or an update or delete of a row that a foreign key with NO ACTION still
+	// references.
+	ErrForeignKey = exec.ErrForeignKey
+	// ErrRestrict is an update or delete of a row that a foreign key with RESTRICT references.
+	ErrRestrict = exec.ErrRestrict
+	// ErrInvalidForeignKey is a foreign key that references columns without a primary key or
+	// unique index, or a different number of columns than it has.
+	ErrInvalidForeignKey = exec.ErrInvalidForeignKey
 	// ErrNotNull is a NULL in a NOT NULL column.
 	ErrNotNull = exec.ErrNotNull
 	// ErrDivisionByZero is a division or modulo by zero.

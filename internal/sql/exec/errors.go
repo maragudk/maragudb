@@ -41,6 +41,15 @@ var (
 	ErrCheck = errors.New("new row violates check constraint")
 	// ErrDuplicateObject is a constraint whose name another constraint of the table has.
 	ErrDuplicateObject = errors.New("duplicate object")
+	// ErrForeignKey is an insert or update of a row whose foreign key has no row in the
+	// referenced table, or an update or delete of a row that a foreign key with NO ACTION still
+	// references.
+	ErrForeignKey = errors.New("violates foreign key constraint")
+	// ErrRestrict is an update or delete of a row that a foreign key with RESTRICT references.
+	ErrRestrict = errors.New("violates RESTRICT setting of foreign key constraint")
+	// ErrInvalidForeignKey is a foreign key whose referenced columns are not those of a primary
+	// key or a unique index, or whose columns do not match them in number.
+	ErrInvalidForeignKey = errors.New("invalid foreign key")
 	// ErrNotNull is a NULL in a NOT NULL column.
 	ErrNotNull = errors.New("null value violates not-null constraint")
 	// ErrDivisionByZero is a division or modulo by zero.

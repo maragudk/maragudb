@@ -4,10 +4,12 @@
 package exec
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 
 	"github.com/antithesishq/antithesis-sdk-go/assert"
 
@@ -48,6 +50,14 @@ type Mutations struct {
 	UniqueOwnWrites bool
 	// CheckSkipUpdate checks the CHECK constraints of a row only when it is inserted.
 	CheckSkipUpdate bool
+	// ForeignKeyNoChildCheck skips the check that an inserted or updated row has a parent row.
+	ForeignKeyNoChildCheck bool
+	// ForeignKeyNoParentCheck skips the checks and actions on the rows that reference a deleted or
+	// updated row.
+	ForeignKeyNoParentCheck bool
+	// ForeignKeyOwnWrites makes the lookups of foreign keys read the transaction without the
+	// statement's own writes.
+	ForeignKeyOwnWrites bool
 }
 
 // Session runs statements for one client, serially. It is not safe for concurrent use.
@@ -68,7 +78,11 @@ type Session struct {
 	tables map[string]*table
 	// checks caches the bound CHECK constraints of the tables in tables.
 	checks map[*table][]boundCheck
-	kv     kvstore
+	// events are the rows the statement wrote, for its foreign keys, and cascaded the tables in
+	// which its actions deleted rows.
+	events   []rowEvent
+	cascaded map[string]bool
+	kv       kvstore
 }
 
 // NewSession over db.
@@ -315,6 +329,11 @@ func (s *Session) Execute(ctx context.Context, st *Statement, params []value.Val
 			if unique {
 				reach.Hit(ctx, reach.UniqueAfterConflict)
 			}
+			fk := conflicted && errors.Is(err, ErrForeignKey)
+			assert.Sometimes(fk, "a foreign key violation occurs only because of a concurrent commit", nil)
+			if fk {
+				reach.Hit(ctx, reach.ForeignKeyAfterConflict)
+			}
 			s.rollback()
 			return nil, Result{}, err
 		}
@@ -342,7 +361,9 @@ func (s *Session) Execute(ctx context.Context, st *Statement, params []value.Val
 // run one statement in the current transaction, applying its writes only when it succeeds. A
 // failure in an explicit transaction aborts it.
 func (s *Session) run(ctx context.Context, st *Statement, params []value.Value) (*Rows, Result, error) {
+	s.events = nil
 	rows, res, err := s.execute(ctx, st.ast, params)
+	s.events = nil
 	ddl := false
 	switch st.ast.(type) {
 	case *ast.CreateTable, *ast.DropTable, *ast.CreateIndex, *ast.DropIndex:
@@ -499,6 +520,46 @@ func (k *kvstore) apply() error {
 		}
 	}
 	return nil
+}
+
+// wrote reports whether the transaction or the statement has written the key.
+func (k *kvstore) wrote(key []byte) bool {
+	_, ok := k.pending[string(key)]
+	return ok || k.tx.Wrote(key)
+}
+
+// kvPair is a key and its value.
+type kvPair struct {
+	key, value []byte
+}
+
+// scanLatest returns the keys in [start, end) and their values in order, as the statement sees
+// them: with its own pending writes, unlike [kvstore.scan]. With txOnly, it leaves out the
+// pending writes.
+func (k *kvstore) scanLatest(ctx context.Context, start, end []byte, txOnly bool) ([]kvPair, error) {
+	var out []kvPair
+	it := k.tx.Scan(ctx, start, end)
+	for it.Next() {
+		key := string(it.Key())
+		if _, ok := k.pending[key]; ok && !txOnly {
+			continue
+		}
+		out = append(out, kvPair{key: []byte(key), value: append([]byte{}, it.Value()...)})
+	}
+	if err := it.Err(); err != nil {
+		return nil, err
+	}
+	if txOnly {
+		return out, nil
+	}
+	for key, e := range k.pending {
+		if e.tombstone || key < string(start) || key >= string(end) {
+			continue
+		}
+		out = append(out, kvPair{key: []byte(key), value: e.value})
+	}
+	slices.SortFunc(out, func(a, b kvPair) int { return bytes.Compare(a.key, b.key) })
+	return out, nil
 }
 
 func (k *kvstore) discard() {

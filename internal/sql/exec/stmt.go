@@ -27,9 +27,6 @@ func (s *Session) createTable(ctx context.Context, st *ast.CreateTable) error {
 	if exists && st.IfNotExists {
 		return nil
 	}
-	if len(st.ForeignKeys) > 0 {
-		return fmt.Errorf("%w: FOREIGN KEY is not supported yet", ErrUnsupported)
-	}
 	t, err := newTable(st)
 	if err != nil {
 		return err
@@ -64,6 +61,9 @@ func (s *Session) createTable(ctx context.Context, st *ast.CreateTable) error {
 	if err := s.addIndexes(ctx, t, cs, &n); err != nil {
 		return err
 	}
+	if err := s.addForeignKeys(ctx, t, st, &n); err != nil {
+		return err
+	}
 	t.Constraints = n.list
 	for _, name := range n.list {
 		s.kv.put(constraintKey(name, t.Name), []byte(t.Name))
@@ -83,6 +83,9 @@ func (s *Session) dropTable(ctx context.Context, st *ast.DropTable) error {
 		return fmt.Errorf("%w: table %q does not exist", ErrNoTable, st.Name)
 	case t.IndexOf != "":
 		return fmt.Errorf("%w: %q is not a table, use DROP INDEX to remove an index", ErrWrongObjectType, st.Name)
+	}
+	if err := s.dropForeignKeys(ctx, t); err != nil {
+		return err
 	}
 	start, end := t.rowRange()
 	it := s.kv.scan(ctx, start, end)
@@ -214,7 +217,7 @@ func (s *Session) insert(ctx context.Context, st *ast.Insert, params []value.Val
 			return Result{}, err
 		}
 	}
-	return Result{RowsAffected: int64(len(bound))}, nil
+	return Result{RowsAffected: int64(len(bound))}, s.firing(ctx)
 }
 
 // writeRow checks constraints and writes row and its index entries, replacing old, the row at
@@ -230,6 +233,7 @@ func (s *Session) writeRow(ctx context.Context, t *table, oldKey []byte, old, ro
 		}
 	}
 	key := t.rowKey(row)
+	wrote := oldKey != nil && s.kv.wrote(oldKey)
 	if oldKey == nil || string(key) != string(oldKey) {
 		if _, exists, err := s.kv.get(ctx, key); err != nil {
 			return err
@@ -244,6 +248,7 @@ func (s *Session) writeRow(ctx context.Context, t *table, oldKey []byte, old, ro
 		return err
 	}
 	s.kv.put(key, value.EncodeRow(nil, row))
+	s.queue(rowEvent{t: t, oldKey: oldKey, key: key, old: old, row: row, wrote: wrote})
 	return nil
 }
 
@@ -499,14 +504,21 @@ func (s *Session) update(ctx context.Context, st *ast.Update, params []value.Val
 	}
 	switch {
 	case s.opts.Mutations.UpdateSeesOwnWrites:
-		return Result{RowsAffected: n}, s.updateRestarting(ctx, t, a, f, apply, &n)
+		if err := s.updateRestarting(ctx, t, a, f, apply, &n); err != nil {
+			return Result{}, err
+		}
+		return Result{RowsAffected: n}, s.firing(ctx)
 	case movesKeys:
-		return s.updateKeys(ctx, t, a, f, assign)
+		res, err := s.updateKeys(ctx, t, a, f, assign)
+		if err != nil {
+			return Result{}, err
+		}
+		return res, s.firing(ctx)
 	}
 	if err := s.scanRows(ctx, t, a, f, apply); err != nil {
 		return Result{}, err
 	}
-	return Result{RowsAffected: n}, nil
+	return Result{RowsAffected: n}, s.firing(ctx)
 }
 
 // updateKeys runs an UPDATE that assigns columns of the primary key or of a unique index, each a
@@ -647,6 +659,10 @@ func (s *Session) updateKeys(ctx context.Context, t *table, a access, f filter, 
 	if orderDependent != nil {
 		return Result{}, orderDependent
 	}
+	wrote := make([]bool, len(moves))
+	for i, m := range moves {
+		wrote[i] = s.kv.wrote(m.oldKey)
+	}
 	for _, m := range moves {
 		if string(t.rowKey(m.row)) != string(m.oldKey) {
 			s.kv.del(m.oldKey)
@@ -661,13 +677,15 @@ func (s *Session) updateKeys(ctx context.Context, t *table, a access, f filter, 
 			}
 		}
 	}
-	for _, m := range moves {
+	for j, m := range moves {
 		pk := t.appendKey(nil, m.row)
-		s.kv.put(t.rowKeyOf(pk), value.EncodeRow(nil, m.row))
+		key := t.rowKeyOf(pk)
+		s.kv.put(key, value.EncodeRow(nil, m.row))
 		for i := range t.Indexes {
 			k, _ := t.Indexes[i].entry(t, m.row)
 			s.kv.put(k, pk)
 		}
+		s.queue(rowEvent{t: t, oldKey: m.oldKey, key: key, old: m.old, row: m.row, wrote: wrote[j]})
 	}
 	return Result{RowsAffected: int64(len(moves))}, nil
 }
@@ -809,19 +827,24 @@ func (s *Session) delete(ctx context.Context, st *ast.Delete, params []value.Val
 	if err := s.writable(st); err != nil {
 		return Result{}, err
 	}
+	if err := s.checkActionOrder(ctx, t); err != nil {
+		return Result{}, err
+	}
 	f.candidates = t.candidates(f, nil, nil)
 	a := t.plan(f, nil)
 	var n int64
 	err = s.scanRows(ctx, t, a, f, func(key []byte, row []value.Value) (bool, error) {
+		key = append([]byte{}, key...)
 		s.kv.del(key)
 		s.deleteRowEntries(t, row)
+		s.queue(rowEvent{t: t, oldKey: key, old: row})
 		n++
 		return true, nil
 	})
 	if err != nil {
 		return Result{}, err
 	}
-	return Result{RowsAffected: n}, nil
+	return Result{RowsAffected: n}, s.firing(ctx)
 }
 
 // orderKey is one ORDER BY item, bound either to an output column or to an expression over the

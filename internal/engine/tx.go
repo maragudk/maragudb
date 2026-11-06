@@ -115,6 +115,12 @@ func (tx *Tx) Delete(key []byte) error {
 	return nil
 }
 
+// Wrote reports whether the transaction has put or deleted the key.
+func (tx *Tx) Wrote(key []byte) bool {
+	_, ok := tx.writes[string(key)]
+	return ok
+}
+
 // Scan keys in [start, end) in order. A nil start begins at the first key, and a nil end is unbounded.
 func (tx *Tx) Scan(ctx context.Context, start, end []byte) *Iterator {
 	it := &Iterator{end: end}

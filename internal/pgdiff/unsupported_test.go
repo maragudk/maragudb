@@ -166,6 +166,30 @@ func TestUnsupported(t *testing.T) {
 		)
 	})
 
+	t.Run("UNS-FOREIGN-KEY other forms of FOREIGN KEY", func(t *testing.T) {
+		verify.Covers(t, "a foreign key with MATCH FULL, ON UPDATE CASCADE, SET NULL, or SET DEFAULT, NOT VALID, NOT ENFORCED, or DEFERRABLE, or on double precision columns, is rejected, and Postgres accepts the table", "UNS-FOREIGN-KEY")
+		rejects(t, "CREATE TABLE dev (i bigint PRIMARY KEY, f double precision UNIQUE)",
+			example{SQL: "CREATE TABLE dev2 (a bigint PRIMARY KEY, b bigint REFERENCES dev MATCH FULL)"},
+			example{SQL: "CREATE TABLE dev2 (a bigint PRIMARY KEY, b bigint REFERENCES dev ON UPDATE CASCADE)"},
+			example{SQL: "CREATE TABLE dev2 (a bigint PRIMARY KEY, b bigint REFERENCES dev ON UPDATE SET NULL)"},
+			example{SQL: "CREATE TABLE dev2 (a bigint PRIMARY KEY, b bigint REFERENCES dev ON UPDATE SET DEFAULT)"},
+			example{SQL: "CREATE TABLE dev2 (a bigint PRIMARY KEY, b bigint, FOREIGN KEY (b) REFERENCES dev NOT VALID)"},
+			example{SQL: "CREATE TABLE dev2 (a bigint PRIMARY KEY, b bigint REFERENCES dev NOT ENFORCED)"},
+			example{SQL: "CREATE TABLE dev2 (a bigint PRIMARY KEY, b bigint REFERENCES dev DEFERRABLE)"},
+			example{SQL: "CREATE TABLE dev2 (a bigint PRIMARY KEY, b double precision REFERENCES dev (f))"},
+			example{SQL: "CREATE TABLE dev2 (a bigint PRIMARY KEY, b bigint REFERENCES dev (f))"},
+		)
+	})
+
+	t.Run("UNS-FOREIGN-KEY-ORDER a DELETE whose foreign key actions depend on their order", func(t *testing.T) {
+		verify.Covers(t, "a DELETE whose foreign key actions could write columns that a check reads, or write a table through more than one foreign key, is rejected, and Postgres accepts it when it fires the actions in the right order", "UNS-FOREIGN-KEY-ORDER")
+		rejects(t, create,
+			example{SQL: "DELETE FROM dev WHERE i = 1", Setup: []string{rows, "CREATE TABLE dev2 (a bigint PRIMARY KEY, y bigint REFERENCES dev ON DELETE CASCADE, x bigint REFERENCES dev)", "INSERT INTO dev2 VALUES (1, 1, 1)"}},
+			example{SQL: "DELETE FROM dev WHERE i = 1", Setup: []string{rows, "CREATE TABLE dev2 (a bigint PRIMARY KEY, y bigint REFERENCES dev ON DELETE CASCADE, x bigint REFERENCES dev ON DELETE SET NULL)", "INSERT INTO dev2 VALUES (1, 1, 1)"}},
+			example{SQL: "DELETE FROM dev", Setup: []string{rows, "CREATE TABLE dev2 (a bigint PRIMARY KEY, x bigint REFERENCES dev ON DELETE SET NULL, y bigint REFERENCES dev ON DELETE CASCADE, CHECK (x IS NOT NULL))", "INSERT INTO dev2 VALUES (1, 1, 2)"}},
+		)
+	})
+
 	t.Run("UNS-NO-PRIMARY-KEY tables without a primary key", func(t *testing.T) {
 		verify.Covers(t, "a table without a primary key is rejected, and Postgres accepts it", "UNS-NO-PRIMARY-KEY")
 		rejects(t, create, example{SQL: "CREATE TABLE dev2 (a bigint)"})

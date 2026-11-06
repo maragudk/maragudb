@@ -19,7 +19,7 @@ func TestErrorClasses(t *testing.T) {
 	// Each case fails on both databases. Postgres is the Postgres spelling when it differs.
 	// Each statement fails on both databases.
 	tests := []struct {
-		setup string
+		setup []string
 		sql   string
 		want  error
 		code  string
@@ -30,15 +30,18 @@ func TestErrorClasses(t *testing.T) {
 		{sql: "SELECT CAST(1e300::float8 AS bigint)", want: maragudb.ErrOutOfRange, code: "22003"},
 		{sql: "INSERT INTO dev VALUES (2, NULL)", want: maragudb.ErrNotNull, code: "23502"},
 		{sql: "INSERT INTO dev VALUES (1, 1)", want: maragudb.ErrDuplicateKey, code: "23505"},
-		{setup: "CREATE TABLE dev2 (a bigint PRIMARY KEY CHECK (a > 0))", sql: "INSERT INTO dev2 VALUES (0)", want: maragudb.ErrCheck, code: "23514"},
+		{setup: []string{"CREATE TABLE dev2 (a bigint PRIMARY KEY CHECK (a > 0))"}, sql: "INSERT INTO dev2 VALUES (0)", want: maragudb.ErrCheck, code: "23514"},
 		{sql: "CREATE TABLE dev2 (a bigint PRIMARY KEY, CONSTRAINT c CHECK (a > 0), CONSTRAINT c CHECK (a < 9))", want: maragudb.ErrDuplicateObject, code: "42710"},
+		{setup: []string{"CREATE TABLE dev2 (a bigint PRIMARY KEY REFERENCES dev)"}, sql: "INSERT INTO dev2 VALUES (2)", want: maragudb.ErrForeignKey, code: "23503"},
+		{setup: []string{"CREATE TABLE dev2 (a bigint PRIMARY KEY REFERENCES dev ON DELETE RESTRICT)", "INSERT INTO dev2 VALUES (1)"}, sql: "DELETE FROM dev", want: maragudb.ErrRestrict, code: "23001"},
+		{sql: "CREATE TABLE dev2 (a bigint PRIMARY KEY REFERENCES dev (j))", want: maragudb.ErrInvalidForeignKey, code: "42830"},
 		{sql: "SELEC 1", want: maragudb.ErrSyntax, code: "42601"},
 		{sql: "SELECT 1 ORDER BY 'a'", want: maragudb.ErrSyntax, code: "42601"},
 		{sql: "SELECT * FROM nope", want: maragudb.ErrNoTable, code: "42P01"},
 		{sql: "CREATE TABLE dev (i bigint PRIMARY KEY)", want: maragudb.ErrTableExists, code: "42P07"},
 		{sql: "CREATE INDEX dev ON dev (j)", want: maragudb.ErrTableExists, code: "42P07"},
 		{sql: "CREATE TABLE dev_pkey (i bigint PRIMARY KEY)", want: maragudb.ErrTableExists, code: "42P07"},
-		{setup: "CREATE UNIQUE INDEX ON dev (j, j)", sql: "INSERT INTO dev VALUES (3, 1)", want: maragudb.ErrDuplicateKey, code: "23505"},
+		{setup: []string{"CREATE UNIQUE INDEX ON dev (j, j)"}, sql: "INSERT INTO dev VALUES (3, 1)", want: maragudb.ErrDuplicateKey, code: "23505"},
 		{sql: "DROP INDEX nope", want: maragudb.ErrNoIndex, code: "42704"},
 		{sql: "DROP INDEX dev", want: maragudb.ErrWrongObjectType, code: "42809"},
 		{sql: "DROP TABLE IF EXISTS dev_pkey", want: maragudb.ErrWrongObjectType, code: "42809"},
@@ -79,8 +82,8 @@ func TestErrorClasses(t *testing.T) {
 				_, err := db.ExecContext(t.Context(), "INSERT INTO dev VALUES (1, 1)")
 				is.NotError(t, err)
 			}
-			if test.setup != "" {
-				b.exec(t, test.setup)
+			for _, q := range test.setup {
+				b.exec(t, q)
 			}
 			_, mErr := b.m.ExecContext(t.Context(), test.sql)
 			_, pgErr := b.pg.ExecContext(t.Context(), test.sql)

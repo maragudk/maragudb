@@ -124,6 +124,11 @@ func (s *Session) dropIndex(ctx context.Context, st *ast.DropIndex) error {
 	if t.Indexes[i].Constraint {
 		return fmt.Errorf("%w: cannot drop index %q because a unique constraint of table %q requires it", ErrDependentObjects, st.Name, t.Name)
 	}
+	if r, ok, err := s.indexDependent(ctx, t, st.Name); err != nil {
+		return err
+	} else if ok {
+		return fmt.Errorf("%w: cannot drop index %q because constraint %q on table %q depends on it", ErrDependentObjects, st.Name, r.Name, r.Table)
+	}
 	if err := s.deleteEntries(ctx, &t.Indexes[i]); err != nil {
 		return err
 	}
@@ -254,6 +259,10 @@ func (t *table) clone() *table {
 	c.Columns = slices.Clone(t.Columns)
 	c.PrimaryKey = slices.Clone(t.PrimaryKey)
 	c.Indexes = slices.Clone(t.Indexes)
+	c.Checks = slices.Clone(t.Checks)
+	c.ForeignKeys = slices.Clone(t.ForeignKeys)
+	c.ReferencedBy = slices.Clone(t.ReferencedBy)
+	c.Constraints = slices.Clone(t.Constraints)
 	return &c
 }
 

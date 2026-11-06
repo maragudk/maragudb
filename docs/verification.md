@@ -10,10 +10,10 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 ## At a glance
 
-- 32 acceptance criteria (`AC-`), 23 key invariants (`INV-`), 21 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
+- 33 acceptance criteria (`AC-`), 24 key invariants (`INV-`), 23 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
 - 11 mutants (`MUT-`), deliberate bugs, of which 10 are detected by the simulator's checkers within 20 seeds.
 - 15 interesting states (`STATE-`) that the simulator's fixed corpus must reach.
-- 162 declarations of coverage in the tests.
+- 170 declarations of coverage in the tests.
 
 ## Acceptance criteria
 
@@ -139,6 +139,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/pgdiff` `TestDefaults/fills_in_defaults_as_Postgres_does,_with_the_same_errors`: a column's DEFAULT is used for a column that an INSERT leaves out, for DEFAULT in VALUES and in SET, and for DEFAULT VALUES, converted to the column's type by assignment, and a DEFAULT that reads a column, has a parameter, has the wrong type, or fails to fold fails as in Postgres
 - `internal/pgdiff` `TestDifferential/generated_statements_give_the_same_results_on_Postgres_and_maragudb`: hegel-generated schemas, rows, transactions, and statements, written once as Postgres SQL, give the same results, column names, affected-row counts, and transaction states on both sides, ordered exactly when ORDER BY decides the order and as multisets otherwise, and fail on both sides with the same error class, except for statements that maragudb rejects as unsupported, which Postgres skips
 - `internal/pgdiff` `TestErrorClasses`: every maragudb error class fails with its mapped SQLSTATE code on Postgres for the same statement
+- `internal/pgdiff` `TestForeignKeys/creates_and_drops_foreign_keys_as_Postgres_does,_with_the_same_names_and_errors`: FOREIGN KEY and REFERENCES get Postgres's names, reference a primary key or the first unique index on the referenced columns, fail with the class of Postgres's error for a missing table or column, columns without a unique index, a different number of columns, and incompatible types, and DROP TABLE and DROP INDEX of what a foreign key depends on fail with 2BP01
 - `internal/pgdiff` `TestIndexConditions/evaluates_the_other_conditions_only_on_the_rows_that_the_primary_key_conditions_select,_as_Postgres_does_with_an_index_scan`: with sequential scans off, Postgres evaluates the other WHERE conditions only on the rows that the conditions on the primary key index select: comparisons and IN of constants on any key column, a boolean key column, and key equalities implied by equalities with a constant; maragudb accepts such statements and gives the same results
 - `internal/pgdiff` `TestIndexConditions/takes_the_index_conditions_out_of_an_OR_as_Postgres_does_when_it_drops_constants_and_common_conditions_from_the_OR`: in a WHERE clause, Postgres drops the arguments of an OR that are FALSE or NULL constants and takes the conditions common to every argument out of the OR, which can make them index conditions; maragudb does the same and gives the same results
 - `internal/pgdiff` `TestIndexPlans/evaluates_the_other_conditions_only_on_the_rows_that_every_index_scan_Postgres_could_pick_skips,_and_otherwise_on_every_row`: with several indexes, a condition that can fail is evaluated on the rows that any index scan Postgres could pick reads: those of each index's certain conditions, and every row when an index without them could serve a condition or ORDER BY; maragudb gives Postgres's result when every such scan agrees, and rejects the statement otherwise
@@ -172,6 +173,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 - `.` `TestMaintenance/keeps_the_commit_and_warm-read_budgets_in_steady_state`: with background maintenance, an INSERT and a warm SELECT keep their request budgets
 - `.` `TestRequestBudgets/an_autocommit_INSERT_makes_one_conditional_GET_and_two_PUTs_regardless_of_database_size`: an autocommit INSERT makes one conditional GET and two PUTs at every database size
+- `.` `TestRequestBudgets_ForeignKeys/an_insert_of_a_row_with_a_foreign_key_adds_no_request_with_a_warm_cache,_and_a_logarithmic_number_of_GETs_with_a_cold_one`: an autocommit INSERT of a row that references a parent makes one conditional GET and two PUTs with a warm cache at every database size, and with a cold cache one descent of the tree each for the table definitions, the duplicate key check, and the lookup of the parent
 - `.` `TestRequestBudgets_Indexes/a_commit_that_changes_indexed_columns_makes_one_conditional_GET_and_two_PUTs_regardless_of_database_size`: an autocommit UPDATE that changes the columns of two indexes, and so deletes and writes entries of both, makes one conditional GET and two PUTs at every database size
 - `internal/engine` `TestRequestBudgets/a_commit_uses_two_PUTs_and_one_GET_regardless_of_database_size`: a commit makes one conditional GET, one PUT, and one conditional PUT at 100 to 100,000 keys
 
@@ -202,6 +204,12 @@ Each entry names the test's package, the test's name, and what the test asserts,
 > S3 request budgets: A commit that changes indexed columns still uses O(1) PUTs, independent of database size and of the number of indexes.
 
 - `.` `TestRequestBudgets_Indexes/a_commit_that_changes_indexed_columns_makes_one_conditional_GET_and_two_PUTs_regardless_of_database_size`: an autocommit UPDATE that changes the columns of two indexes, and so deletes and writes entries of both, makes one conditional GET and two PUTs at every database size
+
+### `AC-5.7`
+
+> S3 request budgets: An insert of a row with a foreign key with a warm cache uses no request beyond those of any other commit, and with a cold cache O(log n) GETs for the lookup of the referenced row.
+
+- `.` `TestRequestBudgets_ForeignKeys/an_insert_of_a_row_with_a_foreign_key_adds_no_request_with_a_warm_cache,_and_a_logarithmic_number_of_GETs_with_a_cold_one`: an autocommit INSERT of a row that references a parent makes one conditional GET and two PUTs with a warm cache at every database size, and with a cold cache one descent of the tree each for the table definitions, the duplicate key check, and the lookup of the parent
 
 ### `AC-5.4`
 
@@ -402,6 +410,10 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/pgdiff` `TestChecks/checks_CHECK_constraints_in_the_order_of_their_names,_after_NOT_NULL_and_before_the_keys,_as_Postgres_does`: an INSERT or UPDATE evaluates the NOT NULL constraints, then the CHECK constraints in the order of their names, failing at the first that is false or fails itself, and then the primary key and the unique indexes, row by row, so it fails with the same class as Postgres, and NULL passes a CHECK
 - `internal/pgdiff` `TestChecks/names_CHECK_constraints_as_Postgres_does,_and_fails_a_CHECK_as_Postgres_does_when_the_table_is_created`: CHECK constraints get Postgres's names, after the one column they read or after the table, numbered past the names of every constraint of every table, they share the names of a table's constraints with its PRIMARY KEY and UNIQUE constraints and its NOT NULL constraints, and a CHECK that is not boolean, reads a missing column, or repeats a name fails with the class of Postgres's error
 - `internal/pgdiff` `TestDefaults/fills_in_defaults_as_Postgres_does,_with_the_same_errors`: a column's DEFAULT is used for a column that an INSERT leaves out, for DEFAULT in VALUES and in SET, and for DEFAULT VALUES, converted to the column's type by assignment, and a DEFAULT that reads a column, has a parameter, has the wrong type, or fails to fold fails as in Postgres
+- `internal/pgdiff` `TestForeignKeys/cascades_through_chains_of_tables_and_trees,_and_rejects_actions_whose_outcome_depends_on_their_order`: ON DELETE CASCADE, SET NULL, and SET DEFAULT go through chains of tables and down self-referencing trees as in Postgres, the rows they change are checked like any other, and a DELETE whose actions could give another outcome in another order is rejected
+- `internal/pgdiff` `TestForeignKeys/checks_a_self-referencing_table_at_the_end_of_the_statement,_as_Postgres_does`: a self-referencing table is checked at the end of each statement, so an UPDATE that moves parents and children together passes, one that moves only the parents fails, a cycle of references can be inserted in one statement, and deleting a whole tree passes where deleting part of it fails
+- `internal/pgdiff` `TestForeignKeys/checks_foreign_keys_and_fires_their_actions_as_Postgres_does`: an insert or update of a row whose foreign key has no NULL and no parent row fails with 23503 at the end of the statement, a delete or key update of a referenced row fails with 23503 for NO ACTION and 23001 for RESTRICT, or deletes, sets to NULL, or sets to the defaults the referencing rows, with the rows the same on both afterwards
+- `internal/pgdiff` `TestForeignKeys/creates_and_drops_foreign_keys_as_Postgres_does,_with_the_same_names_and_errors`: FOREIGN KEY and REFERENCES get Postgres's names, reference a primary key or the first unique index on the referenced columns, fail with the class of Postgres's error for a missing table or column, columns without a unique index, a different number of columns, and incompatible types, and DROP TABLE and DROP INDEX of what a foreign key depends on fail with 2BP01
 - `internal/pgdiff` `TestIndexConditions/evaluates_the_other_conditions_only_on_the_rows_that_the_primary_key_conditions_select,_as_Postgres_does_with_an_index_scan`: with sequential scans off, Postgres evaluates the other WHERE conditions only on the rows that the conditions on the primary key index select: comparisons and IN of constants on any key column, a boolean key column, and key equalities implied by equalities with a constant; maragudb accepts such statements and gives the same results
 - `internal/pgdiff` `TestIndexConditions/takes_the_index_conditions_out_of_an_OR_as_Postgres_does_when_it_drops_constants_and_common_conditions_from_the_OR`: in a WHERE clause, Postgres drops the arguments of an OR that are FALSE or NULL constants and takes the conditions common to every argument out of the OR, which can make them index conditions; maragudb does the same and gives the same results
 - `internal/pgdiff` `TestIndexPlans/Postgres_takes_the_certain_conditions_on_an_indexed_column_as_conditions_of_the_scan_of_the_index,_and_picks_between_indexes`: EXPLAIN on Postgres 18 with sequential scans off shows that comparisons, IN, and boolean conditions on any column of a secondary index are conditions of its scan, that it picks between the primary key and another index with conditions, and that it scans a whole index in order for ORDER BY
@@ -458,6 +470,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 - `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus, with the unique workload under the same faults, finds no two rows with the same unique value in any snapshot a reader saw or in the final state, and after every run through SQL every index of the store matches its table, and lookups through the indexes find the rows of the table
 - `internal/sql/exec` `TestMutations_Indexes/IndexStaleDelete_leaves_entries_that_CheckIndexes_finds`: with the mutant, an UPDATE or DELETE leaves its old index entries, which the index check finds
+- `internal/sql/exec` `TestSession_ForeignKeysKeepInvariants/random_writes_on_referenced,_referencing,_and_self-referencing_tables_keep_every_foreign_key_and_check,_with_and_without_an_index_on_the_referencing_columns`: random inserts, updates, and deletes, in and out of transactions, on a parent, a child with a random ON DELETE action, and a self-referencing table never leave a row whose foreign key has no parent or a row that violates a CHECK, and a session whose child has an index on its referencing columns gives the same outcomes and rows as one without
 - `internal/sql/exec` `TestSession_IndexesMatchModel/random_writes_on_a_table_with_indexes_match_a_model,_and_every_index_matches_its_table_after_every_statement`: random inserts, updates, deletes, and index creations and drops on a table with unique and other indexes give the rows and the unique violations of a model, the indexes match the table after every statement, and lookups through every index return the rows of the model
 - `internal/sql/value` `TestEncodeIndexKey/byte_order_of_composite_index_keys_equals_the_order_of_every_column_with_its_direction_and_NULL_placement`: the index key encoding sorts composite keys of every type, ascending or descending, with NULLs first or last, in the order Postgres sorts the index
 
@@ -478,6 +491,16 @@ Each entry names the test's package, the test's name, and what the test asserts,
 > No committed row ever violates a CHECK constraint of its table.
 
 - `internal/pgdiff` `TestChecks/checks_CHECK_constraints_in_the_order_of_their_names,_after_NOT_NULL_and_before_the_keys,_as_Postgres_does`: an INSERT or UPDATE evaluates the NOT NULL constraints, then the CHECK constraints in the order of their names, failing at the first that is false or fails itself, and then the primary key and the unique indexes, row by row, so it fails with the same class as Postgres, and NULL passes a CHECK
+- `internal/sql/exec` `TestSession_ForeignKeysKeepInvariants/random_writes_on_referenced,_referencing,_and_self-referencing_tables_keep_every_foreign_key_and_check,_with_and_without_an_index_on_the_referencing_columns`: random inserts, updates, and deletes, in and out of transactions, on a parent, a child with a random ON DELETE action, and a self-referencing table never leave a row whose foreign key has no parent or a row that violates a CHECK, and a session whose child has an index on its referencing columns gives the same outcomes and rows as one without
+
+### `INV-FK`
+
+> No committed state ever has a child row whose key has no NULL and no matching parent row (MATCH SIMPLE).
+
+- `internal/pgdiff` `TestForeignKeys/cascades_through_chains_of_tables_and_trees,_and_rejects_actions_whose_outcome_depends_on_their_order`: ON DELETE CASCADE, SET NULL, and SET DEFAULT go through chains of tables and down self-referencing trees as in Postgres, the rows they change are checked like any other, and a DELETE whose actions could give another outcome in another order is rejected
+- `internal/pgdiff` `TestForeignKeys/checks_a_self-referencing_table_at_the_end_of_the_statement,_as_Postgres_does`: a self-referencing table is checked at the end of each statement, so an UPDATE that moves parents and children together passes, one that moves only the parents fails, a cycle of references can be inserted in one statement, and deleting a whole tree passes where deleting part of it fails
+- `internal/pgdiff` `TestForeignKeys/checks_foreign_keys_and_fires_their_actions_as_Postgres_does`: an insert or update of a row whose foreign key has no NULL and no parent row fails with 23503 at the end of the statement, a delete or key update of a referenced row fails with 23503 for NO ACTION and 23001 for RESTRICT, or deletes, sets to NULL, or sets to the defaults the referencing rows, with the rows the same on both afterwards
+- `internal/sql/exec` `TestSession_ForeignKeysKeepInvariants/random_writes_on_referenced,_referencing,_and_self-referencing_tables_keep_every_foreign_key_and_check,_with_and_without_an_index_on_the_referencing_columns`: random inserts, updates, and deletes, in and out of transactions, on a parent, a child with a random ON DELETE action, and a self-referencing table never leave a row whose foreign key has no parent or a row that violates a CHECK, and a session whose child has an index on its referencing columns gives the same outcomes and rows as one without
 
 ## Unsupported statements
 
@@ -528,6 +551,12 @@ Each entry names the test's package, the test's name, and what the test asserts,
 > Other forms of CHECK.
 
 - `internal/pgdiff` `TestUnsupported/UNS-CHECK_other_forms_of_CHECK`: a CHECK with NO INHERIT, NOT VALID, or NOT ENFORCED, or whose constant part fails, is rejected, and Postgres accepts the table
+
+### `UNS-FOREIGN-KEY`
+
+> Other forms of FOREIGN KEY.
+
+- `internal/pgdiff` `TestUnsupported/UNS-FOREIGN-KEY_other_forms_of_FOREIGN_KEY`: a foreign key with MATCH FULL, ON UPDATE CASCADE, SET NULL, or SET DEFAULT, NOT VALID, NOT ENFORCED, or DEFERRABLE, or on double precision columns, is rejected, and Postgres accepts the table
 
 ### `UNS-INDEX`
 
@@ -608,6 +637,13 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 - `internal/pgdiff` `TestUnsupported/UNS-STABLE-CONSTANT_a_conversion_between_text_and_timestamptz_that_reads_no_columns_and_can_fail`: a conversion between text and timestamptz without columns that can fail is rejected, because whether Postgres evaluates it while planning depends on the plan, and Postgres accepts it when it does not fail
 - `internal/sql/exec` `TestSession_Select/does_not_fold_the_stable_conversions_between_timestamptz_and_text,_as_Postgres_does_not,_and_rejects_one_that_can_fail`: a conversion between timestamptz and text is evaluated when the statement runs, so a CASE does not prune on it and a WHERE condition on it is evaluated once before rows are read, and one without columns that can fail is ErrUnsupported
+
+### `UNS-FOREIGN-KEY-ORDER`
+
+> Foreign key actions whose outcome depends on their order.
+
+- `internal/pgdiff` `TestForeignKeys/cascades_through_chains_of_tables_and_trees,_and_rejects_actions_whose_outcome_depends_on_their_order`: ON DELETE CASCADE, SET NULL, and SET DEFAULT go through chains of tables and down self-referencing trees as in Postgres, the rows they change are checked like any other, and a DELETE whose actions could give another outcome in another order is rejected
+- `internal/pgdiff` `TestUnsupported/UNS-FOREIGN-KEY-ORDER_a_DELETE_whose_foreign_key_actions_depend_on_their_order`: a DELETE whose foreign key actions could write columns that a check reads, or write a table through more than one foreign key, is rejected, and Postgres accepts it when it fires the actions in the right order
 
 ### `UNS-KEY-UPDATE-ORDER`
 

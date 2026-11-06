@@ -5,8 +5,10 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -431,11 +433,6 @@ var (
 // own, and then begins a transaction that it aborts, which behaves like the aborted read-only
 // one until it ends.
 func (s *sides) inKeyOrder(ctx context.Context, text, table string, query bool) (error, error) {
-	var keys []string
-	for _, k := range s.keys[table] {
-		keys = append(keys, ast.RenderExpr(&ast.ColumnRef{Name: k}))
-	}
-	tableName := ast.RenderExpr(&ast.ColumnRef{Name: table})
 	inTx := s.inTx && !s.readOnly
 	steps := []string{"BEGIN"}
 	switch {
@@ -444,12 +441,40 @@ func (s *sides) inKeyOrder(ctx context.Context, text, table string, query bool) 
 	case s.inTx:
 		steps = []string{"ROLLBACK", "BEGIN"}
 	}
-	steps = append(steps,
-		"CREATE TEMP TABLE sorted ON COMMIT DROP AS SELECT * FROM "+tableName,
-		"DELETE FROM "+tableName,
-		"INSERT INTO "+tableName+" SELECT * FROM sorted ORDER BY "+strings.Join(keys, ", "),
-		"UPDATE pg_index SET indisvalid = false WHERE indrelid = '"+strings.ReplaceAll(tableName, "'", "''")+"'::regclass AND NOT indisprimary",
-	)
+	for _, q := range steps {
+		if _, err := s.pg.ExecContext(ctx, q); err != nil {
+			return nil, fmt.Errorf("postgres: %s: %w", q, err)
+		}
+	}
+	// The rows of the statement's table, and of every other table, which foreign key actions
+	// visit, are stored again in key order, with the referential triggers off, so that the rows
+	// stay as they are.
+	steps = []string{"SET LOCAL session_replication_role = replica"}
+	tables := slices.Sorted(maps.Keys(s.keys))
+	for i, name := range tables {
+		var exists bool
+		if err := s.pg.QueryRowContext(ctx, "SELECT EXISTS (SELECT 1 FROM pg_class WHERE relname = $1 AND relkind = 'r' AND relpersistence = 'p')", name).Scan(&exists); err != nil {
+			return nil, fmt.Errorf("postgres: %w", err)
+		}
+		if !exists {
+			continue
+		}
+		var keys []string
+		for _, k := range s.keys[name] {
+			keys = append(keys, ast.RenderExpr(&ast.ColumnRef{Name: k}))
+		}
+		tableName := ast.RenderExpr(&ast.ColumnRef{Name: name})
+		sorted := fmt.Sprint("sorted", i)
+		steps = append(steps,
+			"CREATE TEMP TABLE "+sorted+" ON COMMIT DROP AS SELECT * FROM "+tableName,
+			"DELETE FROM "+tableName,
+			"INSERT INTO "+tableName+" SELECT * FROM "+sorted+" ORDER BY "+strings.Join(keys, ", "),
+		)
+		if name == table {
+			steps = append(steps, "UPDATE pg_index SET indisvalid = false WHERE indrelid = '"+strings.ReplaceAll(tableName, "'", "''")+"'::regclass AND NOT indisprimary")
+		}
+	}
+	steps = append(steps, "SET LOCAL session_replication_role = origin")
 	for _, q := range steps {
 		if _, err := s.pg.ExecContext(ctx, q); err != nil {
 			return nil, fmt.Errorf("postgres: %s: %w", q, err)

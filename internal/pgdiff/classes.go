@@ -30,6 +30,10 @@ var ErrorClasses = []ErrorClass{
 	{Name: "duplicate key", Err: maragudb.ErrDuplicateKey, Codes: []string{"23505"}},
 	// 23514 is check_violation.
 	{Name: "check", Err: maragudb.ErrCheck, Codes: []string{"23514"}},
+	// 23503 is foreign_key_violation, 23001 restrict_violation, and 42830 invalid_foreign_key.
+	{Name: "foreign key", Err: maragudb.ErrForeignKey, Codes: []string{"23503"}},
+	{Name: "restrict", Err: maragudb.ErrRestrict, Codes: []string{"23001"}},
+	{Name: "invalid foreign key", Err: maragudb.ErrInvalidForeignKey, Codes: []string{"42830"}},
 	// 42710 is duplicate_object.
 	{Name: "duplicate object", Err: maragudb.ErrDuplicateObject, Codes: []string{"42710"}},
 	{Name: "syntax", Err: maragudb.ErrSyntax, Codes: []string{"42601"}},

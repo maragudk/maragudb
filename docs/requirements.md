@@ -63,6 +63,7 @@ The project is built in three sections. A section is done only when all of its a
 - The `UNIQUE`, `DEFAULT` (including expressions such as `now()`), and `CHECK` constraints.
   - No committed row ever violates a CHECK constraint of its table. `INV-CHECK`
 - `FOREIGN KEY`, always enforced.
+  - No committed state ever has a child row whose key has no NULL and no matching parent row (MATCH SIMPLE). `INV-FK`
 
 ### Section 3: Queries
 
@@ -102,6 +103,7 @@ These apply to every section, for the SQL surface that exists at that point.
    - A point lookup with a cold cache uses O(log n) GETs. `AC-5.3`
    - A point lookup through a secondary index with a cold cache uses O(log n) GETs. `AC-5.5`
    - A commit that changes indexed columns still uses O(1) PUTs, independent of database size and of the number of indexes. `AC-5.6`
+   - An insert of a row with a foreign key with a warm cache uses no request beyond those of any other commit, and with a cold cache O(log n) GETs for the lookup of the referenced row. `AC-5.7`
 
    Latency against Tigris is measured and reported, but it does not gate. `AC-5.4`
 6. **Bounded storage.** After compaction, the object count grows with data size, not with commit count. `AC-6.1` GC never deletes an object that a snapshot within the configured grace period still references. `AC-6.2` A reader older than the grace period gets a clear error, never wrong data. `AC-6.3`
