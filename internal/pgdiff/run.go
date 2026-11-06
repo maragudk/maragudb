@@ -462,7 +462,7 @@ var (
 	reasonCondition = regexp.MustCompile(`whether .+? fails depends on the plan`)
 	// reasonJoinCondition is the condition in a rejection of UNS-PLAN-DEPENDENT-JOIN.
 	reasonJoinCondition = regexp.MustCompile(`whether .+? fails depends on the join plan`)
-	reasonDetail    = regexp.MustCompile(`"[^"]*"|'[^']*'|\$?\d+`)
+	reasonDetail        = regexp.MustCompile(`"[^"]*"|'[^']*'|\$?\d+`)
 )
 
 // inKeyOrder runs a statement that failed on Postgres again, with the rows of its table stored

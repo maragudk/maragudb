@@ -1193,9 +1193,21 @@ func sortedColumns(s *ast.Select, columns []string) []int {
 				i = p
 			}
 		case *ast.ColumnRef:
-			// Postgres resolves a name alone in ORDER BY to an output column first.
+			// Postgres resolves a name alone in ORDER BY to an output column first. A qualified
+			// name sorts by the column, which an output column of the same text before any star
+			// shows.
 			if e.Table == "" {
 				i = slices.Index(columns, e.Name)
+				break
+			}
+			for j, item := range s.Items {
+				if item.Star {
+					break
+				}
+				if ref, ok := item.Expr.(*ast.ColumnRef); ok && *ref == *e {
+					i = j
+					break
+				}
 			}
 		}
 		if i < 0 {
@@ -1372,6 +1384,15 @@ func (g *gen) joinSelect() *ast.Select {
 			o.Expr = g.expr(g.anyTypeIn(sc), sc, 1)
 		}
 		s.OrderBy = append(s.OrderBy, o)
+	}
+	// The columns that ORDER BY sorts by are in the output too, so that the harness compares the
+	// order, unless a position in ORDER BY would then name another column.
+	if !limited && !s.Distinct && !slices.ContainsFunc(s.OrderBy, func(o ast.OrderItem) bool { _, ok := o.Expr.(*ast.Literal); return ok }) {
+		for _, o := range s.OrderBy {
+			if ref, ok := o.Expr.(*ast.ColumnRef); ok {
+				s.Items = append(s.Items, ast.SelectItem{Expr: ref})
+			}
+		}
 	}
 	if limited {
 		// A total order, which a LIMIT needs, by every key column of every table.

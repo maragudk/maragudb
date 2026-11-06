@@ -187,7 +187,8 @@ func (b *binder) column(r colRef) *cexpr {
 // forEntry is a binder for the rows of the entry i alone, whose table's indexes its WHERE clause
 // can use, in the same namespace.
 func (b *binder) forEntry(i int) *binder {
-	nb := &binder{scope: b.scope, ns: b.ns, table: b.scope.entries[i].t, entry: i, params: b.params, now: b.now, phase: b.phase}
+	nb := b.fresh()
+	nb.table, nb.entry = b.scope.entries[i].t, i
 	nb.layout = make([]int, len(b.scope.entries))
 	for j := range nb.layout {
 		nb.layout[j] = -1

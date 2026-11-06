@@ -493,7 +493,7 @@ func (p *parser) createTable() (ast.Statement, error) {
 		s.IfNotExists = true
 	}
 	var err error
-	if s.Name, err = p.ident(); err != nil {
+	if s.Name, err = p.tableName(); err != nil {
 		return nil, err
 	}
 	if p.isKeyword("as") || p.isWord("of") || p.isKeyword("like") {
@@ -711,7 +711,7 @@ func (p *parser) references(name string, columns []string) (ast.ForeignKey, erro
 		return fk, err
 	}
 	var err error
-	if fk.Table, err = p.ident(); err != nil {
+	if fk.Table, err = p.tableName(); err != nil {
 		return fk, err
 	}
 	if p.isOp("(") {
@@ -1003,7 +1003,7 @@ func (p *parser) createIndex() (ast.Statement, error) {
 	if p.isKeyword("only") {
 		return nil, p.unsupportedf("ON ONLY is not supported, there is no inheritance")
 	}
-	if s.Table, err = p.ident(); err != nil {
+	if s.Table, err = p.tableName(); err != nil {
 		return nil, err
 	}
 	if p.isKeyword("using") {
@@ -1104,7 +1104,7 @@ func (p *parser) dropTable() (ast.Statement, error) {
 		}
 		ifExists = true
 	}
-	name, err := p.ident()
+	name, err := p.tableName()
 	if err != nil {
 		return nil, err
 	}
@@ -1129,7 +1129,7 @@ func (p *parser) insert() (ast.Statement, error) {
 	}
 	s := &ast.Insert{}
 	var err error
-	if s.Table, err = p.ident(); err != nil {
+	if s.Table, err = p.tableName(); err != nil {
 		return nil, err
 	}
 	if p.isKeyword("as") {
@@ -1222,11 +1222,8 @@ func (p *parser) update() (ast.Statement, error) {
 	}
 	s := &ast.Update{}
 	var err error
-	if s.Table, err = p.ident(); err != nil {
+	if s.Table, err = p.tableName(); err != nil {
 		return nil, err
-	}
-	if p.isOp(".") {
-		return nil, p.unsupportedf("a table name with a schema is not supported, name the table alone")
 	}
 	// SET is a keyword only in context, and never an alias without AS, as in Postgres.
 	if s.Alias, err = p.alias(!p.isWord("set")); err != nil {
@@ -1291,11 +1288,8 @@ func (p *parser) delete() (ast.Statement, error) {
 	}
 	s := &ast.Delete{}
 	var err error
-	if s.Table, err = p.ident(); err != nil {
+	if s.Table, err = p.tableName(); err != nil {
 		return nil, err
-	}
-	if p.isOp(".") {
-		return nil, p.unsupportedf("a table name with a schema is not supported, name the table alone")
 	}
 	if s.Alias, err = p.alias(true); err != nil {
 		return nil, err
@@ -1321,6 +1315,15 @@ func (p *parser) alias(bare bool) (string, error) {
 		return p.ident()
 	}
 	return "", nil
+}
+
+// tableName is the name of a table, which a schema must not qualify.
+func (p *parser) tableName() (string, error) {
+	name, err := p.ident()
+	if err == nil && p.isOp(".") {
+		return "", p.unsupportedf("a table name with a schema is not supported, name the table alone")
+	}
+	return name, err
 }
 
 // label is a name after a dot, which can be any keyword, as in Postgres.
@@ -1379,7 +1382,7 @@ func (p *parser) selectStmt() (ast.Statement, error) {
 			switch {
 			case p.isOp("."):
 				return nil, p.errorf("improper use of \"*\"")
-			case item.Table != "" && !p.isOp(",") && !p.isOp(";") && p.tok.kind != tokEOF && !p.isKeyword("from") && !p.isKeyword("where") && !p.isKeyword("order") && !p.isKeyword("limit") && !p.isKeyword("offset"):
+			case item.Table != "" && p.continuesExpression():
 				return nil, p.unsupportedf("%s.* is not supported in an expression, name the columns", item.Table)
 			}
 		} else {
@@ -1527,6 +1530,23 @@ func (p *parser) selectStmt() (ast.Statement, error) {
 	return s, nil
 }
 
+// continuesExpression reports whether the current token continues an expression, as an
+// operator does, or an alias after it.
+func (p *parser) continuesExpression() bool {
+	if p.tok.kind == tokOp {
+		return !p.isOp(",") && !p.isOp(";") && !p.isOp(")")
+	}
+	if p.tok.kind == tokIdent {
+		return true
+	}
+	for _, w := range []string{"as", "is", "isnull", "notnull", "and", "or", "not", "like", "ilike", "similar", "between", "in", "collate", "at"} {
+		if p.isWord(w) {
+			return true
+		}
+	}
+	return false
+}
+
 // tableRef is an item of FROM: a table or a parenthesized join, followed by any joins with it
 // on the left, which associate to the left.
 func (p *parser) tableRef() (ast.TableExpr, error) {
@@ -1655,13 +1675,10 @@ func (p *parser) tablePrimary() (ast.TableExpr, error) {
 	}
 	t := &ast.TableRef{}
 	var err error
-	if t.Name, err = p.ident(); err != nil {
+	if t.Name, err = p.tableName(); err != nil {
 		return nil, err
 	}
-	switch {
-	case p.isOp("."):
-		return nil, p.unsupportedf("a table name with a schema is not supported, name the table alone")
-	case p.isOp("("):
+	if p.isOp("(") {
 		return nil, p.unsupportedf("functions in FROM are not supported")
 	}
 	if t.Alias, err = p.alias(true); err != nil {

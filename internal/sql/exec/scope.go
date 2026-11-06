@@ -179,6 +179,8 @@ type fromNode struct {
 	ns     namespace
 	cols   []nsCol
 	tables tableSet
+	// members are the entries of tables, in order.
+	members []int
 }
 
 // from builds the scope of a FROM clause, and binds the conditions of its joins, in the order
@@ -250,7 +252,7 @@ func (b *binder) fromItem(ctx context.Context, s *Session, item ast.TableExpr) (
 		b.scope.width += len(t.Columns)
 		i := len(b.scope.entries) - 1
 		it := b.scope.item(i)
-		return &fromNode{entry: i, ns: namespace{it}, cols: it.cols, tables: tableSet(0).with(i)}, nil
+		return &fromNode{entry: i, ns: namespace{it}, cols: it.cols, tables: tableSet(0).with(i), members: []int{i}}, nil
 	case *ast.Join:
 		l, err := b.fromItem(ctx, s, item.Left)
 		if err != nil {
@@ -263,7 +265,7 @@ func (b *binder) fromItem(ctx context.Context, s *Session, item ast.TableExpr) (
 		if err := b.checkNames(l.ns, r.ns); err != nil {
 			return nil, err
 		}
-		n := &fromNode{entry: -1, kind: item.Kind, left: l, right: r, tables: l.tables | r.tables}
+		n := &fromNode{entry: -1, kind: item.Kind, left: l, right: r, tables: l.tables | r.tables, members: append(slices.Clone(l.members), r.members...)}
 		n.onNS = append(append(namespace{}, l.ns...), r.ns...)
 		if item.Kind == ast.JoinLeft {
 			for _, i := range r.tables.members() {

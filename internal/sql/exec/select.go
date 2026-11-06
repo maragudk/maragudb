@@ -465,16 +465,7 @@ func (b *binder) reads(st *ast.Select, i int) []int {
 			out = append(out, col)
 		}
 	}
-	walk := func(ns namespace, e ast.Expr) {
-		ast.Walk(e, func(x ast.Expr) bool {
-			if ref, ok := x.(*ast.ColumnRef); ok {
-				if r, err := b.scope.resolve(ns, ref); err == nil && r.entry == i {
-					add(r.col)
-				}
-			}
-			return true
-		})
-	}
+	walk := func(ns namespace, e ast.Expr) { b.columnsOf(ns, e, i, add) }
 	for _, item := range st.Items {
 		if !item.Star {
 			walk(b.ns, item.Expr)
@@ -492,6 +483,18 @@ func (b *binder) reads(st *ast.Select, i int) []int {
 		walk(b.ns, o.Expr)
 	}
 	return out
+}
+
+// columnsOf calls fn with the columns of entry i that e reads, resolved in the namespace ns.
+func (b *binder) columnsOf(ns namespace, e ast.Expr, i int, fn func(col int)) {
+	ast.Walk(e, func(x ast.Expr) bool {
+		if ref, ok := x.(*ast.ColumnRef); ok {
+			if r, err := b.scope.resolve(ns, ref); err == nil && r.entry == i {
+				fn(r.col)
+			}
+		}
+		return true
+	})
 }
 
 // errorKinds are the errors whose class Postgres's SQLSTATE codes tell apart, which a statement

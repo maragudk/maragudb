@@ -54,7 +54,9 @@ type joinPlan struct {
 	// lookups are the equalities between a column of an entry and an expression of the entries
 	// before it, by entry and by the entries bound before it.
 	lookups map[lookupKey][]lookup
-	orders  map[*fromNode][]*fromNode
+	groups  map[*fromNode]*groupRun
+	// nulls are the rows of NULLs of each entry.
+	nulls [][]value.Value
 }
 
 type lookupKey struct {
@@ -72,7 +74,10 @@ type lookup struct {
 
 // selectJoin runs a SELECT on several tables.
 func (s *Session) selectJoin(ctx context.Context, st *ast.Select, b *binder, nodes []*fromNode, where filter, o output, order []orderKey, offsetExpr, limitExpr *cexpr) (*Rows, error) {
-	p := &joinPlan{s: s, b: b, st: st, where: where, conds: map[*fromNode][]*jcond{}, post: map[*fromNode][]*jcond{}, never: map[*fromNode]bool{}, lookups: map[lookupKey][]lookup{}, orders: map[*fromNode][]*fromNode{}}
+	p := &joinPlan{s: s, b: b, st: st, where: where, conds: map[*fromNode][]*jcond{}, post: map[*fromNode][]*jcond{}, never: map[*fromNode]bool{}, lookups: map[lookupKey][]lookup{}, groups: map[*fromNode]*groupRun{}}
+	for _, e := range b.scope.entries {
+		p.nulls = append(p.nulls, nullRow(e.t))
+	}
 	p.top = nodes[0]
 	for _, n := range nodes[1:] {
 		p.top = &fromNode{entry: -1, kind: ast.JoinCross, left: p.top, right: n, tables: p.top.tables | n.tables}
@@ -112,7 +117,11 @@ func (s *Session) selectJoin(ctx context.Context, st *ast.Select, b *binder, nod
 	if err != nil {
 		return nil, err
 	}
-	var rows [][]value.Value
+	// Postgres evaluates the output on every row of the join, and fails at the first row that
+	// fails, which depends on the order of its plan. The class of the error is the same in every
+	// order only when every row that fails fails with it.
+	var collected []sortable
+	var first error
 	if open && !where.never {
 		if err := p.candidates(ctx, order); err != nil {
 			return nil, err
@@ -122,33 +131,24 @@ func (s *Session) selectJoin(ctx context.Context, st *ast.Select, b *binder, nod
 		}
 		r := &joinRun{p: p, ctx: ctx, row: make([]value.Value, b.scope.width)}
 		err := r.node(p.top, 0, nil, func() error {
-			rows = append(rows, slices.Clone(r.row))
+			out, err := project(o.items, r.row)
+			var keys []value.Value
+			if err == nil {
+				keys, err = sortKeys(order, out, r.row)
+			}
+			switch {
+			case err == nil:
+				collected = append(collected, sortable{out, keys})
+			case first == nil:
+				first = err
+			case !errors.Is(err, errorKind(first)):
+				return fmt.Errorf("%w: %w: rows of this join fail with different errors, %v and %v, and which of them Postgres reports depends on the order of its plan; select the rows first, and compute the expressions on them", ErrUnsupported, errOrderDependent, errorKind(first), errorKind(err))
+			}
 			return nil
 		})
 		if err != nil {
 			return nil, err
 		}
-	}
-	// Postgres evaluates the output on every row of the join, and fails at the first row that
-	// fails, which depends on the order of its plan. The class of the error is the same in every
-	// order only when every row that fails fails with it.
-	var collected []sortable
-	var first error
-	for _, row := range rows {
-		r, err := project(o.items, row)
-		var keys []value.Value
-		if err == nil {
-			keys, err = sortKeys(order, r, row)
-		}
-		if err != nil {
-			if first == nil {
-				first = err
-			} else if !errors.Is(err, errorKind(first)) {
-				return nil, fmt.Errorf("%w: %w: rows of this join fail with different errors, %v and %v, and which of them Postgres reports depends on the order of its plan; select the rows first, and compute the expressions on them", ErrUnsupported, errOrderDependent, errorKind(first), errorKind(err))
-			}
-			continue
-		}
-		collected = append(collected, sortable{r, keys})
 	}
 	if first != nil {
 		return nil, first
@@ -297,18 +297,10 @@ func (p *joinPlan) candidates(ctx context.Context, order []orderKey) error {
 	return nil
 }
 
-// columnsOf calls fn with the columns of entry i that e reads.
+// columnsOf calls fn with the columns of entry i that e reads. The conditions are normalized, so
+// their references resolve by the names of the entries in any namespace of the statement.
 func (p *joinPlan) columnsOf(e ast.Expr, i int, fn func(col int)) {
-	ast.Walk(e, func(x ast.Expr) bool {
-		if ref, ok := x.(*ast.ColumnRef); ok {
-			// The conditions are normalized, so their references resolve by the names of the
-			// entries, in any namespace of the statement.
-			if r, err := p.b.scope.resolve(p.b.ns, ref); err == nil && r.entry == i {
-				fn(r.col)
-			}
-		}
-		return true
-	})
+	p.b.columnsOf(p.b.ns, e, i, fn)
 }
 
 // reads are the columns of entry i that the statement reads anywhere.
@@ -388,7 +380,7 @@ func (p *joinPlan) check(ctx context.Context) error {
 			return nil, err
 		}
 		if e.nullable {
-			d = append(d, nullRow(e.t))
+			d = append(d, p.nulls[i])
 		}
 		rows[i] = d
 		return d, nil
@@ -503,15 +495,34 @@ func (p *joinPlan) group(n *fromNode) ([]*fromNode, []*jcond, bool) {
 	return append(li, ri...), append(append(append([]*jcond{}, lc...), rc...), p.conds[n]...), ln || rn || p.never[n]
 }
 
+// groupRun is the group of a node with the conditions of an enclosing left join, and the order
+// of its items, which are the same on every run of the node.
+type groupRun struct {
+	order []*fromNode
+	conds []*jcond
+	never bool
+}
+
+// groupAt returns the [groupRun] of n with the conditions extra, made on the first run.
+func (p *joinPlan) groupAt(n *fromNode, bound tableSet, extra []*jcond) *groupRun {
+	if g, ok := p.groups[n]; ok {
+		return g
+	}
+	items, conds, never := p.group(n)
+	conds = append(conds, extra...)
+	g := &groupRun{order: p.order(items, conds, bound), conds: conds, never: never}
+	p.groups[n] = g
+	return g
+}
+
 // node runs the joins at n, with the entries of bound already in the row, and calls emit for
 // every row they produce. The conditions extra, of an enclosing left join, must hold too.
 func (r *joinRun) node(n *fromNode, bound tableSet, extra []*jcond, emit func() error) error {
-	items, conds, never := r.p.group(n)
-	if never {
+	g := r.p.groupAt(n, bound, extra)
+	if g.never {
 		return nil
 	}
-	conds = append(conds, extra...)
-	order := r.p.order(n, items, conds, bound)
+	order, conds := g.order, g.conds
 	var step func(k int, bound tableSet) error
 	step = func(k int, bound tableSet) error {
 		if k == len(order) {
@@ -575,9 +586,8 @@ func (r *joinRun) item(n *fromNode, bound tableSet, conds []*jcond, emit func() 
 		if matched {
 			return nil
 		}
-		for _, i := range n.right.tables.members() {
-			e := r.p.b.scope.entries[i]
-			copy(r.row[e.offset:], nullRow(e.t))
+		for _, i := range n.right.members {
+			copy(r.row[r.p.b.scope.entries[i].offset:], r.p.nulls[i])
 		}
 		return emit()
 	})
@@ -654,10 +664,7 @@ func (p *joinPlan) lookupsFor(i int, bound tableSet, conds []*jcond) []lookup {
 // to the items before it, preferring an entry that a lookup finds, and the next in FROM order when
 // none is linked, which keeps the loops of a long chain of equalities short. The rows the group
 // produces are the same in every order.
-func (p *joinPlan) order(n *fromNode, items []*fromNode, conds []*jcond, bound tableSet) []*fromNode {
-	if o, ok := p.orders[n]; ok {
-		return o
-	}
+func (p *joinPlan) order(items []*fromNode, conds []*jcond, bound tableSet) []*fromNode {
 	rest := slices.Clone(items)
 	var out []*fromNode
 	have := bound
@@ -686,6 +693,5 @@ func (p *joinPlan) order(n *fromNode, items []*fromNode, conds []*jcond, bound t
 		have |= rest[pick].tables
 		rest = slices.Delete(rest, pick, pick+1)
 	}
-	p.orders[n] = out
 	return out
 }

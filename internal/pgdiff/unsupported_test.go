@@ -276,6 +276,7 @@ func TestUnsupported(t *testing.T) {
 			example{SQL: "SELECT * FROM (SELECT 1) AS a"},
 			example{SQL: "SELECT * FROM generate_series(1, 2)"},
 			example{SQL: "SELECT i FROM public.dev"},
+			example{SQL: "INSERT INTO public.dev VALUES (9, 1, 'x')"},
 			example{SQL: "SELECT public.dev.i FROM dev"},
 			example{SQL: "SELECT dev FROM dev"},
 			example{SQL: "SELECT dev.* IS NULL FROM dev"},

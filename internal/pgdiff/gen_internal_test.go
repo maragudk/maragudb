@@ -55,6 +55,9 @@ func TestSortedColumns(t *testing.T) {
 		{"SELECT a FROM t ORDER BY c, a", []string{"a"}, nil},
 		{"SELECT a FROM t ORDER BY a + 1", []string{"a"}, nil},
 		{"SELECT a FROM t ORDER BY 2", []string{"a"}, nil},
+		{"SELECT x.a, y.a FROM t x, t y ORDER BY y.a, x.a", []string{"a", "a"}, []int{1, 0}},
+		{"SELECT x.a FROM t x, t y ORDER BY x.b, x.a", []string{"a"}, nil},
+		{"SELECT *, x.a FROM t x ORDER BY x.a", []string{"a", "a"}, nil},
 	}
 	for _, test := range tests {
 		t.Run(test.sql, func(t *testing.T) {
