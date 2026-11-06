@@ -1,6 +1,7 @@
 package exec
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"math"
@@ -184,7 +185,7 @@ func (r *aggRun) add(row []value.Value) {
 	} else {
 		for i, k := range g.keys {
 			if k.used && !keys[i].Null && value.Format(keys[i]) != value.Format(gs.keys[i]) {
-				r.planDependent = cmpOr(r.planDependent, fmt.Errorf("%w: GROUP BY of -0 and 0 in one group is not supported when the query reads the value of the group, because which of them Postgres reads depends on its plan; add 0 to the expression, which makes -0 0", ErrUnsupported))
+				r.planDependent = cmp.Or(r.planDependent, fmt.Errorf("%w: GROUP BY of -0 and 0 in one group is not supported when the query reads the value of the group, because which of them Postgres reads depends on its plan; add 0 to the expression, which makes -0 0", ErrUnsupported))
 			}
 		}
 	}
@@ -204,14 +205,6 @@ func (r *aggRun) add(row []value.Value) {
 		}
 		gs.states[i].add(v, a)
 	}
-}
-
-// cmpOr returns a, or b when a is nil.
-func cmpOr(a, b error) error {
-	if a != nil {
-		return a
-	}
-	return b
 }
 
 // keyValue is v as a value that the key encoding has, with equal values encoded equally: an
@@ -262,7 +255,7 @@ func (r *aggRun) rows(distinct bool, offset, limit int64) (*Rows, error) {
 			if err != nil {
 				// The statement is rejected unless something fails, and the group goes on with a
 				// NULL, which only the errors of its HAVING and output depend on.
-				r.planDependent = cmpOr(r.planDependent, err)
+				r.planDependent = cmp.Or(r.planDependent, err)
 				v = value.NewNull(a.typ)
 			}
 			if gs.states[i].overflows {
@@ -276,7 +269,7 @@ func (r *aggRun) rows(distinct bool, offset, limit int64) (*Rows, error) {
 		pass, err := r.passes(row)
 		if err != nil {
 			if errors.Is(err, errOrderDependent) {
-				r.orderDependent = cmpOr(r.orderDependent, err)
+				r.orderDependent = cmp.Or(r.orderDependent, err)
 			} else {
 				failures = append(failures, err)
 			}
@@ -342,7 +335,7 @@ func (r *aggRun) passes(row []value.Value) (bool, error) {
 		v, err := c.value(row)
 		switch {
 		case err != nil:
-			failure = cmpOr(failure, err)
+			failure = cmp.Or(failure, err)
 		case v.Null || !v.B:
 			pass = false
 			if rejecting < 0 {
@@ -360,8 +353,9 @@ func (r *aggRun) passes(row []value.Value) (bool, error) {
 type aggState struct {
 	// n counts the rows, or the values that are not NULL.
 	n int64
-	// sum of integers.
-	sum *big.Int
+	// small is the sum of integers while it fits in a bigint, and sum the sum after that.
+	small int64
+	sum   *big.Int
 	// floats are the values of a float SUM or AVG.
 	floats []float64
 	// best is the value of a MIN or MAX so far.
@@ -405,7 +399,11 @@ func (s *aggState) add(v value.Value, a *aggregate) {
 			return
 		}
 		if s.sum == nil {
-			s.sum = new(big.Int)
+			if r, overflow := addInt64(s.small, v.I); !overflow {
+				s.small = r
+				return
+			}
+			s.sum = big.NewInt(s.small)
 		}
 		s.sum.Add(s.sum, big.NewInt(v.I))
 	case "min", "max":
@@ -430,6 +428,9 @@ func (s *aggState) result(a *aggregate) (value.Value, error) {
 	}
 	switch a.name {
 	case "sum", "avg":
+		if a.typ != value.Float && s.sum == nil {
+			s.sum = big.NewInt(s.small)
+		}
 		switch {
 		case a.typ == value.Float:
 			return s.floatResult(a)
@@ -568,4 +569,10 @@ func exactSum(xs []float64) bool {
 		}
 	}
 	return true
+}
+
+// addInt64 adds two bigints and reports whether the sum overflows.
+func addInt64(a, b int64) (int64, bool) {
+	r := a + b
+	return r, (r > a) != (b > 0)
 }

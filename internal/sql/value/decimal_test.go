@@ -1,7 +1,9 @@
 package value_test
 
 import (
+	"fmt"
 	"math/big"
+	"strings"
 	"testing"
 
 	"hegel.dev/go/hegel"
@@ -91,20 +93,41 @@ func TestCompare_decimal(t *testing.T) {
 		is.Equal(t, value.DecimalKey("2.50"), value.DecimalKey("2.5"))
 	})
 
-	t.Run("orders quotients as their exact values are ordered", func(t *testing.T) {
+	t.Run("rounds every quotient to within half a unit of its last digit, and orders quotients as their exact values", func(t *testing.T) {
 		hegel.Test(t, func(ht *hegel.T) {
-			a := big.NewInt(hegel.Draw(ht, hegel.Integers[int64](-1_000_000, 1_000_000)))
-			b := big.NewInt(hegel.Draw(ht, hegel.Integers[int64](1, 1_000)))
-			c := big.NewInt(hegel.Draw(ht, hegel.Integers[int64](-1_000_000, 1_000_000)))
-			d := big.NewInt(hegel.Draw(ht, hegel.Integers[int64](1, 1_000)))
-			// a/b < c/d exactly when a*d < c*b, and the rounded quotients keep a strict order of
-			// values that differ by more than their rounding.
+			draw := func() (*big.Int, *big.Int) {
+				n := big.NewInt(hegel.Draw(ht, hegel.Integers[int64](-1<<62, 1<<62)))
+				n.Mul(n, big.NewInt(hegel.Draw(ht, hegel.Integers[int64](1, 1<<20))))
+				return n, big.NewInt(hegel.Draw(ht, hegel.Integers[int64](1, 1<<40)))
+			}
+			a, b := draw()
+			c, d := draw()
+			x, y := value.DecimalDiv(a, b), value.DecimalDiv(c, d)
+			ht.Note(fmt.Sprintf("%v/%v = %s, %v/%v = %s", a, b, x.S, c, d, y.S))
+			for _, q := range []struct {
+				n, d *big.Int
+				v    value.Value
+			}{{a, b, x}, {c, d, y}} {
+				got, ok := new(big.Rat).SetString(q.v.S)
+				if !ok {
+					ht.Fatalf("bad text %q", q.v.S)
+				}
+				scale := 0
+				if _, frac, ok := strings.Cut(q.v.S, "."); ok {
+					scale = len(frac)
+				}
+				diff := new(big.Rat).Sub(got, new(big.Rat).SetFrac(q.n, q.d))
+				half := new(big.Rat).SetFrac(big.NewInt(1), new(big.Int).Mul(big.NewInt(2), new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil)))
+				if diff.Abs(diff).Cmp(half) > 0 {
+					ht.Fatalf("%v/%v is %s, off by more than half a unit", q.n, q.d, q.v.S)
+				}
+				if digits := len(strings.TrimLeft(strings.NewReplacer("-", "", ".", "").Replace(q.v.S), "0")); got.Sign() != 0 && digits < 16 {
+					ht.Fatalf("%s has %d significant digits, fewer than 16", q.v.S, digits)
+				}
+			}
 			exact := new(big.Int).Mul(a, d).Cmp(new(big.Int).Mul(c, b))
-			got := value.Compare(value.DecimalDiv(a, b), value.DecimalDiv(c, d))
-			if exact == 0 {
-				is.Equal(t, 0, got)
-			} else if got != 0 {
-				is.Equal(t, exact, got)
+			if got := value.Compare(x, y); exact == 0 && got != 0 || exact != 0 && got != 0 && got != exact {
+				ht.Fatalf("exact order %d, compared %d", exact, got)
 			}
 		})
 	})

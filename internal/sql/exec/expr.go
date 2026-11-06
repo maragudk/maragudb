@@ -1410,17 +1410,16 @@ func (b *binder) call(e *ast.Call) (*cexpr, error) {
 	if ast.Aggregates[e.Name] {
 		return b.aggregate(e)
 	}
-	if e.Distinct {
-		// The arguments are analyzed first, as in Postgres.
-		for _, a := range e.Args {
-			if _, err := b.bind(a); err != nil {
-				return nil, err
-			}
+	if e.Distinct || e.Star {
+		// Postgres finds the function first, and then reports that it is no aggregate.
+		if _, err := b.call(&ast.Call{Name: e.Name, Args: e.Args}); err != nil {
+			return nil, err
 		}
-		return nil, fmt.Errorf("%w: DISTINCT specified, but %s is not an aggregate function", ErrWrongObjectType, e.Name)
-	}
-	if e.Star {
-		return nil, fmt.Errorf("%w: function %s() does not exist", ErrType, e.Name)
+		what := "DISTINCT"
+		if e.Star {
+			what = e.Name + "(*)"
+		}
+		return nil, fmt.Errorf("%w: %s specified, but %s is not an aggregate function", ErrWrongObjectType, what, e.Name)
 	}
 	if e.Name == "nullif" {
 		return b.nullif(e)

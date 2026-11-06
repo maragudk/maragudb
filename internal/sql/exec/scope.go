@@ -2,6 +2,7 @@ package exec
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 
@@ -132,7 +133,7 @@ func (sc *scope) resolve(ns namespace, ref *ast.ColumnRef) (colRef, error) {
 		case 1:
 			return found[0], nil
 		}
-		return colRef{}, fmt.Errorf("%w: column reference %q is ambiguous", ErrInvalid, ref.Table+"."+ref.Name)
+		return colRef{}, fmt.Errorf("%w: %w: column reference %q is ambiguous", ErrInvalid, errAmbiguous, ref.Table+"."+ref.Name)
 	}
 	for _, it := range ns {
 		for _, c := range it.cols {
@@ -150,8 +151,11 @@ func (sc *scope) resolve(ns namespace, ref *ast.ColumnRef) (colRef, error) {
 	case 1:
 		return found[0], nil
 	}
-	return colRef{}, fmt.Errorf("%w: column reference %q is ambiguous", ErrInvalid, ref.Name)
+	return colRef{}, fmt.Errorf("%w: %w: column reference %q is ambiguous", ErrInvalid, errAmbiguous, ref.Name)
 }
+
+// errAmbiguous is wrapped by the error of a column name that several columns have.
+var errAmbiguous = errors.New("ambiguous")
 
 // expr is an expression that resolves to the column r in a namespace where the entries of the
 // statement are visible by name.

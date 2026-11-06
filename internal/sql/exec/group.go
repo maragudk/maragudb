@@ -68,8 +68,10 @@ type grouping struct {
 	// group has the same values in all their columns.
 	dependent map[int]bool
 	aggs      []*aggregate
-	// input binds the expressions of the input rows, for messages and the text of expressions.
-	input *binder
+	// input binds the expressions of the input rows, for messages and the text of expressions,
+	// and canons are the texts it made, by expression.
+	input  *binder
+	canons map[ast.Expr]string
 }
 
 // groupKey is a GROUP BY expression.
@@ -132,7 +134,11 @@ func (b *binder) groupedExpr(e ast.Expr) (*cexpr, bool, error) {
 		return nil, false, nil
 	}
 	if g.nonVar {
-		canon := g.input.canonical(e)
+		canon, ok := g.canons[e]
+		if !ok {
+			canon = g.input.canonical(e)
+			g.canons[e] = canon
+		}
 		for i, k := range g.keys {
 			if k.canon == canon {
 				k.used = true
@@ -195,6 +201,9 @@ func (b *binder) aggregate(e *ast.Call) (*cexpr, error) {
 	switch {
 	case found:
 		return nil, fmt.Errorf("%w: aggregate function calls cannot be nested", ErrGrouping)
+	case agg.arg != nil && agg.arg.typ == value.Decimal:
+		// A numeric argument is only the result of another aggregate, which is an error above.
+		return nil, errDecimalArithmetic()
 	case b.agg == nil:
 		clause := cmp.Or(b.aggClause, "this clause")
 		return nil, fmt.Errorf("%w: aggregate functions are not allowed in %s", ErrGrouping, clause)
@@ -232,6 +241,9 @@ func (b *binder) aggregateType(agg *aggregate, e *ast.Call, args []*cexpr) error
 		}
 		agg.typ = value.Int
 		return nil
+	}
+	if e.Name == "count" && len(args) == 0 {
+		return fmt.Errorf("%w: count(*) must be used to call a parameterless aggregate function", ErrWrongObjectType)
 	}
 	if len(args) != 1 {
 		return notExist()
@@ -441,7 +453,7 @@ func (s *Session) selectGrouped(ctx context.Context, st *ast.Select, b *binder, 
 // none of that name, the name of an output column, and anything else is an expression. An item
 // that is an output column must not have an aggregate.
 func (b *binder) grouping(st *ast.Select, o output) (*grouping, error) {
-	g := &grouping{dependent: map[int]bool{}}
+	g := &grouping{dependent: map[int]bool{}, canons: map[ast.Expr]string{}}
 	if b.scope != nil {
 		g.width = b.scope.width
 	}
@@ -468,7 +480,7 @@ func (b *binder) grouping(st *ast.Select, o output) (*grouping, error) {
 			if err == nil {
 				break
 			}
-			if strings.Contains(err.Error(), "ambiguous") {
+			if errors.Is(err, errAmbiguous) {
 				return nil, err
 			}
 			// A name that is no column of FROM is an output column's name. Several output
