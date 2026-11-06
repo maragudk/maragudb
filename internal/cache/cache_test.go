@@ -42,6 +42,36 @@ func TestMemory(t *testing.T) {
 		is.True(t, m.Bytes() <= 10)
 	})
 
+	t.Run("keeps a parsed value with its entry until the entry is replaced or evicted", func(t *testing.T) {
+		m := cache.NewMemory(8)
+		v := []byte("1234")
+		m.Put("a", v)
+		_, parsed, ok := m.GetParsed("a")
+		is.True(t, ok)
+		is.True(t, parsed == nil)
+		m.SetParsed("a", v, 1234)
+		got, parsed, ok := m.GetParsed("a")
+		is.True(t, ok)
+		is.Equal(t, "1234", string(got))
+		is.Equal(t, any(1234), parsed)
+		is.Equal(t, int64(4), m.Bytes(), "the parsed value is not counted")
+
+		m.Put("a", []byte("5678"))
+		_, parsed, _ = m.GetParsed("a")
+		is.True(t, parsed == nil, "a new value drops the parsed one")
+		m.SetParsed("a", v, 1234)
+		_, parsed, _ = m.GetParsed("a")
+		is.True(t, parsed == nil, "a parsed value of an older value is not kept")
+
+		m.Put("b", make([]byte, 4))
+		m.Put("c", make([]byte, 4))
+		_, _, ok = m.GetParsed("a")
+		is.True(t, !ok, "the parsed value leaves with its entry")
+		m.SetParsed("a", v, 1234)
+		_, _, ok = m.GetParsed("a")
+		is.True(t, !ok, "setting a parsed value does not add an entry")
+	})
+
 	t.Run("keeps a single entry larger than the budget", func(t *testing.T) {
 		m := cache.NewMemory(2)
 		m.Put("a", make([]byte, 4))

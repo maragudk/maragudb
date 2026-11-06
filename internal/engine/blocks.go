@@ -22,9 +22,16 @@ func (db *DB) readBlock(ctx context.Context, snapshotAt time.Time, objectKey str
 	ck := blockCacheKey(objectKey, ref)
 	// A corrupt cache entry is ignored and replaced from the store.
 	if db.mem != nil {
-		if b, ok := db.mem.Get(ck); ok {
+		// The decoded block is kept with the cached bytes, so that a hit does not decode them
+		// again. Readers share it and never change it.
+		if b, parsed, ok := db.mem.GetParsed(ck); ok {
+			if d, ok := parsed.(*decodedBlock); ok {
+				db.memHits.Add(1)
+				return d, nil
+			}
 			if d, err := decodeBlock(b); err == nil {
 				db.memHits.Add(1)
+				db.mem.SetParsed(ck, b, d)
 				return d, nil
 			}
 			db.log.Warn("corrupt block in memory cache", "key", ck)

@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"unsafe"
 )
 
 // Cache of byte values by key. Implementations must be safe for concurrent use.
@@ -30,6 +31,8 @@ type Memory struct {
 type memoryEntry struct {
 	key   string
 	value []byte
+	// parsed is a value that [Memory.SetParsed] derived from value, or nil.
+	parsed any
 }
 
 // NewMemory cache holding at most maxBytes of values, except that the newest entry is always
@@ -55,7 +58,7 @@ func (m *Memory) Put(key string, value []byte) {
 	if e, ok := m.entries[key]; ok {
 		entry := e.Value.(*memoryEntry)
 		m.bytes += int64(len(value)) - int64(len(entry.value))
-		entry.value = value
+		entry.value, entry.parsed = value, nil
 		m.order.MoveToFront(e)
 	} else {
 		e := m.order.PushFront(&memoryEntry{key: key, value: value})
@@ -68,6 +71,36 @@ func (m *Memory) Put(key string, value []byte) {
 		m.order.Remove(oldest)
 		delete(m.entries, entry.key)
 		m.bytes -= int64(len(entry.value))
+	}
+}
+
+// GetParsed returns the value of key, like [Memory.Get], and the value that [Memory.SetParsed]
+// derived from it, or nil. The parsed value is not counted in the bytes the cache holds, and it
+// leaves the cache with its value.
+func (m *Memory) GetParsed(key string) ([]byte, any, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e, ok := m.entries[key]
+	if !ok {
+		return nil, nil, false
+	}
+	m.order.MoveToFront(e)
+	entry := e.Value.(*memoryEntry)
+	return entry.value, entry.parsed, true
+}
+
+// SetParsed keeps parsed, a value derived from value, next to the entry of key, when the entry
+// still holds that same value. Every caller that reads parsed shares it, so it must not change.
+func (m *Memory) SetParsed(key string, value []byte, parsed any) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	e, ok := m.entries[key]
+	if !ok {
+		return
+	}
+	entry := e.Value.(*memoryEntry)
+	if len(entry.value) == len(value) && unsafe.SliceData(entry.value) == unsafe.SliceData(value) {
+		entry.parsed = parsed
 	}
 }
 

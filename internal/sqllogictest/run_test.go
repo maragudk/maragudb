@@ -29,7 +29,12 @@ func TestMain(m *testing.M) {
 func newFileRunner(t *testing.T) *fileRunner {
 	t.Helper()
 	return &fileRunner{pg: pgdiff.Postgres(t), newMaragudb: func() (*sql.DB, error) {
-		c, err := maragudb.NewConnector(maragudb.Options{Store: s3test.NewStore(s3fake.New())}, "s3://bucket/sqllogictest")
+		// Background maintenance checks for work often, and garbage collection deletes the
+		// segments that compaction replaced after a few seconds instead of an hour, so that a file
+		// of thousands of commits neither reads through hundreds of segments nor writes a manifest
+		// whose list of garbage grows with every compaction. No statement of the corpus runs for
+		// nearly as long as the grace period, which would fail it with ErrSnapshotExpired.
+		c, err := maragudb.NewConnector(maragudb.Options{Store: s3test.NewStore(s3fake.New()), MaintenanceInterval: new(20 * time.Millisecond), GCGracePeriod: new(5 * time.Second)}, "s3://bucket/sqllogictest")
 		if err != nil {
 			return nil, err
 		}

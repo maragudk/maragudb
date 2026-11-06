@@ -58,6 +58,34 @@ func (w *world) open(opts maragudb.Options) *sql.DB {
 	return db
 }
 
+// clone the world into a new one for t, with a copy of every object and no faults.
+func (w *world) clone(t *testing.T) *world {
+	t.Helper()
+	c := newWorld(t)
+	for _, key := range w.fake.Keys() {
+		body, _ := w.fake.Body(key)
+		_, err := c.fake.WithoutFaults().Put(t.Context(), key, body, s3.PutOptions{})
+		is.NotError(t, err)
+	}
+	return c
+}
+
+// loadedWorlds returns a function that gives a world with the database that load makes for n,
+// loaded once per n for every subtest of t and copied for each, so that no subtest sees the
+// requests or the writes of another.
+func loadedWorlds(t *testing.T, load func(t *testing.T, db *sql.DB, n int)) func(t *testing.T, n int) *world {
+	worlds := map[int]*world{}
+	return func(sub *testing.T, n int) *world {
+		sub.Helper()
+		if worlds[n] == nil {
+			w := newWorld(t)
+			load(t, w.open(maragudb.Options{}), n)
+			worlds[n] = w
+		}
+		return worlds[n].clone(sub)
+	}
+}
+
 func newDB(t *testing.T) *sql.DB {
 	t.Helper()
 	return newWorld(t).open(maragudb.Options{})
@@ -739,13 +767,12 @@ func TestRequestBudgets_Indexes(t *testing.T) {
 		}
 		return depth
 	}
+	loaded := loadedWorlds(t, load)
 
 	t.Run("a point lookup through a unique index with a cold cache makes a logarithmic number of GETs", func(t *testing.T) {
 		verify.Covers(t, "a SELECT by a unique secondary index with a cold cache makes a logarithmic number of GETs: one descent each for the table definition, the index entry, and the row", "AC-5.5")
 		for _, n := range sizes {
-			w := newWorld(t)
-			db := w.open(maragudb.Options{})
-			load(t, db, n)
+			w := loaded(t, n)
 			cold := w.open(maragudb.Options{MemoryCacheBytes: new(int64)})
 			before := stats(t, cold)
 			is.Equal(t, fmt.Sprint(n/2), queryRows(t, cold, "SELECT id FROM t WHERE email = $1", fmt.Sprintf("user-%d@example.com", n/2)))
@@ -763,11 +790,12 @@ func TestRequestBudgets_Indexes(t *testing.T) {
 	t.Run("a commit that changes indexed columns makes one conditional GET and two PUTs regardless of database size", func(t *testing.T) {
 		verify.Covers(t, "an autocommit UPDATE that changes the columns of two indexes, and so deletes and writes entries of both, makes one conditional GET and two PUTs at every database size", "AC-5.6", "AC-5.1")
 		for _, n := range sizes {
-			w := newWorld(t)
-			db := w.open(maragudb.Options{})
-			load(t, db, n)
-			// Warm the cache with the same statement on another row.
+			db := loaded(t, n).open(maragudb.Options{})
+			// Warm the cache with the same statement on another row, and with reads of the row and
+			// of the index entry that the measured statement checks.
 			mustExec(t, db, "UPDATE t SET email = $1, n = n + 1 WHERE id = $2", "warm@example.com", n/3)
+			is.Equal(t, fmt.Sprint(n/2), queryRows(t, db, "SELECT id FROM t WHERE id = $1", n/2))
+			is.Equal(t, "", queryRows(t, db, "SELECT id FROM t WHERE email = $1", "moved@example.com"))
 			before := stats(t, db)
 			mustExec(t, db, "UPDATE t SET email = $1, n = n + 1 WHERE id = $2", "moved@example.com", n/2)
 			d := stats(t, db).Sub(before)
@@ -776,6 +804,7 @@ func TestRequestBudgets_Indexes(t *testing.T) {
 			is.Equal(t, int64(1), d.Put)
 			is.Equal(t, int64(1), d.PutConditional)
 			is.Equal(t, int64(1), d.GetConditional)
+			is.Equal(t, int64(0), d.Get, "the cache is warm")
 		}
 	})
 }
