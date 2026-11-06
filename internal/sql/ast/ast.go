@@ -41,6 +41,61 @@ type CreateTable struct {
 	PrimaryKeyName string
 	// Unique constraints, column and table constraints alike, in the order they are written.
 	Unique []UniqueConstraint
+	// Checks are the CHECK constraints, column and table constraints alike, in the order they
+	// are written.
+	Checks []CheckConstraint
+	// ForeignKeys are the FOREIGN KEY and REFERENCES constraints, column and table constraints
+	// alike, in the order they are written.
+	ForeignKeys []ForeignKey
+}
+
+// CheckConstraint of a [CreateTable].
+type CheckConstraint struct {
+	// Name of the constraint, or "" for the name Postgres chooses.
+	Name string
+	Expr Expr
+}
+
+// ForeignKey constraint of a [CreateTable]: its columns reference the columns RefColumns of the
+// table Table, or its primary key when RefColumns is empty. Every row whose columns have no NULL
+// must have a row in Table with the same values, which MATCH SIMPLE means.
+type ForeignKey struct {
+	// Name of the constraint, or "" for the name Postgres chooses.
+	Name       string
+	Columns    []string
+	Table      string
+	RefColumns []string
+	// OnDelete and OnUpdate are the referential actions.
+	OnDelete, OnUpdate Action
+	// SetColumns are the columns that ON DELETE SET NULL or SET DEFAULT sets, or empty for every
+	// column of the key.
+	SetColumns []string
+}
+
+// Action of a [ForeignKey] when a referenced row is deleted or its key updated.
+type Action int
+
+// Actions.
+const (
+	NoAction Action = iota
+	Restrict
+	Cascade
+	SetNull
+	SetDefault
+)
+
+func (a Action) String() string {
+	switch a {
+	case Restrict:
+		return "RESTRICT"
+	case Cascade:
+		return "CASCADE"
+	case SetNull:
+		return "SET NULL"
+	case SetDefault:
+		return "SET DEFAULT"
+	}
+	return "NO ACTION"
 }
 
 // UniqueConstraint of a [CreateTable].
@@ -83,6 +138,8 @@ type ColumnDef struct {
 	Name    string
 	Type    value.Type
 	NotNull bool
+	// Default is the expression of the column's DEFAULT, or nil.
+	Default Expr
 }
 
 // DropTable statement.
@@ -91,12 +148,14 @@ type DropTable struct {
 	IfExists bool
 }
 
-// Insert statement with one or more VALUES rows. An empty Columns list means every column in
-// table order.
+// Insert statement with one or more VALUES rows, in which an item can be [Default]. An empty
+// Columns list means every column in table order. With DefaultValues, the statement is INSERT
+// ... DEFAULT VALUES, which has no columns and no rows.
 type Insert struct {
-	Table   string
-	Columns []string
-	Rows    [][]Expr
+	Table         string
+	Columns       []string
+	Rows          [][]Expr
+	DefaultValues bool
 }
 
 // Update statement.
@@ -106,7 +165,7 @@ type Update struct {
 	Where Expr
 }
 
-// Assignment in an [Update].
+// Assignment in an [Update]. Its Value can be [Default].
 type Assignment struct {
 	Column string
 	Value  Expr
@@ -277,11 +336,17 @@ type When struct {
 	Cond, Result Expr
 }
 
-// Call of a scalar function by lowercase name.
+// Call of a scalar function by lowercase name. With Keyword, it is a function that SQL writes as
+// a keyword without parentheses, such as CURRENT_TIMESTAMP, and has no arguments.
 type Call struct {
-	Name string
-	Args []Expr
+	Name    string
+	Args    []Expr
+	Keyword bool
 }
+
+// Default is the DEFAULT keyword in the VALUES of an INSERT or the SET of an UPDATE, which
+// stands for the default value of the column.
+type Default struct{}
 
 // Cast is `CAST(expr AS type)`, `expr::type`, or, for a quoted string, `type 'string'`.
 type Cast struct {
@@ -312,6 +377,7 @@ func (*Like) expr()      {}
 func (*Case) expr()      {}
 func (*Call) expr()      {}
 func (*Cast) expr()      {}
+func (*Default) expr()   {}
 
 // Walk calls fn on e and then on every subexpression, depth first, while fn returns true.
 func Walk(e Expr, fn func(Expr) bool) {
@@ -391,7 +457,7 @@ func Map(e Expr, fn func(Expr) Expr) Expr {
 		}
 		return fn(c)
 	case *Call:
-		return fn(&Call{Name: e.Name, Args: list(e.Args)})
+		return fn(&Call{Name: e.Name, Args: list(e.Args), Keyword: e.Keyword})
 	case *Cast:
 		return fn(&Cast{Expr: m(e.Expr), Type: e.Type, Style: e.Style})
 	}

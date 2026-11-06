@@ -31,7 +31,7 @@ func newBoth(t *testing.T, create string) both {
 	is.NotError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
 	b := both{m: m, pg: r.PG}
-	for _, q := range []string{"DROP VIEW IF EXISTS dev_view", "DROP TABLE IF EXISTS dev", "DROP TABLE IF EXISTS dev2"} {
+	for _, q := range []string{"DROP VIEW IF EXISTS dev_view", "DROP TABLE IF EXISTS dev2 CASCADE", "DROP TABLE IF EXISTS dev CASCADE", "DROP SEQUENCE IF EXISTS dev_seq"} {
 		_, err = b.pg.ExecContext(t.Context(), q)
 		is.NotError(t, err)
 	}
@@ -136,17 +136,35 @@ func TestUnsupported(t *testing.T) {
 		)
 	})
 
+	t.Run("UNS-SEQUENCES sequences, serial types, and identity columns", func(t *testing.T) {
+		verify.Covers(t, "sequences, the serial types, and identity columns are rejected with a hint, and Postgres accepts them", "UNS-SEQUENCES")
+		rejects(t, create,
+			example{SQL: "CREATE TABLE dev2 (a serial PRIMARY KEY)"},
+			example{SQL: "CREATE TABLE dev2 (a bigserial PRIMARY KEY)"},
+			example{SQL: "CREATE TABLE dev2 (a bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY)"},
+			example{SQL: "CREATE SEQUENCE dev_seq"},
+		)
+	})
+
+	t.Run("UNS-DEFAULT a DEFAULT that can fail", func(t *testing.T) {
+		verify.Covers(t, "a DEFAULT whose constant part fails, or that can fail when it is evaluated, is rejected when the table is created, and Postgres accepts the table", "UNS-DEFAULT")
+		rejects(t, create,
+			example{SQL: "CREATE TABLE dev2 (a bigint PRIMARY KEY, b bigint DEFAULT 1 / 0)"},
+			example{SQL: "CREATE TABLE dev2 (a bigint PRIMARY KEY, b bigint DEFAULT 2147483647 + 1)"},
+			example{SQL: "CREATE TABLE dev2 (a bigint PRIMARY KEY, b timestamptz DEFAULT CAST(CAST(now() AS text) AS timestamptz))"},
+		)
+	})
+
 	t.Run("UNS-NO-PRIMARY-KEY tables without a primary key", func(t *testing.T) {
 		verify.Covers(t, "a table without a primary key is rejected, and Postgres accepts it", "UNS-NO-PRIMARY-KEY")
 		rejects(t, create, example{SQL: "CREATE TABLE dev2 (a bigint)"})
 	})
 
 	t.Run("UNS-DDL other schema statements and constraints", func(t *testing.T) {
-		verify.Covers(t, "schema statements other than CREATE TABLE, DROP TABLE, CREATE INDEX, and DROP INDEX, and constraints other than PRIMARY KEY, UNIQUE, and NOT NULL, are rejected, and Postgres accepts them", "UNS-DDL")
+		verify.Covers(t, "schema statements other than CREATE TABLE, DROP TABLE, CREATE INDEX, and DROP INDEX, constraints other than PRIMARY KEY, UNIQUE, NOT NULL, DEFAULT, CHECK, and FOREIGN KEY, and a named NOT NULL are rejected, and Postgres accepts them", "UNS-DDL")
 		rejects(t, create,
-			example{SQL: "CREATE TABLE dev2 (a bigint PRIMARY KEY, b bigint DEFAULT 1)"},
-			example{SQL: "CREATE TABLE dev2 (a bigint PRIMARY KEY CHECK (a > 0))"},
-			example{SQL: "CREATE TABLE dev2 (a bigint PRIMARY KEY, b bigint REFERENCES dev2 (a))"},
+			example{SQL: "CREATE TABLE dev2 (a bigint PRIMARY KEY, b bigint, EXCLUDE USING btree (b WITH =))"},
+			example{SQL: "CREATE TABLE dev2 (a bigint CONSTRAINT dev2_a_nn NOT NULL PRIMARY KEY)"},
 			example{SQL: "CREATE TEMP TABLE dev2 (a bigint PRIMARY KEY)"},
 			example{SQL: "CREATE VIEW dev_view AS SELECT 1"},
 			example{SQL: "ALTER TABLE dev ADD COLUMN k bigint"},
@@ -196,7 +214,7 @@ func TestUnsupported(t *testing.T) {
 	})
 
 	t.Run("UNS-CLAUSES other clauses of queries and writes", func(t *testing.T) {
-		verify.Covers(t, "DISTINCT, GROUP BY, joins, subqueries, set operations, aliases, qualified names, FOR UPDATE, RETURNING, ON CONFLICT, INSERT ... SELECT, and DEFAULT are rejected, and Postgres accepts them", "UNS-CLAUSES")
+		verify.Covers(t, "DISTINCT, GROUP BY, joins, subqueries, set operations, aliases, qualified names, FOR UPDATE, RETURNING, ON CONFLICT, and INSERT ... SELECT are rejected, and Postgres accepts them", "UNS-CLAUSES")
 		rejects(t, create,
 			example{SQL: "SELECT DISTINCT j FROM dev"},
 			example{SQL: "SELECT j FROM dev GROUP BY j"},
@@ -207,15 +225,18 @@ func TestUnsupported(t *testing.T) {
 			example{SQL: "INSERT INTO dev VALUES (5, 1, 'x') RETURNING i"},
 			example{SQL: "INSERT INTO dev SELECT 6, 1, 'x'"},
 			example{SQL: "INSERT INTO dev VALUES (7, 1, 'x') ON CONFLICT DO NOTHING"},
-			example{SQL: "INSERT INTO dev VALUES (8, DEFAULT, 'x')"},
 		)
 	})
 
-	t.Run("UNS-FUNCTIONS functions other than the supported five", func(t *testing.T) {
-		verify.Covers(t, "functions other than abs, coalesce, length, lower, and upper, including aggregates and window functions, are rejected, and Postgres accepts them", "UNS-FUNCTIONS")
+	t.Run("UNS-FUNCTIONS functions other than the supported ones", func(t *testing.T) {
+		verify.Covers(t, "functions other than abs, coalesce, length, lower, upper, now, transaction_timestamp, and CURRENT_TIMESTAMP, including aggregates, window functions, the other clocks, and CURRENT_TIMESTAMP with a precision, are rejected, and Postgres accepts them", "UNS-FUNCTIONS")
 		rejects(t, create,
 			example{SQL: "SELECT count(*) FROM dev"},
-			example{SQL: "SELECT now()"},
+			example{SQL: "SELECT statement_timestamp()"},
+			example{SQL: "SELECT clock_timestamp()"},
+			example{SQL: "SELECT CURRENT_TIMESTAMP(3)"},
+			example{SQL: "SELECT LOCALTIMESTAMP"},
+			example{SQL: "SELECT CURRENT_DATE"},
 			example{SQL: "SELECT nullif(1, 2)"},
 			example{SQL: "SELECT int8pl(1, 2)"},
 			example{SQL: "SELECT count(*) OVER () FROM dev"},

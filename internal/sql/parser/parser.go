@@ -64,6 +64,18 @@ func ParseExpr(sql string) (ast.Expr, error) {
 type parser struct {
 	lex lexer
 	tok token
+	// restricted is set while parsing the expression of a DEFAULT, which is Postgres's b_expr:
+	// outside of parentheses, function calls, CASE, and CAST, it has no boolean operators, IS,
+	// LIKE, BETWEEN, or IN.
+	restricted bool
+}
+
+// unrestricted lifts the restriction of a DEFAULT expression inside a construct with delimiters
+// of its own, and returns the function that restores it.
+func (p *parser) unrestricted() func() {
+	restricted := p.restricted
+	p.restricted = false
+	return func() { p.restricted = restricted }
 }
 
 func (p *parser) errorf(format string, args ...any) error {
@@ -336,8 +348,9 @@ func (p *parser) begin() (ast.Statement, error) {
 // unsupportedTypes that Postgres has and maragudb does not, with the type to use instead.
 var unsupportedTypes = map[string]string{
 	"integer": "integer is not supported, use bigint", "int": "int is not supported, use bigint", "int4": "int4 is not supported, use bigint",
-	"smallint": "smallint is not supported, use bigint", "int2": "int2 is not supported, use bigint", "serial": "serial is not supported, use bigint",
-	"bigserial": "bigserial is not supported, use bigint", "smallserial": "smallserial is not supported, use bigint",
+	"smallint": "smallint is not supported, use bigint", "int2": "int2 is not supported, use bigint", "serial": "serial is not supported, because there are no sequences; use bigint and generate the keys in the application",
+	"bigserial": "bigserial is not supported, because there are no sequences; use bigint and generate the keys in the application",
+	"smallserial": "smallserial is not supported, because there are no sequences; use bigint and generate the keys in the application",
 	"real": "real is not supported, use double precision", "float4": "float4 is not supported, use double precision",
 	"numeric": "numeric is not supported, use double precision or bigint", "decimal": "decimal is not supported, use double precision or bigint",
 	"dec": "dec is not supported, use double precision or bigint", "money": "money is not supported, use bigint",
@@ -526,8 +539,32 @@ func (p *parser) createTable() (ast.Statement, error) {
 				return nil, err
 			}
 			s.Unique = append(s.Unique, u)
+		case p.isKeyword("check"):
+			c, err := p.check(name)
+			if err != nil {
+				return nil, err
+			}
+			s.Checks = append(s.Checks, c)
+		case p.isKeyword("foreign"):
+			if err := p.advance(); err != nil {
+				return nil, err
+			}
+			if err := p.expectWord("key"); err != nil {
+				return nil, err
+			}
+			columns, err := p.columnList()
+			if err != nil {
+				return nil, err
+			}
+			fk, err := p.references(name, columns)
+			if err != nil {
+				return nil, err
+			}
+			s.ForeignKeys = append(s.ForeignKeys, fk)
 		case p.tok.kind == tokKeyword && unsupportedConstraints[p.tok.text] != "":
 			return nil, p.unsupportedf("%s", unsupportedConstraints[p.tok.text])
+		case p.isWord("exclude") && (p.peekIsWord("using") || p.peek().kind == tokOp && p.peek().text == "("):
+			return nil, p.unsupportedf("%s", unsupportedConstraints["exclude"])
 		case p.isKeyword("like"):
 			return nil, p.unsupportedf("LIKE in CREATE TABLE is not supported")
 		case name != "":
@@ -544,6 +581,8 @@ func (p *parser) createTable() (ast.Statement, error) {
 			}
 			s.Columns = append(s.Columns, col.def)
 			s.Unique = append(s.Unique, col.unique...)
+			s.Checks = append(s.Checks, col.checks...)
+			s.ForeignKeys = append(s.ForeignKeys, col.foreignKeys...)
 		}
 		if p.isOp(",") {
 			if err := p.advance(); err != nil {
@@ -629,25 +668,176 @@ func (p *parser) constraintOptions() error {
 	return nil
 }
 
+// check parses CHECK (expr) and its options, of a constraint with the given name.
+func (p *parser) check(name string) (ast.CheckConstraint, error) {
+	c := ast.CheckConstraint{Name: name}
+	if err := p.advance(); err != nil {
+		return c, err
+	}
+	if err := p.expectOp("("); err != nil {
+		return c, err
+	}
+	var err error
+	if c.Expr, err = p.expr(0); err != nil {
+		return c, err
+	}
+	if err := p.expectOp(")"); err != nil {
+		return c, err
+	}
+	if p.isWord("no") && p.peekIsWord("inherit") {
+		return c, p.unsupportedf("NO INHERIT is not supported, there is no inheritance")
+	}
+	return c, p.enforcement()
+}
+
+// references parses REFERENCES and what follows it, of a foreign key with the given name on the
+// given columns.
+func (p *parser) references(name string, columns []string) (ast.ForeignKey, error) {
+	fk := ast.ForeignKey{Name: name, Columns: columns}
+	if err := p.expectWord("references"); err != nil {
+		return fk, err
+	}
+	var err error
+	if fk.Table, err = p.ident(); err != nil {
+		return fk, err
+	}
+	if p.isOp("(") {
+		if fk.RefColumns, err = p.columnList(); err != nil {
+			return fk, err
+		}
+	}
+	if p.isWord("match") {
+		if err := p.advance(); err != nil {
+			return fk, err
+		}
+		switch {
+		case p.isKeyword("full"):
+			return fk, p.unsupportedf("MATCH FULL is not supported, write MATCH SIMPLE or nothing, and NOT NULL on the columns that must be set together")
+		case p.isWord("partial"):
+			return fk, p.unsupportedf("MATCH PARTIAL is not supported")
+		case p.isWord("simple"):
+		default:
+			return fk, p.errorf("expected FULL, PARTIAL, or SIMPLE, got %v", p.tok)
+		}
+		if err := p.advance(); err != nil {
+			return fk, err
+		}
+	}
+	var onDelete, onUpdate bool
+	for p.isKeyword("on") {
+		if err := p.advance(); err != nil {
+			return fk, err
+		}
+		switch {
+		case p.isWord("delete") && !onDelete:
+			onDelete = true
+			if err := p.advance(); err != nil {
+				return fk, err
+			}
+			if fk.OnDelete, fk.SetColumns, err = p.referentialAction(true); err != nil {
+				return fk, err
+			}
+		case p.isWord("update") && !onUpdate:
+			onUpdate = true
+			if err := p.advance(); err != nil {
+				return fk, err
+			}
+			if fk.OnUpdate, _, err = p.referentialAction(false); err != nil {
+				return fk, err
+			}
+		default:
+			return fk, p.errorf("syntax error at or near %v", p.tok)
+		}
+	}
+	return fk, p.enforcement()
+}
+
+// referentialAction parses the action of ON DELETE, or of ON UPDATE, and the columns of SET NULL
+// or SET DEFAULT.
+func (p *parser) referentialAction(onDelete bool) (ast.Action, []string, error) {
+	var a ast.Action
+	switch {
+	case p.isWord("no"):
+		if err := p.advance(); err != nil {
+			return a, nil, err
+		}
+		if err := p.expectWord("action"); err != nil {
+			return a, nil, err
+		}
+		return ast.NoAction, nil, nil
+	case p.isWord("restrict"):
+		a = ast.Restrict
+	case p.isWord("cascade"):
+		a = ast.Cascade
+	case p.isWord("set"):
+		if err := p.advance(); err != nil {
+			return a, nil, err
+		}
+		switch {
+		case p.isKeyword("null"):
+			a = ast.SetNull
+		case p.isKeyword("default"):
+			a = ast.SetDefault
+		default:
+			return a, nil, p.errorf("expected NULL or DEFAULT, got %v", p.tok)
+		}
+	default:
+		return a, nil, p.errorf("expected a referential action, got %v", p.tok)
+	}
+	if !onDelete && a != ast.Restrict {
+		return a, nil, p.unsupportedf("ON UPDATE %s is not supported, only NO ACTION and RESTRICT; update the referencing rows in a statement of their own", a)
+	}
+	if err := p.advance(); err != nil {
+		return a, nil, err
+	}
+	var columns []string
+	if (a == ast.SetNull || a == ast.SetDefault) && p.isOp("(") {
+		var err error
+		if columns, err = p.columnList(); err != nil {
+			return a, nil, err
+		}
+	}
+	return a, columns, nil
+}
+
+// enforcement parses the options of a CHECK or FOREIGN KEY constraint: ENFORCED, which every
+// constraint is, and rejects NOT ENFORCED and NOT VALID.
+func (p *parser) enforcement() error {
+	for {
+		switch {
+		case p.isWord("enforced"):
+			if err := p.advance(); err != nil {
+				return err
+			}
+		case p.isKeyword("not") && p.peekIsWord("enforced"):
+			return p.unsupportedf("NOT ENFORCED is not supported, every constraint is enforced")
+		case p.isKeyword("not") && p.peekIsWord("valid"):
+			return p.unsupportedf("NOT VALID is not supported, every constraint holds for every row")
+		case p.isKeyword("deferrable"), p.isKeyword("initially"), p.isKeyword("not") && p.peekIsWord("deferrable"):
+			return p.unsupportedf("%s", unsupportedConstraints["deferrable"])
+		default:
+			return nil
+		}
+	}
+}
+
 // unsupportedConstraints are the table and column constraints Postgres has beyond PRIMARY KEY,
-// UNIQUE, and NOT NULL.
+// UNIQUE, NOT NULL, DEFAULT, CHECK, and FOREIGN KEY.
 var unsupportedConstraints = map[string]string{
-	"check":      "CHECK is not supported",
-	"foreign":    "FOREIGN KEY is not supported",
-	"references": "REFERENCES is not supported",
 	"exclude":    "EXCLUDE is not supported",
-	"default":    "DEFAULT is not supported",
-	"generated":  "GENERATED columns are not supported",
+	"generated":  "GENERATED columns, identity columns among them, are not supported, because there are no sequences; generate the values in the application",
 	"collate":    "COLLATE is not supported, strings compare by byte order",
 	"deferrable": "DEFERRABLE and NOT DEFERRABLE are not supported, every constraint is checked at once",
 	"initially":  "DEFERRABLE and NOT DEFERRABLE are not supported, every constraint is checked at once",
 }
 
 type columnDef struct {
-	def    ast.ColumnDef
-	pk     bool
-	pkName string
-	unique []ast.UniqueConstraint
+	def         ast.ColumnDef
+	pk          bool
+	pkName      string
+	unique      []ast.UniqueConstraint
+	checks      []ast.CheckConstraint
+	foreignKeys []ast.ForeignKey
 }
 
 func (p *parser) columnDef() (columnDef, error) {
@@ -674,13 +864,49 @@ func (p *parser) columnDef() (columnDef, error) {
 			if err := p.advance(); err != nil {
 				return c, err
 			}
-			if p.isKeyword("deferrable") {
+			switch {
+			case p.isKeyword("deferrable"):
 				return c, p.unsupportedf("%s", unsupportedConstraints["deferrable"])
+			case p.isWord("enforced"):
+				return c, p.unsupportedf("NOT ENFORCED is not supported, every constraint is enforced")
 			}
 			if err := p.expectWord("null"); err != nil {
 				return c, err
 			}
+			if name != "" {
+				return c, p.unsupportedf("a name for a NOT NULL constraint is not supported, leave out CONSTRAINT %s", name)
+			}
 			c.def.NotNull = true
+		case p.isKeyword("default"):
+			if c.def.Default != nil {
+				return c, p.errorf("multiple default values specified for column %q", c.def.Name)
+			}
+			if err := p.advance(); err != nil {
+				return c, err
+			}
+			p.restricted = true
+			e, err := p.expr(0)
+			p.restricted = false
+			if err != nil {
+				return c, err
+			}
+			c.def.Default = e
+		case p.isKeyword("check"):
+			check, err := p.check(name)
+			if err != nil {
+				return c, err
+			}
+			c.checks = append(c.checks, check)
+		case p.isKeyword("references"):
+			fk, err := p.references(name, []string{c.def.Name})
+			if err != nil {
+				return c, err
+			}
+			c.foreignKeys = append(c.foreignKeys, fk)
+		case p.isWord("enforced"):
+			if err := p.advance(); err != nil {
+				return c, err
+			}
 		case p.isKeyword("null"):
 			if err := p.advance(); err != nil {
 				return c, err
@@ -921,8 +1147,12 @@ func (p *parser) insert() (ast.Statement, error) {
 	switch {
 	case p.isKeyword("select"), p.isKeyword("with"), p.isOp("("):
 		return nil, p.unsupportedf("INSERT ... SELECT is not supported, write VALUES")
-	case p.isKeyword("default"):
-		return nil, p.unsupportedf("INSERT ... DEFAULT VALUES is not supported, write VALUES")
+	case p.isKeyword("default") && s.Columns == nil:
+		if err := p.advance(); err != nil {
+			return nil, err
+		}
+		s.DefaultValues = true
+		return s, p.expectWord("values")
 	case p.isWord("overriding"):
 		return nil, p.unsupportedf("OVERRIDING is not supported")
 	}
@@ -998,9 +1228,6 @@ func (p *parser) update() (ast.Statement, error) {
 		}
 		if err := p.expectOp("="); err != nil {
 			return nil, err
-		}
-		if p.isKeyword("default") {
-			return nil, p.unsupportedf("DEFAULT is not supported")
 		}
 		e, err := p.expr(0)
 		if err != nil {
@@ -1280,6 +1507,10 @@ func (p *parser) expr(minBp int) (ast.Expr, error) {
 	}
 	for {
 		switch {
+		case p.restricted && (p.isKeyword("and") || p.isKeyword("or") || p.isKeyword("is") || p.isKeyword("isnull") || p.isKeyword("notnull") ||
+			p.isKeyword("not") || p.isWord("between") || p.isKeyword("in") || p.isKeyword("like") || p.isKeyword("ilike") || p.isKeyword("similar")):
+			// What follows is not part of the restricted expression of a DEFAULT.
+			return left, nil
 		case p.tok.kind == tokOp || p.isKeyword("and") || p.isKeyword("or"):
 			op, bp, ok := binaryOp(p.tok.text)
 			if !ok || bp < minBp {
@@ -1406,6 +1637,8 @@ func (p *parser) expr(minBp int) (ast.Expr, error) {
 
 func (p *parser) unary() (ast.Expr, error) {
 	switch {
+	case p.isKeyword("not") && p.restricted:
+		return nil, p.errorf("syntax error at or near NOT")
 	case p.isKeyword("not"):
 		if err := p.advance(); err != nil {
 			return nil, err
@@ -1555,7 +1788,18 @@ var typeFuncNameKeywords = map[string]bool{
 }
 
 // supportedFunctions, which the executor binds.
-var supportedFunctions = map[string]bool{"length": true, "lower": true, "upper": true, "abs": true, "coalesce": true}
+var supportedFunctions = map[string]bool{"length": true, "lower": true, "upper": true, "abs": true, "coalesce": true, "now": true, "transaction_timestamp": true}
+
+// unsupportedFunctions have a message with what to write instead.
+var unsupportedFunctions = map[string]string{
+	"statement_timestamp": "function statement_timestamp is not supported, write now(), which is the start of the transaction",
+	"clock_timestamp":     "function clock_timestamp is not supported, write now(), which is the start of the transaction",
+	"timeofday":           "function timeofday is not supported, write now(), which is the start of the transaction",
+	"nextval":             "function nextval is not supported, because there are no sequences; generate the keys in the application",
+	"currval":             "function currval is not supported, because there are no sequences",
+	"setval":              "function setval is not supported, because there are no sequences",
+	"lastval":             "function lastval is not supported, because there are no sequences",
+}
 
 func (p *parser) primary() (ast.Expr, error) {
 	tok := p.tok
@@ -1583,10 +1827,22 @@ func (p *parser) primary() (ast.Expr, error) {
 		case "case":
 			return p.caseExpr()
 		case "default":
-			return nil, p.unsupportedf("DEFAULT is not supported")
+			// DEFAULT is an expression only where it stands for a column's default value, as a
+			// whole item of VALUES or of SET, which the executor checks, as Postgres does.
+			return &ast.Default{}, p.advance()
 		case "array":
 			return nil, p.unsupportedf("arrays are not supported")
-		case "current_date", "current_time", "current_timestamp", "localtime", "localtimestamp", "current_user", "current_role", "current_catalog", "current_schema", "session_user", "system_user", "user":
+		case "current_timestamp":
+			if err := p.advance(); err != nil {
+				return nil, err
+			}
+			if p.isOp("(") {
+				return nil, p.unsupportedf("CURRENT_TIMESTAMP with a precision is not supported, write CURRENT_TIMESTAMP")
+			}
+			return &ast.Call{Name: tok.text, Keyword: true}, nil
+		case "current_date", "current_time", "localtime", "localtimestamp":
+			return nil, p.unsupportedf("%s is not supported, because its type is not; write CURRENT_TIMESTAMP or now()", strings.ToUpper(tok.text))
+		case "current_user", "current_role", "current_catalog", "current_schema", "session_user", "system_user", "user":
 			return nil, p.unsupportedf("%s is not supported, pass the value as a parameter", strings.ToUpper(tok.text))
 		case "select", "with":
 			return nil, p.unsupportedf("subqueries are not supported")
@@ -1632,6 +1888,7 @@ func (p *parser) primary() (ast.Expr, error) {
 		return &ast.ColumnRef{Name: tok.text}, nil
 	case tokOp:
 		if tok.text == "(" {
+			defer p.unrestricted()()
 			if err := p.advance(); err != nil {
 				return nil, err
 			}
@@ -1673,11 +1930,15 @@ func (p *parser) prefixLiteral() (ast.Expr, error) {
 // call parses the arguments of a function call, after its name. A quoted name is never one of
 // the Postgres functions that are reported as unsupported.
 func (p *parser) call(name string, quoted bool) (ast.Expr, error) {
+	defer p.unrestricted()()
 	if err := p.advance(); err != nil {
 		return nil, err
 	}
 	// Postgres has far more functions than the list above, so any other name is unsupported too,
 	// rather than a function that does not exist.
+	if msg, ok := unsupportedFunctions[name]; ok {
+		return nil, p.unsupportedf("%s", msg)
+	}
 	if !supportedFunctions[name] {
 		return nil, p.unsupportedf("function %s is not supported", name)
 	}
@@ -1712,6 +1973,7 @@ func (p *parser) call(name string, quoted bool) (ast.Expr, error) {
 }
 
 func (p *parser) cast() (ast.Expr, error) {
+	defer p.unrestricted()()
 	if err := p.advance(); err != nil {
 		return nil, err
 	}
@@ -1736,6 +1998,7 @@ func (p *parser) cast() (ast.Expr, error) {
 }
 
 func (p *parser) caseExpr() (ast.Expr, error) {
+	defer p.unrestricted()()
 	if err := p.advance(); err != nil {
 		return nil, err
 	}

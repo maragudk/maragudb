@@ -67,6 +67,8 @@ type binder struct {
 	// stableErr rejects an expression that [binder.fold] cannot fold because it is stable and
 	// that can fail.
 	stableErr error
+	// now is the value of now() and its synonyms: the start of the transaction.
+	now value.Value
 }
 
 // Phases of a statement, in the order in which Postgres folds their constants: the output
@@ -470,6 +472,8 @@ func (b *binder) bind(e ast.Expr) (*cexpr, error) {
 			return nil, err
 		}
 		return b.cast(x, e.Type)
+	case *ast.Default:
+		return nil, fmt.Errorf("%w: DEFAULT is not allowed in this context", ErrSyntax)
 	}
 	return nil, fmt.Errorf("exec: unsupported expression %T", e)
 }
@@ -1262,6 +1266,16 @@ func (b *binder) call(e *ast.Call) (*cexpr, error) {
 		return nil
 	}
 	switch e.Name {
+	case "now", "transaction_timestamp", "current_timestamp":
+		if err := arity(0); err != nil {
+			return nil, err
+		}
+		// The start of the transaction, which Postgres marks stable, so that it is evaluated when
+		// the statement runs, and never folded.
+		now := b.now
+		return &cexpr{typ: value.Time, stable: true, eval: func([]value.Value) (value.Value, error) {
+			return now, nil
+		}}, nil
 	case "coalesce":
 		if len(e.Args) == 0 {
 			return nil, fmt.Errorf("%w: COALESCE needs at least one argument", ErrSyntax)

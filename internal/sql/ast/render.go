@@ -29,6 +29,10 @@ func TypeName(t value.Type) string {
 
 type renderer struct {
 	b strings.Builder
+	// restricted is set while rendering the restricted expression of a DEFAULT, Postgres's
+	// b_expr, in which a boolean operator, IS, LIKE, BETWEEN, and IN must be in parentheses,
+	// unless they are inside a construct with delimiters of its own, such as a function call.
+	restricted bool
 }
 
 func (r *renderer) stmt(s Statement) {
@@ -49,6 +53,14 @@ func (r *renderer) stmt(s Statement) {
 			r.b.WriteString(TypeName(c.Type))
 			if c.NotNull {
 				r.b.WriteString(" NOT NULL")
+			}
+			if c.Default != nil {
+				// A DEFAULT takes a restricted expression, in which only a parenthesized
+				// expression can have a boolean operator, IS, LIKE, BETWEEN, or IN.
+				r.b.WriteString(" DEFAULT ")
+				r.restricted = true
+				r.expr(c.Default, 0)
+				r.restricted = false
 			}
 		}
 		r.b.WriteString(", ")
@@ -74,6 +86,39 @@ func (r *renderer) stmt(s Statement) {
 			r.b.WriteByte('(')
 			r.idents(u.Columns)
 			r.b.WriteByte(')')
+		}
+		for _, c := range s.Checks {
+			r.b.WriteString(", ")
+			r.constraintName(c.Name)
+			r.b.WriteString("CHECK (")
+			r.expr(c.Expr, 0)
+			r.b.WriteByte(')')
+		}
+		for _, f := range s.ForeignKeys {
+			r.b.WriteString(", ")
+			r.constraintName(f.Name)
+			r.b.WriteString("FOREIGN KEY (")
+			r.idents(f.Columns)
+			r.b.WriteString(") REFERENCES ")
+			r.ident(f.Table)
+			if len(f.RefColumns) > 0 {
+				r.b.WriteString(" (")
+				r.idents(f.RefColumns)
+				r.b.WriteByte(')')
+			}
+			if f.OnDelete != NoAction {
+				r.b.WriteString(" ON DELETE ")
+				r.b.WriteString(f.OnDelete.String())
+				if len(f.SetColumns) > 0 {
+					r.b.WriteString(" (")
+					r.idents(f.SetColumns)
+					r.b.WriteByte(')')
+				}
+			}
+			if f.OnUpdate != NoAction {
+				r.b.WriteString(" ON UPDATE ")
+				r.b.WriteString(f.OnUpdate.String())
+			}
 		}
 		r.b.WriteByte(')')
 	case *DropTable:
@@ -130,6 +175,10 @@ func (r *renderer) stmt(s Statement) {
 			r.b.WriteString(" (")
 			r.idents(s.Columns)
 			r.b.WriteByte(')')
+		}
+		if s.DefaultValues {
+			r.b.WriteString(" DEFAULT VALUES")
+			return
 		}
 		r.b.WriteString(" VALUES ")
 		for i, row := range s.Rows {
@@ -215,6 +264,15 @@ func (r *renderer) stmt(s Statement) {
 		r.b.WriteString("ROLLBACK")
 	default:
 		panic(fmt.Sprintf("ast: rendering %T", s))
+	}
+}
+
+// constraintName writes CONSTRAINT and the name, when there is one.
+func (r *renderer) constraintName(name string) {
+	if name != "" {
+		r.b.WriteString("CONSTRAINT ")
+		r.ident(name)
+		r.b.WriteByte(' ')
 	}
 }
 
@@ -318,13 +376,40 @@ func bindingPower(e Expr) int {
 	return bpPrimary
 }
 
+// restrictable reports whether e can be written without parentheses in a restricted
+// expression.
+func restrictable(e Expr) bool {
+	switch e := e.(type) {
+	case *IsNull, *Between, *In, *Like:
+		return false
+	case *Unary:
+		return e.Op != Not
+	case *Binary:
+		return e.Op != And && e.Op != Or
+	}
+	return true
+}
+
 // expr renders e, parenthesized when its binding power is below minimum.
 func (r *renderer) expr(e Expr, minimum int) {
-	if bindingPower(e) < minimum {
+	if bindingPower(e) < minimum || r.restricted && !restrictable(e) {
+		restricted := r.restricted
+		r.restricted = false
 		r.b.WriteByte('(')
 		r.expr(e, 0)
 		r.b.WriteByte(')')
+		r.restricted = restricted
 		return
+	}
+	if r.restricted {
+		switch e.(type) {
+		case *Case, *Call, *Cast:
+			// Their parts have delimiters of their own, except for a cast in :: style.
+			if c, ok := e.(*Cast); !ok || c.Style != CastColons {
+				r.restricted = false
+				defer func() { r.restricted = true }()
+			}
+		}
 	}
 	switch e := e.(type) {
 	case *Literal:
@@ -415,7 +500,13 @@ func (r *renderer) expr(e Expr, minimum int) {
 			r.expr(e.Else, 0)
 		}
 		r.b.WriteString(" END")
+	case *Default:
+		r.b.WriteString("DEFAULT")
 	case *Call:
+		if e.Keyword {
+			r.b.WriteString(strings.ToUpper(e.Name))
+			return
+		}
 		r.ident(e.Name)
 		r.b.WriteByte('(')
 		r.exprs(e.Args)

@@ -46,11 +46,12 @@ var ErrorClasses = []ErrorClass{
 	// hex, and 42846 cannot_coerce.
 	{Name: "cast", Err: maragudb.ErrCast, Codes: []string{"22P02", "22007", "22008", "22009", "22023", "42846"}},
 	// 42703 is undefined_column, 42883 undefined_function, 42P10 invalid_column_reference, 42701
-	// duplicate_column, 42702 ambiguous_column, and 42P16 invalid_table_definition. It also covers
+	// duplicate_column, 42702 ambiguous_column, 42P16 invalid_table_definition, and 42P02
+	// undefined_parameter, for a parameter in a DEFAULT or CHECK. It also covers
 	// arguments that are invalid in themselves, which Postgres classes as data exceptions: 22025
 	// invalid_escape_sequence for a LIKE pattern ending in its escape, and 2201W and 2201X for a
 	// negative LIMIT or OFFSET.
-	{Name: "invalid", Err: maragudb.ErrInvalid, Codes: []string{"42703", "42883", "42P10", "42701", "42702", "42P16", "22025", "2201W", "2201X"}},
+	{Name: "invalid", Err: maragudb.ErrInvalid, Codes: []string{"42703", "42883", "42P10", "42701", "42702", "42P16", "42P02", "22025", "2201W", "2201X"}},
 	// 25006 is read_only_sql_transaction.
 	{Name: "read-only transaction", Err: maragudb.ErrReadOnlyTx, Codes: []string{"25006"}},
 	// 25P02 is in_failed_sql_transaction.

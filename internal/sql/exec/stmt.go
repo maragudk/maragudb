@@ -27,6 +27,9 @@ func (s *Session) createTable(ctx context.Context, st *ast.CreateTable) error {
 	if exists && st.IfNotExists {
 		return nil
 	}
+	if len(st.Checks) > 0 || len(st.ForeignKeys) > 0 {
+		return fmt.Errorf("%w: CHECK and FOREIGN KEY are not supported yet", ErrUnsupported)
+	}
 	t, err := newTable(st)
 	if err != nil {
 		return err
@@ -37,6 +40,14 @@ func (s *Session) createTable(ctx context.Context, st *ast.CreateTable) error {
 	}
 	if exists {
 		return fmt.Errorf("%w: relation %q already exists", ErrTableExists, st.Name)
+	}
+	for i, c := range st.Columns {
+		if c.Default == nil {
+			continue
+		}
+		if t.Columns[i].Default, err = s.checkDefault(t, i, c.Default); err != nil {
+			return err
+		}
 	}
 	if err := s.putTable(t); err != nil {
 		return err
@@ -84,7 +95,9 @@ func (s *Session) insert(ctx context.Context, st *ast.Insert, params []value.Val
 		return Result{}, err
 	}
 	cols := make([]int, 0, len(t.Columns))
-	if len(st.Columns) == 0 {
+	if st.DefaultValues {
+		// One row in which every column takes its default.
+	} else if len(st.Columns) == 0 {
 		for i := range t.Columns {
 			cols = append(cols, i)
 		}
@@ -103,13 +116,27 @@ func (s *Session) insert(ctx context.Context, st *ast.Insert, params []value.Val
 		}
 	}
 	// Every row is bound and folded before any is evaluated, as in Postgres.
-	b := &binder{params: params}
+	b := &binder{params: params, now: s.now()}
 	var bound [][]*cexpr
+	rows := st.Rows
+	width := 0
+	if st.DefaultValues {
+		rows = [][]ast.Expr{{}}
+	}
 	// As in Postgres, each row is analyzed, checked against the first row's length and the
 	// target columns, and converted to the column types before the next row.
-	for _, exprRow := range st.Rows {
+	for _, exprRow := range rows {
 		var es []*cexpr
-		for _, e := range exprRow {
+		for i, e := range exprRow {
+			if _, ok := e.(*ast.Default); ok && i < len(cols) {
+				// The column's default, which is converted to its type already.
+				c, err := s.defaultExpr(b, t, cols[i])
+				if err != nil {
+					return Result{}, err
+				}
+				es = append(es, c)
+				continue
+			}
 			c, err := b.bind(e)
 			if err != nil {
 				return Result{}, err
@@ -117,20 +144,36 @@ func (s *Session) insert(ctx context.Context, st *ast.Insert, params []value.Val
 			es = append(es, c)
 		}
 		switch {
-		case len(bound) > 0 && len(es) != len(bound[0]):
+		case len(bound) > 0 && len(es) != width:
 			return Result{}, fmt.Errorf("%w: VALUES lists must all be the same length", ErrSyntax)
 		case len(es) > len(cols):
 			return Result{}, fmt.Errorf("%w: INSERT has more expressions than target columns", ErrSyntax)
-		case len(es) < len(cols):
+		case len(es) < len(cols) && len(st.Columns) > 0:
 			return Result{}, fmt.Errorf("%w: INSERT has more target columns than expressions", ErrSyntax)
 		}
+		// Without a column list, the values go to the first columns, and the others take their
+		// defaults.
+		width = len(es)
 		for i := range es {
 			var err error
 			if es[i], err = b.assignable(es[i], t, cols[i]); err != nil {
 				return Result{}, err
 			}
 		}
-		bound = append(bound, es)
+		// The columns the statement leaves out take their defaults.
+		full := make([]*cexpr, len(t.Columns))
+		for i, c := range es {
+			full[cols[i]] = c
+		}
+		for i := range full {
+			if full[i] == nil {
+				var err error
+				if full[i], err = s.defaultExpr(b, t, i); err != nil {
+					return Result{}, err
+				}
+			}
+		}
+		bound = append(bound, full)
 	}
 	if err := b.folding(); err != nil {
 		return Result{}, err
@@ -142,12 +185,9 @@ func (s *Session) insert(ctx context.Context, st *ast.Insert, params []value.Val
 	// it does not fold.
 	for _, es := range bound {
 		row := make([]value.Value, len(t.Columns))
-		for i, c := range t.Columns {
-			row[i] = value.NewNull(c.Type)
-		}
 		for i, c := range es {
 			var err error
-			if row[cols[i]], err = c.value(nil); err != nil {
+			if row[i], err = c.value(nil); err != nil {
 				return Result{}, err
 			}
 		}
@@ -155,7 +195,7 @@ func (s *Session) insert(ctx context.Context, st *ast.Insert, params []value.Val
 			return Result{}, err
 		}
 	}
-	return Result{RowsAffected: int64(len(st.Rows))}, nil
+	return Result{RowsAffected: int64(len(bound))}, nil
 }
 
 // writeRow checks constraints and writes row and its index entries, replacing old, the row at
@@ -350,7 +390,7 @@ func (s *Session) update(ctx context.Context, st *ast.Update, params []value.Val
 	if err != nil {
 		return Result{}, err
 	}
-	b := &binder{table: t, params: params}
+	b := &binder{table: t, params: params, now: s.now()}
 	type assignment struct {
 		col int
 		e   *cexpr
@@ -365,6 +405,10 @@ func (s *Session) update(ctx context.Context, st *ast.Update, params []value.Val
 	b.phase = phaseOutput
 	values := make([]*cexpr, len(st.Set))
 	for i, a := range st.Set {
+		if _, ok := a.Value.(*ast.Default); ok {
+			// Bound with its column below.
+			continue
+		}
 		if values[i], err = b.bind(a.Value); err != nil {
 			return Result{}, err
 		}
@@ -376,7 +420,12 @@ func (s *Session) update(ctx context.Context, st *ast.Update, params []value.Val
 		if !ok {
 			return Result{}, fmt.Errorf("%w: column %q of relation %q does not exist", ErrInvalid, a.Column, t.Name)
 		}
-		e, err := b.assignable(values[j], t, i)
+		var e *cexpr
+		if values[j] == nil {
+			e, err = s.defaultExpr(b, t, i)
+		} else {
+			e, err = b.assignable(values[j], t, i)
+		}
 		if err != nil {
 			return Result{}, err
 		}
@@ -718,7 +767,7 @@ func (s *Session) delete(ctx context.Context, st *ast.Delete, params []value.Val
 	if err != nil {
 		return Result{}, err
 	}
-	b := &binder{table: t, params: params, phase: phaseWhere}
+	b := &binder{table: t, params: params, phase: phaseWhere, now: s.now()}
 	f, err := b.where(st.Where)
 	if err != nil {
 		return Result{}, err
@@ -768,7 +817,7 @@ func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value
 			return nil, err
 		}
 	}
-	b := &binder{table: t, params: params}
+	b := &binder{table: t, params: params, now: s.now()}
 
 	var columns []Column
 	var items []*cexpr

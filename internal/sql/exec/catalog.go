@@ -41,6 +41,8 @@ type column struct {
 	Name    string     `json:"name"`
 	Type    value.Type `json:"type"`
 	NotNull bool       `json:"notNull"`
+	// Default is the SQL text of the column's DEFAULT expression, or "".
+	Default string `json:"default,omitempty"`
 }
 
 // index is a secondary index of a table.

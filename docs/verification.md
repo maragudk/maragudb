@@ -10,10 +10,10 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 ## At a glance
 
-- 32 acceptance criteria (`AC-`), 22 key invariants (`INV-`), 18 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
+- 32 acceptance criteria (`AC-`), 22 key invariants (`INV-`), 20 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
 - 11 mutants (`MUT-`), deliberate bugs, of which 10 are detected by the simulator's checkers within 20 seeds.
 - 15 interesting states (`STATE-`) that the simulator's fixed corpus must reach.
-- 155 declarations of coverage in the tests.
+- 159 declarations of coverage in the tests.
 
 ## Acceptance criteria
 
@@ -135,6 +135,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 > Differential testing against Postgres: Both systems must agree on whether a statement succeeds or fails, and on the error class when both fail. Postgres runs with enable_seqscan = off, so that the differences with a DEV- ID do not show.
 
+- `internal/pgdiff` `TestDefaults/fills_in_defaults_as_Postgres_does,_with_the_same_errors`: a column's DEFAULT is used for a column that an INSERT leaves out, for DEFAULT in VALUES and in SET, and for DEFAULT VALUES, converted to the column's type by assignment, and a DEFAULT that reads a column, has a parameter, has the wrong type, or fails to fold fails as in Postgres
 - `internal/pgdiff` `TestDifferential/generated_statements_give_the_same_results_on_Postgres_and_maragudb`: hegel-generated schemas, rows, transactions, and statements, written once as Postgres SQL, give the same results, column names, affected-row counts, and transaction states on both sides, ordered exactly when ORDER BY decides the order and as multisets otherwise, and fail on both sides with the same error class, except for statements that maragudb rejects as unsupported, which Postgres skips
 - `internal/pgdiff` `TestErrorClasses`: every maragudb error class fails with its mapped SQLSTATE code on Postgres for the same statement
 - `internal/pgdiff` `TestIndexConditions/evaluates_the_other_conditions_only_on_the_rows_that_the_primary_key_conditions_select,_as_Postgres_does_with_an_index_scan`: with sequential scans off, Postgres evaluates the other WHERE conditions only on the rows that the conditions on the primary key index select: comparisons and IN of constants on any key column, a boolean key column, and key equalities implied by equalities with a constant; maragudb accepts such statements and gives the same results
@@ -397,6 +398,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `.` `TestTx/a_statement_that_does_not_parse_aborts_the_transaction,_as_in_Postgres`: a syntax error or an unsupported statement in an explicit transaction aborts it, so a later commit rolls everything back
 - `internal/pgdiff` `TestCasts/every_value_casts_to_every_type_the_same_as_Postgres,_or_is_rejected_as_unsupported`: hegel-drawn values of every supported type, and integer and numeric literals, cast to every supported type and back to text with the same result or error class as Postgres, unless maragudb rejects the cast as unsupported
 - `internal/pgdiff` `TestCasts/text_casts_to_every_type,_and_back_to_text,_the_same_as_Postgres,_or_are_rejected_as_unsupported`: hegel-drawn text near valid input for bigint, double precision, boolean, bytea, and timestamptz casts to the type and back to text with the same result or the same error class as Postgres, unless maragudb rejects it as unsupported
+- `internal/pgdiff` `TestDefaults/fills_in_defaults_as_Postgres_does,_with_the_same_errors`: a column's DEFAULT is used for a column that an INSERT leaves out, for DEFAULT in VALUES and in SET, and for DEFAULT VALUES, converted to the column's type by assignment, and a DEFAULT that reads a column, has a parameter, has the wrong type, or fails to fold fails as in Postgres
 - `internal/pgdiff` `TestIndexConditions/evaluates_the_other_conditions_only_on_the_rows_that_the_primary_key_conditions_select,_as_Postgres_does_with_an_index_scan`: with sequential scans off, Postgres evaluates the other WHERE conditions only on the rows that the conditions on the primary key index select: comparisons and IN of constants on any key column, a boolean key column, and key equalities implied by equalities with a constant; maragudb accepts such statements and gives the same results
 - `internal/pgdiff` `TestIndexConditions/takes_the_index_conditions_out_of_an_OR_as_Postgres_does_when_it_drops_constants_and_common_conditions_from_the_OR`: in a WHERE clause, Postgres drops the arguments of an OR that are FALSE or NULL constants and takes the conditions common to every argument out of the OR, which can make them index conditions; maragudb does the same and gives the same results
 - `internal/pgdiff` `TestIndexPlans/Postgres_takes_the_certain_conditions_on_an_indexed_column_as_conditions_of_the_scan_of_the_index,_and_picks_between_indexes`: EXPLAIN on Postgres 18 with sequential scans off shows that comparisons, IN, and boolean conditions on any column of a secondary index are conditions of its scan, that it picks between the primary key and another index with conditions, and that it scans a whole index in order for ORDER BY
@@ -405,6 +407,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/pgdiff` `TestIndexes/fails_a_cycle_of_unique_values_in_an_UPDATE_as_Postgres_does_in_every_order,_and_rejects_a_chain`: an UPDATE whose rows swap the values of a unique index or of the primary key fails with SQLSTATE 23505 on both, an UPDATE that moves a chain of rows onto the values the next one leaves is rejected, and one that moves rows onto free values succeeds on both
 - `internal/pgdiff` `TestIndexes/names_indexes_as_Postgres_does,_in_the_namespace_of_tables,_with_the_same_errors`: CREATE INDEX, DROP INDEX, and UNIQUE constraints name their indexes as Postgres does, tables and indexes share one namespace, and every clash, missing name, and wrong kind of relation fails with the class of Postgres's error
 - `internal/pgdiff` `TestParameters/a_parameter_of_every_Go_type_in_every_context_gives_the_same_result_as_Postgres_with_pgx,_or_is_rejected_as_unsupported`: hegel-drawn Go values bound as parameters in contexts that infer different types give the same result or error class as Postgres with pgx, or fail on both when pgx refuses to encode them, unless maragudb rejects them as unsupported
+- `internal/sql/exec` `TestSession_Defaults/now()_is_the_start_of_the_transaction,_the_same_for_every_use_in_it,_from_the_engine's_clock_at_microsecond_precision`: now(), CURRENT_TIMESTAMP, and transaction_timestamp() are the start of the transaction on the engine's clock, truncated to microseconds, the same in every statement of a transaction and in a DEFAULT, and later in a later transaction
 - `internal/sql/exec` `TestSession_Insert/applies_Postgres's_assignment_casts`: an INSERT applies the assignment casts Postgres has: a quoted literal as the column's type, numeric and float literals rounded into bigint, integers widened to double precision, and any value written into text
 - `internal/sql/exec` `TestSession_Select/accepts_a_WHERE_clause_only_when_its_outcome_is_the_same_in_every_order_Postgres_could_pick_on_the_rows_its_primary_key_index_selects`: a WHERE clause whose outcome on a row depends on the order Postgres evaluates its conditions in, including the equalities its equivalence classes imply, is ErrUnsupported, and so is a LIKE on a key column that can fail; the other conditions are evaluated only on the rows that the primary key conditions select, and every other WHERE clause fails exactly when Postgres fails in every order
 - `internal/sql/exec` `TestSession_Select/does_not_fold_the_stable_conversions_between_timestamptz_and_text,_as_Postgres_does_not,_and_rejects_one_that_can_fail`: a conversion between timestamptz and text is evaluated when the statement runs, so a CASE does not prune on it and a WHERE condition on it is evaluated once before rows are read, and one without columns that can fail is ErrUnsupported
@@ -497,7 +500,19 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 > Other schema statements and constraints.
 
-- `internal/pgdiff` `TestUnsupported/UNS-DDL_other_schema_statements_and_constraints`: schema statements other than CREATE TABLE, DROP TABLE, CREATE INDEX, and DROP INDEX, and constraints other than PRIMARY KEY, UNIQUE, and NOT NULL, are rejected, and Postgres accepts them
+- `internal/pgdiff` `TestUnsupported/UNS-DDL_other_schema_statements_and_constraints`: schema statements other than CREATE TABLE, DROP TABLE, CREATE INDEX, and DROP INDEX, constraints other than PRIMARY KEY, UNIQUE, NOT NULL, DEFAULT, CHECK, and FOREIGN KEY, and a named NOT NULL are rejected, and Postgres accepts them
+
+### `UNS-SEQUENCES`
+
+> Sequences.
+
+- `internal/pgdiff` `TestUnsupported/UNS-SEQUENCES_sequences,_serial_types,_and_identity_columns`: sequences, the serial types, and identity columns are rejected with a hint, and Postgres accepts them
+
+### `UNS-DEFAULT`
+
+> A DEFAULT that can fail.
+
+- `internal/pgdiff` `TestUnsupported/UNS-DEFAULT_a_DEFAULT_that_can_fail`: a DEFAULT whose constant part fails, or that can fail when it is evaluated, is rejected when the table is created, and Postgres accepts the table
 
 ### `UNS-INDEX`
 
@@ -515,13 +530,13 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 > Other clauses.
 
-- `internal/pgdiff` `TestUnsupported/UNS-CLAUSES_other_clauses_of_queries_and_writes`: DISTINCT, GROUP BY, joins, subqueries, set operations, aliases, qualified names, FOR UPDATE, RETURNING, ON CONFLICT, INSERT ... SELECT, and DEFAULT are rejected, and Postgres accepts them
+- `internal/pgdiff` `TestUnsupported/UNS-CLAUSES_other_clauses_of_queries_and_writes`: DISTINCT, GROUP BY, joins, subqueries, set operations, aliases, qualified names, FOR UPDATE, RETURNING, ON CONFLICT, and INSERT ... SELECT are rejected, and Postgres accepts them
 
 ### `UNS-FUNCTIONS`
 
 > Other functions.
 
-- `internal/pgdiff` `TestUnsupported/UNS-FUNCTIONS_functions_other_than_the_supported_five`: functions other than abs, coalesce, length, lower, and upper, including aggregates and window functions, are rejected, and Postgres accepts them
+- `internal/pgdiff` `TestUnsupported/UNS-FUNCTIONS_functions_other_than_the_supported_ones`: functions other than abs, coalesce, length, lower, upper, now, transaction_timestamp, and CURRENT_TIMESTAMP, including aggregates, window functions, the other clocks, and CURRENT_TIMESTAMP with a precision, are rejected, and Postgres accepts them
 
 ### `UNS-OPERATORS`
 

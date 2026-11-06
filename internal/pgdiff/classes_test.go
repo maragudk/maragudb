@@ -63,6 +63,7 @@ func TestErrorClasses(t *testing.T) {
 		{sql: "CREATE TABLE dev2 (a bigint PRIMARY KEY, a bigint)", want: maragudb.ErrInvalid, code: "42701"},
 		{sql: "SELECT i AS a, j AS a FROM dev ORDER BY a", want: maragudb.ErrInvalid, code: "42702"},
 		{sql: "CREATE TABLE dev2 (a bigint PRIMARY KEY, b bigint PRIMARY KEY)", want: maragudb.ErrInvalid, code: "42P16"},
+		{sql: "CREATE TABLE dev2 (a bigint PRIMARY KEY, b bigint DEFAULT $1)", want: maragudb.ErrInvalid, code: "42P02"},
 		{sql: "SELECT 'ab' LIKE 'a\\'", want: maragudb.ErrInvalid, code: "22025"},
 		{sql: "SELECT 1 LIMIT -1", want: maragudb.ErrInvalid, code: "2201W"},
 		{sql: "SELECT 1 OFFSET -1", want: maragudb.ErrInvalid, code: "2201X"},

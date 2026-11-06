@@ -98,7 +98,7 @@ INSERT INTO t1 VALUES(1, 'x')
 
 	t.Run("skips the statements that depend on a table whose creation was rejected or failed, until it is created", func(t *testing.T) {
 		rep := runScript(t, newFileRunner(t), `statement ok
-CREATE TABLE t1(a INTEGER CHECK (a > 0))
+CREATE TABLE t1(a INTEGER, b INTEGER GENERATED ALWAYS AS (a + 1) STORED)
 
 statement ok
 INSERT INTO t1 VALUES(1)
@@ -133,7 +133,7 @@ SELECT a FROM t1
 `)
 		is.True(t, rep.Mismatch == nil, fmt.Sprint(rep.Mismatch))
 		is.Equal(t, 5, rep.Skipped)
-		is.Equal(t, 4, rep.SkippedFor["rejected: CHECK_is_not_supported"], "also the view on the table, and the query of the view")
+		is.Equal(t, 4, rep.SkippedFor["rejected: GENERATED_columns"], "also the view on the table, and the query of the view")
 		is.Equal(t, 1, rep.SkippedFor["failed on Postgres: 42701 column _ specified more than once"])
 		is.Equal(t, 1, rep.SetupFailed["23502 null value in column _ of relation _ violates not-null constraint"], "the primary key of the rewrite makes the column NOT NULL")
 		is.Equal(t, 1, rep.Rejected)
