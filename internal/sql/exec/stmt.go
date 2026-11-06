@@ -495,7 +495,8 @@ func (s *Session) updateKeys(ctx context.Context, t *table, a access, f filter, 
 		for i, c := range cs {
 			live[i] = map[string]bool{}
 			for _, m := range moves {
-				if m.err == nil {
+				// A row holds its old key until it is visited, also when it then fails.
+				if m.old != nil {
 					if k, ok := c.key(t, m.old); ok {
 						live[i][k] = true
 					}

@@ -174,6 +174,9 @@ func TestSession_Unique(t *testing.T) {
 		mustExec(t, s, "INSERT INTO t VALUES (1, 1, 1), (2, 2, 0), (3, 3, 1)")
 		is.Error(t, exec.ErrDuplicateKey, queryErr(t, s, "UPDATE t SET a = 3, n = 10 / n WHERE id <= 2"))
 		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "UPDATE t SET a = a + 10, n = 10 / n"))
+		// Row 1 moves onto the value of row 2, which holds it until it is visited, and fails.
+		is.Error(t, exec.ErrDuplicateKey, queryErr(t, s, "UPDATE t SET a = a + 1, n = 10 / n"))
+		is.Error(t, exec.ErrDuplicateKey, queryErr(t, s, "UPDATE t SET id = id + 1, n = 10 / n"))
 	})
 }
 

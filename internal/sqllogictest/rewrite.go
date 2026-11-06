@@ -8,8 +8,6 @@ import (
 // both databases, so a rewrite can never hide a difference between them; it only decides how
 // much of the corpus maragudb can run. These are all the rewrites:
 //
-//   - CREATE INDEX and CREATE UNIQUE INDEX are dropped, because maragudb has no indexes yet. The
-//     corpus is written so that indexes never change a result.
 //   - Column types and the target types of CAST become the supported types: INTEGER and INT
 //     become bigint; FLOAT, REAL, and DOUBLE PRECISION become double precision; and TEXT,
 //     VARCHAR(n), CHAR(n), and CHARACTER(n) become text.
@@ -21,10 +19,9 @@ import (
 //     The rows are those of the text, so a row whose insert failed makes the expanded insert
 //     fail as a whole. That only costs coverage, which the setup failures in the report show.
 //
-// It returns the records to run and the number of records it dropped.
-func rewrite(records []record) ([]record, int) {
+// It returns the records to run.
+func rewrite(records []record) []record {
 	var out []record
-	dropped := 0
 	tables := map[string]*tableValues{}
 	for _, r := range records {
 		if r.kind == kindHalt {
@@ -33,10 +30,6 @@ func rewrite(records []record) ([]record, int) {
 		}
 		toks := lex(r.sql)
 		words := keywords(toks)
-		if r.kind == kindStatement && isCreateIndex(words) {
-			dropped++
-			continue
-		}
 		toks = rewriteTypes(toks)
 		if isCreateTable(words) {
 			toks = addPrimaryKey(toks)
@@ -47,7 +40,7 @@ func rewrite(records []record) ([]record, int) {
 		}
 		out = append(out, r)
 	}
-	return out, dropped
+	return out
 }
 
 // tableValues are the VALUES lists that filled a table since its CREATE TABLE, when nothing
@@ -125,10 +118,6 @@ func markWritten(tables map[string]*tableValues, name string) {
 	if t := tables[name]; t != nil {
 		t.clean = false
 	}
-}
-
-func isCreateIndex(words []string) bool {
-	return len(words) >= 3 && words[0] == "CREATE" && (words[1] == "INDEX" || words[1] == "UNIQUE" && words[2] == "INDEX")
 }
 
 func isCreateTable(words []string) bool {

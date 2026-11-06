@@ -87,11 +87,10 @@ INSERT INTO t1 VALUES(1, 'x')
 `)
 		is.True(t, rep.Mismatch == nil, fmt.Sprint(rep.Mismatch))
 		is.Equal(t, 9, rep.Records)
-		is.Equal(t, 1, rep.Dropped, "CREATE INDEX")
 		is.Equal(t, 1, rep.OtherEngine, "only for MySQL")
-		is.Equal(t, 7, rep.Statements)
+		is.Equal(t, 8, rep.Statements)
 		is.Equal(t, 1, rep.Rejected, "DISTINCT")
-		is.Equal(t, 6, rep.Executed)
+		is.Equal(t, 7, rep.Executed, "CREATE INDEX runs too")
 		is.Equal(t, 1, rep.Errors, "the duplicate key")
 		is.Equal(t, 1, rep.SetupFailed["23505 duplicate key value violates unique constraint _"])
 		is.Equal(t, 0, rep.Skipped)
@@ -99,7 +98,7 @@ INSERT INTO t1 VALUES(1, 'x')
 
 	t.Run("skips the statements that depend on a table whose creation was rejected or failed, until it is created", func(t *testing.T) {
 		rep := runScript(t, newFileRunner(t), `statement ok
-CREATE TABLE t1(a INTEGER UNIQUE)
+CREATE TABLE t1(a INTEGER CHECK (a > 0))
 
 statement ok
 INSERT INTO t1 VALUES(1)
@@ -134,7 +133,7 @@ SELECT a FROM t1
 `)
 		is.True(t, rep.Mismatch == nil, fmt.Sprint(rep.Mismatch))
 		is.Equal(t, 5, rep.Skipped)
-		is.Equal(t, 4, rep.SkippedFor["rejected: UNIQUE_is_not_supported"], "also the view on the table, and the query of the view")
+		is.Equal(t, 4, rep.SkippedFor["rejected: CHECK_is_not_supported"], "also the view on the table, and the query of the view")
 		is.Equal(t, 1, rep.SkippedFor["failed on Postgres: 42701 column _ specified more than once"])
 		is.Equal(t, 1, rep.SetupFailed["23502 null value in column _ of relation _ violates not-null constraint"], "the primary key of the rewrite makes the column NOT NULL")
 		is.Equal(t, 1, rep.Rejected)
@@ -382,7 +381,7 @@ func TestCorpus(t *testing.T) {
 			}
 		}
 		t.Logf("%s, %d files in %v: %v", name, len(files), time.Since(start).Round(time.Millisecond), total.Report)
-		t.Logf("%d records, %d for other engines, %d dropped by the rewrites, %d skipped", total.Records, total.OtherEngine, total.Dropped, total.Skipped)
+		t.Logf("%d records, %d for other engines, %d skipped", total.Records, total.OtherEngine, total.Skipped)
 		t.Logf("rejected for: %s", topCounts(total.RejectedFor, 30))
 		t.Logf("setup failed on Postgres for: %s", topCounts(total.SetupFailed, 30))
 		t.Logf("skipped for: %s", topCounts(total.SkippedFor, 30))
@@ -422,6 +421,5 @@ func TestCorpus(t *testing.T) {
 		is.True(t, total.Ordered > 0, "some comparisons are ordered")
 		is.True(t, total.SortKeysOrdered > 0, "some comparisons check the order of the sort keys")
 		is.True(t, total.Skipped > 0, "some statements depend on a table that could not be created")
-		is.True(t, total.Dropped > 0, "the rewrites drop some statements")
 	})
 }

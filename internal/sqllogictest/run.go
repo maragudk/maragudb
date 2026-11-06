@@ -26,10 +26,10 @@ const engine = "postgresql"
 // fileReport counts what the records of a test file did.
 type fileReport struct {
 	pgdiff.Report
-	// Records in the file, of which OtherEngine were for other engines or after a halt, and
-	// Dropped were dropped by [rewrite]. Every other record is a statement in the Report, which
-	// ran on both sides, was rejected, or was Skipped.
-	Records, OtherEngine, Dropped int
+	// Records in the file, of which OtherEngine were for other engines or after a halt. Every
+	// other record is a statement in the Report, which ran on both sides, was rejected, or was
+	// Skipped.
+	Records, OtherEngine int
 	// SetupFailed counts the statements that failed on both sides, which a query of the corpus
 	// does not do, by the Postgres error. They are the corpus's own setup that Postgres does not
 	// run as SQLite does, such as an insert of a NULL into a column that the primary key rewrite
@@ -56,7 +56,6 @@ func (r *fileReport) add(o fileReport) {
 	r.Add(o.Report)
 	r.Records += o.Records
 	r.OtherEngine += o.OtherEngine
-	r.Dropped += o.Dropped
 	r.Skipped += o.Skipped
 	for k, v := range o.SetupFailed {
 		r.SetupFailed[k] += v
@@ -100,7 +99,7 @@ func (r *fileRunner) run(ctx context.Context, worker int, name string, content [
 		}
 		applicable = append(applicable, rec)
 	}
-	applicable, rep.Dropped = rewrite(applicable)
+	applicable = rewrite(applicable)
 
 	m, err := r.newMaragudb()
 	if err != nil {

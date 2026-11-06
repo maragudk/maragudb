@@ -698,6 +698,88 @@ func TestRequestBudgets(t *testing.T) {
 	})
 }
 
+func TestRequestBudgets_Indexes(t *testing.T) {
+	sizes := []int{100, 1_000, 10_000, 100_000}
+	// load a table with a unique index and another index, whose entries are keys next to the
+	// rows, so the tree holds about three keys per row.
+	load := func(t *testing.T, db *sql.DB, n int) {
+		t.Helper()
+		mustExec(t, db, "CREATE TABLE t (id bigint PRIMARY KEY, email text UNIQUE, n bigint, name text)")
+		mustExec(t, db, "CREATE INDEX t_n ON t (n)")
+		const batch = 1000
+		for i := 0; i < n; i += batch {
+			var b strings.Builder
+			b.WriteString("INSERT INTO t VALUES ")
+			for j := i; j < min(i+batch, n); j++ {
+				if j > i {
+					b.WriteString(", ")
+				}
+				fmt.Fprintf(&b, "(%d, 'user-%d@example.com', %d, 'name-%d')", j, j, j%97, j)
+			}
+			mustExec(t, db, b.String())
+			// The unique check of every row looks in every segment whose keys span the index, so
+			// the load compacts as it goes.
+			if i/batch%4 == 3 {
+				is.NotError(t, maragudb.Compact(t.Context(), db))
+			}
+		}
+		is.NotError(t, maragudb.Compact(t.Context(), db))
+	}
+	stats := func(t *testing.T, db *sql.DB) maragudb.Requests {
+		t.Helper()
+		s, err := maragudb.Stats(t.Context(), db)
+		is.NotError(t, err)
+		return s.Requests
+	}
+	maxDepth := func(keys int) int {
+		// Blocks of 16 KiB hold at least 64 rows or entries, so the depth is at most 1 + log64(n).
+		depth := 1
+		for m := keys; m > 1; m = (m + 63) / 64 {
+			depth++
+		}
+		return depth
+	}
+
+	t.Run("a point lookup through a unique index with a cold cache makes a logarithmic number of GETs", func(t *testing.T) {
+		verify.Covers(t, "a SELECT by a unique secondary index with a cold cache makes a logarithmic number of GETs: one descent each for the table definition, the index entry, and the row", "AC-5.5")
+		for _, n := range sizes {
+			w := newWorld(t)
+			db := w.open(maragudb.Options{})
+			load(t, db, n)
+			cold := w.open(maragudb.Options{MemoryCacheBytes: new(int64)})
+			before := stats(t, cold)
+			is.Equal(t, fmt.Sprint(n/2), queryRows(t, cold, "SELECT id FROM t WHERE email = $1", fmt.Sprintf("user-%d@example.com", n/2)))
+			d := stats(t, cold).Sub(before)
+			t.Logf("n=%d cold select through the index: %+v", n, d)
+			// A scan of the entry can read the next leaf too.
+			limit := int64(3*maxDepth(3*n) + 1)
+			verify.CheckBudget(t, "SQL SELECT by unique index, cold: GETs", n, d.Get, limit)
+			is.True(t, d.Get <= limit, fmt.Sprintf("n=%d: %d GETs, max %d", n, d.Get, limit))
+			is.Equal(t, int64(1), d.GetConditional, "one freshness check")
+			is.Equal(t, int64(0), d.Put+d.PutConditional+d.List+d.Delete)
+		}
+	})
+
+	t.Run("a commit that changes indexed columns makes one conditional GET and two PUTs regardless of database size", func(t *testing.T) {
+		verify.Covers(t, "an autocommit UPDATE that changes the columns of two indexes, and so deletes and writes entries of both, makes one conditional GET and two PUTs at every database size", "AC-5.6", "AC-5.1")
+		for _, n := range sizes {
+			w := newWorld(t)
+			db := w.open(maragudb.Options{})
+			load(t, db, n)
+			// Warm the cache with the same statement on another row.
+			mustExec(t, db, "UPDATE t SET email = $1, n = n + 1 WHERE id = $2", "warm@example.com", n/3)
+			before := stats(t, db)
+			mustExec(t, db, "UPDATE t SET email = $1, n = n + 1 WHERE id = $2", "moved@example.com", n/2)
+			d := stats(t, db).Sub(before)
+			t.Logf("n=%d warm update of indexed columns: %+v", n, d)
+			verify.CheckBudget(t, "SQL autocommit UPDATE of indexed columns: PUTs", n, d.Put+d.PutConditional, 2)
+			is.Equal(t, int64(1), d.Put)
+			is.Equal(t, int64(1), d.PutConditional)
+			is.Equal(t, int64(1), d.GetConditional)
+		}
+	})
+}
+
 // nullableValuer is a Valuer with a value receiver, so a nil pointer to it must be NULL.
 type nullableValuer struct{}
 

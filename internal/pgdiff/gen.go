@@ -37,6 +37,11 @@ type gen struct {
 	table *ast.CreateTable
 	// cols by type.
 	cols map[value.Type][]string
+	// indexed are the columns of the indexes the case may have, the primary key first, which key
+	// conditions compare.
+	indexed [][]string
+	// indexes are the names of the indexes the case created with a name.
+	indexes []string
 }
 
 // Source of the generator's choices.
@@ -133,6 +138,11 @@ func Generate(src Source) Case {
 	g.schema()
 	c := Case{Create: g.table}
 	c.Statements = append(c.Statements, g.insert(g.draw(0, 6)))
+	// Indexes on the rows, so that later statements use them, and so that a unique index on rows
+	// that repeat its values fails.
+	for range g.draw(0, 2) {
+		c.Statements = append(c.Statements, g.createIndex())
+	}
 	n := g.draw(1, 6)
 	// A third of the cases run some statements in an explicit transaction, which ends with a
 	// COMMIT, a ROLLBACK, or not at all.
@@ -199,7 +209,73 @@ func (g *gen) schema() {
 			t.PrimaryKey = append(t.PrimaryKey, t.Columns[second].Name)
 		}
 	}
+	// Constraints get names that nothing else in the case has, so that the table is always
+	// created.
+	names := []string{"k0", "k1", "k2"}
+	if g.rarely(6) {
+		t.PrimaryKeyName = names[0]
+	}
+	g.indexed = [][]string{t.PrimaryKey}
 	g.table = t
+	// Now and then UNIQUE constraints, which may repeat each other or the primary key.
+	for range g.draw(0, 2) {
+		if g.draw(0, 2) > 0 {
+			break
+		}
+		// A column twice is an error in a constraint, which would fail the CREATE TABLE.
+		u := ast.UniqueConstraint{Columns: slices.Compact(g.indexColumns()), NullsNotDistinct: g.rarely(4)}
+		if g.rarely(3) {
+			u.Name = names[1+len(t.Unique)]
+			g.indexes = append(g.indexes, u.Name)
+		}
+		t.Unique = append(t.Unique, u)
+		g.indexed = append(g.indexed, u.Columns)
+	}
+}
+
+// indexColumns are one or two columns for an index, now and then the same one twice.
+func (g *gen) indexColumns() []string {
+	cols := []string{g.table.Columns[g.draw(0, len(g.table.Columns)-1)].Name}
+	if g.bool() {
+		cols = append(cols, g.table.Columns[g.draw(0, len(g.table.Columns)-1)].Name)
+	}
+	return cols
+}
+
+// indexName for a new index, one of a few, so that names clash now and then, also with the
+// names Postgres chooses.
+func (g *gen) indexName() string {
+	name := pick(g, []string{"i0", "i1", "i2", "t_pkey", "t_c0_key", "t_c0_idx", "t"})
+	g.indexes = append(g.indexes, name)
+	return name
+}
+
+// createIndex of one or two columns, with a name or without.
+func (g *gen) createIndex() *ast.CreateIndex {
+	ci := &ast.CreateIndex{Table: tableName, Unique: g.bool(), NullsNotDistinct: g.rarely(5)}
+	if g.rarely(20) {
+		ci.Table = pick(g, []string{"nope", "t_pkey"})
+	}
+	if g.bool() {
+		ci.Name = g.indexName()
+		ci.IfNotExists = g.rarely(3)
+	}
+	var names []string
+	for _, name := range g.indexColumns() {
+		if g.rarely(30) {
+			name = "nope"
+		}
+		ci.Columns = append(ci.Columns, ast.IndexColumn{Name: name, Desc: g.bool(), Nulls: ast.NullsOrder(g.draw(0, 2))})
+		names = append(names, name)
+	}
+	g.indexed = append(g.indexed, names)
+	return ci
+}
+
+// dropIndex of an index the case named, or of one Postgres may have named.
+func (g *gen) dropIndex() *ast.DropIndex {
+	names := append([]string{"t_pkey", "t_c0_key", "t_c0_idx", "t_c1_idx", "t", "nope"}, g.indexes...)
+	return &ast.DropIndex{Name: pick(g, names), IfExists: g.rarely(3)}
 }
 
 func (g *gen) column(name string) ast.ColumnDef {
@@ -580,7 +656,7 @@ func (g *gen) where(s scope) ast.Expr {
 	if !g.rarely(6) {
 		s.safe = true
 	}
-	if g.draw(0, 2) == 0 && len(g.table.PrimaryKey) > 0 {
+	if g.draw(0, 2) == 0 {
 		e := g.keyCondition()
 		if g.bool() {
 			if mayFail && g.bool() {
@@ -599,10 +675,25 @@ func (g *gen) where(s scope) ast.Expr {
 	return g.expr(value.Bool, s, 0)
 }
 
-// keyCondition on the primary key columns, so that key access paths are exercised: a
-// comparison of a key column with a literal, an IN of literals, or a range of two comparisons.
+// keyCondition on the columns of the primary key or another index, so that index access paths
+// are exercised: a comparison of an indexed column with a literal, an IN of literals, or a range
+// of two comparisons, and now and then two of them on two indexes.
 func (g *gen) keyCondition() ast.Expr {
-	name := pick(g, g.table.PrimaryKey)
+	if len(g.indexed) > 1 && g.rarely(4) {
+		return &ast.Binary{Op: ast.And, Left: g.indexCondition(), Right: g.indexCondition()}
+	}
+	return g.indexCondition()
+}
+
+func (g *gen) indexCondition() ast.Expr {
+	cols := pick(g, g.indexed)
+	if g.bool() {
+		cols = g.table.PrimaryKey
+	}
+	name := pick(g, cols)
+	if g.indexOf(name) < 0 {
+		name = pick(g, g.table.PrimaryKey)
+	}
 	col := &ast.ColumnRef{Name: name}
 	typ := g.column(name).Type
 	switch g.draw(0, 3) {
@@ -622,7 +713,23 @@ func (g *gen) keyCondition() ast.Expr {
 	return &ast.Binary{Op: op, Left: col, Right: g.literal(typ)}
 }
 
+// indexOf the column, or -1.
+func (g *gen) indexOf(name string) int {
+	for i, c := range g.table.Columns {
+		if c.Name == name {
+			return i
+		}
+	}
+	return -1
+}
+
 func (g *gen) statement() ast.Statement {
+	if g.rarely(8) {
+		if len(g.indexes) > 0 && g.rarely(3) || g.rarely(6) {
+			return g.dropIndex()
+		}
+		return g.createIndex()
+	}
 	switch g.draw(0, 5) {
 	case 0:
 		return g.insert(g.draw(1, 3))

@@ -48,9 +48,9 @@ func TestRewrite(t *testing.T) {
 			want: []string{"SELECT CAST ( col0 AS bigint ) AS integer, CAST(NULL AS double precision), 'CAST(x AS INTEGER)', (col0 AS INTEGER) FROM tab0"},
 		},
 		{
-			name: "drops CREATE INDEX",
+			name: "keeps CREATE INDEX",
 			in:   []string{"CREATE INDEX idx_tab1_0 on tab1 (col0)", "CREATE UNIQUE INDEX i ON t(a)", "SELECT 1"},
-			want: []string{"SELECT 1"},
+			want: []string{"CREATE INDEX idx_tab1_0 on tab1 (col0)", "CREATE UNIQUE INDEX i ON t(a)", "SELECT 1"},
 		},
 		{
 			name: "replaces INSERT ... SELECT * from a table filled only by INSERT ... VALUES with those values",
@@ -117,14 +117,14 @@ func TestRewrite(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			got, _ := rewrite(statements(test.in...))
+			got := rewrite(statements(test.in...))
 			is.EqualSlice(t, test.want, texts(got))
 		})
 	}
 
-	t.Run("counts the dropped records and keeps the line numbers", func(t *testing.T) {
-		got, dropped := rewrite(statements("CREATE INDEX i ON t(a)", "SELECT 1"))
-		is.Equal(t, 1, dropped)
-		is.Equal(t, 2, got[0].line)
+	t.Run("keeps CREATE INDEX and the line numbers", func(t *testing.T) {
+		got := rewrite(statements("CREATE INDEX i ON t(a)", "SELECT 1"))
+		is.EqualSlice(t, []string{"CREATE INDEX i ON t(a)", "SELECT 1"}, texts(got))
+		is.Equal(t, 2, got[1].line)
 	})
 }
