@@ -50,6 +50,7 @@ func (c *client) uniqueSQL(ctx context.Context) {
 	h := history.Tx{Client: c.id, Invoke: c.run.stamp()}
 	// frees is the email that the statement frees when it commits, and takes the one it takes.
 	var frees, takes string
+	var res sql.Result
 	var err error
 	switch c.rng.IntN(6) {
 	case 0:
@@ -65,10 +66,10 @@ func (c *client) uniqueSQL(ctx context.Context) {
 		_, err = c.sql.ExecContext(ctx, "INSERT INTO users VALUES ($1, $2, 0), ($3, $4, 0)", c.value(), c.nullableEmail(), c.value(), c.nullableEmail())
 	case 3:
 		frees, takes = c.email(), c.email()
-		_, err = c.sql.ExecContext(ctx, "UPDATE users SET email = $1, n = n + 1 WHERE email = $2", takes, frees)
+		res, err = c.sql.ExecContext(ctx, "UPDATE users SET email = $1, n = n + 1 WHERE email = $2", takes, frees)
 	case 4:
 		frees = c.email()
-		_, err = c.sql.ExecContext(ctx, "DELETE FROM users WHERE email = $1", frees)
+		res, err = c.sql.ExecContext(ctx, "DELETE FROM users WHERE email = $1", frees)
 	default:
 		err = c.uniqueTx(ctx)
 	}
@@ -83,6 +84,12 @@ func (c *client) uniqueSQL(ctx context.Context) {
 	c.record(h)
 	if h.Outcome != history.OK {
 		return
+	}
+	if res != nil {
+		// A statement that changed no row freed and took nothing.
+		if n, _ := res.RowsAffected(); n == 0 {
+			frees, takes = "", ""
+		}
 	}
 	assert.Sometimes(c.freed[takes], "a unique value that a committed write freed is taken again", nil)
 	if c.freed[takes] {

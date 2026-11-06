@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"slices"
+	"strings"
 	"testing"
 
 	"maragu.dev/is"
@@ -41,6 +42,8 @@ func TestErrorClasses(t *testing.T) {
 		{sql: "DROP TABLE IF EXISTS dev_pkey", want: maragudb.ErrWrongObjectType, code: "42809"},
 		{sql: "SELECT * FROM dev_pkey", want: maragudb.ErrWrongObjectType, code: "42809"},
 		{sql: "DROP INDEX dev_pkey", want: maragudb.ErrDependentObjects, code: "2BP01"},
+		{sql: "CREATE INDEX ON dev (" + strings.TrimSuffix(strings.Repeat("j, ", 33), ", ") + ")", want: maragudb.ErrProgramLimit, code: "54011"},
+		{sql: "CREATE TABLE dev2 (a bigint PRIMARY KEY, UNIQUE (" + strings.TrimSuffix(strings.Repeat("a, ", 33), ", ") + "))", want: maragudb.ErrInvalid, code: "42701"},
 		{sql: "SELECT 1 WHERE 1", want: maragudb.ErrType, code: "42804"},
 		{sql: "INSERT INTO dev VALUES (TRUE, 1)", want: maragudb.ErrType, code: "42804"},
 		{sql: "SELECT 1 + TRUE", want: maragudb.ErrType, code: "42883"},

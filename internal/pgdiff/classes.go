@@ -35,6 +35,8 @@ var ErrorClasses = []ErrorClass{
 	{Name: "no index", Err: maragudb.ErrNoIndex, Codes: []string{"42704"}},
 	{Name: "wrong object type", Err: maragudb.ErrWrongObjectType, Codes: []string{"42809"}},
 	{Name: "dependent objects", Err: maragudb.ErrDependentObjects, Codes: []string{"2BP01"}},
+	// 54011 is too_many_columns.
+	{Name: "program limit", Err: maragudb.ErrProgramLimit, Codes: []string{"54011"}},
 	// 42804 is datatype_mismatch and 42883 is undefined_function, which Postgres reports for an
 	// operator without a variant for its operand types.
 	{Name: "type", Err: maragudb.ErrType, Codes: []string{"42804", "42883"}},

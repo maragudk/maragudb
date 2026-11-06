@@ -22,6 +22,9 @@ func (s *Session) createIndex(ctx context.Context, st *ast.CreateIndex) error {
 	if err != nil {
 		return err
 	}
+	if err := checkIndexColumns(len(st.Columns)); err != nil {
+		return err
+	}
 	x := index{Unique: st.Unique, NullsNotDistinct: st.NullsNotDistinct}
 	var names []string
 	for _, c := range st.Columns {
@@ -185,6 +188,9 @@ func (t *table) indexConstraints(st *ast.CreateTable) ([]indexConstraint, error)
 // time, so that the name Postgres chooses for one depends on the names of those before it.
 func (s *Session) addIndexes(ctx context.Context, t *table, cs []indexConstraint) error {
 	for i, c := range cs {
+		if err := checkIndexColumns(len(c.columns)); err != nil {
+			return err
+		}
 		name := c.name
 		var err error
 		switch {
@@ -223,6 +229,17 @@ func (s *Session) addIndexes(ctx context.Context, t *table, cs []indexConstraint
 		if err := s.putTable(t); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// maxIndexColumns is the most columns that Postgres allows in an index, INDEX_MAX_KEYS.
+const maxIndexColumns = 32
+
+// checkIndexColumns checks the number of columns of a new index against [maxIndexColumns].
+func checkIndexColumns(n int) error {
+	if n > maxIndexColumns {
+		return fmt.Errorf("%w: cannot use more than %d columns in an index", ErrProgramLimit, maxIndexColumns)
 	}
 	return nil
 }

@@ -31,6 +31,9 @@ var (
 	ErrWrongObjectType = errors.New("wrong object type")
 	// ErrDependentObjects is a DROP INDEX of an index that a constraint of its table needs.
 	ErrDependentObjects = errors.New("dependent objects still exist")
+	// ErrProgramLimit is a statement beyond a limit of Postgres, such as an index of more than
+	// 32 columns.
+	ErrProgramLimit = errors.New("program limit exceeded")
 	// ErrDuplicateKey is an insert or update that would repeat a primary key or the values of a
 	// unique index, or a CREATE UNIQUE INDEX on rows that do.
 	ErrDuplicateKey = errors.New("duplicate key value violates unique constraint")

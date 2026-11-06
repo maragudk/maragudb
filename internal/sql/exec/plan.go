@@ -1101,15 +1101,11 @@ func (t *table) span(sc scan, f filter) span {
 // condition can fail, it reads the rows of every candidate, so that [filter.matches] sees every
 // row some plan of Postgres reads, or every row when there are no candidates. Otherwise, the
 // conditions decide the rows whatever the plan, and it reads the narrowest span of one index, or
-// the span of stream, in the order of its entries, when stream is set.
+// the span of stream in the order of its entries, when stream is set and no other index is
+// narrower. A stream is only given when nothing can fail.
 func (t *table) plan(f filter, stream *scan) access {
 	if f.never {
 		return access{empty: true}
-	}
-	if stream != nil {
-		sp := t.span(*stream, f)
-		sp.ordered = true
-		return sp.access
 	}
 	if f.fallible {
 		if len(f.candidates) == 0 {
@@ -1129,31 +1125,37 @@ func (t *table) plan(f filter, stream *scan) access {
 		}
 		return access{union: union}
 	}
+	score := func(sc scan, sp span) int {
+		switch {
+		case sp.point != nil:
+			return 1000
+		case sc.index.Unique && sp.eqs == len(sc.index.Columns):
+			return 900
+		case sp.ranged:
+			return 10*sp.eqs + 1
+		}
+		return 10 * sp.eqs
+	}
 	var best span
 	bestScore := -1
 	for _, sc := range t.scans() {
 		sp := t.span(sc, f)
-		score := 10*sp.eqs + btoi(sp.ranged)
-		switch {
-		case sp.empty:
+		if sp.empty {
 			return sp.access
-		case sp.point != nil:
-			score = 1000
-		case sc.index.Unique && sp.eqs == len(sc.index.Columns):
-			score = 900
 		}
-		if score > bestScore {
-			best, bestScore = sp, score
+		if s := score(sc, sp); s > bestScore {
+			best, bestScore = sp, s
+		}
+	}
+	// A scan in the order of ORDER BY saves the sort, and stops early under a LIMIT, unless
+	// another index narrows the rows more.
+	if stream != nil {
+		if sp := t.span(*stream, f); score(*stream, sp) >= bestScore {
+			sp.ordered = true
+			return sp.access
 		}
 	}
 	return best.access
-}
-
-func btoi(b bool) int {
-	if b {
-		return 1
-	}
-	return 0
 }
 
 // orderedScan returns a scan whose entries are in the order that ORDER BY sorts by, if any: the

@@ -96,6 +96,9 @@ var (
 	// ErrDependentObjects is a DROP INDEX of an index that a PRIMARY KEY or UNIQUE constraint of
 	// its table needs; dropping the table drops it.
 	ErrDependentObjects = exec.ErrDependentObjects
+	// ErrProgramLimit is a statement beyond a limit of Postgres, such as an index of more than
+	// 32 columns.
+	ErrProgramLimit = exec.ErrProgramLimit
 	// ErrDuplicateKey is an insert or update that would repeat a primary key or the values of a
 	// unique index, or a CREATE UNIQUE INDEX on rows that do.
 	ErrDuplicateKey = exec.ErrDuplicateKey

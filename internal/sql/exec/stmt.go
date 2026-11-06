@@ -253,18 +253,6 @@ func (s *Session) scanRows(ctx context.Context, t *table, a access, f filter, fn
 		}
 		return orderDependent
 	}
-	if a.index == nil && a.union == nil {
-		it := s.kv.scan(ctx, a.start, a.end)
-		for it.Next() {
-			if more, err := visit(it.Key(), it.Value()); err != nil || !more {
-				return err
-			}
-		}
-		if err := it.Err(); err != nil {
-			return err
-		}
-		return orderDependent
-	}
 	// The rows that an index finds are read from the transaction, like the rows of a scan, and
 	// not from the statement's own writes.
 	fetch := func(key []byte, fromIndex bool) (bool, error) {
@@ -279,10 +267,18 @@ func (s *Session) scanRows(ctx context.Context, t *table, a access, f filter, fn
 		}
 		return visit(key, val)
 	}
-	if a.ordered {
+	if a.index == nil && a.union == nil || a.ordered {
+		// A range of rows, or of the entries of an index, in order.
 		it := s.kv.scan(ctx, a.start, a.end)
 		for it.Next() {
-			if more, err := fetch(t.rowKeyOf(it.Value()), true); err != nil || !more {
+			var more bool
+			var err error
+			if a.index == nil {
+				more, err = visit(it.Key(), it.Value())
+			} else {
+				more, err = fetch(t.rowKeyOf(it.Value()), true)
+			}
+			if err != nil || !more {
 				return err
 			}
 		}

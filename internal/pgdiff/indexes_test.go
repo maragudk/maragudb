@@ -15,6 +15,17 @@ import (
 // indexes.
 var indexTables = []string{"ix", "ix2", "ix_pkey", "ix_a_key", "ixu", "ixs", "ixo"}
 
+// columns33 are the definitions and names33 the names of 33 columns, one more than an index
+// can have.
+var columns33, names33 = func() (string, string) {
+	var defs, names []string
+	for i := range 33 {
+		defs = append(defs, fmt.Sprintf("c%d bigint", i))
+		names = append(names, fmt.Sprintf("c%d", i))
+	}
+	return strings.Join(defs, ", "), strings.Join(names, ", ")
+}()
+
 // newIndexSession compares statements on fresh tables named in [indexTables].
 func newIndexSession(t *testing.T) *pgdiff.Session {
 	t.Helper()
@@ -100,6 +111,13 @@ func TestIndexes(t *testing.T) {
 			outcome{sql: "DROP INDEX ix_b_idx", code: "2BP01"},
 			outcome{sql: "CREATE TABLE ix2 (id bigint PRIMARY KEY, UNIQUE (nope))", code: "42703"},
 			outcome{sql: "CREATE TABLE ix2 (id bigint PRIMARY KEY, UNIQUE (id, id))", code: "42701"},
+			outcome{sql: "CREATE TABLE ixs (" + columns33 + ", PRIMARY KEY (c0), UNIQUE (" + names33 + "))", code: "54011"},
+			outcome{sql: "CREATE TABLE ix (" + columns33 + ", PRIMARY KEY (c0), UNIQUE (" + names33 + "))", code: "42P07"},
+			outcome{sql: "CREATE TABLE ixs (" + columns33 + ", PRIMARY KEY (c0), UNIQUE (" + names33 + ", nope))", code: "42703"},
+			outcome{sql: "CREATE TABLE ixs (" + columns33 + ", PRIMARY KEY (c0))"},
+			outcome{sql: "CREATE INDEX ON ixs (" + names33 + ")", code: "54011"},
+			outcome{sql: "CREATE INDEX ON ixs (" + names33 + ", nope)", code: "54011"},
+			outcome{sql: "DROP TABLE ixs"},
 			outcome{sql: "DROP TABLE ix"},
 			outcome{sql: "CREATE TABLE ix (id bigint PRIMARY KEY, a bigint UNIQUE)"},
 			outcome{sql: "DROP TABLE ix2"},
