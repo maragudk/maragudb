@@ -31,6 +31,10 @@ var ErrorClasses = []ErrorClass{
 	{Name: "syntax", Err: maragudb.ErrSyntax, Codes: []string{"42601"}},
 	{Name: "no table", Err: maragudb.ErrNoTable, Codes: []string{"42P01"}},
 	{Name: "table exists", Err: maragudb.ErrTableExists, Codes: []string{"42P07"}},
+	// 42704 is undefined_object, 42809 wrong_object_type, and 2BP01 dependent_objects_still_exist.
+	{Name: "no index", Err: maragudb.ErrNoIndex, Codes: []string{"42704"}},
+	{Name: "wrong object type", Err: maragudb.ErrWrongObjectType, Codes: []string{"42809"}},
+	{Name: "dependent objects", Err: maragudb.ErrDependentObjects, Codes: []string{"2BP01"}},
 	// 42804 is datatype_mismatch and 42883 is undefined_function, which Postgres reports for an
 	// operator without a variant for its operand types.
 	{Name: "type", Err: maragudb.ErrType, Codes: []string{"42804", "42883"}},

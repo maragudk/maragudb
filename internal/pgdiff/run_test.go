@@ -40,6 +40,27 @@ func TestRunner_Run(t *testing.T) {
 		is.Equal(t, 1, rep.ErrorClasses["out of range/22003"])
 	})
 
+	t.Run("accepts different errors that agree once Postgres visits the rows in key order instead of the order of an index", func(t *testing.T) {
+		verify.Covers(t, "when Postgres reads the rows through an index in the order of its entries and reports another row's error than maragudb, which reads them in key order, the rerun in key order marks the other indexes invalid, so that Postgres agrees", "AC-4.3")
+		r := newRunner(t)
+		create := &ast.CreateTable{Name: "t", Columns: []ast.ColumnDef{{Name: "id", Type: value.Int}, {Name: "a", Type: value.Int}, {Name: "n", Type: value.Int}, {Name: "s", Type: value.String}}, PrimaryKey: []string{"id"}}
+		stmts := []ast.Statement{
+			&ast.CreateIndex{Name: "t_a", Table: "t", Columns: []ast.IndexColumn{{Name: "a"}}},
+			&ast.Insert{Table: "t", Rows: [][]ast.Expr{
+				{&ast.Literal{Value: value.NewInt(1)}, &ast.Literal{Value: value.NewInt(2)}, &ast.Literal{Value: value.NewInt(0)}, &ast.Literal{Value: value.NewUnknown("1")}},
+				{&ast.Literal{Value: value.NewInt(2)}, &ast.Literal{Value: value.NewInt(1)}, &ast.Literal{Value: value.NewInt(1)}, &ast.Literal{Value: value.NewUnknown("z")}},
+			}},
+			&ast.Select{From: "t", Items: []ast.SelectItem{{Expr: &ast.Binary{Op: ast.Add,
+				Left:  &ast.Binary{Op: ast.Div, Left: &ast.Literal{Value: value.NewInt4(10)}, Right: &ast.ColumnRef{Name: "n"}},
+				Right: &ast.Cast{Expr: &ast.ColumnRef{Name: "s"}, Type: value.Int},
+			}}}, OrderBy: []ast.OrderItem{{Expr: &ast.ColumnRef{Name: "a"}}}},
+		}
+		rep, err := r.Run(t.Context(), pgdiff.Case{Create: create, Statements: stmts})
+		is.NotError(t, err)
+		is.Equal(t, 1, rep.Reordered)
+		is.Equal(t, 1, rep.ErrorClasses["division by zero/22012"])
+	})
+
 	t.Run("also inside a transaction, which stays aborted on both sides", func(t *testing.T) {
 		r := newRunner(t)
 		sel := &ast.Select{From: "t", Items: []ast.SelectItem{

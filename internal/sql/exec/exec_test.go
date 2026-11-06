@@ -857,7 +857,7 @@ func TestSession_Update(t *testing.T) {
 	})
 
 	t.Run("moves rows when the primary key changes, and rejects a move whose outcome depends on row order", func(t *testing.T) {
-		verify.Covers(t, "an UPDATE of primary key columns succeeds or fails as in Postgres in every row order, and a row that moves onto a key another row moves away from is ErrUnsupported", "UNS-KEY-UPDATE-ORDER", "INV-PG-SUBSET")
+		verify.Covers(t, "an UPDATE of primary key columns succeeds or fails as in Postgres in every row order, and a chain of rows that move onto keys that other rows move away from is ErrUnsupported, and a cycle of them ErrDuplicateKey", "UNS-KEY-UPDATE-ORDER", "INV-PG-SUBSET")
 		s := newSession(t)
 		mustExec(t, s, "CREATE TABLE h (id bigint PRIMARY KEY)")
 		mustExec(t, s, "INSERT INTO h VALUES (1), (2), (3)")
@@ -877,7 +877,7 @@ func TestSession_Update(t *testing.T) {
 		is.Equal(t, "12\n24\n26", query(t, s, "SELECT id FROM h"))
 		mustExec(t, s, "CREATE TABLE k (a bigint, b bigint, PRIMARY KEY (a, b))")
 		mustExec(t, s, "INSERT INTO k VALUES (1, 1), (1, 2)")
-		is.Error(t, exec.ErrUnsupported, queryErr(t, s, "UPDATE k SET b = 3 - b"), "the rows swap keys")
+		is.Error(t, exec.ErrDuplicateKey, queryErr(t, s, "UPDATE k SET b = 3 - b"), "the rows swap keys, which fails in every order")
 		is.Equal(t, int64(2), mustExec(t, s, "UPDATE k SET a = 2").RowsAffected)
 		is.Equal(t, "2 1\n2 2", query(t, s, "SELECT * FROM k"))
 		mustExec(t, s, "CREATE TABLE d (id bigint PRIMARY KEY, n bigint)")

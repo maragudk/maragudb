@@ -31,7 +31,7 @@ func newBoth(t *testing.T, create string) both {
 	is.NotError(t, err)
 	t.Cleanup(func() { _ = m.Close() })
 	b := both{m: m, pg: r.PG}
-	for _, q := range []string{"DROP TABLE IF EXISTS dev", "DROP TABLE IF EXISTS dev2"} {
+	for _, q := range []string{"DROP VIEW IF EXISTS dev_view", "DROP TABLE IF EXISTS dev", "DROP TABLE IF EXISTS dev2"} {
 		_, err = b.pg.ExecContext(t.Context(), q)
 		is.NotError(t, err)
 	}
@@ -142,15 +142,43 @@ func TestUnsupported(t *testing.T) {
 	})
 
 	t.Run("UNS-DDL other schema statements and constraints", func(t *testing.T) {
-		verify.Covers(t, "schema statements other than CREATE TABLE and DROP TABLE, and constraints other than PRIMARY KEY and NOT NULL, are rejected, and Postgres accepts them", "UNS-DDL")
+		verify.Covers(t, "schema statements other than CREATE TABLE, DROP TABLE, CREATE INDEX, and DROP INDEX, and constraints other than PRIMARY KEY, UNIQUE, and NOT NULL, are rejected, and Postgres accepts them", "UNS-DDL")
 		rejects(t, create,
-			example{SQL: "CREATE TABLE dev2 (a bigint PRIMARY KEY, b bigint UNIQUE)"},
 			example{SQL: "CREATE TABLE dev2 (a bigint PRIMARY KEY, b bigint DEFAULT 1)"},
 			example{SQL: "CREATE TABLE dev2 (a bigint PRIMARY KEY CHECK (a > 0))"},
+			example{SQL: "CREATE TABLE dev2 (a bigint PRIMARY KEY, b bigint REFERENCES dev2 (a))"},
 			example{SQL: "CREATE TEMP TABLE dev2 (a bigint PRIMARY KEY)"},
-			example{SQL: "CREATE INDEX ON dev (j)"},
+			example{SQL: "CREATE VIEW dev_view AS SELECT 1"},
 			example{SQL: "ALTER TABLE dev ADD COLUMN k bigint"},
 			example{SQL: "DROP TABLE IF EXISTS dev2, dev3"},
+			example{SQL: "DROP TABLE IF EXISTS dev2 CASCADE"},
+		)
+	})
+
+	t.Run("UNS-INDEX other forms of indexes and of their constraints", func(t *testing.T) {
+		verify.Covers(t, "indexes on expressions, partial indexes, INCLUDE, USING, CONCURRENTLY, ON ONLY, operator classes, COLLATE, storage parameters, tablespaces, ALTER INDEX, several indexes in one DROP INDEX, and DEFERRABLE and NOT DEFERRABLE constraints are rejected, and Postgres accepts them", "UNS-INDEX")
+		rejects(t, create,
+			example{SQL: "CREATE INDEX ON dev ((j + 1))"},
+			example{SQL: "CREATE INDEX ON dev (lower(s))"},
+			example{SQL: "CREATE INDEX ON dev (j) WHERE j > 0"},
+			example{SQL: "CREATE UNIQUE INDEX ON dev (j) INCLUDE (s)"},
+			example{SQL: "CREATE INDEX ON dev USING btree (j)"},
+			example{SQL: "CREATE INDEX ON dev USING hash (j)"},
+			example{SQL: "CREATE INDEX CONCURRENTLY ON dev (j)"},
+			example{SQL: "CREATE INDEX ON ONLY dev (j)"},
+			example{SQL: "CREATE INDEX ON dev (s text_pattern_ops)"},
+			example{SQL: `CREATE INDEX ON dev (s COLLATE "C")`},
+			example{SQL: "CREATE INDEX ON dev (j) WITH (fillfactor = 70)"},
+			example{SQL: "CREATE INDEX ON dev (j) TABLESPACE pg_default"},
+			example{SQL: "ALTER INDEX dev_pkey RENAME TO dev_key"},
+			example{SQL: "DROP INDEX CONCURRENTLY IF EXISTS dev2"},
+			example{SQL: "DROP INDEX IF EXISTS dev2, dev3"},
+			example{SQL: "CREATE TABLE dev2 (a bigint PRIMARY KEY, b bigint UNIQUE DEFERRABLE)"},
+			example{SQL: "CREATE TABLE dev2 (a bigint PRIMARY KEY NOT DEFERRABLE)"},
+			example{SQL: "CREATE TABLE dev2 (a bigint, b bigint, PRIMARY KEY (a) DEFERRABLE INITIALLY DEFERRED)"},
+			example{SQL: "CREATE TABLE dev2 (a bigint PRIMARY KEY, b bigint, UNIQUE (b) INCLUDE (a))"},
+			example{SQL: "CREATE TABLE dev2 (a bigint PRIMARY KEY, b bigint UNIQUE WITH (fillfactor = 70))"},
+			example{SQL: "CREATE TABLE dev2 (a bigint PRIMARY KEY USING INDEX TABLESPACE pg_default)"},
 		)
 	})
 
@@ -278,9 +306,12 @@ func TestUnsupported(t *testing.T) {
 	})
 
 	t.Run("UNS-KEY-UPDATE-ORDER an UPDATE that moves a key onto one it moves away", func(t *testing.T) {
-		verify.Covers(t, "an UPDATE that moves a row onto the primary key of a row that the same statement moves away is rejected, because Postgres checks the key row by row in storage order, and Postgres accepts it when it stores the rows in the right order", "UNS-KEY-UPDATE-ORDER")
+		verify.Covers(t, "an UPDATE that moves a row onto the primary key, or the values of a unique index, of a row that the same statement moves away is rejected, because Postgres checks the key row by row in the order it visits the rows, and Postgres accepts it when it stores the rows in the right order", "UNS-KEY-UPDATE-ORDER")
+		uniqueRows := []string{"CREATE UNIQUE INDEX dev_j ON dev (j)", "INSERT INTO dev VALUES (2, 2, 'b'), (1, 1, 'a')"}
 		rejects(t, create,
 			example{SQL: "UPDATE dev SET i = i + 1", Setup: []string{rows}},
+			example{SQL: "UPDATE dev SET j = j + 1", Setup: uniqueRows},
+			example{SQL: "UPDATE dev SET j = j + 1 WHERE j > 0", Setup: uniqueRows},
 		)
 	})
 }

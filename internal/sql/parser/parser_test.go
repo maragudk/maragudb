@@ -30,7 +30,15 @@ func TestParse(t *testing.T) {
 			{"create table t (id bigint primary key, name text not null, f double precision null)", "CREATE TABLE t (id bigint NOT NULL, name text NOT NULL, f double precision, PRIMARY KEY (id))"},
 			{"CREATE TABLE IF NOT EXISTS t (a int8, b bytea, c bool, d timestamptz, e float8, f boolean, g timestamp with time zone, h float, PRIMARY KEY (a, b))", "CREATE TABLE IF NOT EXISTS t (a bigint, b bytea, c boolean, d timestamptz, e double precision, f boolean, g timestamptz, h double precision, PRIMARY KEY (a, b))"},
 			{"create table t (id bigint constraint pk primary key, constraint c2 primary key (id))", ""},
-			{"create table t (id bigint, constraint pk primary key (id))", "CREATE TABLE t (id bigint, PRIMARY KEY (id))"},
+			{"create table t (id bigint, constraint pk primary key (id))", "CREATE TABLE t (id bigint, CONSTRAINT pk PRIMARY KEY (id))"},
+			{"create table t (id bigint constraint pk primary key, a text constraint u unique nulls not distinct, b bytea unique nulls distinct unique, unique (a, b), constraint ab unique nulls not distinct (b, a))", "CREATE TABLE t (id bigint NOT NULL, a text, b bytea, CONSTRAINT pk PRIMARY KEY (id), CONSTRAINT u UNIQUE NULLS NOT DISTINCT (a), UNIQUE (b), UNIQUE (b), UNIQUE (a, b), CONSTRAINT ab UNIQUE NULLS NOT DISTINCT (b, a))"},
+			{"create table t (id bigint unique primary key constraint n not null)", "CREATE TABLE t (id bigint NOT NULL, PRIMARY KEY (id), UNIQUE (id))"},
+			{"create index on t (a)", "CREATE INDEX ON t (a)"},
+			{"create unique index if not exists i on t (a desc, b asc nulls first, c nulls last, d desc nulls last) nulls not distinct", "CREATE UNIQUE INDEX IF NOT EXISTS i ON t (a DESC, b NULLS FIRST, c NULLS LAST, d DESC NULLS LAST) NULLS NOT DISTINCT"},
+			{"create index if on t (a) nulls distinct", "CREATE INDEX if ON t (a)"},
+			{`create index "Index" on "T" ("A")`, `CREATE INDEX "Index" ON "T" ("A")`},
+			{"drop index i", "DROP INDEX i"},
+			{"drop index if exists i restrict", "DROP INDEX IF EXISTS i"},
 			{"create table t (key bigint primary key, if bigint, exists bigint, set bigint, begin bigint, nulls bigint, first bigint, read bigint, by bigint, bigint bigint, time bigint, double bigint, delete bigint)", "CREATE TABLE t (key bigint NOT NULL, if bigint, exists bigint, set bigint, begin bigint, nulls bigint, first bigint, read bigint, by bigint, bigint bigint, time bigint, double bigint, delete bigint, PRIMARY KEY (key))"},
 			{"drop table t", "DROP TABLE t"},
 			{"drop table if exists T restrict", "DROP TABLE IF EXISTS t"},
@@ -250,6 +258,12 @@ func TestParse(t *testing.T) {
 			{"start", "syntax error at position 6: expected TRANSACTION, got end of statement"},
 			{"start work", "syntax error at position 7: expected TRANSACTION, got \"work\""},
 			{"select 1_", "syntax error at position 8: trailing junk after numeric literal"},
+			{"create index if not exists on t (a)", "syntax error at position 28: expected identifier, got ON"},
+			{"create index i on t (a nulls sometimes)", "syntax error at position 30: expected FIRST or LAST, got \"sometimes\""},
+			{"create index i on t ()", "syntax error at position 22: expected identifier, got \")\""},
+			{"create index i on t (a) nulls distinct x", "syntax error at position 40: unexpected \"x\""},
+			{"create table t (a bigint primary key, constraint c bigint)", "syntax error at position 52: expected a constraint after CONSTRAINT c, got \"bigint\""},
+			{"create table t (a bigint primary key, unique a)", "syntax error at position 46: expected \"(\", got \"a\""},
 			{`select "coalesce"(1)`, `invalid statement at position 19: function "coalesce" does not exist`},
 		}
 		for _, test := range tests {
@@ -330,17 +344,38 @@ func TestParse(t *testing.T) {
 			{"create table t (a serial primary key)", "serial is not supported, use bigint"},
 			{"create table t (a bigint)", "a table without a primary key is not supported, add PRIMARY KEY to a column or PRIMARY KEY (columns)"},
 			{"create table t ()", "a table without columns is not supported"},
-			{"create table t (a bigint primary key, b bigint unique)", "UNIQUE is not supported"},
 			{"create table t (a bigint primary key, b bigint default 1)", "DEFAULT is not supported"},
 			{"create table t (a bigint primary key, b bigint check (b > 0))", "CHECK is not supported"},
 			{"create table t (a bigint primary key, b bigint references u)", "REFERENCES is not supported"},
-			{"create table t (a bigint primary key, unique (a))", "UNIQUE is not supported"},
+			{"create table t (a bigint primary key, unique (a) include (b))", "INCLUDE is not supported"},
+			{"create table t (a bigint primary key include (b))", "INCLUDE is not supported"},
+			{"create table t (a bigint primary key, unique (a) with (fillfactor = 70))", "WITH storage parameters are not supported"},
+			{"create table t (a bigint primary key using index tablespace x)", "USING INDEX TABLESPACE is not supported"},
+			{"create table t (a bigint primary key, unique (a) deferrable)", "DEFERRABLE and NOT DEFERRABLE are not supported, every constraint is checked at once"},
+			{"create table t (a bigint primary key, b bigint unique not deferrable)", "DEFERRABLE and NOT DEFERRABLE are not supported, every constraint is checked at once"},
+			{"create table t (a bigint primary key initially deferred)", "DEFERRABLE and NOT DEFERRABLE are not supported, every constraint is checked at once"},
+			{"create table t (a bigint, primary key (a) deferrable initially deferred)", "DEFERRABLE and NOT DEFERRABLE are not supported, every constraint is checked at once"},
 			{"create temp table t (a bigint primary key)", "TEMP tables are not supported"},
-			{"create index i on t (a)", "CREATE INDEX is not supported, only CREATE TABLE"},
+			{"create view v as select 1", "CREATE VIEW is not supported, only CREATE TABLE and CREATE INDEX"},
+			{"create index concurrently i on t (a)", "CREATE INDEX CONCURRENTLY is not supported, every statement is atomic"},
+			{"create index i on only t (a)", "ON ONLY is not supported, there is no inheritance"},
+			{"create index i on t using btree (a)", "USING is not supported, every index is a btree"},
+			{"create index i on t ((a + 1))", "expression indexes are not supported, index columns"},
+			{"create index i on t (lower(a))", "expression indexes are not supported, index columns"},
+			{"create index i on t (a collate \"C\")", "COLLATE is not supported, strings compare by byte order"},
+			{"create index i on t (a text_pattern_ops)", "operator classes are not supported"},
+			{"create index i on t (a) include (b)", "INCLUDE is not supported"},
+			{"create index i on t (a) with (fillfactor = 70)", "WITH storage parameters are not supported"},
+			{"create index i on t (a) tablespace x", "TABLESPACE is not supported"},
+			{"create index i on t (a) where a > 0", "partial indexes are not supported, index the whole table"},
+			{"drop index concurrently i", "DROP INDEX CONCURRENTLY is not supported, every statement is atomic"},
+			{"drop index i, j", "dropping several tables or indexes in one statement is not supported, drop them one at a time"},
+			{"drop index i cascade", "CASCADE is not supported, drop the tables one at a time"},
+			{"alter index i rename to j", "ALTER is not supported"},
 			{"create table t (a bigint primary key) inherits (u)", "INHERITS is not supported"},
 			{"drop table t cascade", "CASCADE is not supported, drop the tables one at a time"},
-			{"drop table t, u", "dropping several tables in one statement is not supported, drop them one at a time"},
-			{"drop index i", "DROP INDEX is not supported, only DROP TABLE"},
+			{"drop table t, u", "dropping several tables or indexes in one statement is not supported, drop them one at a time"},
+			{"drop view v", "DROP VIEW is not supported, only DROP TABLE and DROP INDEX"},
 			{"insert into t select * from u", "INSERT ... SELECT is not supported, write VALUES"},
 			{"insert into t default values", "INSERT ... DEFAULT VALUES is not supported, write VALUES"},
 			{"insert into t values (1) on conflict do nothing", "ON CONFLICT is not supported"},
@@ -584,8 +619,21 @@ func drawStatement(ht hegel.TestCase) ast.Statement {
 			s.Columns = append(s.Columns, ast.ColumnDef{Name: drawName(ht), Type: hegel.Draw(ht, hegel.SampledFrom(allTypes)), NotNull: hegel.Draw(ht, hegel.Booleans())})
 		}
 		s.PrimaryKey = drawNames(ht, 1, 2)
+		if hegel.Draw(ht, hegel.Booleans()) {
+			s.PrimaryKeyName = drawName(ht)
+		}
+		for range hegel.Draw(ht, hegel.Integers(0, 2)) {
+			u := ast.UniqueConstraint{Columns: drawNames(ht, 1, 2), NullsNotDistinct: hegel.Draw(ht, hegel.Booleans())}
+			if hegel.Draw(ht, hegel.Booleans()) {
+				u.Name = drawName(ht)
+			}
+			s.Unique = append(s.Unique, u)
+		}
 		return s
 	case 1:
+		if hegel.Draw(ht, hegel.Booleans()) {
+			return &ast.DropIndex{Name: drawName(ht), IfExists: hegel.Draw(ht, hegel.Booleans())}
+		}
 		return &ast.DropTable{Name: drawName(ht), IfExists: hegel.Draw(ht, hegel.Booleans())}
 	case 2:
 		s := &ast.Insert{Table: drawName(ht)}
@@ -627,6 +675,17 @@ func drawStatement(ht hegel.TestCase) ast.Statement {
 		s.Offset = drawOptionalExpr(ht)
 		return s
 	case 7:
+		if hegel.Draw(ht, hegel.Booleans()) {
+			s := &ast.CreateIndex{Table: drawName(ht), Unique: hegel.Draw(ht, hegel.Booleans()), NullsNotDistinct: hegel.Draw(ht, hegel.Booleans())}
+			if hegel.Draw(ht, hegel.Booleans()) {
+				s.Name = drawName(ht)
+				s.IfNotExists = hegel.Draw(ht, hegel.Booleans())
+			}
+			for _, name := range drawNames(ht, 1, 3) {
+				s.Columns = append(s.Columns, ast.IndexColumn{Name: name, Desc: hegel.Draw(ht, hegel.Booleans()), Nulls: ast.NullsOrder(hegel.Draw(ht, hegel.Integers(0, 2)))})
+			}
+			return s
+		}
 		return &ast.Begin{ReadOnly: hegel.Draw(ht, hegel.Booleans())}
 	default:
 		if hegel.Draw(ht, hegel.Booleans()) {

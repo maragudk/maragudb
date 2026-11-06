@@ -85,9 +85,19 @@ var (
 	ErrType = exec.ErrType
 	// ErrNoTable is a reference to a table that does not exist.
 	ErrNoTable = exec.ErrNoTable
-	// ErrTableExists is a CREATE TABLE of a table that exists.
+	// ErrTableExists is a CREATE TABLE or CREATE INDEX of a name that a table or index has.
+	// Tables and indexes share one namespace, as in Postgres.
 	ErrTableExists = exec.ErrTableExists
-	// ErrDuplicateKey is an insert or update that would repeat a primary key.
+	// ErrNoIndex is a DROP INDEX of an index that does not exist.
+	ErrNoIndex = exec.ErrNoIndex
+	// ErrWrongObjectType is a statement on a relation of the wrong kind, such as a SELECT from an
+	// index or a DROP INDEX of a table.
+	ErrWrongObjectType = exec.ErrWrongObjectType
+	// ErrDependentObjects is a DROP INDEX of an index that a PRIMARY KEY or UNIQUE constraint of
+	// its table needs; dropping the table drops it.
+	ErrDependentObjects = exec.ErrDependentObjects
+	// ErrDuplicateKey is an insert or update that would repeat a primary key or the values of a
+	// unique index, or a CREATE UNIQUE INDEX on rows that do.
 	ErrDuplicateKey = exec.ErrDuplicateKey
 	// ErrNotNull is a NULL in a NOT NULL column.
 	ErrNotNull = exec.ErrNotNull

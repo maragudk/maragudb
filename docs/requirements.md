@@ -58,6 +58,8 @@ The project is built in three sections. A section is done only when all of its a
 ### Section 2: Integrity
 
 - `CREATE INDEX`, including `UNIQUE`. The planner uses indexes for lookups and range scans.
+  - After any committed history, every index holds exactly the entries derived from its table's rows. `INV-INDEX-CONSISTENT`
+  - No committed state ever has two rows with equal non-NULL values in a UNIQUE index. `INV-UNIQUE`
 - The `UNIQUE`, `DEFAULT` (including expressions such as `now()`), and `CHECK` constraints.
 - `FOREIGN KEY`, always enforced.
 
@@ -97,6 +99,8 @@ These apply to every section, for the SQL surface that exists at that point.
    - A commit uses O(1) PUTs, independent of database size. `AC-5.1`
    - A transaction with a warm cache uses one conditional GET (or HEAD) for the freshness check, plus nothing else for cached data. `AC-5.2`
    - A point lookup with a cold cache uses O(log n) GETs. `AC-5.3`
+   - A point lookup through a secondary index with a cold cache uses O(log n) GETs. `AC-5.5`
+   - A commit that changes indexed columns still uses O(1) PUTs, independent of database size and of the number of indexes. `AC-5.6`
 
    Latency against Tigris is measured and reported, but it does not gate. `AC-5.4`
 6. **Bounded storage.** After compaction, the object count grows with data size, not with commit count. `AC-6.1` GC never deletes an object that a snapshot within the configured grace period still references. `AC-6.2` A reader older than the grace period gets a clear error, never wrong data. `AC-6.3`

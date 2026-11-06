@@ -419,8 +419,12 @@ var (
 )
 
 // inKeyOrder runs a statement that failed on Postgres again, with the rows of its table stored
-// in primary key order so that a scan visits them in that order, and returns the statement's
-// error, which is nil if it succeeded. Nothing it does is kept. Inside a transaction, it rolls
+// in primary key order and its other indexes marked invalid, so that the planner scans the
+// table or its primary key and visits the rows in that order, and returns the statement's error,
+// which is nil if it succeeded. An invalid index is still kept up to date and still enforces
+// uniqueness; the planner only does not use it. A scan of the primary key is one of the plans
+// Postgres can pick, and maragudb fails a statement for certain only on a row that every plan
+// reads. Nothing it does is kept. Inside a transaction, it rolls
 // back to the savepoint taken before the statement, reruns it, and aborts the transaction
 // again. A read-only transaction cannot store the rows again, but it has written nothing
 // either, so its rows are the committed ones: the rerun ends it, runs in a transaction of its
@@ -444,6 +448,7 @@ func (s *sides) inKeyOrder(ctx context.Context, text, table string, query bool) 
 		"CREATE TEMP TABLE sorted ON COMMIT DROP AS SELECT * FROM "+tableName,
 		"DELETE FROM "+tableName,
 		"INSERT INTO "+tableName+" SELECT * FROM sorted ORDER BY "+strings.Join(keys, ", "),
+		"UPDATE pg_index SET indisvalid = false WHERE indrelid = '"+strings.ReplaceAll(tableName, "'", "''")+"'::regclass AND NOT indisprimary",
 	)
 	for _, q := range steps {
 		if _, err := s.pg.ExecContext(ctx, q); err != nil {

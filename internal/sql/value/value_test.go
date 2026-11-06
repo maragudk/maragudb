@@ -148,6 +148,73 @@ func TestEncodeKey(t *testing.T) {
 	})
 }
 
+func TestEncodeIndexKey(t *testing.T) {
+	// compareIndex is the order of an index column as Postgres sorts it: by value, reversed when
+	// descending, with NULL first or last.
+	compareIndex := func(a, b value.Value, desc, nullsFirst bool) int {
+		switch {
+		case a.Null && b.Null:
+			return 0
+		case a.Null && nullsFirst, b.Null && !nullsFirst:
+			return -1
+		case a.Null, b.Null:
+			return 1
+		}
+		c := value.Compare(a, b)
+		if desc {
+			c = -c
+		}
+		return sign(c)
+	}
+
+	t.Run("byte order of composite index keys equals the order of every column with its direction and NULL placement", func(t *testing.T) {
+		verify.Covers(t, "the index key encoding sorts composite keys of every type, ascending or descending, with NULLs first or last, in the order Postgres sorts the index", "INV-INDEX-CONSISTENT")
+		hegel.Test(t, func(ht *hegel.T) {
+			types := hegel.Draw(ht, hegel.Lists(hegel.SampledFrom(allTypes)).MinSize(1).MaxSize(4))
+			var ka, kb []byte
+			want := 0
+			for _, typ := range types {
+				desc := hegel.Draw(ht, hegel.Booleans())
+				nullsFirst := hegel.Draw(ht, hegel.Booleans())
+				a := drawValue(ht, typ, true)
+				b := a
+				if hegel.Draw(ht, hegel.Booleans()) {
+					b = drawValue(ht, typ, true)
+				}
+				ka = value.EncodeIndexKey(ka, a, desc, nullsFirst)
+				kb = value.EncodeIndexKey(kb, b, desc, nullsFirst)
+				if want == 0 {
+					want = compareIndex(a, b, desc, nullsFirst)
+				}
+				ht.Note(fmt.Sprintf("%v %v desc=%v nullsFirst=%v", a, b, desc, nullsFirst))
+			}
+			if got := sign(bytes.Compare(ka, kb)); got != want {
+				ht.Fatalf("encoding order %d, index order %d: %x, %x", got, want, ka, kb)
+			}
+		}, hegel.WithTestCases(3000))
+	})
+
+	t.Run("values that Postgres's index compares as equal encode the same, and others differently", func(t *testing.T) {
+		zero := value.EncodeIndexKey(nil, value.NewFloat(0), true, false)
+		is.True(t, bytes.Equal(zero, value.EncodeIndexKey(nil, value.NewFloat(math.Copysign(0, -1)), true, false)), "0 and -0")
+		is.True(t, !bytes.Equal(value.EncodeIndexKey(nil, value.NewNull(value.Int), false, true), value.EncodeIndexKey(nil, value.NewNull(value.Int), false, false)), "NULL first and last")
+		hegel.Test(t, func(ht *hegel.T) {
+			typ := hegel.Draw(ht, hegel.SampledFrom(allTypes))
+			desc := hegel.Draw(ht, hegel.Booleans())
+			a := drawValue(ht, typ, false)
+			b := drawValue(ht, typ, false)
+			ka := value.EncodeIndexKey(nil, a, desc, false)
+			kb := value.EncodeIndexKey(nil, b, desc, false)
+			if bytes.Equal(ka, kb) != (value.Compare(a, b) == 0) {
+				ht.Fatalf("%v and %v: %x, %x", a, b, ka, kb)
+			}
+			if len(ka) < len(kb) && bytes.HasPrefix(kb, ka) {
+				ht.Fatalf("%v (%x) is a prefix of %v (%x)", a, ka, b, kb)
+			}
+		}, hegel.WithTestCases(2000))
+	})
+}
+
 func TestEncodeRow(t *testing.T) {
 	t.Run("round trips every type and NULL", func(t *testing.T) {
 		verify.Covers(t, "every value of the six types and NULL round-trips through the row encoding", "INV-TYPES")

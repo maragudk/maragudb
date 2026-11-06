@@ -18,9 +18,10 @@ func TestErrorClasses(t *testing.T) {
 	// Each case fails on both databases. Postgres is the Postgres spelling when it differs.
 	// Each statement fails on both databases.
 	tests := []struct {
-		sql  string
-		want error
-		code string
+		setup string
+		sql   string
+		want  error
+		code  string
 	}{
 		{sql: "SELECT 1 / 0", want: maragudb.ErrDivisionByZero, code: "22012"},
 		{sql: "SELECT 9223372036854775807 + 1", want: maragudb.ErrOutOfRange, code: "22003"},
@@ -32,6 +33,14 @@ func TestErrorClasses(t *testing.T) {
 		{sql: "SELECT 1 ORDER BY 'a'", want: maragudb.ErrSyntax, code: "42601"},
 		{sql: "SELECT * FROM nope", want: maragudb.ErrNoTable, code: "42P01"},
 		{sql: "CREATE TABLE dev (i bigint PRIMARY KEY)", want: maragudb.ErrTableExists, code: "42P07"},
+		{sql: "CREATE INDEX dev ON dev (j)", want: maragudb.ErrTableExists, code: "42P07"},
+		{sql: "CREATE TABLE dev_pkey (i bigint PRIMARY KEY)", want: maragudb.ErrTableExists, code: "42P07"},
+		{setup: "CREATE UNIQUE INDEX ON dev (j, j)", sql: "INSERT INTO dev VALUES (3, 1)", want: maragudb.ErrDuplicateKey, code: "23505"},
+		{sql: "DROP INDEX nope", want: maragudb.ErrNoIndex, code: "42704"},
+		{sql: "DROP INDEX dev", want: maragudb.ErrWrongObjectType, code: "42809"},
+		{sql: "DROP TABLE IF EXISTS dev_pkey", want: maragudb.ErrWrongObjectType, code: "42809"},
+		{sql: "SELECT * FROM dev_pkey", want: maragudb.ErrWrongObjectType, code: "42809"},
+		{sql: "DROP INDEX dev_pkey", want: maragudb.ErrDependentObjects, code: "2BP01"},
 		{sql: "SELECT 1 WHERE 1", want: maragudb.ErrType, code: "42804"},
 		{sql: "INSERT INTO dev VALUES (TRUE, 1)", want: maragudb.ErrType, code: "42804"},
 		{sql: "SELECT 1 + TRUE", want: maragudb.ErrType, code: "42883"},
@@ -63,6 +72,9 @@ func TestErrorClasses(t *testing.T) {
 			for _, db := range []*sql.DB{b.m, b.pg} {
 				_, err := db.ExecContext(t.Context(), "INSERT INTO dev VALUES (1, 1)")
 				is.NotError(t, err)
+			}
+			if test.setup != "" {
+				b.exec(t, test.setup)
 			}
 			_, mErr := b.m.ExecContext(t.Context(), test.sql)
 			_, pgErr := b.pg.ExecContext(t.Context(), test.sql)

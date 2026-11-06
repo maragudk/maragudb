@@ -439,13 +439,16 @@ func (p *parser) createTable() (ast.Statement, error) {
 	if err := p.advance(); err != nil {
 		return nil, err
 	}
+	if p.isKeyword("unique") || p.isWord("index") {
+		return p.createIndex()
+	}
 	for _, w := range []string{"temp", "temporary", "unlogged", "global", "local"} {
 		if p.isWord(w) {
 			return nil, p.unsupportedf("%s tables are not supported", strings.ToUpper(w))
 		}
 	}
 	if !p.isKeyword("table") {
-		return nil, p.unsupportedf("CREATE %s is not supported, only CREATE TABLE", strings.ToUpper(p.tok.text))
+		return nil, p.unsupportedf("CREATE %s is not supported, only CREATE TABLE and CREATE INDEX", strings.ToUpper(p.tok.text))
 	}
 	if err := p.advance(); err != nil {
 		return nil, err
@@ -476,61 +479,71 @@ func (p *parser) createTable() (ast.Statement, error) {
 	if p.isOp(")") {
 		return nil, p.unsupportedf("a table without columns is not supported")
 	}
+	setPrimaryKey := func(name string, columns []string) error {
+		if s.PrimaryKey != nil {
+			return fmt.Errorf("%w: multiple primary keys for table %q are not allowed", ErrInvalid, s.Name)
+		}
+		s.PrimaryKey, s.PrimaryKeyName = columns, name
+		return nil
+	}
 	for {
+		name := ""
 		if p.isKeyword("constraint") {
 			if err := p.advance(); err != nil {
 				return nil, err
 			}
-			if _, err := p.ident(); err != nil {
+			if name, err = p.ident(); err != nil {
 				return nil, err
 			}
 		}
-		if p.isKeyword("primary") {
+		switch {
+		case p.isKeyword("primary"):
 			if err := p.advance(); err != nil {
 				return nil, err
-			}
-			if s.PrimaryKey != nil {
-				return nil, fmt.Errorf("%w: multiple primary keys for table %q are not allowed", ErrInvalid, s.Name)
 			}
 			if err := p.expectWord("key"); err != nil {
 				return nil, err
 			}
-			if err := p.expectOp("("); err != nil {
+			columns, err := p.columnList()
+			if err != nil {
 				return nil, err
 			}
-			for {
-				col, err := p.ident()
-				if err != nil {
-					return nil, err
-				}
-				s.PrimaryKey = append(s.PrimaryKey, col)
-				if p.isOp(",") {
-					if err := p.advance(); err != nil {
-						return nil, err
-					}
-					continue
-				}
-				break
-			}
-			if err := p.expectOp(")"); err != nil {
+			if err := setPrimaryKey(name, columns); err != nil {
 				return nil, err
 			}
-		} else if msg, ok := unsupportedConstraints[p.tok.text]; ok && p.tok.kind == tokKeyword {
-			return nil, p.unsupportedf("%s", msg)
-		} else if p.isKeyword("like") {
+			if err := p.constraintOptions(); err != nil {
+				return nil, err
+			}
+		case p.isKeyword("unique"):
+			u, err := p.unique(name)
+			if err != nil {
+				return nil, err
+			}
+			if u.Columns, err = p.columnList(); err != nil {
+				return nil, err
+			}
+			if err := p.constraintOptions(); err != nil {
+				return nil, err
+			}
+			s.Unique = append(s.Unique, u)
+		case p.tok.kind == tokKeyword && unsupportedConstraints[p.tok.text] != "":
+			return nil, p.unsupportedf("%s", unsupportedConstraints[p.tok.text])
+		case p.isKeyword("like"):
 			return nil, p.unsupportedf("LIKE in CREATE TABLE is not supported")
-		} else {
+		case name != "":
+			return nil, p.errorf("expected a constraint after CONSTRAINT %s, got %v", name, p.tok)
+		default:
 			col, err := p.columnDef()
 			if err != nil {
 				return nil, err
 			}
 			if col.pk {
-				if s.PrimaryKey != nil {
-					return nil, fmt.Errorf("%w: multiple primary keys for table %q are not allowed", ErrInvalid, s.Name)
+				if err := setPrimaryKey(col.pkName, []string{col.def.Name}); err != nil {
+					return nil, err
 				}
-				s.PrimaryKey = []string{col.def.Name}
 			}
 			s.Columns = append(s.Columns, col.def)
+			s.Unique = append(s.Unique, col.unique...)
 		}
 		if p.isOp(",") {
 			if err := p.advance(); err != nil {
@@ -552,10 +565,73 @@ func (p *parser) createTable() (ast.Statement, error) {
 	return s, nil
 }
 
-// unsupportedConstraints are the table and column constraints Postgres has beyond PRIMARY KEY
-// and NOT NULL.
+// columnList parses a parenthesized list of column names.
+func (p *parser) columnList() ([]string, error) {
+	if err := p.expectOp("("); err != nil {
+		return nil, err
+	}
+	var columns []string
+	for {
+		col, err := p.ident()
+		if err != nil {
+			return nil, err
+		}
+		columns = append(columns, col)
+		if !p.isOp(",") {
+			break
+		}
+		if err := p.advance(); err != nil {
+			return nil, err
+		}
+	}
+	return columns, p.expectOp(")")
+}
+
+// unique parses UNIQUE [NULLS [NOT] DISTINCT] of a constraint with the given name.
+func (p *parser) unique(name string) (ast.UniqueConstraint, error) {
+	u := ast.UniqueConstraint{Name: name}
+	if err := p.advance(); err != nil {
+		return u, err
+	}
+	var err error
+	u.NullsNotDistinct, err = p.nullsDistinct()
+	return u, err
+}
+
+// nullsDistinct parses an optional NULLS [NOT] DISTINCT and reports whether it is NOT DISTINCT.
+func (p *parser) nullsDistinct() (bool, error) {
+	if !p.isWord("nulls") {
+		return false, nil
+	}
+	if err := p.advance(); err != nil {
+		return false, err
+	}
+	not, err := p.accept("not")
+	if err != nil {
+		return false, err
+	}
+	return not, p.expectWord("distinct")
+}
+
+// constraintOptions rejects the index options that may follow a PRIMARY KEY or UNIQUE
+// constraint.
+func (p *parser) constraintOptions() error {
+	switch {
+	case p.isWord("include"):
+		return p.unsupportedf("INCLUDE is not supported")
+	case p.isKeyword("with"):
+		return p.unsupportedf("WITH storage parameters are not supported")
+	case p.isKeyword("using"):
+		return p.unsupportedf("USING INDEX TABLESPACE is not supported")
+	case p.isKeyword("deferrable"), p.isKeyword("initially"), p.isKeyword("not") && p.peekIsWord("deferrable"):
+		return p.unsupportedf("DEFERRABLE and NOT DEFERRABLE are not supported, every constraint is checked at once")
+	}
+	return nil
+}
+
+// unsupportedConstraints are the table and column constraints Postgres has beyond PRIMARY KEY,
+// UNIQUE, and NOT NULL.
 var unsupportedConstraints = map[string]string{
-	"unique":     "UNIQUE is not supported",
 	"check":      "CHECK is not supported",
 	"foreign":    "FOREIGN KEY is not supported",
 	"references": "REFERENCES is not supported",
@@ -563,13 +639,15 @@ var unsupportedConstraints = map[string]string{
 	"default":    "DEFAULT is not supported",
 	"generated":  "GENERATED columns are not supported",
 	"collate":    "COLLATE is not supported, strings compare by byte order",
-	"deferrable": "DEFERRABLE is not supported",
-	"initially":  "DEFERRABLE is not supported",
+	"deferrable": "DEFERRABLE and NOT DEFERRABLE are not supported, every constraint is checked at once",
+	"initially":  "DEFERRABLE and NOT DEFERRABLE are not supported, every constraint is checked at once",
 }
 
 type columnDef struct {
-	def ast.ColumnDef
-	pk  bool
+	def    ast.ColumnDef
+	pk     bool
+	pkName string
+	unique []ast.UniqueConstraint
 }
 
 func (p *parser) columnDef() (columnDef, error) {
@@ -582,11 +660,12 @@ func (p *parser) columnDef() (columnDef, error) {
 		return c, err
 	}
 	for {
+		name := ""
 		if p.isKeyword("constraint") {
 			if err := p.advance(); err != nil {
 				return c, err
 			}
-			if _, err := p.ident(); err != nil {
+			if name, err = p.ident(); err != nil {
 				return c, err
 			}
 		}
@@ -596,7 +675,7 @@ func (p *parser) columnDef() (columnDef, error) {
 				return c, err
 			}
 			if p.isKeyword("deferrable") {
-				return c, p.unsupportedf("DEFERRABLE is not supported")
+				return c, p.unsupportedf("%s", unsupportedConstraints["deferrable"])
 			}
 			if err := p.expectWord("null"); err != nil {
 				return c, err
@@ -613,28 +692,170 @@ func (p *parser) columnDef() (columnDef, error) {
 			if err := p.expectWord("key"); err != nil {
 				return c, err
 			}
-			c.pk = true
+			if c.pk {
+				return c, fmt.Errorf("%w: multiple primary keys for table are not allowed", ErrInvalid)
+			}
+			c.pk, c.pkName = true, name
 			c.def.NotNull = true
+			if err := p.constraintOptions(); err != nil {
+				return c, err
+			}
+		case p.isKeyword("unique"):
+			u, err := p.unique(name)
+			if err != nil {
+				return c, err
+			}
+			u.Columns = []string{c.def.Name}
+			c.unique = append(c.unique, u)
+			if err := p.constraintOptions(); err != nil {
+				return c, err
+			}
 		default:
 			if msg, ok := unsupportedConstraints[p.tok.text]; ok && (p.tok.kind == tokKeyword || (p.tok.kind == tokIdent && !p.tok.quoted)) {
 				return c, p.unsupportedf("%s", msg)
+			}
+			if name != "" {
+				return c, p.errorf("expected a constraint after CONSTRAINT %s, got %v", name, p.tok)
 			}
 			return c, nil
 		}
 	}
 }
 
+// createIndex parses CREATE [UNIQUE] INDEX after CREATE.
+func (p *parser) createIndex() (ast.Statement, error) {
+	s := &ast.CreateIndex{}
+	if p.isKeyword("unique") {
+		s.Unique = true
+		if err := p.advance(); err != nil {
+			return nil, err
+		}
+	}
+	if err := p.expectWord("index"); err != nil {
+		return nil, err
+	}
+	if p.isKeyword("concurrently") {
+		return nil, p.unsupportedf("CREATE INDEX CONCURRENTLY is not supported, every statement is atomic")
+	}
+	var err error
+	switch {
+	case p.isWord("if") && p.peek().text == "not":
+		if err := p.advance(); err != nil {
+			return nil, err
+		}
+		if err := p.expectWord("not"); err != nil {
+			return nil, err
+		}
+		if err := p.expectWord("exists"); err != nil {
+			return nil, err
+		}
+		s.IfNotExists = true
+		if s.Name, err = p.ident(); err != nil {
+			return nil, err
+		}
+	case !p.isKeyword("on"):
+		if s.Name, err = p.ident(); err != nil {
+			return nil, err
+		}
+	}
+	if err := p.expectWord("on"); err != nil {
+		return nil, err
+	}
+	if p.isKeyword("only") {
+		return nil, p.unsupportedf("ON ONLY is not supported, there is no inheritance")
+	}
+	if s.Table, err = p.ident(); err != nil {
+		return nil, err
+	}
+	if p.isKeyword("using") {
+		return nil, p.unsupportedf("USING is not supported, every index is a btree")
+	}
+	if err := p.expectOp("("); err != nil {
+		return nil, err
+	}
+	for {
+		if p.isOp("(") {
+			return nil, p.unsupportedf("expression indexes are not supported, index columns")
+		}
+		var c ast.IndexColumn
+		if c.Name, err = p.ident(); err != nil {
+			return nil, err
+		}
+		switch {
+		case p.isOp("("):
+			return nil, p.unsupportedf("expression indexes are not supported, index columns")
+		case p.isKeyword("collate"):
+			return nil, p.unsupportedf("COLLATE is not supported, strings compare by byte order")
+		case p.tok.kind == tokIdent && !p.isWord("nulls"):
+			return nil, p.unsupportedf("operator classes are not supported")
+		}
+		if p.isKeyword("desc") {
+			c.Desc = true
+		}
+		if p.isKeyword("asc") || p.isKeyword("desc") {
+			if err := p.advance(); err != nil {
+				return nil, err
+			}
+		}
+		if p.isWord("nulls") {
+			if err := p.advance(); err != nil {
+				return nil, err
+			}
+			switch {
+			case p.isWord("first"):
+				c.Nulls = ast.NullsFirst
+			case p.isWord("last"):
+				c.Nulls = ast.NullsLast
+			default:
+				return nil, p.errorf("expected FIRST or LAST, got %v", p.tok)
+			}
+			if err := p.advance(); err != nil {
+				return nil, err
+			}
+		}
+		s.Columns = append(s.Columns, c)
+		if !p.isOp(",") {
+			break
+		}
+		if err := p.advance(); err != nil {
+			return nil, err
+		}
+	}
+	if err := p.expectOp(")"); err != nil {
+		return nil, err
+	}
+	if p.isWord("include") {
+		return nil, p.unsupportedf("INCLUDE is not supported")
+	}
+	if s.NullsNotDistinct, err = p.nullsDistinct(); err != nil {
+		return nil, err
+	}
+	switch {
+	case p.isKeyword("with"):
+		return nil, p.unsupportedf("WITH storage parameters are not supported")
+	case p.isWord("tablespace"):
+		return nil, p.unsupportedf("TABLESPACE is not supported")
+	case p.isKeyword("where"):
+		return nil, p.unsupportedf("partial indexes are not supported, index the whole table")
+	}
+	return s, nil
+}
+
 func (p *parser) dropTable() (ast.Statement, error) {
 	if err := p.advance(); err != nil {
 		return nil, err
 	}
-	if !p.isKeyword("table") {
-		return nil, p.unsupportedf("DROP %s is not supported, only DROP TABLE", strings.ToUpper(p.tok.text))
+	index := p.isWord("index")
+	if !p.isKeyword("table") && !index {
+		return nil, p.unsupportedf("DROP %s is not supported, only DROP TABLE and DROP INDEX", strings.ToUpper(p.tok.text))
 	}
 	if err := p.advance(); err != nil {
 		return nil, err
 	}
-	s := &ast.DropTable{}
+	if index && p.isKeyword("concurrently") {
+		return nil, p.unsupportedf("DROP INDEX CONCURRENTLY is not supported, every statement is atomic")
+	}
+	ifExists := false
 	if p.isWord("if") && p.peek().text == "exists" {
 		if err := p.advance(); err != nil {
 			return nil, err
@@ -642,19 +863,22 @@ func (p *parser) dropTable() (ast.Statement, error) {
 		if err := p.expectWord("exists"); err != nil {
 			return nil, err
 		}
-		s.IfExists = true
+		ifExists = true
 	}
-	var err error
-	if s.Name, err = p.ident(); err != nil {
+	name, err := p.ident()
+	if err != nil {
 		return nil, err
 	}
 	if p.isOp(",") {
-		return nil, p.unsupportedf("dropping several tables in one statement is not supported, drop them one at a time")
+		return nil, p.unsupportedf("dropping several tables or indexes in one statement is not supported, drop them one at a time")
 	}
 	if _, err := p.accept("restrict"); err != nil {
 		return nil, err
 	}
-	return s, nil
+	if index {
+		return &ast.DropIndex{Name: name, IfExists: ifExists}, nil
+	}
+	return &ast.DropTable{Name: name, IfExists: ifExists}, nil
 }
 
 func (p *parser) insert() (ast.Statement, error) {

@@ -36,6 +36,46 @@ type CreateTable struct {
 	Columns     []ColumnDef
 	// PrimaryKey columns in key order. Required.
 	PrimaryKey []string
+	// PrimaryKeyName is the name of the primary key constraint, and of its index, or "" for the
+	// name Postgres chooses.
+	PrimaryKeyName string
+	// Unique constraints, column and table constraints alike, in the order they are written.
+	Unique []UniqueConstraint
+}
+
+// UniqueConstraint of a [CreateTable].
+type UniqueConstraint struct {
+	// Name of the constraint and its index, or "" for the name Postgres chooses.
+	Name    string
+	Columns []string
+	// NullsNotDistinct makes NULLs equal to each other, so that two rows with NULL in the same
+	// columns are a duplicate.
+	NullsNotDistinct bool
+}
+
+// CreateIndex statement.
+type CreateIndex struct {
+	// Name of the index, or "" for the name Postgres chooses.
+	Name        string
+	IfNotExists bool
+	Unique      bool
+	Table       string
+	Columns     []IndexColumn
+	// NullsNotDistinct makes NULLs equal to each other in a unique index.
+	NullsNotDistinct bool
+}
+
+// IndexColumn of a [CreateIndex].
+type IndexColumn struct {
+	Name  string
+	Desc  bool
+	Nulls NullsOrder
+}
+
+// DropIndex statement.
+type DropIndex struct {
+	Name     string
+	IfExists bool
 }
 
 // ColumnDef in a [CreateTable].
@@ -125,6 +165,8 @@ type Rollback struct{}
 
 func (*CreateTable) stmt() {}
 func (*DropTable) stmt()   {}
+func (*CreateIndex) stmt() {}
+func (*DropIndex) stmt()   {}
 func (*Insert) stmt()      {}
 func (*Update) stmt()      {}
 func (*Delete) stmt()      {}

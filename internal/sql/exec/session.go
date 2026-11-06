@@ -38,6 +38,14 @@ type Mutations struct {
 	// UpdateSeesOwnWrites makes UPDATE restart its scan after every row it writes, so it can
 	// visit a row it has already changed, which is the Halloween problem.
 	UpdateSeesOwnWrites bool
+	// IndexStaleDelete leaves the old index entries of a row that an UPDATE changes or a DELETE
+	// removes.
+	IndexStaleDelete bool
+	// UniqueNoCheck skips the check that no other row has a row's entry in a unique index.
+	UniqueNoCheck bool
+	// UniqueOwnWrites makes the check of a unique entry read the transaction without the
+	// statement's own writes, so that it misses a duplicate within one statement.
+	UniqueOwnWrites bool
 }
 
 // Session runs statements for one client, serially. It is not safe for concurrent use.
@@ -321,8 +329,9 @@ func (s *Session) Execute(ctx context.Context, st *Statement, params []value.Val
 // failure in an explicit transaction aborts it.
 func (s *Session) run(ctx context.Context, st *Statement, params []value.Value) (*Rows, Result, error) {
 	rows, res, err := s.execute(ctx, st.ast, params)
-	_, ddl := st.ast.(*ast.CreateTable)
-	if _, drop := st.ast.(*ast.DropTable); drop {
+	ddl := false
+	switch st.ast.(type) {
+	case *ast.CreateTable, *ast.DropTable, *ast.CreateIndex, *ast.DropIndex:
 		ddl = true
 	}
 	if err != nil {
@@ -352,7 +361,7 @@ func (s *Session) execute(ctx context.Context, st ast.Statement, params []value.
 	case *ast.Select:
 		rows, err := s.selectStmt(ctx, st, params)
 		return rows, Result{}, err
-	case *ast.CreateTable, *ast.DropTable:
+	case *ast.CreateTable, *ast.DropTable, *ast.CreateIndex, *ast.DropIndex:
 		// Postgres refuses DDL in a read-only transaction before it looks at the statement, and
 		// INSERT, UPDATE, and DELETE only once they are analyzed and planned, which
 		// [Session.writable] checks.
@@ -367,6 +376,10 @@ func (s *Session) execute(ctx context.Context, st ast.Statement, params []value.
 		err = s.createTable(ctx, st)
 	case *ast.DropTable:
 		err = s.dropTable(ctx, st)
+	case *ast.CreateIndex:
+		err = s.createIndex(ctx, st)
+	case *ast.DropIndex:
+		err = s.dropIndex(ctx, st)
 	case *ast.Insert:
 		res, err = s.insert(ctx, st, params)
 	case *ast.Update:
@@ -393,6 +406,10 @@ func verb(st ast.Statement) string {
 		return "CREATE TABLE"
 	case *ast.DropTable:
 		return "DROP TABLE"
+	case *ast.CreateIndex:
+		return "CREATE INDEX"
+	case *ast.DropIndex:
+		return "DROP INDEX"
 	case *ast.Insert:
 		return "INSERT"
 	case *ast.Update:

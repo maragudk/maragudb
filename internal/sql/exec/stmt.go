@@ -1,11 +1,13 @@
 package exec
 
 import (
+	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 	"unicode/utf8"
@@ -23,37 +25,46 @@ func (s *Session) lookupTable(ctx context.Context, name string) (*table, bool, e
 	return t, err == nil, err
 }
 
+// createTable runs CREATE TABLE. As in Postgres, IF NOT EXISTS skips a statement whose name is
+// taken before anything else, and otherwise the definition is checked before the name, which
+// tables and indexes share.
 func (s *Session) createTable(ctx context.Context, st *ast.CreateTable) error {
-	if _, exists, err := s.lookupTable(ctx, st.Name); err != nil {
+	_, exists, err := s.relation(ctx, st.Name)
+	if err != nil {
 		return err
-	} else if exists {
-		if st.IfNotExists {
-			return nil
-		}
-		return fmt.Errorf("%w: relation %q already exists", ErrTableExists, st.Name)
+	}
+	if exists && st.IfNotExists {
+		return nil
 	}
 	t, err := newTable(st)
 	if err != nil {
 		return err
 	}
-	b, err := json.Marshal(t)
+	cs, err := t.indexConstraints(st)
 	if err != nil {
 		return err
 	}
-	s.kv.put(catalogKey(st.Name), b)
-	return nil
+	if exists {
+		return fmt.Errorf("%w: relation %q already exists", ErrTableExists, st.Name)
+	}
+	if err := s.putTable(t); err != nil {
+		return err
+	}
+	return s.addIndexes(ctx, t, cs)
 }
 
+// dropTable runs DROP TABLE, which drops the table's indexes too.
 func (s *Session) dropTable(ctx context.Context, st *ast.DropTable) error {
-	t, exists, err := s.lookupTable(ctx, st.Name)
-	if err != nil {
+	t, exists, err := s.relation(ctx, st.Name)
+	switch {
+	case err != nil:
 		return err
-	}
-	if !exists {
-		if st.IfExists {
-			return nil
-		}
+	case !exists && st.IfExists:
+		return nil
+	case !exists:
 		return fmt.Errorf("%w: table %q does not exist", ErrNoTable, st.Name)
+	case t.IndexOf != "":
+		return fmt.Errorf("%w: %q is not a table, use DROP INDEX to remove an index", ErrWrongObjectType, st.Name)
 	}
 	start, end := t.rowRange()
 	it := s.kv.scan(ctx, start, end)
@@ -63,7 +74,16 @@ func (s *Session) dropTable(ctx context.Context, st *ast.DropTable) error {
 	if err := it.Err(); err != nil {
 		return err
 	}
-	s.kv.del(catalogKey(st.Name))
+	for i := range t.Indexes {
+		if err := s.deleteEntries(ctx, &t.Indexes[i]); err != nil {
+			return err
+		}
+		s.deleteRelation(t.Indexes[i].Name)
+	}
+	if t.PrimaryKeyIndex != "" {
+		s.deleteRelation(t.PrimaryKeyIndex)
+	}
+	s.deleteRelation(st.Name)
 	return nil
 }
 
@@ -140,15 +160,17 @@ func (s *Session) insert(ctx context.Context, st *ast.Insert, params []value.Val
 				return Result{}, err
 			}
 		}
-		if err := s.writeRow(ctx, t, nil, row); err != nil {
+		if err := s.writeRow(ctx, t, nil, nil, row); err != nil {
 			return Result{}, err
 		}
 	}
 	return Result{RowsAffected: int64(len(st.Rows))}, nil
 }
 
-// writeRow checks constraints and writes row, replacing the row at oldKey when given.
-func (s *Session) writeRow(ctx context.Context, t *table, oldKey []byte, row []value.Value) error {
+// writeRow checks constraints and writes row and its index entries, replacing old, the row at
+// oldKey, when given. As in Postgres, it checks NOT NULL, then the primary key, and then the
+// unique indexes.
+func (s *Session) writeRow(ctx context.Context, t *table, oldKey []byte, old, row []value.Value) error {
 	if err := t.checkRow(row); err != nil {
 		return err
 	}
@@ -157,14 +179,22 @@ func (s *Session) writeRow(ctx context.Context, t *table, oldKey []byte, row []v
 		if _, exists, err := s.kv.get(ctx, key); err != nil {
 			return err
 		} else if exists {
-			return fmt.Errorf("%w: table %q already has a row with key %s", ErrDuplicateKey, t.Name, keyDescription(t, row))
+			return keyDuplicate(t, row)
 		}
 		if oldKey != nil {
 			s.kv.del(oldKey)
 		}
 	}
+	if err := s.writeEntries(ctx, t, old, row); err != nil {
+		return err
+	}
 	s.kv.put(key, value.EncodeRow(nil, row))
 	return nil
+}
+
+// keyDuplicate is the error of a row whose primary key another row has.
+func keyDuplicate(t *table, row []value.Value) error {
+	return fmt.Errorf("%w: duplicate key value violates unique constraint %q: table %q already has a row with key %s", ErrDuplicateKey, t.PrimaryKeyIndex, t.Name, keyDescription(t, row))
 }
 
 // checkRow checks the NOT NULL constraints and that strings are valid UTF-8.
@@ -189,7 +219,8 @@ func keyDescription(t *table, row []value.Value) string {
 }
 
 // scanRows calls fn with the key and decoded row of every row of t that the access path and
-// filter admit, in key order, until fn returns false.
+// filter admit, in key order, or in the order of an index's entries for an ordered access,
+// until fn returns false.
 //
 // A row whose outcome depends on the order in which Postgres evaluates the WHERE conditions
 // does not stop the scan at once: a later row may fail in every order, and then the statement
@@ -231,16 +262,100 @@ func (s *Session) scanRows(ctx context.Context, t *table, a access, f filter, fn
 		}
 		return orderDependent
 	}
-	it := s.kv.scan(ctx, a.start, a.end)
-	for it.Next() {
-		if more, err := visit(it.Key(), it.Value()); err != nil || !more {
+	if a.index == nil && a.union == nil {
+		it := s.kv.scan(ctx, a.start, a.end)
+		for it.Next() {
+			if more, err := visit(it.Key(), it.Value()); err != nil || !more {
+				return err
+			}
+		}
+		if err := it.Err(); err != nil {
+			return err
+		}
+		return orderDependent
+	}
+	// The rows that an index finds are read from the transaction, like the rows of a scan, and
+	// not from the statement's own writes.
+	fetch := func(key []byte, fromIndex bool) (bool, error) {
+		val, ok, err := s.kv.tx.Get(ctx, key)
+		switch {
+		case err != nil:
+			return false, err
+		case !ok && fromIndex:
+			return false, fmt.Errorf("exec: %w: an entry of an index of %q points to the missing row %x", ErrIndexInconsistent, t.Name, key)
+		case !ok:
+			return true, nil
+		}
+		return visit(key, val)
+	}
+	if a.ordered {
+		it := s.kv.scan(ctx, a.start, a.end)
+		for it.Next() {
+			if more, err := fetch(t.rowKeyOf(it.Value()), true); err != nil || !more {
+				return err
+			}
+		}
+		if err := it.Err(); err != nil {
+			return err
+		}
+		return orderDependent
+	}
+	keys, err := s.rowKeys(ctx, t, a)
+	if err != nil {
+		return err
+	}
+	for _, k := range keys {
+		if more, err := fetch([]byte(k.key), k.fromIndex); err != nil || !more {
 			return err
 		}
 	}
-	if err := it.Err(); err != nil {
-		return err
-	}
 	return orderDependent
+}
+
+// rowKey of a row that an access reads, and whether an index entry points to it.
+type rowKey struct {
+	key       string
+	fromIndex bool
+}
+
+// rowKeys that an access reads, in key order and each once.
+func (s *Session) rowKeys(ctx context.Context, t *table, a access) ([]rowKey, error) {
+	fromIndex := map[string]bool{}
+	var add func(a access) error
+	add = func(a access) error {
+		switch {
+		case a.empty:
+		case a.union != nil:
+			for _, u := range a.union {
+				if err := add(u); err != nil {
+					return err
+				}
+			}
+		case a.point != nil:
+			fromIndex[string(a.point)] = false
+		default:
+			it := s.kv.scan(ctx, a.start, a.end)
+			for it.Next() {
+				key := string(it.Key())
+				if a.index != nil {
+					key = string(t.rowKeyOf(it.Value()))
+				}
+				prev, seen := fromIndex[key]
+				fromIndex[key] = a.index != nil && (!seen || prev)
+			}
+			return it.Err()
+		}
+		return nil
+	}
+	if err := add(a); err != nil {
+		return nil, err
+	}
+	keys := make([]rowKey, 0, len(fromIndex))
+	for k, f := range fromIndex {
+		keys = append(keys, rowKey{key: k, fromIndex: f})
+	}
+	sort.Slice(keys, func(i, j int) bool { return keys[i].key < keys[j].key })
+	return keys, nil
 }
 
 func (s *Session) update(ctx context.Context, st *ast.Update, params []value.Value) (Result, error) {
@@ -279,7 +394,7 @@ func (s *Session) update(ctx context.Context, st *ast.Update, params []value.Val
 			return Result{}, err
 		}
 		sets = append(sets, assignment{i, e})
-		movesKeys = movesKeys || t.isPrimaryKey(i)
+		movesKeys = movesKeys || t.constrains(i)
 	}
 	seen := map[int]bool{}
 	for _, set := range sets {
@@ -298,7 +413,8 @@ func (s *Session) update(ctx context.Context, st *ast.Update, params []value.Val
 	if err := s.writable(st); err != nil {
 		return Result{}, err
 	}
-	a := t.plan(f)
+	f.candidates = t.candidates(f, nil, nil)
+	a := t.plan(f, nil)
 	var n int64
 	assign := func(old []value.Value) ([]value.Value, error) {
 		row := append([]value.Value{}, old...)
@@ -315,7 +431,7 @@ func (s *Session) update(ctx context.Context, st *ast.Update, params []value.Val
 		if err != nil {
 			return false, err
 		}
-		if err := s.writeRow(ctx, t, key, row); err != nil {
+		if err := s.writeRow(ctx, t, key, old, row); err != nil {
 			return false, err
 		}
 		n++
@@ -333,28 +449,27 @@ func (s *Session) update(ctx context.Context, st *ast.Update, params []value.Val
 	return Result{RowsAffected: n}, nil
 }
 
-// updateKeys runs an UPDATE that assigns primary key columns. Postgres checks the primary key
-// of each row as it writes it, in the order it stores the rows, so when a row moves onto the key
-// of a row that the same statement moves away, whether the statement fails depends on that
-// order. Such a statement is rejected; every other outcome is the same in every order: a move
-// onto a key that stays is a duplicate, two rows moving onto one key are a duplicate, and
-// anything else succeeds. When a row's new values fail, or the WHERE clause fails on a row, the
-// statement fails in every order, and the error is the one Postgres reports when it visits the
-// rows in key order, which can be a duplicate key of a row before.
+// updateKeys runs an UPDATE that assigns columns of the primary key or of a unique index, each a
+// constraint whose keys no two rows may share. Postgres checks the constraints of each row as it
+// writes it, in the order it visits the rows, so when a row moves onto the key of a row that the
+// same statement moves away, whether the statement fails depends on that order. Such a
+// statement is rejected; every other outcome is the same in every order: a move onto a key
+// that stays is a duplicate, two rows moving onto one key are a duplicate, and anything else
+// succeeds. When a row's new values fail, or the WHERE clause fails on a row, the statement fails
+// in every order, and the error is the one Postgres reports when it visits the rows in key order,
+// which can be a duplicate key of a row before.
 func (s *Session) updateKeys(ctx context.Context, t *table, a access, f filter, assign func([]value.Value) ([]value.Value, error)) (Result, error) {
 	type move struct {
-		oldKey, newKey []byte
-		row            []value.Value
-		err            error
+		oldKey   []byte
+		old, row []value.Value
+		err      error
 	}
 	var moves []move
 	failed := false
 	err := s.scanRows(ctx, t, a, f, func(key []byte, old []value.Value) (bool, error) {
-		m := move{oldKey: append([]byte{}, key...)}
+		m := move{oldKey: append([]byte{}, key...), old: old}
 		if m.row, m.err = assign(old); m.err == nil {
-			if m.err = t.checkRow(m.row); m.err == nil {
-				m.newKey = t.rowKey(m.row)
-			}
+			m.err = t.checkRow(m.row)
 		}
 		failed = failed || m.err != nil
 		moves = append(moves, m)
@@ -368,67 +483,215 @@ func (s *Session) updateKeys(ctx context.Context, t *table, a access, f filter, 
 	case err != nil && (!failed || !errors.Is(err, errOrderDependent)):
 		return Result{}, err
 	}
+	cs := t.keyConstraints(s.opts.Mutations.UniqueNoCheck)
+	matched := map[string]bool{}
+	for _, m := range moves {
+		matched[string(m.oldKey)] = true
+	}
 	if failed {
 		// Visit the rows in key order as Postgres would, checking each new key against the keys
 		// of the rows not visited yet and the new keys of those visited.
-		live, matched := map[string]bool{}, map[string]bool{}
-		for _, m := range moves {
-			live[string(m.oldKey)] = true
-			matched[string(m.oldKey)] = true
+		live := make([]map[string]bool, len(cs))
+		for i, c := range cs {
+			live[i] = map[string]bool{}
+			for _, m := range moves {
+				if m.err == nil {
+					if k, ok := c.key(t, m.old); ok {
+						live[i][k] = true
+					}
+				}
+			}
 		}
 		for _, m := range moves {
 			if m.err != nil {
 				return Result{}, m.err
 			}
-			k := string(m.newKey)
-			if k != string(m.oldKey) {
-				_, exists, err := s.kv.get(ctx, m.newKey)
-				if err != nil {
-					return Result{}, err
+			for i, c := range cs {
+				k, ok := c.key(t, m.row)
+				old, oldOK := c.key(t, m.old)
+				if ok && oldOK && k == old {
+					continue
 				}
-				if live[k] || exists && !matched[k] {
-					return Result{}, fmt.Errorf("%w: table %q already has a row with key %s", ErrDuplicateKey, t.Name, keyDescription(t, m.row))
+				if ok {
+					holder, err := s.keyHolder(ctx, t, c, k)
+					if err != nil {
+						return Result{}, err
+					}
+					if live[i][k] || holder != "" && !matched[holder] {
+						return Result{}, c.duplicate(t, m.row)
+					}
+					live[i][k] = true
 				}
-				delete(live, string(m.oldKey))
+				if oldOK {
+					delete(live[i], old)
+				}
 			}
-			live[k] = true
 		}
 		panic("exec: a failed UPDATE row went unreported")
 	}
-	vacated := map[string]bool{}
-	for _, m := range moves {
-		if string(m.newKey) != string(m.oldKey) {
-			vacated[string(m.oldKey)] = true
+	// A duplicate in every order comes before an outcome that depends on the order. A row that
+	// moves onto the key of a row that moves away needs that row visited first, so rows whose
+	// moves form a cycle are a duplicate in every order, and a chain of moves succeeds only in
+	// the right order.
+	var orderDependent error
+	for _, c := range cs {
+		// leaving maps the old key of every row that leaves it to the row.
+		leaving := map[string]int{}
+		for i, m := range moves {
+			old, oldOK := c.key(t, m.old)
+			if k, ok := c.key(t, m.row); oldOK && (!ok || k != old) {
+				leaving[old] = i
+			}
+		}
+		taken := map[string]bool{}
+		// next is the row whose old key a row moves onto.
+		next := map[int]int{}
+		for i, m := range moves {
+			k, ok := c.key(t, m.row)
+			if !ok {
+				continue
+			}
+			if taken[k] {
+				return Result{}, c.duplicate(t, m.row)
+			}
+			taken[k] = true
+			if old, oldOK := c.key(t, m.old); oldOK && k == old {
+				continue
+			}
+			if j, ok := leaving[k]; ok {
+				next[i] = j
+				continue
+			}
+			if holder, err := s.keyHolder(ctx, t, c, k); err != nil {
+				return Result{}, err
+			} else if holder != "" {
+				return Result{}, c.duplicate(t, m.row)
+			}
+		}
+		if i, ok := cycle(next); ok {
+			return Result{}, c.duplicate(t, moves[i].row)
+		}
+		if len(next) > 0 && orderDependent == nil {
+			for i := range moves {
+				if _, ok := next[i]; ok {
+					orderDependent = fmt.Errorf("%w: whether this UPDATE fails in Postgres depends on the order it visits the rows in, because a row moves onto the key %s of a row that the statement moves away; update the rows in two statements", ErrUnsupported, c.description(t, moves[i].row))
+					break
+				}
+			}
 		}
 	}
-	taken := map[string]bool{}
-	for _, m := range moves {
-		k := string(m.newKey)
-		if taken[k] {
-			return Result{}, fmt.Errorf("%w: table %q already has a row with key %s", ErrDuplicateKey, t.Name, keyDescription(t, m.row))
-		}
-		taken[k] = true
-		if k == string(m.oldKey) {
-			continue
-		}
-		if vacated[k] {
-			return Result{}, fmt.Errorf("%w: whether this UPDATE fails in Postgres depends on the order it stores the rows in, because a row moves onto the key %s of a row that the statement moves away; update the rows in two statements", ErrUnsupported, keyDescription(t, m.row))
-		}
-		if _, exists, err := s.kv.get(ctx, m.newKey); err != nil {
-			return Result{}, err
-		} else if exists {
-			return Result{}, fmt.Errorf("%w: table %q already has a row with key %s", ErrDuplicateKey, t.Name, keyDescription(t, m.row))
-		}
+	if orderDependent != nil {
+		return Result{}, orderDependent
 	}
 	for _, m := range moves {
-		if string(m.newKey) != string(m.oldKey) {
+		if string(t.rowKey(m.row)) != string(m.oldKey) {
 			s.kv.del(m.oldKey)
 		}
+		if s.opts.Mutations.IndexStaleDelete {
+			continue
+		}
+		for i := range t.Indexes {
+			old, _ := t.Indexes[i].entry(t, m.old)
+			if k, _ := t.Indexes[i].entry(t, m.row); !bytes.Equal(k, old) {
+				s.kv.del(old)
+			}
+		}
 	}
 	for _, m := range moves {
-		s.kv.put(m.newKey, value.EncodeRow(nil, m.row))
+		pk := t.appendKey(nil, m.row)
+		s.kv.put(t.rowKeyOf(pk), value.EncodeRow(nil, m.row))
+		for i := range t.Indexes {
+			k, _ := t.Indexes[i].entry(t, m.row)
+			s.kv.put(k, pk)
+		}
 	}
 	return Result{RowsAffected: int64(len(moves))}, nil
+}
+
+// cycle returns a node on a cycle of next, a graph in which every node has at most one
+// successor and at most one predecessor, if there is a cycle.
+func cycle(next map[int]int) (int, bool) {
+	const (
+		unvisited = iota
+		onPath
+		done
+	)
+	state := map[int]int{}
+	for _, start := range slices.Sorted(maps.Keys(next)) {
+		var path []int
+		i := start
+		for state[i] == unvisited {
+			state[i] = onPath
+			path = append(path, i)
+			j, ok := next[i]
+			if !ok {
+				break
+			}
+			i = j
+		}
+		if state[i] == onPath && len(path) > 0 {
+			if _, ok := next[path[len(path)-1]]; ok {
+				return i, true
+			}
+		}
+		for _, p := range path {
+			state[p] = done
+		}
+	}
+	return 0, false
+}
+
+// keyConstraint is the primary key, when index is nil, or a unique index of a table.
+type keyConstraint struct {
+	index *index
+}
+
+// keyConstraints of a table: the primary key, and the unique indexes unless skipUnique.
+func (t *table) keyConstraints(skipUnique bool) []keyConstraint {
+	cs := []keyConstraint{{}}
+	for i := range t.Indexes {
+		if t.Indexes[i].Unique && !skipUnique {
+			cs = append(cs, keyConstraint{index: &t.Indexes[i]})
+		}
+	}
+	return cs
+}
+
+// key of a row under the constraint, which no other row may have, or false when the row has a
+// NULL in a unique index whose NULLs are distinct, so that it never collides.
+func (c keyConstraint) key(t *table, row []value.Value) (string, bool) {
+	if c.index == nil {
+		return string(t.rowKey(row)), true
+	}
+	k, unique := c.index.entry(t, row)
+	return string(k), unique
+}
+
+func (c keyConstraint) duplicate(t *table, row []value.Value) error {
+	if c.index == nil {
+		return keyDuplicate(t, row)
+	}
+	return duplicate(t, c.index, row)
+}
+
+func (c keyConstraint) description(t *table, row []value.Value) string {
+	if c.index == nil {
+		return keyDescription(t, row)
+	}
+	return c.index.description(t, row)
+}
+
+// keyHolder is the row key of the row that has the key of the constraint in the transaction, or
+// "" when no row has it.
+func (s *Session) keyHolder(ctx context.Context, t *table, c keyConstraint, key string) (string, error) {
+	v, exists, err := s.kv.get(ctx, []byte(key))
+	switch {
+	case err != nil || !exists:
+		return "", err
+	case c.index == nil:
+		return key, nil
+	}
+	return string(t.rowKeyOf(v)), nil
 }
 
 // updateRestarting is the mutated UPDATE: it applies each write to the transaction at once and
@@ -436,6 +699,11 @@ func (s *Session) updateKeys(ctx context.Context, t *table, a access, f filter, 
 func (s *Session) updateRestarting(ctx context.Context, t *table, a access, f filter, apply func([]byte, []value.Value) (bool, error), n *int64) error {
 	if a.point != nil {
 		return s.scanRows(ctx, t, a, f, apply)
+	}
+	if a.index != nil || a.union != nil {
+		// Restarting needs a range of keys; the filter still selects the rows.
+		start, end := t.rowRange()
+		a = access{start: start, end: end}
 	}
 	for {
 		var last []byte
@@ -477,10 +745,12 @@ func (s *Session) delete(ctx context.Context, st *ast.Delete, params []value.Val
 	if err := s.writable(st); err != nil {
 		return Result{}, err
 	}
-	a := t.plan(f)
+	f.candidates = t.candidates(f, nil, nil)
+	a := t.plan(f, nil)
 	var n int64
-	err = s.scanRows(ctx, t, a, f, func(key []byte, _ []value.Value) (bool, error) {
+	err = s.scanRows(ctx, t, a, f, func(key []byte, row []value.Value) (bool, error) {
 		s.kv.del(key)
+		s.deleteRowEntries(t, row)
 		n++
 		return true, nil
 	})
@@ -498,8 +768,8 @@ type orderKey struct {
 	desc   bool
 	// nullsFirst after applying the Postgres default: last when ascending, first when descending.
 	nullsFirst bool
-	// keyColumn is the index of the primary key column the item sorts by, or -1.
-	keyColumn int
+	// column is the index of the column the item sorts by, when it is a plain column, or -1.
+	column int
 }
 
 func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value.Value) (*Rows, error) {
@@ -565,7 +835,7 @@ func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value
 	b.phase = phaseOutput
 	var order []orderKey
 	for _, o := range st.OrderBy {
-		k := orderKey{output: -1, desc: o.Desc, keyColumn: -1}
+		k := orderKey{output: -1, desc: o.Desc, column: -1}
 		switch o.Nulls {
 		case ast.NullsFirst:
 			k.nullsFirst = true
@@ -615,15 +885,15 @@ func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value
 				return nil, fmt.Errorf("%w: the numeric type is not supported, cast the literal to double precision or bigint", ErrUnsupported)
 			}
 		}
-		// The item sorts by a primary key column when it is that column, either directly or
-		// through an output column that is a plain reference to it.
+		// The item sorts by a column when it is that column, either directly or through an
+		// output column that is a plain reference to it.
 		sorted := o.Expr
 		if k.output >= 0 {
 			sorted = itemExprs[k.output]
 		}
 		if ref, ok := sorted.(*ast.ColumnRef); ok && t != nil {
-			if i, ok := t.columnIndex(ref.Name); ok && t.isPrimaryKey(i) {
-				k.keyColumn = i
+			if i, ok := t.columnIndex(ref.Name); ok {
+				k.column = i
 			}
 		}
 		order = append(order, k)
@@ -654,7 +924,18 @@ func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value
 	// The planner needs the folded constants.
 	var a access
 	if t != nil {
-		a = t.plan(f)
+		var sortCols []int
+		for _, k := range order {
+			if k.column >= 0 {
+				sortCols = append(sortCols, k.column)
+			}
+		}
+		f.candidates = t.candidates(f, sortCols, t.reads(st))
+		var stream *scan
+		if !fallible(f, items, order) {
+			stream = t.orderedScan(order)
+		}
+		a = t.plan(f, stream)
 	}
 	offset, err := limitValue(offsetExpr, "OFFSET")
 	if err != nil {
@@ -669,6 +950,8 @@ func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value
 		return &Rows{Columns: columns, Rows: [][]value.Value{}}, nil
 	}
 
+	// The rows are sorted after they are read, unless the access reads them in order.
+	sorting := len(order) > 0 && !a.ordered
 	type sortable struct {
 		out  []value.Value
 		keys []value.Value
@@ -687,14 +970,14 @@ func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value
 		return o, nil
 	}
 	visit := func(_ []byte, row []value.Value) (bool, error) {
-		if len(order) == 0 && limit >= 0 && int64(len(out)) >= limit {
+		if !sorting && limit >= 0 && int64(len(out)) >= limit {
 			return false, nil
 		}
 		o, err := project(row)
 		if err != nil {
 			return false, err
 		}
-		if len(order) > 0 {
+		if sorting {
 			keys := make([]value.Value, len(order))
 			for i, k := range order {
 				if k.output >= 0 {
@@ -730,7 +1013,7 @@ func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value
 	} else if err := s.scanRows(ctx, t, a, f, visit); err != nil {
 		return nil, err
 	}
-	if len(order) > 0 {
+	if sorting {
 		sort.SliceStable(collected, func(i, j int) bool {
 			return compareKeys(order, collected[i].keys, collected[j].keys) < 0
 		})
@@ -750,6 +1033,56 @@ func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value
 	return &Rows{Columns: columns, Rows: out}, nil
 }
 
+// reads are the columns of t that a SELECT reads, by name, in its output, WHERE, and ORDER BY.
+func (t *table) reads(st *ast.Select) []int {
+	var out []int
+	add := func(e ast.Expr) {
+		ast.Walk(e, func(x ast.Expr) bool {
+			if ref, ok := x.(*ast.ColumnRef); ok {
+				if i, ok := t.columnIndex(ref.Name); ok && !slices.Contains(out, i) {
+					out = append(out, i)
+				}
+			}
+			return true
+		})
+	}
+	for _, item := range st.Items {
+		if item.Star {
+			for i := range t.Columns {
+				if !slices.Contains(out, i) {
+					out = append(out, i)
+				}
+			}
+			continue
+		}
+		add(item.Expr)
+	}
+	add(st.Where)
+	for _, o := range st.OrderBy {
+		add(o.Expr)
+	}
+	return out
+}
+
+// fallible reports whether evaluating a SELECT on a row can fail, in its WHERE clause, its
+// output, or its ORDER BY, so that which row fails first depends on the order of the rows.
+func fallible(f filter, items []*cexpr, order []orderKey) bool {
+	if f.fallible {
+		return true
+	}
+	for _, e := range items {
+		if e.fallible {
+			return true
+		}
+	}
+	for _, k := range order {
+		if k.expr != nil && k.expr.fallible {
+			return true
+		}
+	}
+	return false
+}
+
 // limitable checks that a SELECT with LIMIT or OFFSET gives the same rows and the same errors
 // in every plan Postgres could choose: the ORDER BY must sort by every primary key column, so
 // that the row order is fully determined, and no output expression or WHERE condition may be
@@ -759,7 +1092,7 @@ func limitable(t *table, order []orderKey, items []*cexpr, f filter) error {
 	for _, col := range t.PrimaryKey {
 		found := false
 		for _, k := range order {
-			found = found || k.keyColumn == col
+			found = found || k.column == col
 		}
 		if !found {
 			return fmt.Errorf("%w: LIMIT and OFFSET without an ORDER BY on every primary key column are not supported, because which rows Postgres returns is then not determined; add %s to ORDER BY", ErrUnsupported, t.Columns[col].Name)

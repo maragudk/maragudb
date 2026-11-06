@@ -51,11 +51,74 @@ func (r *renderer) stmt(s Statement) {
 				r.b.WriteString(" NOT NULL")
 			}
 		}
-		r.b.WriteString(", PRIMARY KEY (")
+		r.b.WriteString(", ")
+		if s.PrimaryKeyName != "" {
+			r.b.WriteString("CONSTRAINT ")
+			r.ident(s.PrimaryKeyName)
+			r.b.WriteByte(' ')
+		}
+		r.b.WriteString("PRIMARY KEY (")
 		r.idents(s.PrimaryKey)
-		r.b.WriteString("))")
+		r.b.WriteByte(')')
+		for _, u := range s.Unique {
+			r.b.WriteString(", ")
+			if u.Name != "" {
+				r.b.WriteString("CONSTRAINT ")
+				r.ident(u.Name)
+				r.b.WriteByte(' ')
+			}
+			r.b.WriteString("UNIQUE ")
+			if u.NullsNotDistinct {
+				r.b.WriteString("NULLS NOT DISTINCT ")
+			}
+			r.b.WriteByte('(')
+			r.idents(u.Columns)
+			r.b.WriteByte(')')
+		}
+		r.b.WriteByte(')')
 	case *DropTable:
 		r.b.WriteString("DROP TABLE ")
+		if s.IfExists {
+			r.b.WriteString("IF EXISTS ")
+		}
+		r.ident(s.Name)
+	case *CreateIndex:
+		r.b.WriteString("CREATE ")
+		if s.Unique {
+			r.b.WriteString("UNIQUE ")
+		}
+		r.b.WriteString("INDEX ")
+		if s.IfNotExists {
+			r.b.WriteString("IF NOT EXISTS ")
+		}
+		if s.Name != "" {
+			r.ident(s.Name)
+			r.b.WriteByte(' ')
+		}
+		r.b.WriteString("ON ")
+		r.ident(s.Table)
+		r.b.WriteString(" (")
+		for i, c := range s.Columns {
+			if i > 0 {
+				r.b.WriteString(", ")
+			}
+			r.ident(c.Name)
+			if c.Desc {
+				r.b.WriteString(" DESC")
+			}
+			switch c.Nulls {
+			case NullsFirst:
+				r.b.WriteString(" NULLS FIRST")
+			case NullsLast:
+				r.b.WriteString(" NULLS LAST")
+			}
+		}
+		r.b.WriteByte(')')
+		if s.NullsNotDistinct {
+			r.b.WriteString(" NULLS NOT DISTINCT")
+		}
+	case *DropIndex:
+		r.b.WriteString("DROP INDEX ")
 		if s.IfExists {
 			r.b.WriteString("IF EXISTS ")
 		}

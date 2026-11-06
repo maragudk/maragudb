@@ -299,6 +299,31 @@ func EncodeKey(dst []byte, v Value) []byte {
 	panic(fmt.Sprintf("value: encoding %v", v.Type))
 }
 
+// EncodeIndexKey appends the encoding of v as a column of an index to dst, so that the byte
+// order of the encodings is the order in which Postgres sorts the column: by [Compare], reversed
+// when desc, with NULL first when nullsFirst and last otherwise. Like [EncodeKey], it is
+// self-delimiting, so that the encodings of several columns concatenate into one key in
+// lexicographic order.
+func EncodeIndexKey(dst []byte, v Value, desc, nullsFirst bool) []byte {
+	// The first byte places NULL before a value with 0x00 and after it with 0x02.
+	if v.Null {
+		if nullsFirst {
+			return append(dst, 0x00)
+		}
+		return append(dst, 0x02)
+	}
+	start := len(dst)
+	dst = EncodeKey(dst, v)
+	if desc {
+		// The payload is self-delimiting, so no encoding is a proper prefix of another, and
+		// inverting every byte reverses the order.
+		for i := start + 1; i < len(dst); i++ {
+			dst[i] = ^dst[i]
+		}
+	}
+	return dst
+}
+
 // floatKeyBits maps a float to bits whose unsigned order is the [Compare] order: negative floats
 // have every bit flipped, non-negative floats have the sign bit flipped, negative zero becomes
 // zero, and NaN becomes a single canonical value above positive infinity.

@@ -22,10 +22,18 @@ var (
 	ErrType = errors.New("type mismatch")
 	// ErrNoTable is a reference to a table that does not exist.
 	ErrNoTable = errors.New("no such table")
-	// ErrTableExists is a CREATE TABLE of a table that exists.
-	ErrTableExists = errors.New("table exists")
-	// ErrDuplicateKey is an insert or update that would repeat a primary key.
-	ErrDuplicateKey = errors.New("duplicate key value violates primary key")
+	// ErrTableExists is a CREATE TABLE or CREATE INDEX of a name that a table or index has.
+	ErrTableExists = errors.New("relation exists")
+	// ErrNoIndex is a DROP INDEX of an index that does not exist.
+	ErrNoIndex = errors.New("no such index")
+	// ErrWrongObjectType is a statement on a relation of the wrong kind, such as a SELECT from an
+	// index or a DROP INDEX of a table.
+	ErrWrongObjectType = errors.New("wrong object type")
+	// ErrDependentObjects is a DROP INDEX of an index that a constraint of its table needs.
+	ErrDependentObjects = errors.New("dependent objects still exist")
+	// ErrDuplicateKey is an insert or update that would repeat a primary key or the values of a
+	// unique index, or a CREATE UNIQUE INDEX on rows that do.
+	ErrDuplicateKey = errors.New("duplicate key value violates unique constraint")
 	// ErrNotNull is a NULL in a NOT NULL column.
 	ErrNotNull = errors.New("null value violates not-null constraint")
 	// ErrDivisionByZero is a division or modulo by zero.
