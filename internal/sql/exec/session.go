@@ -158,6 +158,17 @@ func exprs(s ast.Statement) []ast.Expr {
 		for _, item := range s.Items {
 			add(item.Expr)
 		}
+		var on func(e ast.TableExpr)
+		on = func(e ast.TableExpr) {
+			if j, ok := e.(*ast.Join); ok {
+				on(j.Left)
+				on(j.Right)
+				add(j.On)
+			}
+		}
+		for _, f := range s.From {
+			on(f)
+		}
 		add(s.Where)
 		for _, o := range s.OrderBy {
 			add(o.Expr)

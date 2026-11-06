@@ -1137,6 +1137,9 @@ func TestPrepare(t *testing.T) {
 		st, err = exec.Prepare("INSERT INTO t VALUES ($2), ($1)")
 		is.NotError(t, err)
 		is.Equal(t, 2, st.NumParams())
+		st, err = exec.Prepare("SELECT 1 FROM t JOIN (u JOIN v ON u.a = $4) ON t.a = $2 WHERE $1 = 1")
+		is.NotError(t, err)
+		is.Equal(t, 4, st.NumParams())
 	})
 
 	t.Run("reports syntax errors", func(t *testing.T) {
