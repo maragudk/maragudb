@@ -189,7 +189,8 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
-            "grace period"
+            "grace period",
+            "final read"
           ]
         }
       ]
@@ -539,7 +540,7 @@
         {
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 14,
           "checkers": [
             "foreign key"
           ]
@@ -1001,7 +1002,7 @@
         {
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 1,
+          "seed": 2,
           "checkers": [
             "foreign key"
           ]
@@ -1075,7 +1076,7 @@
         {
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
             "foreign key"
           ]

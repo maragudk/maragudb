@@ -307,6 +307,34 @@ func (r fkRows) danglingReference() string {
 	return ""
 }
 
+// orphanQueries find the references to missing rows with a LEFT JOIN of each referencing table
+// to the referenced one, in which a missing row is a row of NULLs.
+var orphanQueries = []string{
+	"SELECT 'child', c.id, c.pid FROM children AS c LEFT JOIN parents AS p ON p.id = c.pid WHERE c.pid IS NOT NULL AND p.id IS NULL ORDER BY c.id",
+	"SELECT 'toy', t.id, t.cid FROM toys t LEFT JOIN children c ON c.id = t.cid WHERE c.id IS NULL ORDER BY t.id",
+	"SELECT 'node', n.id, n.pid FROM nodes n LEFT JOIN nodes m ON m.id = n.pid WHERE n.pid IS NOT NULL AND m.id IS NULL ORDER BY n.id",
+	"SELECT 'owned node', n.id, n.owner FROM nodes n LEFT JOIN parents p ON p.id = n.owner WHERE n.owner IS NOT NULL AND p.id IS NULL ORDER BY n.id",
+}
+
+// orphan finds the first reference to a missing row with [orphanQueries], next to
+// [fkRows.danglingReference], which finds them in the rows of every table. It returns "" when
+// there is none.
+func orphan(ctx context.Context, q querier) (string, error) {
+	for _, query := range orphanQueries {
+		var kind string
+		var id, ref int64
+		err := q.QueryRowContext(ctx, query).Scan(&kind, &id, &ref)
+		switch {
+		case errors.Is(err, sql.ErrNoRows):
+			continue
+		case err != nil:
+			return "", err
+		}
+		return fmt.Sprintf("%s %d references the missing row %d, which a LEFT JOIN finds", kind, id, ref), nil
+	}
+	return "", nil
+}
+
 // checkViolation is the first row of r that violates a CHECK of its table, or "".
 func (r fkRows) checkViolation() string {
 	for _, id := range sortedKeys(r.parents) {
@@ -382,6 +410,14 @@ func (c *client) auditForeignKeys(ctx context.Context, h history.Tx) {
 	if n < ticked {
 		c.run.anomaly(CheckerRealTime, "client %d: the counter is %d, but a commit acknowledged before the read began set it to %d", c.id, n, ticked)
 	}
+	o, err := orphan(ctx, tx)
+	if err != nil {
+		c.readErrorSQL(ctx, startedAt, err)
+		return
+	}
+	if o != "" {
+		c.run.anomaly(CheckerForeignKey, "client %d: %s", c.id, o)
+	}
 	c.run.checkForeignKeyRows(rows, fmt.Sprintf("client %d", c.id))
 	h.Complete = c.run.stamp()
 	h.Outcome = history.OK
@@ -404,6 +440,13 @@ func (r *run) readFinalForeignKeys(ctx context.Context, db *sql.DB) ([]string, e
 	rows, err := readForeignKeyRows(ctx, db, func() {})
 	if err != nil {
 		return nil, err
+	}
+	o, err := orphan(ctx, db)
+	if err != nil {
+		return nil, err
+	}
+	if o != "" {
+		r.anomaly(CheckerForeignKey, "final state: %s", o)
 	}
 	r.checkForeignKeyRows(rows, "final state")
 	return []string{rows.String()}, nil

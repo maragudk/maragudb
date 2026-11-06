@@ -10,10 +10,10 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 ## At a glance
 
-- 33 acceptance criteria (`AC-`), 24 key invariants (`INV-`), 26 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
+- 34 acceptance criteria (`AC-`), 24 key invariants (`INV-`), 26 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
 - 15 mutants (`MUT-`), deliberate bugs, of which 14 are detected by the simulator's checkers within 20 seeds.
 - 17 interesting states (`STATE-`) that the simulator's fixed corpus must reach.
-- 183 declarations of coverage in the tests.
+- 184 declarations of coverage in the tests.
 
 ## Acceptance criteria
 
@@ -212,6 +212,12 @@ Each entry names the test's package, the test's name, and what the test asserts,
 > S3 request budgets: An insert of a row with a foreign key with a warm cache uses no request beyond those of any other commit, and with a cold cache O(log n) GETs for the lookup of the referenced row.
 
 - `.` `TestRequestBudgets_ForeignKeys/an_insert_of_a_row_with_a_foreign_key_adds_no_request_with_a_warm_cache,_and_a_logarithmic_number_of_GETs_with_a_cold_one`: an autocommit INSERT of a row that references a parent makes one conditional GET and two PUTs with a warm cache at every database size, and with a cold cache one descent of the tree each for the table definitions, the duplicate key check, and the lookup of the parent
+
+### `AC-5.8`
+
+> S3 request budgets: A join from one row of a table to the rows that reference it, through an index on the referencing columns, with a cold cache uses O(log n) GETs for each row it reads.
+
+- `.` `TestRequestBudgets_Joins/a_join_from_one_parent_row_to_its_children_through_an_index_on_their_foreign_key_makes_a_logarithmic_number_of_GETs_per_row_with_a_cold_cache`: a SELECT that joins one parent row to its children with ON c.pid = p.id, through an index on c (pid), makes with a cold cache one descent of the tree for each table definition, for the parent, for the index entries, and for each child, at every database size
 
 ### `AC-5.4`
 
@@ -760,7 +766,7 @@ Targeted tests:
 | unique through SQL, no maintainers | cannot detect: without maintainers nothing is ever deleted, so no reader can lose an object |
 | unique through SQL, 2 maintainers | detected with seed 1 by grace period |
 | foreign-key through SQL, no maintainers | cannot detect: without maintainers nothing is ever deleted, so no reader can lose an object |
-| foreign-key through SQL, 2 maintainers | detected with seed 1 by grace period |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by grace period, final read |
 
 Targeted tests:
 
@@ -849,7 +855,7 @@ Targeted tests:
 | unique through SQL, no maintainers | detected with seed 1 by index consistency |
 | unique through SQL, 2 maintainers | detected with seed 1 by index consistency |
 | foreign-key through SQL, no maintainers | detected with seed 8 by foreign key |
-| foreign-key through SQL, 2 maintainers | detected with seed 2 by foreign key |
+| foreign-key through SQL, 2 maintainers | detected with seed 14 by foreign key |
 
 Targeted tests:
 
@@ -983,7 +989,7 @@ Targeted tests:
 | unique through SQL, no maintainers | cannot detect: the workload has no foreign keys |
 | unique through SQL, 2 maintainers | cannot detect: the workload has no foreign keys |
 | foreign-key through SQL, no maintainers | detected with seed 1 by foreign key |
-| foreign-key through SQL, 2 maintainers | detected with seed 1 by foreign key |
+| foreign-key through SQL, 2 maintainers | detected with seed 2 by foreign key |
 
 ### `MUT-FK-OWN-WRITES`
 
@@ -1002,7 +1008,7 @@ Targeted tests:
 | unique through SQL, no maintainers | cannot detect: the workload has no foreign keys |
 | unique through SQL, 2 maintainers | cannot detect: the workload has no foreign keys |
 | foreign-key through SQL, no maintainers | detected with seed 1 by foreign key |
-| foreign-key through SQL, 2 maintainers | detected with seed 2 by foreign key |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by foreign key |
 
 ### `MUT-CHECK-SKIP-UPDATE`
 

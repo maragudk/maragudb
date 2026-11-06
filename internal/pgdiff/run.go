@@ -444,6 +444,7 @@ func rejectionReason(err error) string {
 	}
 	msg = strings.TrimLeft(msg, ": ")
 	msg = reasonPosition.ReplaceAllString(msg, "")
+	msg = reasonJoinCondition.ReplaceAllString(msg, "whether _ fails depends on the join plan")
 	msg = reasonCondition.ReplaceAllString(msg, "whether _ fails depends on the plan")
 	msg = strings.TrimPrefix(msg, "order-dependent: ")
 	for _, sep := range []string{",", ";", " because"} {
@@ -459,6 +460,8 @@ var (
 	reasonPosition = regexp.MustCompile(`^at position \d+: `)
 	// reasonCondition is the condition in a rejection of UNS-PLAN-DEPENDENT-WHERE.
 	reasonCondition = regexp.MustCompile(`whether .+? fails depends on the plan`)
+	// reasonJoinCondition is the condition in a rejection of UNS-PLAN-DEPENDENT-JOIN.
+	reasonJoinCondition = regexp.MustCompile(`whether .+? fails depends on the join plan`)
 	reasonDetail    = regexp.MustCompile(`"[^"]*"|'[^']*'|\$?\d+`)
 )
 

@@ -845,6 +845,71 @@ func TestRequestBudgets_ForeignKeys(t *testing.T) {
 	})
 }
 
+func TestRequestBudgets_Joins(t *testing.T) {
+	t.Run("a join from one parent row to its children through an index on their foreign key makes a logarithmic number of GETs per row with a cold cache", func(t *testing.T) {
+		verify.Covers(t, "a SELECT that joins one parent row to its children with ON c.pid = p.id, through an index on c (pid), makes with a cold cache one descent of the tree for each table definition, for the parent, for the index entries, and for each child, at every database size", "AC-5.8")
+		const children = 3
+		for _, n := range []int{100, 1_000, 10_000, 100_000} {
+			w := newWorld(t)
+			db := w.open(maragudb.Options{})
+			mustExec(t, db, "CREATE TABLE p (id bigint PRIMARY KEY, name text)")
+			mustExec(t, db, "CREATE TABLE c (id bigint PRIMARY KEY, pid bigint REFERENCES p)")
+			mustExec(t, db, "CREATE INDEX c_pid ON c (pid)")
+			const batch = 1000
+			for _, table := range []string{"p", "c"} {
+				for i := 0; i < n; i += batch {
+					var b strings.Builder
+					b.WriteString("INSERT INTO " + table + " VALUES ")
+					for j := i; j < min(i+batch, n); j++ {
+						if j > i {
+							b.WriteString(", ")
+						}
+						if table == "p" {
+							fmt.Fprintf(&b, "(%d, 'name-%d')", j, j)
+						} else {
+							// Every parent has a child, and the parent of the query has more.
+							fmt.Fprintf(&b, "(%d, %d)", j, j)
+						}
+					}
+					mustExec(t, db, b.String())
+				}
+			}
+			for k := range children - 1 {
+				mustExec(t, db, "INSERT INTO c VALUES ($1, $2)", n+k, n/2)
+			}
+			is.NotError(t, maragudb.Compact(t.Context(), db))
+
+			cold := w.open(maragudb.Options{MemoryCacheBytes: new(int64)})
+			s, err := maragudb.Stats(t.Context(), cold)
+			is.NotError(t, err)
+			rows, err := cold.QueryContext(t.Context(), "SELECT p.name, c.id FROM p JOIN c ON c.pid = p.id WHERE p.id = $1", n/2)
+			is.NotError(t, err)
+			found := 0
+			for rows.Next() {
+				found++
+			}
+			is.NotError(t, rows.Err())
+			is.NotError(t, rows.Close())
+			is.Equal(t, children, found)
+			after, err := maragudb.Stats(t.Context(), cold)
+			is.NotError(t, err)
+			d := after.Requests.Sub(s.Requests)
+			// Blocks of 16 KiB hold at least 64 rows or entries, so a descent is at most 1 + log64(n)
+			// GETs.
+			depth := int64(1)
+			for m := n; m > 1; m = (m + 63) / 64 {
+				depth++
+			}
+			// The two table definitions, the parent, the index entries, and each child.
+			limit := depth * (2 + 1 + 1 + children)
+			t.Logf("n=%d cold join of a parent to its %d children: %+v, limit %d", n, children, d, limit)
+			verify.CheckBudget(t, "SQL SELECT that joins a parent to its children through an index, cold: GETs", n, d.Get, limit)
+			is.True(t, d.Get <= limit, fmt.Sprintf("n=%d: %d GETs, max %d", n, d.Get, limit))
+			is.Equal(t, maragudb.Requests{Get: d.Get, GetConditional: 1}, d)
+		}
+	})
+}
+
 // nullableValuer is a Valuer with a value receiver, so a nil pointer to it must be NULL.
 type nullableValuer struct{}
 

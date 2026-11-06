@@ -1,6 +1,7 @@
 package pgdiff
 
 import (
+	"cmp"
 	"fmt"
 	"math"
 	"math/rand/v2"
@@ -168,7 +169,9 @@ func Generate(src Source) Case {
 	for range g.draw(0, 2) {
 		c.Statements = append(c.Statements, g.createIndex())
 	}
-	n := g.draw(1, 6)
+	// Two of the kinds of statements are joins, so that the others are as frequent as they were
+	// before there were joins.
+	n := g.draw(1, 8)
 	// A third of the cases run some statements in an explicit transaction, which ends with a
 	// COMMIT, a ROLLBACK, or not at all.
 	begin, end := -1, -1
@@ -556,6 +559,10 @@ func (g *gen) value(t value.Type) value.Value {
 type scope struct {
 	// columns may be referenced.
 	columns bool
+	// refs are the tables of a join whose columns the expression references, each qualified by
+	// its name. Without them, the expression references the columns of the generator's own
+	// table, by their names alone.
+	refs []ref
 	// safe forbids expressions that can fail at runtime, which maragudb rejects where the rows
 	// Postgres evaluates them on depend on its plan, as under a LIMIT.
 	safe bool
@@ -574,8 +581,8 @@ func (g *gen) expr(t value.Type, s scope, depth int) ast.Expr {
 		return &ast.Literal{Value: value.NewNull(value.Unknown)}
 	}
 	s = s.withNull(false)
-	if s.columns && len(g.cols[t]) > 0 && g.draw(0, 2) == 0 {
-		return &ast.ColumnRef{Name: pick(g, g.cols[t])}
+	if s.columns && g.hasColumn(t, s) && g.draw(0, 2) == 0 {
+		return g.columnOfType(t, s)
 	}
 	if depth >= 3 || g.draw(0, 3) == 0 {
 		return g.literal(t)
@@ -586,7 +593,7 @@ func (g *gen) expr(t value.Type, s scope, depth int) ast.Expr {
 	case 0:
 		c := &ast.Case{}
 		if g.bool() {
-			ot := g.anyType()
+			ot := g.anyTypeIn(s)
 			c.Operand = g.expr(ot, s, depth)
 			for i := range g.draw(1, 2) {
 				c.Whens = append(c.Whens, ast.When{Cond: g.expr(ot, s.withNull(true), depth), Result: g.expr(t, s.withNull(i > 0), depth)})
@@ -673,12 +680,12 @@ func (g *gen) expr(t value.Type, s scope, depth int) ast.Expr {
 			op := pick(g, []ast.BinaryOp{ast.And, ast.Or})
 			return &ast.Binary{Op: op, Left: g.expr(t, s.withNull(true), depth), Right: g.expr(t, s.withNull(true), depth)}
 		case 2:
-			return &ast.IsNull{Expr: g.expr(g.anyType(), s.withNull(true), depth), Not: g.bool()}
+			return &ast.IsNull{Expr: g.expr(g.anyTypeIn(s), s.withNull(true), depth), Not: g.bool()}
 		case 3:
-			ot := g.anyType()
+			ot := g.anyTypeIn(s)
 			return &ast.Between{Expr: g.expr(ot, s.withNull(true), depth), Low: g.expr(ot, s.withNull(true), depth), High: g.expr(ot, s.withNull(true), depth), Not: g.bool()}
 		case 4:
-			ot := g.anyType()
+			ot := g.anyTypeIn(s)
 			in := &ast.In{Expr: g.expr(ot, s, depth), Not: g.bool()}
 			for range g.draw(1, 3) {
 				in.List = append(in.List, g.expr(ot, s.withNull(true), depth))
@@ -691,7 +698,7 @@ func (g *gen) expr(t value.Type, s scope, depth int) ast.Expr {
 			}
 			return &ast.Like{Expr: g.expr(value.String, s.withNull(true), depth), Pattern: &ast.Literal{Value: value.NewUnknown(pattern)}, Not: g.bool()}
 		default:
-			ot := g.anyType()
+			ot := g.anyTypeIn(s)
 			op := pick(g, []ast.BinaryOp{ast.Eq, ast.Ne, ast.Lt, ast.Le, ast.Gt, ast.Ge})
 			return &ast.Binary{Op: op, Left: g.expr(ot, s, depth), Right: g.expr(ot, s.withNull(true), depth)}
 		}
@@ -701,14 +708,14 @@ func (g *gen) expr(t value.Type, s scope, depth int) ast.Expr {
 			// || writes a value of any type next to text as text.
 			rt := t
 			if g.rarely(3) {
-				rt = g.anyType()
+				rt = g.anyTypeIn(s)
 			}
 			return &ast.Binary{Op: ast.Concat, Left: g.expr(t, s, depth), Right: g.expr(rt, s.withNull(true), depth)}
 		case 1:
 			name := pick(g, []string{"lower", "upper"})
 			return &ast.Call{Name: name, Args: []ast.Expr{g.expr(t, s.withNull(true), depth)}}
 		case 2:
-			return &ast.Cast{Expr: g.expr(g.anyType(), s.withNull(true), depth), Type: value.String, Style: ast.CastStyle(g.draw(0, 1))}
+			return &ast.Cast{Expr: g.expr(g.anyTypeIn(s), s.withNull(true), depth), Type: value.String, Style: ast.CastStyle(g.draw(0, 1))}
 		default:
 			return g.literal(t)
 		}
@@ -732,11 +739,39 @@ func (g *gen) expr(t value.Type, s scope, depth int) ast.Expr {
 	panic(t)
 }
 
+// hasColumn reports whether a column of type t is in the scope.
+func (g *gen) hasColumn(t value.Type, s scope) bool {
+	if len(s.refs) == 0 {
+		return len(g.cols[t]) > 0
+	}
+	return slices.ContainsFunc(s.refs, func(r ref) bool { return len(r.g.cols[t]) > 0 })
+}
+
+// columnOfType t in the scope, which [gen.hasColumn] reports there is.
+func (g *gen) columnOfType(t value.Type, s scope) ast.Expr {
+	if len(s.refs) == 0 {
+		return &ast.ColumnRef{Name: pick(g, g.cols[t])}
+	}
+	var refs []ref
+	for _, r := range s.refs {
+		if len(r.g.cols[t]) > 0 {
+			refs = append(refs, r)
+		}
+	}
+	r := pick(g, refs)
+	return &ast.ColumnRef{Table: r.name, Name: pick(g, r.g.cols[t])}
+}
+
 // anyType that has a column when columns are in scope, so comparisons tend to touch data.
 func (g *gen) anyType() value.Type {
+	return g.anyTypeIn(scope{})
+}
+
+// anyTypeIn is [gen.anyType] for the columns of the scope.
+func (g *gen) anyTypeIn(s scope) value.Type {
 	var withCols []value.Type
 	for _, t := range allTypes {
-		if len(g.cols[t]) > 0 {
+		if g.hasColumn(t, scope{refs: s.refs}) {
 			withCols = append(withCols, t)
 		}
 	}
@@ -929,13 +964,17 @@ func (g *gen) statement() ast.Statement {
 		}
 		return g.createIndex()
 	}
-	switch g.draw(0, 5) {
+	switch g.draw(0, 7) {
 	case 0:
 		return g.insert(g.draw(1, 3))
 	case 1:
 		return g.update()
 	case 2:
-		return &ast.Delete{Table: g.table.Name, Where: g.where(scope{columns: true})}
+		d := &ast.Delete{Table: g.table.Name, Where: g.where(scope{columns: true})}
+		d.Alias = g.aliased(&d.Where)
+		return d
+	case 3, 4:
+		return g.joinSelect()
 	default:
 		return g.selectStmt()
 	}
@@ -973,6 +1012,11 @@ func (g *gen) update() *ast.Update {
 		u.Set = append(u.Set, ast.Assignment{Column: g.nowColumn, Value: &ast.Default{}})
 	}
 	u.Where = g.where(scope{columns: true})
+	exprs := []*ast.Expr{&u.Where}
+	for i := range u.Set {
+		exprs = append(exprs, &u.Set[i].Value)
+	}
+	u.Alias = g.aliased(exprs...)
 	return u
 }
 
@@ -1015,6 +1059,17 @@ func (g *gen) selectStmt() *ast.Select {
 		}
 		s.OrderBy = append(s.OrderBy, o)
 	}
+	s.Distinct = !limited && g.rarely(5)
+	exprs := []*ast.Expr{&s.Where}
+	for i := range s.Items {
+		if !s.Items[i].Star {
+			exprs = append(exprs, &s.Items[i].Expr)
+		}
+	}
+	for i := range s.OrderBy {
+		exprs = append(exprs, &s.OrderBy[i].Expr)
+	}
+	s.From[0].(*ast.TableRef).Alias = g.aliased(exprs...)
 	if limited {
 		// The order must be fully determined, so every key column is a sort key, except now and
 		// then. An output column named like a key column would shadow it in ORDER BY, so then
@@ -1149,4 +1204,283 @@ func sortedColumns(s *ast.Select, columns []string) []int {
 		out = append(out, i)
 	}
 	return out
+}
+
+// ref is a table of a join, under the name that qualifies its columns.
+type ref struct {
+	name string
+	g    *gen
+}
+
+// qualify every column reference of e that names a column alone with the name of a table.
+func qualify(e ast.Expr, name string) ast.Expr {
+	if e == nil {
+		return nil
+	}
+	return ast.Map(e, func(x ast.Expr) ast.Expr {
+		if c, ok := x.(*ast.ColumnRef); ok && c.Table == "" {
+			return &ast.ColumnRef{Table: name, Name: c.Name}
+		}
+		return x
+	})
+}
+
+// aliased gives a statement on the table an alias now and then, and then qualifies its column
+// references by the alias or by the table's name, now and then the wrong one, or leaves them
+// alone. It returns the alias, or "".
+func (g *gen) aliased(exprs ...*ast.Expr) string {
+	if !g.rarely(3) {
+		return ""
+	}
+	alias := ""
+	if g.bool() {
+		alias = pick(g, []string{"x", "y", g.table.Name})
+	}
+	name := cmp.Or(alias, g.table.Name)
+	if g.rarely(20) {
+		// A reference by the name that the alias hides, which fails on both.
+		name = pick(g, []string{g.table.Name, "q"})
+	}
+	if g.bool() {
+		for _, e := range exprs {
+			*e = qualify(*e, name)
+		}
+	}
+	return alias
+}
+
+// joinSelect is a SELECT on a join of the table with itself, or with the referenced table: a
+// list of tables, CROSS JOIN, an inner or left join with ON, USING, or NATURAL, and now and
+// then a third table, joined from the right in parentheses or from the left, with conditions
+// that compare columns of the tables, the foreign key columns among them, and now and then
+// conditions that can fail, which maragudb rejects where their outcome depends on Postgres's
+// join plan.
+func (g *gen) joinSelect() *ast.Select {
+	s := &ast.Select{Distinct: g.rarely(4)}
+	refs := []ref{{name: "x", g: g}}
+	other := ref{name: "y", g: g}
+	if g.parent != nil && g.bool() {
+		other = ref{name: parentName, g: g.parent}
+		if g.bool() {
+			other.name = "z"
+		}
+	}
+	refs = append(refs, other)
+	table := func(r ref) ast.TableExpr {
+		t := &ast.TableRef{Name: r.g.table.Name}
+		if r.name != t.Name {
+			t.Alias = r.name
+		}
+		return t
+	}
+	kind := pick(g, []ast.JoinKind{ast.JoinInner, ast.JoinInner, ast.JoinLeft, ast.JoinLeft, ast.JoinCross})
+	var conds []ast.Expr
+	var from ast.TableExpr
+	switch g.draw(0, 5) {
+	case 0:
+		// A list of tables, joined by WHERE.
+		s.From = []ast.TableExpr{table(refs[0]), table(refs[1])}
+		conds = append(conds, g.joinCondition(refs[0], refs[1]))
+	case 1:
+		j := &ast.Join{Kind: pick(g, []ast.JoinKind{ast.JoinInner, ast.JoinLeft}), Left: table(refs[0]), Right: table(refs[1])}
+		// NATURAL would compare the column whose default is now(), which differs between the
+		// databases.
+		if g.bool() && g.nowColumn == "" {
+			j.Natural = true
+		} else {
+			j.Using = g.usingColumns(refs[0], refs[1])
+		}
+		from = j
+	default:
+		j := &ast.Join{Kind: kind, Left: table(refs[0]), Right: table(refs[1])}
+		if kind != ast.JoinCross {
+			j.On = g.joinCondition(refs[0], refs[1])
+		}
+		from = j
+	}
+	if from != nil && g.rarely(3) {
+		// A third table, which a join of two references from the right, in parentheses, or which
+		// joins the two from the left.
+		third := ref{name: "w", g: g}
+		if g.parent != nil && other.g != g.parent && g.bool() {
+			third = ref{name: parentName, g: g.parent}
+		}
+		refs = append(refs, third)
+		j := &ast.Join{Kind: pick(g, []ast.JoinKind{ast.JoinInner, ast.JoinLeft})}
+		if g.bool() {
+			inner := from.(*ast.Join)
+			j.Left, j.Right = table(third), inner
+			j.On = g.joinCondition(third, pick(g, refs[:2]))
+		} else {
+			j.Left, j.Right = from, table(third)
+			j.On = g.joinCondition(pick(g, refs[:2]), third)
+		}
+		from = j
+	}
+	if from != nil {
+		s.From = []ast.TableExpr{from}
+	}
+	// Under a LIMIT, an expression that can fail is rejected, so a limited join has none.
+	limited := g.rarely(6)
+	sc := scope{columns: true, refs: refs, safe: limited}
+	hasNow := g.nowColumn != ""
+	for i := range g.draw(1, 3) {
+		switch {
+		case g.draw(0, 5) == 0 && !hasNow:
+			s.Items = append(s.Items, ast.SelectItem{Star: true})
+		case g.draw(0, 4) == 0 && (!hasNow || other.g != g):
+			r := refs[0]
+			if hasNow {
+				r = other
+			}
+			if !hasNow && g.bool() {
+				r = pick(g, refs)
+			}
+			s.Items = append(s.Items, ast.SelectItem{Star: true, Table: r.name})
+		default:
+			item := ast.SelectItem{Expr: g.expr(g.anyTypeIn(sc), sc.withNull(true), 0)}
+			if g.bool() {
+				item.Alias = fmt.Sprint("a", i)
+			}
+			s.Items = append(s.Items, item)
+		}
+	}
+	if g.bool() {
+		r := pick(g, refs)
+		conds = append(conds, qualify(r.g.keyCondition(), r.name))
+	}
+	if g.rarely(3) {
+		// A condition on the tables of the join, which may fail.
+		safe := limited || !g.rarely(3)
+		conds = append(conds, g.expr(value.Bool, scope{columns: true, refs: refs, safe: safe}, 1))
+	}
+	if !limited && g.rarely(5) {
+		conds = append(conds, g.failing(scope{columns: true, refs: refs}))
+	}
+	if len(conds) > 0 {
+		s.Where = join(conds)
+	}
+	for range g.draw(0, 2) {
+		o := ast.OrderItem{Desc: g.bool(), Nulls: ast.NullsOrder(g.draw(0, 2))}
+		switch g.draw(0, 2) {
+		case 0:
+			o.Expr = &ast.Literal{Value: value.NewInt4(int32(g.draw(1, 3)))}
+		case 1:
+			r := pick(g, refs)
+			o.Expr = &ast.ColumnRef{Table: r.name, Name: pick(g, r.g.columnNames())}
+		default:
+			o.Expr = g.expr(g.anyTypeIn(sc), sc, 1)
+		}
+		s.OrderBy = append(s.OrderBy, o)
+	}
+	if limited {
+		// A total order, which a LIMIT needs, by every key column of every table.
+		for _, r := range refs {
+			for _, k := range r.g.table.PrimaryKey {
+				s.OrderBy = append(s.OrderBy, ast.OrderItem{Expr: &ast.ColumnRef{Table: r.name, Name: k}, Desc: g.bool()})
+			}
+		}
+		s.Limit = &ast.Literal{Value: value.NewInt4(int32(g.draw(0, 4)))}
+	}
+	return s
+}
+
+// join the conditions with AND.
+func join(conds []ast.Expr) ast.Expr {
+	out := conds[0]
+	for _, c := range conds[1:] {
+		out = &ast.Binary{Op: ast.And, Left: out, Right: c}
+	}
+	return out
+}
+
+// joinCondition of two tables of a join: mostly equalities of columns of the same type, the
+// foreign key columns of the table with the referenced columns when they are the two tables,
+// and now and then another condition on both, which may fail.
+func (g *gen) joinCondition(l, r ref) ast.Expr {
+	var conds []ast.Expr
+	if l.g != r.g || g.rarely(3) {
+		fkOf := func(c, p ref) bool {
+			for _, fk := range c.g.table.ForeignKeys {
+				if fk.Table != p.g.table.Name || !g.bool() {
+					continue
+				}
+				refCols := fk.RefColumns
+				if len(refCols) == 0 {
+					refCols = p.g.table.PrimaryKey
+				}
+				for i, col := range fk.Columns {
+					conds = append(conds, &ast.Binary{Op: ast.Eq, Left: &ast.ColumnRef{Table: c.name, Name: col}, Right: &ast.ColumnRef{Table: p.name, Name: refCols[i]}})
+				}
+				return true
+			}
+			return false
+		}
+		if !fkOf(l, r) {
+			fkOf(r, l)
+		}
+	}
+	if len(conds) == 0 || g.rarely(4) {
+		var types []value.Type
+		for _, t := range allTypes {
+			if len(l.g.cols[t]) > 0 && len(r.g.cols[t]) > 0 {
+				types = append(types, t)
+			}
+		}
+		if len(types) > 0 {
+			t := pick(g, types)
+			op := ast.Eq
+			if g.rarely(4) {
+				op = pick(g, []ast.BinaryOp{ast.Lt, ast.Ne, ast.Ge})
+			}
+			conds = append(conds, &ast.Binary{Op: op, Left: &ast.ColumnRef{Table: l.name, Name: pick(g, l.g.cols[t])}, Right: &ast.ColumnRef{Table: r.name, Name: pick(g, r.g.cols[t])}})
+		}
+	}
+	if len(conds) == 0 || g.rarely(4) {
+		// A condition on both tables, or on one, which may fail.
+		conds = append(conds, g.expr(value.Bool, scope{columns: true, refs: []ref{l, r}, safe: !g.rarely(3)}, 1))
+	}
+	if g.rarely(8) {
+		conds = append(conds, g.failing(scope{columns: true, refs: []ref{l, r}}))
+	}
+	return join(conds)
+}
+
+// failing is a condition that fails on some rows and not on others, so that whether a join fails
+// depends on the rows and pairs its plan evaluates it on: a division by an integer column, which
+// is often 0, or the text of a column read as a bigint.
+func (g *gen) failing(s scope) ast.Expr {
+	switch {
+	case g.hasColumn(value.Int, s) && !g.rarely(4):
+		divisor := g.columnOfType(value.Int, s)
+		if g.hasColumn(value.Int, s) && g.bool() {
+			// A difference of two columns, which is 0 on the pairs where they are equal.
+			divisor = &ast.Binary{Op: ast.Sub, Left: divisor, Right: g.columnOfType(value.Int, s)}
+		}
+		return &ast.Binary{Op: pick(g, []ast.BinaryOp{ast.Ge, ast.Lt, ast.Ne}), Left: &ast.Binary{Op: ast.Div, Left: &ast.Literal{Value: value.NewInt4(10)}, Right: divisor}, Right: g.literal(value.Int)}
+	case g.hasColumn(value.String, s) && g.bool():
+		return &ast.Binary{Op: ast.Gt, Left: &ast.Cast{Expr: g.columnOfType(value.String, s), Type: value.Int}, Right: g.literal(value.Int)}
+	}
+	return g.expr(value.Bool, s, 1)
+}
+
+// usingColumns are one or two columns that both tables of a join have, which a self-join has
+// all of, and a join with the referenced table mostly c0, now and then of different types.
+func (g *gen) usingColumns(l, r ref) []string {
+	var common []string
+	for _, c := range l.g.columnNames() {
+		if slices.Contains(r.g.columnNames(), c) {
+			common = append(common, c)
+		}
+	}
+	if len(common) == 0 || g.rarely(20) {
+		return []string{"nope"}
+	}
+	cols := []string{pick(g, common)}
+	if len(common) > 1 && g.rarely(3) {
+		if c := pick(g, common); c != cols[0] {
+			cols = append(cols, c)
+		}
+	}
+	return cols
 }
