@@ -1710,13 +1710,46 @@ func (g *gen) aggregate(s scope) (ast.Expr, value.Type) {
 		if t == value.Int && !s.safe {
 			return &ast.Binary{Op: pick(g, []ast.BinaryOp{ast.Add, ast.Mul, ast.Div}), Left: e, Right: g.literal(value.Int)}, value.Int
 		}
-	case 4:
-		if t == value.Numeric && g.rarely(4) {
-			// Arithmetic on numeric, which maragudb rejects.
-			return &ast.Binary{Op: ast.Add, Left: e, Right: &ast.Literal{Value: value.NewInt4(1)}}, t
+	case 4, 5:
+		if t == value.Numeric {
+			return g.numericArithmetic(e, s)
 		}
 	}
 	return e, t
+}
+
+// numericArithmetic is arithmetic on e, a numeric result of SUM or AVG: a sign, or +, -, *, /,
+// or % with an integer or bigint literal, which is often 0, with another aggregate, or now and
+// then with a double precision, or a numeric literal, which maragudb rejects. It returns the
+// expression and its type. In a safe scope it is only a sign, which cannot fail.
+func (g *gen) numericArithmetic(e ast.Expr, s scope) (ast.Expr, value.Type) {
+	if s.safe || g.rarely(4) {
+		return &ast.Unary{Op: pick(g, []ast.UnaryOp{ast.Neg, ast.Neg, ast.Pos}), Expr: e}, value.Numeric
+	}
+	t := value.Numeric
+	var other ast.Expr
+	switch g.draw(0, 9) {
+	case 0, 1, 2:
+		other = &ast.Literal{Value: value.NewInt4(int32(g.draw(-3, 100)))}
+	case 3, 4:
+		other = g.literal(value.Int)
+	case 5, 6:
+		other = &ast.Call{Name: pick(g, []string{"sum", "avg"}), Args: []ast.Expr{g.columnOfTypeOr(value.Int, s)}}
+	case 7:
+		other = &ast.Call{Name: "count", Star: true}
+	case 8:
+		other, t = g.literal(value.Float), value.Float
+	default:
+		other = &ast.Literal{Value: value.NewNumeric(pick(g, []string{"1.5", "0.25", "1e3"}))}
+	}
+	op := pick(g, []ast.BinaryOp{ast.Add, ast.Sub, ast.Mul, ast.Div, ast.Div, ast.Mod})
+	if t == value.Float && op == ast.Mod {
+		op = ast.Mul
+	}
+	if g.bool() {
+		return &ast.Binary{Op: op, Left: e, Right: other}, t
+	}
+	return &ast.Binary{Op: op, Left: other, Right: e}, t
 }
 
 // columnOfTypeOr is a column of type t, or a literal of it when the scope has none.
