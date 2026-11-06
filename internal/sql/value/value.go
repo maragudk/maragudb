@@ -19,8 +19,9 @@ type Type int
 // Types. The first six are the column types. [Int4] is the type of an integer literal that fits
 // in 32 bits and of the functions that return one, as in Postgres, and it widens to [Int] when
 // it meets one. [Numeric] is the type of a numeric literal, one with a decimal point, an
-// exponent, or too many digits for [Int]; it only exists until it is cast. [Unknown] is the type
-// of a NULL or a quoted string literal whose type has not been inferred from its context.
+// exponent, or too many digits for [Int]; it only exists until it is cast. [Decimal] is
+// Postgres's numeric as a value, which only SUM and AVG of integers return. [Unknown] is the
+// type of a NULL or a quoted string literal whose type has not been inferred from its context.
 const (
 	Unknown Type = iota
 	Int
@@ -31,11 +32,13 @@ const (
 	Time
 	Int4
 	Numeric
+	Decimal
 )
 
 var typeNames = map[Type]string{
 	Unknown: "unknown", Int: "bigint", Float: "double precision", Bool: "boolean", String: "text",
 	Bytes: "bytea", Time: "timestamptz", Int4: "integer", Numeric: "numeric",
+	Decimal: "numeric",
 }
 
 // String is the SQL name of the type.
@@ -143,7 +146,7 @@ func Format(v Value) string {
 			return "true"
 		}
 		return "false"
-	case String, Unknown, Numeric:
+	case String, Unknown, Numeric, Decimal:
 		return v.S
 	case Bytes:
 		return "\\x" + fmt.Sprintf("%x", v.Raw)
@@ -207,7 +210,8 @@ func FormatTime(t time.Time) string {
 
 // Compare two non-null values of the same type and return -1, 0 or 1. Strings and bytes compare
 // by byte order. Floats compare in a total order where NaN equals NaN and is greater than
-// everything else, and negative zero equals zero. Both values must be non-NULL and of one type;
+// everything else, and negative zero equals zero. Numerics compare by value, whatever their
+// scale. Both values must be non-NULL and of one type;
 // anything else is a programming error and panics.
 func Compare(a, b Value) int {
 	if a.Null || b.Null {
@@ -227,6 +231,8 @@ func Compare(a, b Value) int {
 		return bytes.Compare([]byte(a.S), []byte(b.S))
 	case Bytes:
 		return bytes.Compare(a.Raw, b.Raw)
+	case Decimal:
+		return compareDecimals(a.S, b.S)
 	case Time:
 		// By Unix seconds and nanoseconds, like the key encoding, which never overflows.
 		if c := cmp(a.T.Unix(), b.T.Unix()); c != 0 {

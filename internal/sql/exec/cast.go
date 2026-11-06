@@ -19,6 +19,8 @@ func (b *binder) cast(x *cexpr, t value.Type) (*cexpr, error) {
 		return resolve(x, t)
 	case value.Numeric:
 		return b.numericTo(x, t)
+	case value.Decimal:
+		return b.decimalTo(x, t)
 	}
 	var f func(v value.Value) (value.Value, error)
 	fallible := false

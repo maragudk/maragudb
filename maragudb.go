@@ -117,6 +117,10 @@ var (
 	ErrInvalidForeignKey = exec.ErrInvalidForeignKey
 	// ErrNotNull is a NULL in a NOT NULL column.
 	ErrNotNull = exec.ErrNotNull
+	// ErrGrouping is a grouped SELECT that reads a column outside of its GROUP BY expressions and
+	// its aggregates, or an aggregate where none is allowed, such as in WHERE or in the arguments
+	// of another aggregate.
+	ErrGrouping = exec.ErrGrouping
 	// ErrDivisionByZero is a division or modulo by zero.
 	ErrDivisionByZero = exec.ErrDivisionByZero
 	// ErrOutOfRange is an integer or bigint overflow, a float overflow or underflow, or a cast

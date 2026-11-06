@@ -556,7 +556,8 @@ func toDriverValue(v value.Value) driver.Value {
 		return v.F
 	case value.Bool:
 		return v.B
-	case value.String:
+	case value.String, value.Decimal:
+		// A numeric is its text, as Postgres drivers give it.
 		return v.S
 	case value.Bytes:
 		return v.Raw
@@ -586,7 +587,7 @@ func (r *Rows) ColumnTypeScanType(i int) reflect.Type {
 		return reflect.TypeFor[float64]()
 	case value.Bool:
 		return reflect.TypeFor[bool]()
-	case value.String:
+	case value.String, value.Decimal:
 		return reflect.TypeFor[string]()
 	case value.Bytes:
 		return reflect.TypeFor[[]byte]()

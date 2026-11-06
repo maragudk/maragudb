@@ -422,7 +422,7 @@ func TestSession_Select(t *testing.T) {
 			"SELECT 1.5", "SELECT 1 + 1.5", "SELECT 1.5 + 1.5", "SELECT -(1.5)", "SELECT abs(1.5)", "SELECT 1 = 1.5", "SELECT '1' + 1.5",
 			"SELECT 9223372036854775808", "SELECT 9223372036854775808 + 1", "SELECT -(-9223372036854775808)", "SELECT 1.5::boolean",
 			"SELECT 'January 2, 2024'::timestamptz", "SELECT 'now'::timestamptz", "SELECT '0001-01-01 00:00:00+01'::timestamptz",
-			"SELECT '\\x01'::bytea LIKE '\\x01'", "SELECT 1::integer", "SELECT count(1)", "SELECT clock_timestamp()", "SELECT nope(1)", "SELECT 1::nope", "SELECT CAST('\\x01'::bytea AS bigint)", "SELECT 5::bytea",
+			"SELECT '\\x01'::bytea LIKE '\\x01'", "SELECT 1::integer", "SELECT sum(1.5)", "SELECT clock_timestamp()", "SELECT nope(1)", "SELECT 1::nope", "SELECT CAST('\\x01'::bytea AS bigint)", "SELECT 5::bytea",
 		} {
 			is.Error(t, exec.ErrUnsupported, queryErr(t, s, sql), sql)
 		}

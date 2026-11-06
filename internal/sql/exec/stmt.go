@@ -138,7 +138,7 @@ func (s *Session) insert(ctx context.Context, st *ast.Insert, params []value.Val
 		}
 	}
 	// Every row is bound and folded before any is evaluated, as in Postgres.
-	b := &binder{params: params, now: s.now()}
+	b := &binder{params: params, now: s.now(), aggClause: "VALUES"}
 	var bound [][]*cexpr
 	rows := st.Rows
 	width := 0
@@ -336,6 +336,10 @@ func (s *Session) scanRows(ctx context.Context, t *table, a access, f filter, fn
 			}
 			return true, nil
 		}
+		if err != nil && f.failures != nil {
+			*f.failures = append(*f.failures, err)
+			return true, nil
+		}
 		if err != nil || !ok {
 			return err == nil, err
 		}
@@ -448,7 +452,7 @@ func (s *Session) update(ctx context.Context, st *ast.Update, params []value.Val
 	if err != nil {
 		return Result{}, err
 	}
-	b := &binder{table: t, params: params, now: s.now()}
+	b := &binder{table: t, params: params, now: s.now(), aggClause: "UPDATE"}
 	b.scope, b.ns = singleScope(t, cmp.Or(st.Alias, t.Name))
 	type assignment struct {
 		col int
@@ -846,7 +850,7 @@ func (s *Session) delete(ctx context.Context, st *ast.Delete, params []value.Val
 	if err != nil {
 		return Result{}, err
 	}
-	b := &binder{table: t, params: params, phase: phaseWhere, now: s.now()}
+	b := &binder{table: t, params: params, phase: phaseWhere, now: s.now(), aggClause: "WHERE"}
 	b.scope, b.ns = singleScope(t, cmp.Or(st.Alias, t.Name))
 	f, err := b.where(st.Where, "WHERE")
 	if err != nil {

@@ -38,6 +38,9 @@ func TestParse(t *testing.T) {
 			{"create table t (id bigint primary key references p, a bigint constraint f references p (x) match simple on update restrict on delete set null, b bigint, foreign key (a, b) references q (x, y) on delete set default (b) on update no action, constraint g foreign key (b) references t on delete cascade)", "CREATE TABLE t (id bigint NOT NULL, a bigint, b bigint, PRIMARY KEY (id), FOREIGN KEY (id) REFERENCES p, CONSTRAINT f FOREIGN KEY (a) REFERENCES p (x) ON DELETE SET NULL ON UPDATE RESTRICT, FOREIGN KEY (a, b) REFERENCES q (x, y) ON DELETE SET DEFAULT (b), CONSTRAINT g FOREIGN KEY (b) REFERENCES t ON DELETE CASCADE)"},
 			{"create table t (id bigint primary key, a bigint references p on delete no action on update no action, b bigint references p on delete restrict, c bigint references p on delete set null (c, c))", "CREATE TABLE t (id bigint NOT NULL, a bigint, b bigint, c bigint, PRIMARY KEY (id), FOREIGN KEY (a) REFERENCES p, FOREIGN KEY (b) REFERENCES p ON DELETE RESTRICT, FOREIGN KEY (c) REFERENCES p ON DELETE SET NULL (c, c))"},
 			{"insert into t default values", "INSERT INTO t DEFAULT VALUES"},
+			{"select a, count(*), count(all b), sum(distinct b) from t where b > 0 group by a, 2 having count(*) > 1 order by a", "SELECT a, count(*), count(b), sum(DISTINCT b) FROM t WHERE b > 0 GROUP BY a, 2 HAVING count(*) > 1 ORDER BY a"},
+			{"select count(*) having true", "SELECT count(*) HAVING TRUE"},
+			{"select nullif(a, 1), lower(all a), coalesce(a) from t", "SELECT nullif(a, 1), lower(a), coalesce(a) FROM t"},
 			{"insert into t (a, b) values (default, 1), (2, DEFAULT)", "INSERT INTO t (a, b) VALUES (DEFAULT, 1), (2, DEFAULT)"},
 			{"update t set a = default, b = 1", "UPDATE t SET a = DEFAULT, b = 1"},
 			{"select now(), current_timestamp, transaction_timestamp(), \"now\"()", "SELECT now(), CURRENT_TIMESTAMP, transaction_timestamp(), now()"},
@@ -254,6 +257,12 @@ func TestParse(t *testing.T) {
 			{"select * from (a)", "syntax error at position 17: unexpected \")\""},
 			{"select a.*.b from a", "syntax error at position 11: improper use of \"*\""},
 			{"select 0x", "syntax error at position 8: invalid number"},
+			{"select nullif(1)", "syntax error at position 16: unexpected \")\""},
+			{"select nullif(1, 2, 3)", "syntax error at position 22: unexpected \")\""},
+			{"select coalesce()", "syntax error at position 17: expected an expression, got \")\""},
+			{"select count(distinct *) from t", "syntax error at position 23: expected an expression, got \"*\""},
+			{"select count(distinct) from t", "syntax error at position 22: expected an expression, got \")\""},
+			{"select a from t having true group by a", "syntax error at position 29: unexpected GROUP"},
 			{"select $", "syntax error at position 8: parameter needs a number"},
 			{"select $0", "syntax error at position 8: there is no parameter $0"},
 			{"select a from t where", "syntax error at position 22: expected an expression, got end of statement"},
@@ -318,18 +327,24 @@ func TestParse(t *testing.T) {
 			{"select t.*::text from t", "t.* is not supported in an expression, name the columns"},
 			{"select x.f(1) from t", "functions with a schema are not supported"},
 			{"select distinct on (a) a from t", "DISTINCT ON is not supported, write DISTINCT"},
-			{"select a from t group by a", "GROUP BY is not supported"},
+			{"select a from t group by rollup (a)", "GROUPING SETS, ROLLUP, and CUBE are not supported, write a query for each grouping"},
+			{"select a from t group by a, cube (a)", "GROUPING SETS, ROLLUP, and CUBE are not supported, write a query for each grouping"},
+			{"select a from t group by grouping sets ((a))", "GROUPING SETS, ROLLUP, and CUBE are not supported, write a query for each grouping"},
+			{"select count(*) from t group by ()", "the empty grouping set () is not supported, leave out GROUP BY"},
+			{"select a from t group by all a", "GROUP BY ALL is not supported, write GROUP BY and the expressions"},
+			{"select a from t group by distinct a", "GROUP BY DISTINCT is not supported, write GROUP BY and the expressions"},
+			{"select sum(a order by a) from t", "ORDER BY in the arguments of an aggregate is not supported, sort the rows in the query"},
+			{"select count(*) filter (where a > 1) from t", "aggregate FILTER is not supported"},
+			{"select string_agg(a, ',') from t", "function string_agg is not supported"},
+			{"select bool_and(a) from t", "function bool_and is not supported"},
 			{"select a from t union select b from u", "UNION is not supported"},
 			{"select from t", "a SELECT without output columns is not supported"},
 			{"select", "a SELECT without output columns is not supported"},
-			{"select count(*) from t", "function count is not supported"},
-			{"select \"count\"(*) from t", "function count is not supported"},
 			{`select "cast"(1)`, "function cast is not supported"},
 			{"select int8pl(1, 2)", "function int8pl is not supported"},
 			{"select cast(a as nope)", "type nope is not supported; the supported types are bigint, double precision, boolean, text, bytea, and timestamptz"},
 			{"select cast(a as int4range)", "type int4range is not supported; the supported types are bigint, double precision, boolean, text, bytea, and timestamptz"},
 			{"select @", "operator @ is not supported"},
-			{"select sum(a) from t", "function sum is not supported"},
 			{"select statement_timestamp()", "function statement_timestamp is not supported, write now(), which is the start of the transaction"},
 			{"select clock_timestamp()", "function clock_timestamp is not supported, write now(), which is the start of the transaction"},
 			{"select current_timestamp(3)", "CURRENT_TIMESTAMP with a precision is not supported, write CURRENT_TIMESTAMP"},
@@ -461,7 +476,6 @@ func TestParse(t *testing.T) {
 			{"select 'a' -- c\n'b'", "string constants continued on the next line are not supported, write one string"},
 			{"select 'a' \v\n 'b'", "string constants continued on the next line are not supported, write one string"},
 			{"select (1, 2)", "row constructors are not supported"},
-			{"select nullif(a, b) from t", "function nullif is not supported"},
 			{"select lower(a) over () from t", "window functions are not supported"},
 		}
 		for _, test := range tests {
@@ -643,8 +657,20 @@ func drawExpr(ht hegel.TestCase, depth int) ast.Expr {
 		}
 		return &ast.Cast{Expr: &ast.Literal{Value: value.NewUnknown(hegel.Draw(ht, hegel.Text().MaxSize(8)))}, Type: typ, Style: ast.CastPrefix}
 	default:
-		name := hegel.Draw(ht, hegel.SampledFrom([]string{"length", "lower", "upper", "abs", "coalesce"}))
-		return &ast.Call{Name: name, Args: drawExprs(ht, depth+1, 0, 3)}
+		name := hegel.Draw(ht, hegel.SampledFrom([]string{"length", "lower", "upper", "abs", "coalesce", "nullif", "count", "sum", "avg", "min", "max"}))
+		switch name {
+		case "coalesce":
+			return &ast.Call{Name: name, Args: drawExprs(ht, depth+1, 1, 3)}
+		case "nullif":
+			return &ast.Call{Name: name, Args: drawExprs(ht, depth+1, 2, 2)}
+		case "count":
+			if hegel.Draw(ht, hegel.Booleans()) {
+				return &ast.Call{Name: name, Star: true}
+			}
+		}
+		c := &ast.Call{Name: name, Args: drawExprs(ht, depth+1, 0, 3)}
+		c.Distinct = len(c.Args) > 0 && hegel.Draw(ht, hegel.Booleans())
+		return c
 	}
 }
 
@@ -762,6 +788,10 @@ func drawStatement(ht hegel.TestCase) ast.Statement {
 			}
 			s.Items = append(s.Items, item)
 		}
+		if hegel.Draw(ht, hegel.Booleans()) {
+			s.GroupBy = drawExprs(ht, 1, 1, 3)
+		}
+		s.Having = drawOptionalExpr(ht)
 		for range hegel.Draw(ht, hegel.Integers(0, 2)) {
 			s.OrderBy = append(s.OrderBy, ast.OrderItem{Expr: drawExpr(ht, 1), Desc: hegel.Draw(ht, hegel.Booleans()), Nulls: ast.NullsOrder(hegel.Draw(ht, hegel.Integers(0, 2)))})
 		}

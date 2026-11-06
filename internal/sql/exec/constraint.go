@@ -50,7 +50,7 @@ func (s *Session) checkDefault(t *table, i int, e ast.Expr) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	b := &binder{now: s.now()}
+	b := &binder{now: s.now(), aggClause: "DEFAULT expressions"}
 	bound, err := b.bind(e)
 	if err != nil {
 		return "", err
@@ -183,7 +183,7 @@ func (s *Session) addNotNullNames(ctx context.Context, t *table, n *names) error
 // the table: a boolean over the table's columns. maragudb also rejects an expression whose
 // constant part fails, which Postgres folds only when the first row is checked.
 func (s *Session) bindCheck(t *table, e ast.Expr) (*cexpr, error) {
-	b := &binder{table: t, now: s.now()}
+	b := &binder{table: t, now: s.now(), aggClause: "check constraints"}
 	c, err := b.bind(e)
 	if err != nil {
 		return nil, err

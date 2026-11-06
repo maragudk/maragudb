@@ -54,6 +54,8 @@ func TestErrorClasses(t *testing.T) {
 		{sql: "SELECT 1 WHERE 1", want: maragudb.ErrType, code: "42804"},
 		{sql: "INSERT INTO dev VALUES (TRUE, 1)", want: maragudb.ErrType, code: "42804"},
 		{sql: "SELECT 1 + TRUE", want: maragudb.ErrType, code: "42883"},
+		{sql: "SELECT sum('1')", want: maragudb.ErrType, code: "42725"},
+		{sql: "SELECT j FROM dev GROUP BY i + 1", want: maragudb.ErrGrouping, code: "42803"},
 		{sql: "SELECT CAST('a' AS bigint)", want: maragudb.ErrCast, code: "22P02"},
 		{sql: "INSERT INTO dev VALUES ('a', 1)", want: maragudb.ErrCast, code: "22P02"},
 		{sql: "SELECT CAST('' AS timestamptz)", want: maragudb.ErrCast, code: "22007"},

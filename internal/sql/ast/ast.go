@@ -182,12 +182,15 @@ type Delete struct {
 }
 
 // Select statement. An empty From selects a single row without a table. Several items in From
-// are joined as with CROSS JOIN, and the WHERE clause filters their rows.
+// are joined as with CROSS JOIN, and the WHERE clause filters their rows. GroupBy and Having
+// group the rows, as do aggregates in Items, Having, or OrderBy.
 type Select struct {
 	Distinct bool
 	Items    []SelectItem
 	From     []TableExpr
 	Where    Expr
+	GroupBy  []Expr
+	Having   Expr
 	OrderBy  []OrderItem
 	Limit    Expr
 	Offset   Expr
@@ -402,12 +405,34 @@ type When struct {
 	Cond, Result Expr
 }
 
-// Call of a scalar function by lowercase name. With Keyword, it is a function that SQL writes as
-// a keyword without parentheses, such as CURRENT_TIMESTAMP, and has no arguments.
+// Call of a function by lowercase name. With Keyword, it is a function that SQL writes as a
+// keyword without parentheses, such as CURRENT_TIMESTAMP, and has no arguments. Star is the *
+// of COUNT(*), which has no arguments, and Distinct the DISTINCT of an aggregate's arguments.
 type Call struct {
-	Name    string
-	Args    []Expr
-	Keyword bool
+	Name     string
+	Args     []Expr
+	Keyword  bool
+	Star     bool
+	Distinct bool
+}
+
+// Aggregates are the names of the aggregate functions, whose calls group the rows of a SELECT.
+var Aggregates = map[string]bool{"count": true, "sum": true, "avg": true, "min": true, "max": true}
+
+// IsAggregate reports whether e is a call of an aggregate function.
+func IsAggregate(e Expr) bool {
+	c, ok := e.(*Call)
+	return ok && !c.Keyword && Aggregates[c.Name]
+}
+
+// HasAggregate reports whether e has a call of an aggregate function.
+func HasAggregate(e Expr) bool {
+	found := false
+	Walk(e, func(x Expr) bool {
+		found = found || IsAggregate(x)
+		return !found
+	})
+	return found
 }
 
 // Default is the DEFAULT keyword in the VALUES of an INSERT or the SET of an UPDATE, which
@@ -523,7 +548,7 @@ func Map(e Expr, fn func(Expr) Expr) Expr {
 		}
 		return fn(c)
 	case *Call:
-		return fn(&Call{Name: e.Name, Args: list(e.Args), Keyword: e.Keyword})
+		return fn(&Call{Name: e.Name, Args: list(e.Args), Keyword: e.Keyword, Star: e.Star, Distinct: e.Distinct})
 	case *Cast:
 		return fn(&Cast{Expr: m(e.Expr), Type: e.Type, Style: e.Style})
 	}

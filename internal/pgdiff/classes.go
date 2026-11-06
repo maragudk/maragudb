@@ -46,8 +46,11 @@ var ErrorClasses = []ErrorClass{
 	// 54011 is too_many_columns.
 	{Name: "program limit", Err: maragudb.ErrProgramLimit, Codes: []string{"54011"}},
 	// 42804 is datatype_mismatch and 42883 is undefined_function, which Postgres reports for an
-	// operator without a variant for its operand types.
-	{Name: "type", Err: maragudb.ErrType, Codes: []string{"42804", "42883"}},
+	// operator without a variant for its operand types, and 42725 ambiguous_function, for a
+	// function or operator whose argument of unknown type fits several variants.
+	{Name: "type", Err: maragudb.ErrType, Codes: []string{"42804", "42883", "42725"}},
+	// 42803 is grouping_error.
+	{Name: "grouping", Err: maragudb.ErrGrouping, Codes: []string{"42803"}},
 	// 22P02 is invalid_text_representation, 22007 invalid_datetime_format, 22008
 	// datetime_field_overflow, 22009 invalid_time_zone_displacement_value, 22023
 	// invalid_parameter_value, which Postgres reports for bytea text in hex format that is not

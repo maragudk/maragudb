@@ -31,7 +31,7 @@ The project is not reviewed manually. Automated tests are the only quality gate,
   | `bytea` | | binary data |
   | `timestamptz` | `timestamp with time zone` | instant with microsecond precision, from 0001-01-01 to the end of 294276, read and written in UTC |
 
-  As in Postgres, an integer literal that fits in 32 bits has type `integer`, and arithmetic on it overflows at 32 bits; `integer` itself is not a column type. NULL is supported. `INV-TYPES`
+  As in Postgres, an integer literal that fits in 32 bits has type `integer`, and arithmetic on it overflows at 32 bits; `integer` itself is not a column type. Postgres's `numeric` is the type of `SUM` of bigint and of `AVG` of integers, and of nothing else: it holds their exact results, which reach Go as text. NULL is supported. `INV-TYPES`
 - **Telemetry:** an optional `*slog.Logger` in Options, plus `Stats()`. `INV-LOGGER` OpenTelemetry is out of scope for now.
 - **Repo bootstrap:** copy LICENSE, `.editorconfig`, `.github`, `.gitignore`, AGENTS.md, CLAUDE.md, and the Makefile from <https://github.com/maragudk/template>, then adapt them. Do not copy `template.go`.
 - **Workflow:** no PRs. Commit directly to `main`.
@@ -116,7 +116,7 @@ These apply to every section, for the SQL surface that exists at that point.
 - A network server or wire protocol
 - OpenTelemetry
 - Recursive CTEs, window functions, and views
-- `NUMERIC` and JSON types
+- `NUMERIC` columns and literals, and JSON types
 - `ALTER TABLE`, unless a section needs it
 - Row-level or range-level conflict detection
 

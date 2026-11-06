@@ -100,14 +100,21 @@ func TestUnsupported(t *testing.T) {
 	const create = "CREATE TABLE dev (i bigint PRIMARY KEY, j bigint, s text)"
 	rows := "INSERT INTO dev VALUES (2, 5, 'b'), (1, 0, 'a')"
 
-	t.Run("UNS-NUMERIC numeric literals outside double precision and bigint contexts", func(t *testing.T) {
-		verify.Covers(t, "numeric literals that Postgres keeps as numeric, such as SELECT 1.5 or a literal beyond the bigint range, are rejected, and Postgres accepts them", "UNS-NUMERIC")
+	t.Run("UNS-NUMERIC numeric literals outside double precision and bigint contexts, and arithmetic on numeric", func(t *testing.T) {
+		verify.Covers(t, "numeric literals that Postgres keeps as numeric, such as SELECT 1.5 or a literal beyond the bigint range, arithmetic on the numeric results of SUM and AVG, and quoted literals read as numeric are rejected, and Postgres accepts them", "UNS-NUMERIC")
 		rejects(t, create,
 			example{SQL: "SELECT 1.5"},
 			example{SQL: "SELECT 1 + 1.5"},
 			example{SQL: "SELECT 9223372036854775808"},
 			example{SQL: "SELECT i FROM dev WHERE i = 1.5"},
 			example{SQL: "SELECT 1.5 + 1.5"},
+			example{SQL: "SELECT sum(j) + 1 FROM dev"},
+			example{SQL: "SELECT -sum(j) FROM dev"},
+			example{SQL: "SELECT avg(j) * 2 FROM dev"},
+			example{SQL: "SELECT abs(avg(j)) FROM dev"},
+			example{SQL: "SELECT sum(j) = '5' FROM dev"},
+			example{SQL: "SELECT avg(j) > 1.5 FROM dev"},
+			example{SQL: "SELECT sum(1.5) FROM dev"},
 		)
 	})
 
@@ -249,10 +256,9 @@ func TestUnsupported(t *testing.T) {
 	})
 
 	t.Run("UNS-CLAUSES other clauses of queries and writes", func(t *testing.T) {
-		verify.Covers(t, "DISTINCT ON, GROUP BY, subqueries, set operations, FOR UPDATE, RETURNING, ON CONFLICT, INSERT ... SELECT, an alias in INSERT, UPDATE ... FROM, and DELETE ... USING are rejected, and Postgres accepts them", "UNS-CLAUSES")
+		verify.Covers(t, "DISTINCT ON, subqueries, set operations, FOR UPDATE, RETURNING, ON CONFLICT, INSERT ... SELECT, an alias in INSERT, UPDATE ... FROM, and DELETE ... USING are rejected, and Postgres accepts them", "UNS-CLAUSES")
 		rejects(t, create,
 			example{SQL: "SELECT DISTINCT ON (j) j FROM dev"},
-			example{SQL: "SELECT j FROM dev GROUP BY j"},
 			example{SQL: "SELECT i FROM dev UNION SELECT 1"},
 			example{SQL: "SELECT i FROM dev WHERE i IN (SELECT 1)"},
 			example{SQL: "SELECT i FROM dev FOR UPDATE"},
@@ -285,15 +291,13 @@ func TestUnsupported(t *testing.T) {
 	})
 
 	t.Run("UNS-FUNCTIONS functions other than the supported ones", func(t *testing.T) {
-		verify.Covers(t, "functions other than abs, coalesce, length, lower, upper, now, transaction_timestamp, and CURRENT_TIMESTAMP, including aggregates, window functions, the other clocks, and CURRENT_TIMESTAMP with a precision, are rejected, and Postgres accepts them", "UNS-FUNCTIONS")
+		verify.Covers(t, "functions other than abs, coalesce, length, lower, nullif, upper, now, transaction_timestamp, CURRENT_TIMESTAMP, and the aggregates, including window functions, the other clocks, and CURRENT_TIMESTAMP with a precision, are rejected, and Postgres accepts them", "UNS-FUNCTIONS")
 		rejects(t, create,
-			example{SQL: "SELECT count(*) FROM dev"},
 			example{SQL: "SELECT statement_timestamp()"},
 			example{SQL: "SELECT clock_timestamp()"},
 			example{SQL: "SELECT CURRENT_TIMESTAMP(3)"},
 			example{SQL: "SELECT LOCALTIMESTAMP"},
 			example{SQL: "SELECT CURRENT_DATE"},
-			example{SQL: "SELECT nullif(1, 2)"},
 			example{SQL: "SELECT int8pl(1, 2)"},
 			example{SQL: "SELECT count(*) OVER () FROM dev"},
 		)
@@ -341,13 +345,50 @@ func TestUnsupported(t *testing.T) {
 		)
 	})
 
+	t.Run("UNS-AGGREGATES other aggregates and forms of grouping", func(t *testing.T) {
+		verify.Covers(t, "FILTER, ORDER BY in an aggregate, WITHIN GROUP, GROUPING SETS, ROLLUP, CUBE, the empty grouping set, GROUP BY ALL and DISTINCT, and the aggregates other than COUNT, SUM, AVG, MIN, and MAX are rejected, and Postgres accepts them", "UNS-AGGREGATES")
+		rejects(t, create,
+			example{SQL: "SELECT count(*) FILTER (WHERE j > 0) FROM dev"},
+			example{SQL: "SELECT sum(j ORDER BY i) FROM dev"},
+			example{SQL: "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY j) FROM dev"},
+			example{SQL: "SELECT j, count(*) FROM dev GROUP BY GROUPING SETS ((j), ())"},
+			example{SQL: "SELECT j, count(*) FROM dev GROUP BY ROLLUP (j)"},
+			example{SQL: "SELECT j, count(*) FROM dev GROUP BY CUBE (j)"},
+			example{SQL: "SELECT count(*) FROM dev GROUP BY ()"},
+			example{SQL: "SELECT j FROM dev GROUP BY ALL j"},
+			example{SQL: "SELECT j FROM dev GROUP BY DISTINCT j"},
+			example{SQL: "SELECT string_agg(s, ',') FROM dev"},
+			example{SQL: "SELECT array_agg(j) FROM dev"},
+			example{SQL: "SELECT bool_and(j > 0), every(j > 0) FROM dev"},
+			example{SQL: "SELECT grouping(j) FROM dev GROUP BY j"},
+		)
+	})
+
+	t.Run("UNS-FLOAT-SUM a SUM or AVG of double precision whose result depends on the order of the rows", func(t *testing.T) {
+		verify.Covers(t, "a SUM or AVG of double precision values whose sum, or whether it overflows, depends on the order in which Postgres adds them is rejected, and Postgres accepts it", "UNS-FLOAT-SUM")
+		rejects(t, "CREATE TABLE dev (i bigint PRIMARY KEY, f double precision)",
+			example{SQL: "SELECT sum(f) FROM dev", Setup: []string{"INSERT INTO dev VALUES (1, 0.1), (2, 0.2), (3, 0.3)"}},
+			example{SQL: "SELECT avg(f) FROM dev", Setup: []string{"INSERT INTO dev VALUES (1, 1e16), (2, 1), (3, -1e16)"}},
+			example{SQL: "SELECT sum(f) FROM dev", Setup: []string{"INSERT INTO dev VALUES (1, 1e308), (2, -1e308), (3, 1e308)"}},
+		)
+	})
+
+	t.Run("UNS-PLAN-DEPENDENT-AGGREGATE MIN and MAX that Postgres can compute from the first row of an index, with a WHERE condition that fails", func(t *testing.T) {
+		verify.Covers(t, "a SELECT on one table without GROUP BY whose aggregates are all MIN and MAX, with a WHERE condition that fails on a row, is rejected, because Postgres can read only the first row of an index that passes the condition, and Postgres accepts it when that row comes first", "UNS-PLAN-DEPENDENT-AGGREGATE")
+		rejects(t, create,
+			example{SQL: "SELECT max(i) FROM dev WHERE 10 / (j - 1) > 0", Setup: []string{"INSERT INTO dev VALUES (1, 1, 'a'), (2, 3, 'b')"}},
+		)
+	})
+
 	t.Run("UNS-LIMIT-ORDER LIMIT and OFFSET without a total order", func(t *testing.T) {
-		verify.Covers(t, "LIMIT and OFFSET without ORDER BY on every primary key column are rejected, because which rows Postgres returns depends on its plan, and Postgres accepts them", "UNS-LIMIT-ORDER")
+		verify.Covers(t, "LIMIT and OFFSET without ORDER BY on every primary key column, or on groups without ORDER BY on every GROUP BY expression, are rejected, because which rows Postgres returns depends on its plan, and Postgres accepts them", "UNS-LIMIT-ORDER")
 		rejects(t, create,
 			example{SQL: "SELECT i FROM dev LIMIT 1", Setup: []string{rows}},
 			example{SQL: "SELECT i FROM dev ORDER BY j OFFSET 1", Setup: []string{rows}},
 			example{SQL: "SELECT a.i FROM dev a, dev b ORDER BY a.i LIMIT 1", Setup: []string{rows}},
 			example{SQL: "SELECT DISTINCT j, s FROM dev ORDER BY j LIMIT 1", Setup: []string{rows}},
+			example{SQL: "SELECT j, count(*) FROM dev GROUP BY j LIMIT 1", Setup: []string{rows}},
+			example{SQL: "SELECT j, s, count(*) FROM dev GROUP BY j, s ORDER BY j LIMIT 1", Setup: []string{rows}},
 		)
 	})
 
@@ -359,11 +400,16 @@ func TestUnsupported(t *testing.T) {
 		)
 	})
 
-	t.Run("UNS-DISTINCT-ZERO DISTINCT of -0 and 0", func(t *testing.T) {
-		verify.Covers(t, "a SELECT DISTINCT whose result has -0 and 0 in one group is rejected, because which of them Postgres outputs depends on its plan, and Postgres accepts it", "UNS-DISTINCT-ZERO")
-		rejects(t, "CREATE TABLE dev (i bigint PRIMARY KEY, f double precision)",
-			example{SQL: "SELECT DISTINCT f FROM dev", Setup: []string{"INSERT INTO dev VALUES (1, '-0'), (2, 0)"}},
-			example{SQL: "SELECT DISTINCT a.f FROM dev a, dev b", Setup: []string{"INSERT INTO dev VALUES (1, '-0'), (2, 0)"}},
+	t.Run("UNS-DISTINCT-ZERO DISTINCT, GROUP BY, MIN, and MAX of -0 and 0", func(t *testing.T) {
+		verify.Covers(t, "a SELECT DISTINCT whose result has -0 and 0 in one group, or numerics of different scales, a GROUP BY whose group has -0 and 0 when the query reads its value, and a MIN, MAX, or SUM(DISTINCT) of -0 and 0 are rejected, because which of them Postgres outputs depends on its plan, and Postgres accepts them", "UNS-DISTINCT-ZERO")
+		zeros := []string{"INSERT INTO dev VALUES (1, '-0', 1), (2, 0, 1)"}
+		rejects(t, "CREATE TABLE dev (i bigint PRIMARY KEY, f double precision, g bigint)",
+			example{SQL: "SELECT DISTINCT f FROM dev", Setup: zeros},
+			example{SQL: "SELECT DISTINCT a.f FROM dev a, dev b", Setup: zeros},
+			example{SQL: "SELECT f FROM dev GROUP BY f", Setup: zeros},
+			example{SQL: "SELECT min(f), max(f) FROM dev", Setup: zeros},
+			example{SQL: "SELECT sum(DISTINCT f) FROM dev", Setup: zeros},
+			example{SQL: "SELECT DISTINCT CASE WHEN i = 1 THEN sum(g) ELSE avg(g) END FROM dev GROUP BY i", Setup: zeros},
 		)
 	})
 
@@ -372,6 +418,7 @@ func TestUnsupported(t *testing.T) {
 		rejects(t, create,
 			example{SQL: "SELECT i + j FROM dev ORDER BY i LIMIT 1", Setup: []string{rows}},
 			example{SQL: "SELECT i FROM dev WHERE j + 1 > 0 ORDER BY i LIMIT 1", Setup: []string{rows}},
+			example{SQL: "SELECT j, sum(i + 1) FROM dev GROUP BY j ORDER BY j LIMIT 1", Setup: []string{rows}},
 		)
 	})
 
@@ -391,6 +438,8 @@ func TestUnsupported(t *testing.T) {
 		rejects(t, create,
 			example{SQL: "SELECT i FROM dev WHERE j <> 0 AND 10 / j > 1", Setup: []string{rows}},
 			example{SQL: "DELETE FROM dev WHERE j <> 0 AND 10 / j > 1", Setup: []string{rows}},
+			example{SQL: "SELECT j FROM dev GROUP BY j HAVING j <> 0 AND 10 / j > 1", Setup: []string{rows}},
+			example{SQL: "SELECT j FROM dev GROUP BY j HAVING count(*) > 1 AND 10 / (count(*) - 1) > 0", Setup: []string{rows}},
 		)
 	})
 

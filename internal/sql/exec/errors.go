@@ -52,6 +52,10 @@ var (
 	ErrInvalidForeignKey = errors.New("invalid foreign key")
 	// ErrNotNull is a NULL in a NOT NULL column.
 	ErrNotNull = errors.New("null value violates not-null constraint")
+	// ErrGrouping is a grouped SELECT that reads a column outside of its GROUP BY expressions and
+	// its aggregates, or an aggregate where none is allowed, such as in WHERE or in the arguments
+	// of another aggregate.
+	ErrGrouping = errors.New("grouping error")
 	// ErrDivisionByZero is a division or modulo by zero.
 	ErrDivisionByZero = errors.New("division by zero")
 	// ErrOutOfRange is an integer or bigint overflow, a float overflow or underflow, a cast out

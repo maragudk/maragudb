@@ -244,6 +244,14 @@ func (r *renderer) stmt(s Statement) {
 			r.from(from)
 		}
 		r.where(s.Where)
+		if len(s.GroupBy) > 0 {
+			r.b.WriteString(" GROUP BY ")
+			r.exprs(s.GroupBy)
+		}
+		if s.Having != nil {
+			r.b.WriteString(" HAVING ")
+			r.expr(s.Having, 0)
+		}
 		if len(s.OrderBy) > 0 {
 			r.b.WriteString(" ORDER BY ")
 			for i, o := range s.OrderBy {
@@ -590,6 +598,12 @@ func (r *renderer) expr(e Expr, minimum int) {
 		}
 		r.ident(e.Name)
 		r.b.WriteByte('(')
+		switch {
+		case e.Star:
+			r.b.WriteByte('*')
+		case e.Distinct:
+			r.b.WriteString("DISTINCT ")
+		}
 		r.exprs(e.Args)
 		r.b.WriteByte(')')
 	case *Cast:

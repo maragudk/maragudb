@@ -72,8 +72,9 @@ type lookup struct {
 	e   *cexpr
 }
 
-// selectJoin runs a SELECT on several tables.
-func (s *Session) selectJoin(ctx context.Context, st *ast.Select, b *binder, nodes []*fromNode, where filter, o output, order []orderKey, offsetExpr, limitExpr *cexpr) (*Rows, error) {
+// selectJoin runs a SELECT on several tables, whose rows go into the groups of gr when it is
+// grouped.
+func (s *Session) selectJoin(ctx context.Context, st *ast.Select, b *binder, nodes []*fromNode, where filter, o output, order []orderKey, offsetExpr, limitExpr *cexpr, gr *aggRun) (*Rows, error) {
 	p := &joinPlan{s: s, b: b, st: st, where: where, conds: map[*fromNode][]*jcond{}, post: map[*fromNode][]*jcond{}, never: map[*fromNode]bool{}, lookups: map[lookupKey][]lookup{}, groups: map[*fromNode]*groupRun{}}
 	for _, e := range b.scope.entries {
 		p.nulls = append(p.nulls, nullRow(e.t))
@@ -87,7 +88,11 @@ func (s *Session) selectJoin(ctx context.Context, st *ast.Select, b *binder, nod
 		return nil, err
 	}
 	if st.Limit != nil || st.Offset != nil {
-		if err := p.limitable(order, o, st.Distinct); err != nil {
+		if gr != nil {
+			if slices.ContainsFunc(p.all, func(c *jcond) bool { return c.ce.fallible }) {
+				return nil, errLimitFallible()
+			}
+		} else if err := p.limitable(order, o, st.Distinct); err != nil {
 			return nil, err
 		}
 	}
@@ -123,7 +128,17 @@ func (s *Session) selectJoin(ctx context.Context, st *ast.Select, b *binder, nod
 	var collected []sortable
 	var first error
 	if open && !where.never {
-		if err := p.candidates(ctx, order); err != nil {
+		var sorts []colRef
+		if gr != nil {
+			sorts = gr.sortRefs()
+		} else {
+			for _, k := range order {
+				if k.plain {
+					sorts = append(sorts, k.ref)
+				}
+			}
+		}
+		if err := p.candidates(ctx, sorts); err != nil {
 			return nil, err
 		}
 		if err := p.check(ctx); err != nil {
@@ -131,6 +146,10 @@ func (s *Session) selectJoin(ctx context.Context, st *ast.Select, b *binder, nod
 		}
 		r := &joinRun{p: p, ctx: ctx, row: make([]value.Value, b.scope.width)}
 		err := r.node(p.top, 0, nil, func() error {
+			if gr != nil {
+				gr.add(r.row)
+				return nil
+			}
 			out, err := project(o.items, r.row)
 			var keys []value.Value
 			if err == nil {
@@ -149,6 +168,9 @@ func (s *Session) selectJoin(ctx context.Context, st *ast.Select, b *binder, nod
 		if err != nil {
 			return nil, err
 		}
+	}
+	if gr != nil {
+		return gr.rows(st.Distinct, offset, limit)
 	}
 	if first != nil {
 		return nil, first
@@ -265,17 +287,22 @@ func (p *joinPlan) limitable(order []orderKey, o output, distinct bool) error {
 		return fmt.Errorf("%w: LIMIT and OFFSET with an output expression that can fail are not supported, because how many rows Postgres evaluates it on depends on its plan; select the rows first and compute the expression on them", ErrUnsupported)
 	}
 	if slices.ContainsFunc(p.all, func(c *jcond) bool { return c.ce.fallible }) {
-		return fmt.Errorf("%w: LIMIT and OFFSET with a WHERE condition that can fail are not supported, because how many rows Postgres evaluates it on depends on its plan; select the rows first and filter them", ErrUnsupported)
+		return errLimitFallible()
 	}
 	return nil
+}
+
+// errLimitFallible is the error of a LIMIT or OFFSET with a condition that can fail.
+func errLimitFallible() error {
+	return fmt.Errorf("%w: LIMIT and OFFSET with a WHERE condition that can fail are not supported, because how many rows Postgres evaluates it on depends on its plan; select the rows first and filter them", ErrUnsupported)
 }
 
 // candidates sets the scans of each entry that Postgres could pick, which decide the rows that
 // some plan reads, as for a statement on one table, see [table.candidates]. Besides the
 // conditions that its scan evaluates, a scan of the entry can serve a condition of a join, a
-// merge join, or the ORDER BY, so every index on a column that any condition reads, or that
-// ORDER BY sorts by, is a scan Postgres could pick.
-func (p *joinPlan) candidates(ctx context.Context, order []orderKey) error {
+// merge join, or the order of the rows, so every index on a column that any condition reads, or
+// on one of the columns sorts that the rows can be sorted by, is a scan Postgres could pick.
+func (p *joinPlan) candidates(ctx context.Context, sorts []colRef) error {
 	for i, e := range p.b.scope.entries {
 		f := p.filters[i]
 		touched := map[int]bool{}
@@ -286,9 +313,9 @@ func (p *joinPlan) candidates(ctx context.Context, order []orderKey) error {
 			p.columnsOf(c.expr, i, func(col int) { touched[col] = true })
 		}
 		var sortCols []int
-		for _, k := range order {
-			if k.plain && k.ref.entry == i {
-				sortCols = append(sortCols, k.ref.col)
+		for _, ref := range sorts {
+			if ref.entry == i {
+				sortCols = append(sortCols, ref.col)
 			}
 		}
 		f.touched = touched
@@ -474,7 +501,7 @@ func nullRow(t *table) []value.Value {
 
 // fresh is a binder of the same names and rows, whose folding errors are its own.
 func (b *binder) fresh() *binder {
-	return &binder{scope: b.scope, ns: b.ns, layout: b.layout, table: b.table, entry: b.entry, params: b.params, now: b.now, phase: b.phase}
+	return &binder{scope: b.scope, ns: b.ns, layout: b.layout, table: b.table, entry: b.entry, params: b.params, now: b.now, phase: b.phase, aggClause: b.aggClause}
 }
 
 // joinRun is a run of a join plan, which fills the row of the join as it goes.

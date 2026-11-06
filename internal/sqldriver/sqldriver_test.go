@@ -208,4 +208,33 @@ func TestConn(t *testing.T) {
 		is.True(t, ok)
 		is.NotError(t, conn.Close())
 	})
+
+	t.Run("gives a numeric as its text, of the database type NUMERIC", func(t *testing.T) {
+		verify.Covers(t, "the numeric results of SUM and AVG reach database/sql as strings in Postgres's text, and ColumnTypeDatabaseTypeName is NUMERIC, as with Postgres drivers", "INV-TYPES")
+		fake := s3fake.New()
+		d := sqldriver.New(sqldriver.Options{Engine: engine.Options{Client: fake}, Maintenance: sqldriver.MaintenanceOptions{Disabled: true}})
+		c, err := sqldriver.NewConnector(d, "s3://bucket/db")
+		is.NotError(t, err)
+		db := sql.OpenDB(c)
+		defer func() { _ = db.Close() }()
+		for _, q := range []string{"CREATE TABLE t (id bigint PRIMARY KEY, v bigint)", "INSERT INTO t VALUES (1, 9223372036854775807), (2, 9223372036854775807), (3, 1)"} {
+			_, err := db.ExecContext(t.Context(), q)
+			is.NotError(t, err)
+		}
+		rows, err := db.QueryContext(t.Context(), "SELECT sum(v), avg(id), count(*) FROM t")
+		is.NotError(t, err)
+		defer func() { _ = rows.Close() }()
+		types, err := rows.ColumnTypes()
+		is.NotError(t, err)
+		is.Equal(t, "NUMERIC", types[0].DatabaseTypeName())
+		is.Equal(t, "NUMERIC", types[1].DatabaseTypeName())
+		is.Equal(t, "INT8", types[2].DatabaseTypeName())
+		is.True(t, rows.Next())
+		var sum, avg any
+		var count int64
+		is.NotError(t, rows.Scan(&sum, &avg, &count))
+		is.Equal(t, any("18446744073709551615"), sum)
+		is.Equal(t, any("2.0000000000000000"), avg)
+		is.Equal(t, int64(3), count)
+	})
 }

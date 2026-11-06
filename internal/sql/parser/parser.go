@@ -189,8 +189,6 @@ var unsupportedClauses = map[string]string{
 	"union":      "UNION is not supported",
 	"intersect":  "INTERSECT is not supported",
 	"except":     "EXCEPT is not supported",
-	"group":      "GROUP BY is not supported",
-	"having":     "HAVING is not supported",
 	"window":     "WINDOW is not supported",
 	"fetch":      "FETCH is not supported, write LIMIT",
 	"for":        "FOR UPDATE and FOR SHARE are not supported, every transaction is serializable",
@@ -1444,7 +1442,21 @@ func (p *parser) selectStmt() (ast.Statement, error) {
 	if s.Where, err = p.where(); err != nil {
 		return nil, err
 	}
-	for _, w := range []string{"group", "having", "window", "union", "intersect", "except"} {
+	if ok, err := p.accept("group"); err != nil {
+		return nil, err
+	} else if ok {
+		if s.GroupBy, err = p.groupBy(); err != nil {
+			return nil, err
+		}
+	}
+	if ok, err := p.accept("having"); err != nil {
+		return nil, err
+	} else if ok {
+		if s.Having, err = p.expr(0); err != nil {
+			return nil, err
+		}
+	}
+	for _, w := range []string{"window", "union", "intersect", "except"} {
 		if p.isKeyword(w) {
 			return nil, p.unsupportedf("%s", unsupportedClauses[w])
 		}
@@ -1528,6 +1540,38 @@ func (p *parser) selectStmt() (ast.Statement, error) {
 		}
 	}
 	return s, nil
+}
+
+// groupBy parses the items of GROUP BY, after GROUP. Each is an expression, an output column's
+// name, or its position.
+func (p *parser) groupBy() ([]ast.Expr, error) {
+	if err := p.expectWord("by"); err != nil {
+		return nil, err
+	}
+	if p.isKeyword("all") || p.isKeyword("distinct") {
+		return nil, p.unsupportedf("GROUP BY %s is not supported, write GROUP BY and the expressions", strings.ToUpper(p.tok.text))
+	}
+	var items []ast.Expr
+	for {
+		switch {
+		case p.isOp("(") && p.peek().kind == tokOp && p.peek().text == ")":
+			return nil, p.unsupportedf("the empty grouping set () is not supported, leave out GROUP BY")
+		case (p.isWord("rollup") || p.isWord("cube")) && p.peek().kind == tokOp && p.peek().text == "(",
+			p.isWord("grouping") && p.peek().kind == tokIdent && p.peek().text == "sets":
+			return nil, p.unsupportedf("GROUPING SETS, ROLLUP, and CUBE are not supported, write a query for each grouping")
+		}
+		e, err := p.expr(0)
+		if err != nil {
+			return nil, err
+		}
+		items = append(items, e)
+		if !p.isOp(",") {
+			return items, nil
+		}
+		if err := p.advance(); err != nil {
+			return nil, err
+		}
+	}
 }
 
 // continuesExpression reports whether the current token continues an expression, as an
@@ -2034,7 +2078,15 @@ var typeFuncNameKeywords = map[string]bool{
 }
 
 // supportedFunctions, which the executor binds.
-var supportedFunctions = map[string]bool{"length": true, "lower": true, "upper": true, "abs": true, "coalesce": true, "now": true, "transaction_timestamp": true}
+var supportedFunctions = map[string]bool{
+	"length": true, "lower": true, "upper": true, "abs": true, "coalesce": true, "nullif": true, "now": true, "transaction_timestamp": true,
+	"count": true, "sum": true, "avg": true, "min": true, "max": true,
+}
+
+// specialForms are the functions that Postgres's grammar has as constructs of their own, with
+// a list of expressions and nothing else in their parentheses, and that a quoted name does not
+// call.
+var specialForms = map[string]bool{"coalesce": true, "nullif": true}
 
 // unsupportedFunctions have a message with what to write instead.
 var unsupportedFunctions = map[string]string{
@@ -2215,25 +2267,42 @@ func (p *parser) call(name string, quoted bool) (ast.Expr, error) {
 	if !supportedFunctions[name] {
 		return nil, p.unsupportedf("function %s is not supported", name)
 	}
-	if quoted && name == "coalesce" {
-		// COALESCE is a construct of the grammar, so a quoted name is an ordinary function, which
-		// Postgres does not have.
-		return nil, fmt.Errorf("%w at position %d: function \"coalesce\" does not exist", ErrInvalid, p.tok.pos+1)
+	if quoted && specialForms[name] {
+		// COALESCE and NULLIF are constructs of the grammar, so a quoted name is an ordinary
+		// function, which Postgres does not have.
+		return nil, fmt.Errorf("%w at position %d: function \"%s\" does not exist", ErrInvalid, p.tok.pos+1, name)
 	}
-	var args []ast.Expr
-	if !p.isOp(")") {
-		if p.isKeyword("distinct") || p.isKeyword("all") {
-			return nil, p.unsupportedf("aggregate functions are not supported")
-		}
-		if p.isOp("*") {
-			return nil, p.unsupportedf("aggregate functions are not supported")
-		}
-		var err error
-		if args, err = p.exprList(); err != nil {
+	call := &ast.Call{Name: name}
+	special := specialForms[name] && !quoted
+	switch {
+	case p.isOp("*") && !special:
+		call.Star = true
+		if err := p.advance(); err != nil {
 			return nil, err
 		}
-		if p.isKeyword("order") {
-			return nil, p.unsupportedf("aggregate functions are not supported")
+	case p.isOp(")") && !special:
+	default:
+		if !special {
+			// ALL is the default, which Postgres ignores, also in a call of a function that is
+			// not an aggregate.
+			if ok, err := p.accept("all"); err != nil {
+				return nil, err
+			} else if !ok && p.isKeyword("distinct") {
+				call.Distinct = true
+				if err := p.advance(); err != nil {
+					return nil, err
+				}
+			}
+		}
+		var err error
+		if call.Args, err = p.exprList(); err != nil {
+			return nil, err
+		}
+		if name == "nullif" && special && len(call.Args) != 2 {
+			return nil, p.errorf("unexpected %v", p.tok)
+		}
+		if p.isKeyword("order") && !special {
+			return nil, p.unsupportedf("ORDER BY in the arguments of an aggregate is not supported, sort the rows in the query")
 		}
 	}
 	if err := p.expectOp(")"); err != nil {
@@ -2242,7 +2311,7 @@ func (p *parser) call(name string, quoted bool) (ast.Expr, error) {
 	if p.isWord("filter") || p.isWord("within") || p.isWord("over") {
 		return nil, p.unsupportedf("%s", unsupportedClauses[p.tok.text])
 	}
-	return &ast.Call{Name: name, Args: args}, nil
+	return call, nil
 }
 
 func (p *parser) cast() (ast.Expr, error) {

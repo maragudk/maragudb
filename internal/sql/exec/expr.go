@@ -37,6 +37,9 @@ type cexpr struct {
 	// type other than string, which has type [value.Unknown] until its context gives it one.
 	// Its value is in val, typed by its Go type.
 	param int
+	// aggs are the aggregates of a grouped SELECT whose results the expression reads, by their
+	// index in its [grouping].
+	aggs []int
 }
 
 // value of the expression for row.
@@ -79,15 +82,20 @@ type binder struct {
 	stableErr error
 	// now is the value of now() and its synonyms: the start of the transaction.
 	now value.Value
+	// agg is how a call of an aggregate binds, or nil where aggregates are not allowed, in the
+	// clause that aggClause names.
+	agg       *aggScope
+	aggClause string
 }
 
 // Phases of a statement, in the order in which Postgres folds their constants: the output
-// expressions, including those of ORDER BY, then the conditions of the joins, then WHERE, then
-// OFFSET, then LIMIT.
+// expressions, including those of ORDER BY and GROUP BY, then the conditions of the joins, then
+// WHERE, then HAVING, then OFFSET, then LIMIT.
 const (
 	phaseOutput = iota
 	phaseOn
 	phaseWhere
+	phaseHaving
 	phaseOffset
 	phaseLimit
 )
@@ -112,6 +120,7 @@ func (b *binder) fold(e *cexpr, children ...*cexpr) (*cexpr, error) {
 		e.fallible = e.fallible || c.fallible
 		e.refs = e.refs || c.refs
 		e.stable = e.stable || c.stable
+		e.aggs = append(e.aggs, c.aggs...)
 	}
 	if e.refs {
 		return e, nil
@@ -239,6 +248,9 @@ func resolve(e *cexpr, t value.Type) (*cexpr, error) {
 	if t == value.Unknown {
 		return constant(value.NewString(e.val.S)), nil
 	}
+	if t == value.Decimal {
+		return nil, fmt.Errorf("%w: a quoted literal of type numeric, the type of SUM and AVG of integers, is not supported; cast the literal, such as '5'::bigint", ErrUnsupported)
+	}
 	v, err := value.Parse(e.val.S, t)
 	if err != nil {
 		return nil, castError(err)
@@ -265,6 +277,8 @@ func resolveParam(n int, v value.Value, t value.Type) (value.Value, error) {
 		return value.NewInt4(int32(v.I)), nil
 	case v.Type == value.Int && t == value.Float:
 		return value.NewFloat(float64(v.I)), nil
+	case v.Type == value.Int && t == value.Decimal:
+		return value.DecimalFromInt(v.I), nil
 	}
 	// Postgres drivers differ in what they do with such a value: one refuses it, another sends
 	// it as text that the server then reads as the type.
@@ -281,7 +295,7 @@ func goTypeFor(t value.Type) string {
 	if t == value.String {
 		return "string"
 	}
-	if t == value.Int4 {
+	if t == value.Int4 || t == value.Decimal {
 		return "int64"
 	}
 	return goTypeName(t)
@@ -348,7 +362,7 @@ func widen(e *cexpr, t value.Type) *cexpr {
 	if e.folded {
 		return constant(conv(e.val))
 	}
-	return &cexpr{typ: t, refs: e.refs, fallible: e.fallible, stable: e.stable, eval: func(row []value.Value) (value.Value, error) {
+	return &cexpr{typ: t, refs: e.refs, fallible: e.fallible, stable: e.stable, aggs: e.aggs, eval: func(row []value.Value) (value.Value, error) {
 		v, err := e.value(row)
 		if err != nil {
 			return value.Value{}, err
@@ -357,9 +371,73 @@ func widen(e *cexpr, t value.Type) *cexpr {
 	}}
 }
 
+// toDecimal converts an integer or bigint to numeric, which is an implicit cast in Postgres.
+func toDecimal(e *cexpr) *cexpr {
+	conv := func(v value.Value) value.Value {
+		if v.Null {
+			return value.NewNull(value.Decimal)
+		}
+		return value.DecimalFromInt(v.I)
+	}
+	if e.folded {
+		return constant(conv(e.val))
+	}
+	return &cexpr{typ: value.Decimal, refs: e.refs, fallible: e.fallible, stable: e.stable, aggs: e.aggs, eval: func(row []value.Value) (value.Value, error) {
+		v, err := e.value(row)
+		if err != nil {
+			return value.Value{}, err
+		}
+		return conv(v), nil
+	}}
+}
+
+// decimalTo converts a numeric to double precision, bigint, or text, which are the casts that
+// Postgres has from numeric to the supported types: to double precision through its text, which
+// rounds to the nearest double, and to bigint rounded half away from zero, which can fail.
+func (b *binder) decimalTo(e *cexpr, t value.Type) (*cexpr, error) {
+	var conv func(v value.Value) (value.Value, error)
+	switch t {
+	case value.Decimal:
+		return e, nil
+	case value.Float:
+		conv = func(v value.Value) (value.Value, error) {
+			f, err := value.DecimalToFloat(v.S)
+			return value.NewFloat(f), err
+		}
+	case value.Int:
+		conv = func(v value.Value) (value.Value, error) {
+			i, err := value.DecimalToInt(v.S)
+			return value.NewInt(i), err
+		}
+	case value.String:
+		conv = func(v value.Value) (value.Value, error) { return value.NewString(v.S), nil }
+	default:
+		return nil, fmt.Errorf("%w: cannot cast type numeric to %v", ErrCast, t)
+	}
+	if e.folded && e.val.Null {
+		return constant(value.NewNull(t)), nil
+	}
+	return b.fold(&cexpr{typ: t, fallible: t == value.Int, eval: func(row []value.Value) (value.Value, error) {
+		v, err := e.value(row)
+		if err != nil || v.Null {
+			return value.NewNull(t), err
+		}
+		out, err := conv(v)
+		if err != nil {
+			return value.Value{}, castError(err)
+		}
+		return out, nil
+	}}, e)
+}
+
+// errDecimalArithmetic is the error of arithmetic on numeric, which is not supported.
+func errDecimalArithmetic() error {
+	return fmt.Errorf("%w: arithmetic on numeric, the type of SUM and AVG of integers, is not supported; cast it to bigint or double precision first, such as SUM(x)::bigint", ErrUnsupported)
+}
+
 // numeric reports whether t is one of the numeric types, by Postgres's categories.
 func numeric(t value.Type) bool {
-	return t == value.Int4 || t == value.Int || t == value.Float || t == value.Numeric
+	return t == value.Int4 || t == value.Int || t == value.Float || t == value.Numeric || t == value.Decimal
 }
 
 // errNoCommonType is returned by [commonType] when two types do not unify.
@@ -388,6 +466,9 @@ func commonType(a, c value.Type) (value.Type, error) {
 		if a == value.Numeric || c == value.Numeric {
 			return 0, fmt.Errorf("%w: the numeric type is not supported, cast the literal to double precision or bigint", ErrUnsupported)
 		}
+		if a == value.Decimal || c == value.Decimal {
+			return value.Decimal, nil
+		}
 		return value.Int, nil
 	}
 	return 0, errNoCommonType
@@ -405,6 +486,10 @@ func (b *binder) coerce(e *cexpr, t value.Type) (*cexpr, error) {
 		return b.numericTo(e, t)
 	case e.typ == value.Int4 && t == value.Int, (e.typ == value.Int4 || e.typ == value.Int) && t == value.Float:
 		return widen(e, t), nil
+	case (e.typ == value.Int4 || e.typ == value.Int) && t == value.Decimal:
+		return toDecimal(e), nil
+	case e.typ == value.Decimal && t == value.Float:
+		return b.decimalTo(e, t)
 	}
 	return nil, errNoCommonType
 }
@@ -446,6 +531,8 @@ func (b *binder) unifyAll(es []*cexpr, what string) ([]*cexpr, value.Type, error
 				t = value.Int
 			} else if e.typ == value.Numeric && t != value.Float {
 				return nil, 0, fmt.Errorf("%w: the numeric type is not supported, cast the literal to double precision or bigint", ErrUnsupported)
+			} else if e.typ == value.Decimal && t != value.Float {
+				t = value.Decimal
 			}
 		default:
 			return nil, 0, fmt.Errorf("%w: %s %v and %v", ErrType, what, t, e.typ)
@@ -468,6 +555,11 @@ func (b *binder) unifyAll(es []*cexpr, what string) ([]*cexpr, value.Type, error
 }
 
 func (b *binder) bind(e ast.Expr) (*cexpr, error) {
+	if b.agg != nil && b.agg.g != nil && !b.agg.nested {
+		if ce, ok, err := b.groupedExpr(e); ok || err != nil {
+			return ce, err
+		}
+	}
 	switch e := e.(type) {
 	case *ast.Literal:
 		return constant(e.Value), nil
@@ -575,6 +667,8 @@ func (b *binder) unary(e *ast.Unary) (*cexpr, error) {
 			return nil, fmt.Errorf("%w: operator is not unique: %s unknown", ErrType, sym)
 		case value.Numeric:
 			return nil, fmt.Errorf("%w: the numeric type is not supported, write the sign as part of the literal or cast the literal to double precision or bigint", ErrUnsupported)
+		case value.Decimal:
+			return nil, errDecimalArithmetic()
 		case value.Int4, value.Int, value.Float:
 		default:
 			return nil, fmt.Errorf("%w: operator does not exist: %s %v", ErrType, sym, x.typ)
@@ -639,6 +733,9 @@ func (b *binder) binary(e *ast.Binary) (*cexpr, error) {
 		if e.Op == ast.Mod && t == value.Float {
 			return nil, fmt.Errorf("%w: operator does not exist: double precision %% double precision", ErrType)
 		}
+		if t == value.Decimal {
+			return nil, errDecimalArithmetic()
+		}
 		resultType = t
 		op = arithmetic(e.Op, t)
 		fallible = true
@@ -699,7 +796,7 @@ func (b *binder) concat(l, r *cexpr) (*cexpr, error) {
 		if e.folded && e.typ != value.Time {
 			return constant(value.NewString(value.Format(e.val))), nil
 		}
-		return &cexpr{typ: value.String, refs: e.refs, fallible: e.fallible, stable: e.stable || e.typ == value.Time, eval: func(row []value.Value) (value.Value, error) {
+		return &cexpr{typ: value.String, refs: e.refs, fallible: e.fallible, stable: e.stable || e.typ == value.Time, aggs: e.aggs, eval: func(row []value.Value) (value.Value, error) {
 			v, err := e.value(row)
 			if err != nil || v.Null {
 				return value.NewNull(value.String), err
@@ -1310,6 +1407,24 @@ func (b *binder) caseExpr(e *ast.Case) (*cexpr, error) {
 }
 
 func (b *binder) call(e *ast.Call) (*cexpr, error) {
+	if ast.Aggregates[e.Name] {
+		return b.aggregate(e)
+	}
+	if e.Distinct {
+		// The arguments are analyzed first, as in Postgres.
+		for _, a := range e.Args {
+			if _, err := b.bind(a); err != nil {
+				return nil, err
+			}
+		}
+		return nil, fmt.Errorf("%w: DISTINCT specified, but %s is not an aggregate function", ErrWrongObjectType, e.Name)
+	}
+	if e.Star {
+		return nil, fmt.Errorf("%w: function %s() does not exist", ErrType, e.Name)
+	}
+	if e.Name == "nullif" {
+		return b.nullif(e)
+	}
 	var args []*cexpr
 	if e.Name != "coalesce" {
 		args = make([]*cexpr, len(e.Args))
@@ -1450,6 +1565,8 @@ func (b *binder) call(e *ast.Call) (*cexpr, error) {
 			}
 		case value.Numeric:
 			return nil, fmt.Errorf("%w: the numeric type is not supported, cast the literal to double precision or bigint", ErrUnsupported)
+		case value.Decimal:
+			return nil, errDecimalArithmetic()
 		case value.Int4, value.Int, value.Float:
 		default:
 			return nil, fmt.Errorf("%w: function abs(%v) does not exist", ErrType, x.typ)
@@ -1474,6 +1591,51 @@ func (b *binder) call(e *ast.Call) (*cexpr, error) {
 		}}, x)
 	}
 	return nil, fmt.Errorf("%w: function %s does not exist", ErrInvalid, e.Name)
+}
+
+// nullif binds NULLIF(a, b), which is NULL when a = b and a otherwise. As in Postgres, its type
+// is that of the left operand of the equality, which a cross-type equality of integers and
+// bigints leaves as it is, and which the other implicit casts convert to the type of b.
+func (b *binder) nullif(e *ast.Call) (*cexpr, error) {
+	l, err := b.bind(e.Args[0])
+	if err != nil {
+		return nil, err
+	}
+	r, err := b.bind(e.Args[1])
+	if err != nil {
+		return nil, err
+	}
+	cl, cr, err := b.unify(l, r, "=")
+	if err != nil {
+		return nil, err
+	}
+	result := cl
+	if l.typ == value.Int4 && cl.typ == value.Int {
+		// Postgres compares integer with bigint without converting the integer.
+		result = l
+	}
+	if cl.folded && cl.val.Null {
+		return constant(value.NewNull(result.typ)), nil
+	}
+	t := result.typ
+	return b.fold(&cexpr{typ: t, eval: func(row []value.Value) (value.Value, error) {
+		v, err := result.value(row)
+		if err != nil {
+			return value.Value{}, err
+		}
+		x, err := cl.value(row)
+		if err != nil {
+			return value.Value{}, err
+		}
+		y, err := cr.value(row)
+		if err != nil {
+			return value.Value{}, err
+		}
+		if !x.Null && !y.Null && value.Compare(x, y) == 0 {
+			return value.NewNull(t), nil
+		}
+		return v, nil
+	}}, result, cl, cr)
 }
 
 // asciiLower folds ASCII letters only, as Postgres does with the C locale.

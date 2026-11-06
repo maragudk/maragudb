@@ -65,6 +65,9 @@ type filter struct {
 	// reported only after the whole statement is bound and folded, so that an error that
 	// Postgres reports for certain comes first.
 	unsupported error
+	// failures, when set, collects the errors of the rows that fail for certain, and a scan
+	// goes on after them.
+	failures *[]error
 }
 
 // errOrderDependent is wrapped, together with [ErrUnsupported], by the error of a statement
