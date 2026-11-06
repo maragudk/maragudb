@@ -275,8 +275,9 @@ func (s *sides) compare(ctx context.Context, text string, st ast.Statement, rep 
 		rep.Errors++
 		executed.Err = pg.err
 		if !SameClass(mg.err, pg.err) {
-			if s.readOnly && !query {
-				// The writes in a read-only transaction fail before they read rows.
+			if s.readOnly && !query || SQLState(pg.err) == "25P02" {
+				// The writes in a read-only transaction fail before they read rows, and a statement
+				// in an aborted transaction fails before it reads rows too.
 				return executed, mismatch(fmt.Sprintf("both failed, for different reasons: postgres SQLSTATE %s, maragudb %s", SQLState(pg.err), className(mg.err)))
 			}
 			// Different rows can fail for different reasons, and maragudb visits rows in key order

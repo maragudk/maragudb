@@ -67,6 +67,31 @@ func TestRunner_Run(t *testing.T) {
 		is.Equal(t, 1, rep.ErrorClasses["transaction aborted/25P02"], "the transaction stays aborted")
 	})
 
+	t.Run("reports a transaction that is aborted on Postgres only as a mismatch, without a rerun", func(t *testing.T) {
+		r := newRunner(t)
+		m, err := r.New()
+		is.NotError(t, err)
+		t.Cleanup(func() { _ = m.Close() })
+		pgConn, err := r.PG.Conn(t.Context())
+		is.NotError(t, err)
+		t.Cleanup(func() { _ = pgConn.Close() })
+		mConn, err := m.Conn(t.Context())
+		is.NotError(t, err)
+		t.Cleanup(func() { _ = mConn.Close() })
+		_, err = pgConn.ExecContext(t.Context(), "DROP TABLE IF EXISTS aborted")
+		is.NotError(t, err)
+		s := pgdiff.NewSession(pgConn, mConn)
+		for _, q := range []string{"CREATE TABLE aborted (c0 bigint PRIMARY KEY)", "INSERT INTO aborted VALUES (0), (-9223372036854775808)", "BEGIN READ ONLY"} {
+			_, err := s.Exec(t.Context(), q, &pgdiff.Report{})
+			is.NotError(t, err, q)
+		}
+		_, err = pgConn.ExecContext(t.Context(), "SELECT 1 / 0")
+		is.Equal(t, "22012", pgdiff.SQLState(err), "only the Postgres transaction is aborted")
+		_, err = s.Exec(t.Context(), "SELECT c0 / c0, abs(c0) FROM aborted", &pgdiff.Report{})
+		is.True(t, pgdiff.IsMismatch(err), fmt.Sprint(err))
+		is.True(t, err != nil && strings.Contains(err.Error(), "postgres SQLSTATE 25P02, maragudb out of range"), fmt.Sprint(err))
+	})
+
 	t.Run("skips a rejected statement on Postgres, and aborts the transaction there instead", func(t *testing.T) {
 		verify.Covers(t, "a statement that maragudb rejects as unsupported is counted as rejected and not run on Postgres, and inside a transaction both transactions end up aborted", "AC-4.5")
 		r := newRunner(t)
