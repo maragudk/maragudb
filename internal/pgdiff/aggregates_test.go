@@ -3,6 +3,8 @@ package pgdiff_test
 import (
 	"errors"
 	"fmt"
+	"os"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -221,8 +223,17 @@ func TestNumericArithmetic(t *testing.T) {
 			case got.S != pg:
 				ht.Fatalf("maragudb %.200s (%d characters), postgres %.200s (%d characters)", got.S, len(got.S), pg, len(pg))
 			}
-		}, hegel.WithTestCases(castCases()))
+		}, hegel.WithTestCases(numericCases()))
 	})
+}
+
+// numericCases is the number of cases of the numeric property: MARAGUDB_PGDIFF_CASES when set,
+// and otherwise fewer than [castCases], because its values have up to 131072 digits.
+func numericCases() int {
+	if n, err := strconv.Atoi(os.Getenv("MARAGUDB_PGDIFF_CASES")); err == nil {
+		return n
+	}
+	return 600
 }
 
 // tinyNumeric is a numeric with about zeros zeros after the point before up to six digits.

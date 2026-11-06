@@ -195,13 +195,13 @@ func (d decimal) firstDigit() (int, int64) {
 }
 
 // decimalText of a numeric of the magnitude digits, unscaled, with scale digits after the
-// point. Zero has no sign.
+// point, and a minus sign when negative, which zero never is.
 func decimalText(digits string, scale int, negative bool) string {
 	if len(digits) <= scale {
 		digits = strings.Repeat("0", scale-len(digits)+1) + digits
 	}
 	var b strings.Builder
-	if negative && !decimalZero(digits) {
+	if negative {
 		b.WriteByte(decimalSignMinus)
 	}
 	b.WriteString(digits[:len(digits)-scale])
