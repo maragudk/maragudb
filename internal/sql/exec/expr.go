@@ -449,6 +449,11 @@ func (b *binder) bind(e ast.Expr) (*cexpr, error) {
 		d, _ := desugar(e)
 		return b.bind(d)
 	case *ast.In:
+		if mixedIn(e) && !b.commonInType(e) {
+			// Without a common type of the elements that read no columns, Postgres compares every
+			// element in turn, in the order they are written.
+			return b.bind(inChain(e, e.List))
+		}
 		if d, ok := desugar(e); ok {
 			return b.bind(d)
 		}
@@ -882,6 +887,59 @@ func desugar(e ast.Expr) (ast.Expr, bool) {
 	return nil, false
 }
 
+// mixedIn reports whether an IN has several elements that read no columns and some that do,
+// which [desugar] splits into an array comparison and comparisons.
+func mixedIn(e *ast.In) bool {
+	constants := 0
+	for _, item := range e.List {
+		if !readsColumns(item) {
+			constants++
+		}
+	}
+	return constants > 1 && constants < len(e.List)
+}
+
+// commonInType reports whether the left side and the elements that read no columns of an IN
+// have a common type, so that Postgres compares them as an array. It reports true when binding
+// them fails otherwise, so that binding the IN reports the error.
+func (b *binder) commonInType(e *ast.In) bool {
+	x, err := b.bindPruned(e.Expr)
+	if err != nil {
+		return true
+	}
+	es := []*cexpr{x}
+	for _, item := range e.List {
+		if readsColumns(item) {
+			continue
+		}
+		c, err := b.bindPruned(item)
+		if err != nil {
+			return true
+		}
+		es = append(es, c)
+	}
+	_, _, err = b.unifyAll(es, "IN mixes")
+	return !errors.Is(err, ErrType)
+}
+
+// inChain is the comparisons of an IN with the items, joined with OR, or for NOT IN the
+// negated comparisons joined with AND.
+func inChain(e *ast.In, items []ast.Expr) ast.Expr {
+	cmp, join := ast.Eq, ast.Or
+	if e.Not {
+		cmp, join = ast.Ne, ast.And
+	}
+	var chain ast.Expr
+	for _, item := range items {
+		var c ast.Expr = &ast.Binary{Op: cmp, Left: e.Expr, Right: item}
+		if chain != nil {
+			c = &ast.Binary{Op: join, Left: chain, Right: c}
+		}
+		chain = c
+	}
+	return chain
+}
+
 // readsColumns reports whether e references a column.
 func readsColumns(e ast.Expr) bool {
 	found := false
@@ -912,19 +970,7 @@ func (b *binder) in(e *ast.In) (*cexpr, error) {
 	if errors.Is(err, ErrType) {
 		// Without a common type there is no array, and Postgres compares the elements one at a
 		// time instead, each with its own types.
-		cmp, join := ast.Eq, ast.Or
-		if e.Not {
-			cmp, join = ast.Ne, ast.And
-		}
-		var chain ast.Expr
-		for _, item := range e.List {
-			var c ast.Expr = &ast.Binary{Op: cmp, Left: e.Expr, Right: item}
-			if chain != nil {
-				c = &ast.Binary{Op: join, Left: chain, Right: c}
-			}
-			chain = c
-		}
-		return b.bind(chain)
+		return b.bind(inChain(e, e.List))
 	}
 	if err != nil {
 		return nil, err

@@ -99,7 +99,10 @@ func simplify(e ast.Expr) ast.Expr {
 			}
 			return simplify(&ast.Binary{Op: op, Left: x.Expr, Right: x.List[0]})
 		}
-		if d, ok := desugar(x); ok {
+		// An IN of several elements that read no columns and some that do is an array
+		// comparison and comparisons only when the former have a common type, which binding it
+		// decides, as [binder.whereConjuncts] does.
+		if d, ok := desugar(x); ok && !mixedIn(x) {
 			return simplify(d)
 		}
 	case *ast.Unary:
@@ -185,6 +188,11 @@ func negate(e ast.Expr) ast.Expr {
 func (b *binder) whereConjuncts(e ast.Expr) []ast.Expr {
 	var out []ast.Expr
 	for _, c := range conjuncts(e) {
+		if in, ok := c.(*ast.In); ok && mixedIn(in) && b.commonInType(in) {
+			d, _ := desugar(in)
+			out = append(out, b.whereConjuncts(d)...)
+			continue
+		}
 		if canon, ok := b.canonicalQual(c); ok {
 			c = canon
 		}

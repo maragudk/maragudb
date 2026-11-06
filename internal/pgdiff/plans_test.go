@@ -127,6 +127,11 @@ func TestIndexConditions(t *testing.T) {
 			"SELECT i FROM plan_i WHERE i OR TRUE",
 			"SELECT i FROM plan_i WHERE CAST(NULL AS bigint) OR TRUE",
 			"SELECT i FROM plan_i WHERE FALSE AND (TRUE OR j)",
+			// An IN whose constants have no common type compares its elements in the order they
+			// are written, so the mistyped column comes before the bytea that does not parse.
+			"SELECT i FROM plan_i WHERE CAST('\\x' AS bytea) IN (s, '\\', CAST('' AS text))",
+			"SELECT i FROM plan_i WHERE coalesce('' || CAST('\\x' AS bytea) IN (s, '\\', CAST('' AS text)))",
+			"SELECT i FROM plan_i WHERE CAST('\\x' AS bytea) NOT IN (s, '\\', CAST('' AS text))",
 		} {
 			var rep pgdiff.Report
 			o, err := s.Exec(t.Context(), sql, &rep)
