@@ -201,6 +201,38 @@ SELECT 1
 		is.Equal(t, 2, rep.Statements, "the file ends at the mismatch")
 	})
 
+	t.Run("compares in order only by the real primary key of a table", func(t *testing.T) {
+		rep := runScript(t, newFileRunner(t), `statement ok
+CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER)
+
+statement ok
+INSERT INTO t1 VALUES(1, 5), (2, 5), (3, 4)
+
+statement ok
+CREATE TABLE IF NOT EXISTS t1(b INTEGER PRIMARY KEY)
+
+statement ok
+BEGIN
+
+statement ok
+DROP TABLE t1
+
+statement ok
+ROLLBACK
+
+query II nosort
+SELECT a, b FROM t1 ORDER BY b
+----
+
+query II nosort
+SELECT a, b FROM t1 ORDER BY a
+----
+`)
+		is.True(t, rep.Mismatch == nil, fmt.Sprint(rep.Mismatch))
+		is.Equal(t, 1, rep.Ordered, "only the ORDER BY of the key is a total order")
+		is.Equal(t, 1, rep.SortKeysOrdered)
+	})
+
 	t.Run("fails on a file that does not parse", func(t *testing.T) {
 		_, err := newFileRunner(t).run(t.Context(), 0, "bad.test", []byte("frobnicate\n"))
 		is.True(t, err != nil && strings.Contains(err.Error(), "bad.test: line 1"), fmt.Sprint(err))

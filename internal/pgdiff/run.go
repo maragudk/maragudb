@@ -287,7 +287,7 @@ func (s *sides) compare(ctx context.Context, text string, st ast.Statement, rep 
 			if s.keys[table] == nil {
 				return executed, mismatch(fmt.Sprintf("both failed, for different reasons: postgres SQLSTATE %s, maragudb %s", SQLState(pg.err), className(mg.err)))
 			}
-			ordered, err := s.inKeyOrder(ctx, text, table)
+			ordered, err := s.inKeyOrder(ctx, text, table, query)
 			if err != nil {
 				return executed, err
 			}
@@ -311,11 +311,13 @@ func (s *sides) compare(ctx context.Context, text string, st ast.Statement, rep 
 	case *ast.Commit, *ast.Rollback:
 		s.inTx, s.readOnly = false, false
 	case *ast.CreateTable:
-		// A table created in a transaction that rolls back is gone again, which only matters
-		// for the reruns in key order, which then fail.
-		s.keys[st.Name] = st.PrimaryKey
-	case *ast.DropTable:
-		delete(s.keys, st.Name)
+		// CREATE TABLE IF NOT EXISTS of a table that exists changes nothing. The keys of a
+		// dropped table, or of one created in a transaction that rolls back, stay, so that a
+		// DROP TABLE that rolls back keeps them; they are only read for a table that a statement
+		// uses successfully, which then exists.
+		if _, ok := s.keys[st.Name]; !ok || !st.IfNotExists {
+			s.keys[st.Name] = st.PrimaryKey
+		}
 	}
 	sel, isSelect := st.(*ast.Select)
 	if !isSelect {
@@ -332,7 +334,10 @@ func (s *sides) compare(ctx context.Context, text string, st ast.Statement, rep 
 		return executed, mismatch(fmt.Sprintf("row count: postgres %d, maragudb %d", len(pg.rows), len(mg.rows)))
 	}
 	pgRows, mgRows := canonical(pg.rows), canonical(mg.rows)
-	if FullyOrdered(sel, s.keys[sel.From]) {
+	// A table whose primary key is unknown is never fully ordered, but a SELECT without one has
+	// one row.
+	pk, known := s.keys[sel.From]
+	if (known || sel.From == "") && FullyOrdered(sel, pk) {
 		rep.Ordered++
 	} else {
 		if keys := sortedColumns(sel, mg.cols); len(keys) > 0 {
@@ -418,7 +423,7 @@ var (
 // error, which is nil if it succeeded. Nothing it does is kept. Inside a transaction, it rolls
 // back to the savepoint taken before the statement, reruns it, and aborts the transaction
 // again.
-func (s *sides) inKeyOrder(ctx context.Context, text, table string) (error, error) {
+func (s *sides) inKeyOrder(ctx context.Context, text, table string, query bool) (error, error) {
 	var keys []string
 	for _, k := range s.keys[table] {
 		keys = append(keys, ast.RenderExpr(&ast.ColumnRef{Name: k}))
@@ -438,7 +443,7 @@ func (s *sides) inKeyOrder(ctx context.Context, text, table string) (error, erro
 			return nil, fmt.Errorf("postgres: %s: %w", q, err)
 		}
 	}
-	err := run(ctx, s.pg, text, isQuery(text, nil)).err
+	err := run(ctx, s.pg, text, query).err
 	end := "ROLLBACK"
 	if s.inTx {
 		end = "ROLLBACK TO SAVEPOINT pgdiff"

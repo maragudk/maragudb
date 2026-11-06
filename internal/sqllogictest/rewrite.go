@@ -18,6 +18,8 @@ import (
 //   - INSERT INTO a SELECT * FROM b becomes INSERT INTO a VALUES with the rows of every earlier
 //     INSERT INTO b VALUES, when the tables have the same column definitions and b was written
 //     only by those inserts since it was created, because maragudb has no INSERT ... SELECT.
+//     The rows are those of the text, so a row whose insert failed makes the expanded insert
+//     fail as a whole. That only costs coverage, which the setup failures in the report show.
 //
 // It returns the records to run and the number of records it dropped.
 func rewrite(records []record) ([]record, int) {

@@ -161,21 +161,10 @@ func negate(e ast.Expr) ast.Expr {
 	case *ast.IsNull:
 		return &ast.IsNull{Expr: x.Expr, Not: !x.Not}
 	case *ast.Between:
-		d, _ := desugar(x)
-		return negate(d)
+		return simplify(&ast.Between{Expr: x.Expr, Low: x.Low, High: x.High, Not: !x.Not})
 	case *ast.In:
-		if len(x.List) == 1 {
-			op := ast.Ne
-			if x.Not {
-				op = ast.Eq
-			}
-			return simplify(&ast.Binary{Op: op, Left: x.Expr, Right: x.List[0]})
-		}
-		if d, ok := desugar(x); ok {
-			return negate(d)
-		}
 		// An IN of constants stays an array comparison, whose negation is NOT IN.
-		return &ast.In{Expr: x.Expr, List: x.List, Not: !x.Not}
+		return simplify(&ast.In{Expr: x.Expr, List: x.List, Not: !x.Not})
 	}
 	return &ast.Unary{Op: ast.Not, Expr: e}
 }

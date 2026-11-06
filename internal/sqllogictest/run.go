@@ -124,11 +124,9 @@ func (r *fileRunner) run(ctx context.Context, worker int, name string, content [
 		}
 	}
 	session := pgdiff.NewSession(pgConn, mConn)
-	defer func() {
-		if session.InTx() {
-			_, _ = pgConn.ExecContext(context.Background(), "ROLLBACK")
-		}
-	}()
+	// The connection goes back to the pool without a transaction, also after a mismatch in the
+	// middle of one, which the session may not know is open.
+	defer func() { _, _ = pgConn.ExecContext(context.Background(), "ROLLBACK") }()
 
 	// missing maps the tables and views whose creation was rejected or failed to the reason.
 	missing := map[string]string{}
@@ -225,7 +223,8 @@ func createdName(toks []token) string {
 }
 
 // dependsOn returns the reason why a table or view that the statement refers to is missing,
-// or "" when none is. The name that the statement creates does not count.
+// or "" when none is. The name that the statement creates does not count. Any word that is the
+// name counts, also a column of the same name, so it skips too much rather than too little.
 func dependsOn(toks []token, missing map[string]string, created string) string {
 	if len(missing) == 0 {
 		return ""
@@ -319,6 +318,9 @@ func (r *fileRunner) runFiles(ctx context.Context, c *corpus, files []string, wo
 		})
 	}
 	for _, name := range files {
+		if ctx.Err() != nil {
+			break
+		}
 		select {
 		case jobs <- name:
 		case <-ctx.Done():
