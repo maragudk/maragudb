@@ -40,8 +40,10 @@ type Report struct {
 	Checks int
 	// Rows returned by successful SELECTs on maragudb.
 	Rows int
-	// Ordered counts SELECTs compared in order, as opposed to as multisets.
-	Ordered int
+	// Ordered counts SELECTs compared in order, as opposed to as multisets, and
+	// SortKeysOrdered those compared as multisets whose sort keys are also compared in order,
+	// because ORDER BY sorts by output columns but does not determine the order completely.
+	Ordered, SortKeysOrdered int
 	// Reordered counts statements that failed on both sides for reasons that only agree when
 	// Postgres visits the rows in key order, as maragudb does.
 	Reordered int
@@ -62,6 +64,7 @@ func (r *Report) Add(o Report) {
 	r.Checks += o.Checks
 	r.Rows += o.Rows
 	r.Ordered += o.Ordered
+	r.SortKeysOrdered += o.SortKeysOrdered
 	r.Reordered += o.Reordered
 	r.Transactions += o.Transactions
 	if r.ErrorClasses == nil {
@@ -79,8 +82,8 @@ func (r *Report) Add(o Report) {
 }
 
 func (r Report) String() string {
-	return fmt.Sprintf("%d statements: %d executed (%d ok on both, %d errors on both, %d of them agreeing in key order), %d rejected; %d transactions, %d state checks, %d rows, %d ordered comparisons; errors: %s; rejected for: %s",
-		r.Statements, r.Executed, r.OK, r.Errors, r.Reordered, r.Rejected, r.Transactions, r.Checks, r.Rows, r.Ordered, counts(r.ErrorClasses), counts(r.RejectedFor))
+	return fmt.Sprintf("%d statements: %d executed (%d ok on both, %d errors on both, %d of them agreeing in key order), %d rejected; %d transactions, %d state checks, %d rows, %d ordered comparisons, %d comparisons of sort keys in order; errors: %s; rejected for: %s",
+		r.Statements, r.Executed, r.OK, r.Errors, r.Reordered, r.Rejected, r.Transactions, r.Checks, r.Rows, r.Ordered, r.SortKeysOrdered, counts(r.ErrorClasses), counts(r.RejectedFor))
 }
 
 func counts(m map[string]int) string {
@@ -332,6 +335,15 @@ func (s *sides) compare(ctx context.Context, text string, st ast.Statement, rep 
 	if FullyOrdered(sel, s.keys[sel.From]) {
 		rep.Ordered++
 	} else {
+		if keys := sortedColumns(sel, mg.cols); len(keys) > 0 {
+			rep.SortKeysOrdered++
+			pgKeys, mgKeys := sortKeys(pg.rows, keys), sortKeys(mg.rows, keys)
+			for i := range pgKeys {
+				if pgKeys[i] != mgKeys[i] {
+					return executed, mismatch(fmt.Sprintf("the sort keys of row %d differ:\n    postgres: %s\n    maragudb: %s", i, pgKeys[i], mgKeys[i]))
+				}
+			}
+		}
 		sort.Strings(pgRows)
 		sort.Strings(mgRows)
 	}
@@ -499,24 +511,45 @@ func canonical(rows [][]any) []string {
 	for i, row := range rows {
 		parts := make([]string, len(row))
 		for j, v := range row {
-			switch v := v.(type) {
-			case nil:
-				parts[j] = "NULL"
-			case float64:
-				if math.IsNaN(v) {
-					parts[j] = "NaN"
-				} else {
-					parts[j] = fmt.Sprintf("%v(%x)", v, math.Float64bits(v))
-				}
-			case []byte:
-				parts[j] = fmt.Sprintf("X'%x'", v)
-			case time.Time:
-				parts[j] = v.UTC().Format(time.RFC3339Nano)
-			case string:
-				parts[j] = fmt.Sprintf("%q", v)
-			default:
-				parts[j] = fmt.Sprintf("%T(%v)", v, v)
+			parts[j] = canonicalValue(v)
+		}
+		out[i] = strings.Join(parts, " ")
+	}
+	return out
+}
+
+func canonicalValue(v any) string {
+	switch v := v.(type) {
+	case nil:
+		return "NULL"
+	case float64:
+		if math.IsNaN(v) {
+			return "NaN"
+		}
+		return fmt.Sprintf("%v(%x)", v, math.Float64bits(v))
+	case []byte:
+		return fmt.Sprintf("X'%x'", v)
+	case time.Time:
+		return v.UTC().Format(time.RFC3339Nano)
+	case string:
+		return fmt.Sprintf("%q", v)
+	default:
+		return fmt.Sprintf("%T(%v)", v, v)
+	}
+}
+
+// sortKeys renders the given columns of every row, with the values that sort as equal
+// rendered equally, which only -0 and 0 do apart from equal values.
+func sortKeys(rows [][]any, columns []int) []string {
+	out := make([]string, len(rows))
+	for i, row := range rows {
+		parts := make([]string, len(columns))
+		for j, c := range columns {
+			v := row[c]
+			if f, ok := v.(float64); ok && f == 0 {
+				v = 0.0
 			}
+			parts[j] = canonicalValue(v)
 		}
 		out[i] = strings.Join(parts, " ")
 	}

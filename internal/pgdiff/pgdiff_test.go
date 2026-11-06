@@ -68,7 +68,7 @@ func run(t *testing.T, r *pgdiff.Runner, opts ...hegel.Option) pgdiff.Report {
 // ratchet is the committed baseline of the generator's executed statements.
 type ratchet struct {
 	Seed  uint64 `json:"seed"`
-	Cases int   `json:"cases"`
+	Cases int    `json:"cases"`
 	// Executed statements ran on both sides, out of Statements generated; the rest were rejected
 	// by maragudb as unsupported.
 	Executed   int `json:"executed"`
@@ -103,6 +103,7 @@ func TestDifferential(t *testing.T) {
 		is.True(t, len(total.ErrorClasses) >= 3, "failures on both sides are compared by class, for several classes")
 		is.True(t, total.Rows > 0, "rows are returned")
 		is.True(t, total.Ordered > 0, "some comparisons are ordered")
+		is.True(t, total.SortKeysOrdered > 0, "some comparisons check the order of the sort keys")
 		is.True(t, total.Transactions > 0, "some statements run in explicit transactions")
 		is.True(t, total.Rejected > 0, "some statements are rejected, so the rejections are exercised")
 	})

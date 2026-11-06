@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"slices"
 	"strings"
 	"time"
 
@@ -706,6 +707,9 @@ func shadowed(s *ast.Select, k string) bool {
 		if item.Star {
 			continue
 		}
+		if ref, ok := item.Expr.(*ast.ColumnRef); ok && ref.Name == k {
+			continue
+		}
 		name := item.Alias
 		if name == "" {
 			name = exec.OutputName(item.Expr)
@@ -718,20 +722,22 @@ func shadowed(s *ast.Select, k string) bool {
 }
 
 // FullyOrdered reports whether the ORDER BY of s determines the row order completely, which
-// is when every primary key column is a sort key referenced by name and not shadowed by an
-// output column of the same name.
+// is when every primary key column is a sort key, referenced by a name that no output column
+// shadows, or by the position of an output column that is the key column itself.
 func FullyOrdered(s *ast.Select, pk []string) bool {
 	if len(s.OrderBy) == 0 {
 		return false
 	}
 	for _, k := range pk {
-		if shadowed(s, k) {
-			return false
-		}
 		found := false
 		for _, o := range s.OrderBy {
-			if ref, ok := o.Expr.(*ast.ColumnRef); ok && ref.Name == k {
+			if ref, ok := o.Expr.(*ast.ColumnRef); ok && ref.Name == k && !shadowed(s, k) {
 				found = true
+			}
+			if i, ok := orderPosition(o.Expr); ok && i < len(s.Items) && !starBefore(s, i) {
+				if ref, ok := s.Items[i].Expr.(*ast.ColumnRef); ok && ref.Name == k {
+					found = true
+				}
 			}
 		}
 		if !found {
@@ -739,4 +745,50 @@ func FullyOrdered(s *ast.Select, pk []string) bool {
 		}
 	}
 	return true
+}
+
+// orderPosition is the index of the output column that an ORDER BY expression refers to by
+// its position, as Postgres reads it: an integer literal, of which -2147483648 is none.
+func orderPosition(e ast.Expr) (int, bool) {
+	lit, ok := e.(*ast.Literal)
+	if !ok || lit.Value.Null || lit.Value.Type != value.Int4 || lit.Value.I < 1 {
+		return 0, false
+	}
+	return int(lit.Value.I) - 1, true
+}
+
+// starBefore reports whether an item of s up to item i is a *, after which the positions of the
+// items are not the positions of the output columns.
+func starBefore(s *ast.Select, i int) bool {
+	for _, item := range s.Items[:i+1] {
+		if item.Star {
+			return true
+		}
+	}
+	return false
+}
+
+// sortedColumns are the output columns, in order, that the ORDER BY of s sorts by first: the
+// sort keys up to the first one that is not an output column, by position or by name, given the
+// names of the output columns. Rows that ORDER BY sorts are in the same order of these columns
+// in every plan, however the ties between them are broken.
+func sortedColumns(s *ast.Select, columns []string) []int {
+	var out []int
+	for _, o := range s.OrderBy {
+		i := -1
+		switch e := o.Expr.(type) {
+		case *ast.Literal:
+			if p, ok := orderPosition(e); ok && p < len(columns) {
+				i = p
+			}
+		case *ast.ColumnRef:
+			// Postgres resolves a name in ORDER BY to an output column first.
+			i = slices.Index(columns, e.Name)
+		}
+		if i < 0 {
+			break
+		}
+		out = append(out, i)
+	}
+	return out
 }
