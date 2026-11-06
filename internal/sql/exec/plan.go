@@ -33,8 +33,9 @@ type filter struct {
 	fallible bool
 	// index are the conditions that Postgres uses as conditions of the scan of the primary key
 	// index, from [binder.indexCondition] and [binder.impliedIndexConditions]. None of them can
-	// fail.
-	index []*cexpr
+	// fail. indexed marks the conds among them.
+	index   []*cexpr
+	indexed []bool
 	// implied are equalities that follow from the equalities among the conjuncts, which
 	// Postgres's planner derives through its equivalence classes and may evaluate instead of
 	// the written ones. They never change which rows match, but one of them can reject a row on
@@ -187,11 +188,7 @@ func (b *binder) whereConjuncts(e ast.Expr) []ast.Expr {
 		if canon, ok := b.canonicalQual(c); ok {
 			c = canon
 		}
-		if bin, ok := c.(*ast.Binary); ok && bin.Op == ast.And {
-			out = append(out, b.whereConjuncts(c)...)
-			continue
-		}
-		out = append(out, c)
+		out = append(out, flatten(c, ast.And)...)
 	}
 	return out
 }
@@ -203,6 +200,11 @@ func (b *binder) whereConjuncts(e ast.Expr) []ast.Expr {
 // (a AND b) OR (a AND c) becomes a AND (b OR c), and (a AND b) OR a becomes a. The result is
 // true exactly when e is. It matters because a condition taken out of an OR can be an index
 // condition.
+//
+// The result is the constant FALSE only where folding the constants makes it FALSE. Where it is
+// false only because NULL counts as FALSE, as in x AND NULL, the result is NULL instead, which
+// the WHERE clause treats the same, except that Postgres folds the constants of the conjuncts
+// after a NULL, but not those after a FALSE.
 //
 // Postgres checks the types of every argument, and then folds the arguments from the left, and
 // stops at the first FALSE of an AND and the first TRUE of an OR. When an argument is mistyped,
@@ -241,13 +243,12 @@ func (b *binder) canonicalQual(e ast.Expr) (ast.Expr, bool) {
 		}
 		args = append(args, flatten(a, bin.Op)...)
 	}
-	if bin.Op == ast.And {
-		switch {
-		case sawNull:
-			return &ast.Literal{Value: value.NewBool(false)}, true
-		case len(args) == 0:
-			return &ast.Literal{Value: value.NewBool(true)}, true
-		}
+	switch {
+	case bin.Op == ast.And && sawNull, bin.Op == ast.Or && len(args) == 0 && sawNull:
+		return &ast.Literal{Value: value.NewNull(value.Bool)}, true
+	case len(args) == 0:
+		return &ast.Literal{Value: value.NewBool(bin.Op == ast.And)}, true
+	case bin.Op == ast.And:
 		return join(args, ast.And), true
 	}
 	return b.factorOr(args), true
@@ -280,8 +281,11 @@ const (
 )
 
 // constantOf binds e to tell whether it folds to a constant, and which. The binding records
-// nothing in the binder.
+// nothing in the binder. An expression that reads columns is not a constant, and is not bound.
 func (b *binder) constantOf(e ast.Expr) constness {
+	if readsColumns(e) {
+		return notConstant
+	}
 	foldErr, foldPhase, stableErr := b.foldErr, b.foldPhase, b.stableErr
 	b.foldErr, b.stableErr = nil, nil
 	ce, err := b.bind(e)
@@ -310,43 +314,53 @@ func (b *binder) constantOf(e ast.Expr) constness {
 // winners and the OR of what is left of each argument, or of the winners alone when nothing is
 // left of one argument.
 func (b *binder) factorOr(args []ast.Expr) ast.Expr {
-	switch len(args) {
-	case 0:
-		return &ast.Literal{Value: value.NewBool(false)}
-	case 1:
+	if len(args) == 1 {
 		return args[0]
 	}
-	arms := make([][]ast.Expr, len(args))
+	// Postgres compares the conditions as trees, which their [binder.canonical] text
+	// approximates.
+	type cond struct {
+		e   ast.Expr
+		key string
+	}
+	arms := make([][]cond, len(args))
 	ref := 0
 	for i, a := range args {
-		arms[i] = flatten(a, ast.And)
+		for _, c := range flatten(a, ast.And) {
+			arms[i] = append(arms[i], cond{e: c, key: b.canonical(c)})
+		}
 		if len(arms[i]) < len(arms[ref]) {
 			ref = i
 		}
 	}
-	// Postgres compares the conditions as trees, which [binder.canonical] approximates.
-	contains := func(es []ast.Expr, e ast.Expr) bool {
-		r := b.canonical(e)
-		return slices.ContainsFunc(es, func(x ast.Expr) bool { return b.canonical(x) == r })
+	has := func(cs []cond, key string) bool {
+		return slices.ContainsFunc(cs, func(c cond) bool { return c.key == key })
 	}
-	var winners []ast.Expr
+	var winners []cond
 	for _, c := range arms[ref] {
-		if !slices.ContainsFunc(arms, func(arm []ast.Expr) bool { return !contains(arm, c) }) {
+		if !has(winners, c.key) && !slices.ContainsFunc(arms, func(arm []cond) bool { return !has(arm, c.key) }) {
 			winners = append(winners, c)
 		}
 	}
 	if len(winners) == 0 {
 		return join(args, ast.Or)
 	}
+	exprs := func(cs []cond) []ast.Expr {
+		var out []ast.Expr
+		for _, c := range cs {
+			out = append(out, c.e)
+		}
+		return out
+	}
 	var rest []ast.Expr
 	for _, arm := range arms {
-		left := slices.DeleteFunc(slices.Clone(arm), func(c ast.Expr) bool { return contains(winners, c) })
+		left := slices.DeleteFunc(slices.Clone(arm), func(c cond) bool { return has(winners, c.key) })
 		if len(left) == 0 {
-			return join(winners, ast.And)
+			return join(exprs(winners), ast.And)
 		}
-		rest = append(rest, join(left, ast.And))
+		rest = append(rest, join(exprs(left), ast.And))
 	}
-	return join(append(winners, join(rest, ast.Or)), ast.And)
+	return join(append(exprs(winners), join(rest, ast.Or)), ast.And)
 }
 
 // flatten the arguments of nested op, which is AND or OR, into one list.
@@ -433,7 +447,8 @@ func (b *binder) where(e ast.Expr) (filter, error) {
 		f.conds = append(f.conds, c.ce)
 		f.conjuncts = append(f.conjuncts, c.expr)
 		f.fallible = f.fallible || c.ce.fallible
-		if !b.indexCondition(c) {
+		f.indexed = append(f.indexed, b.indexCondition(c))
+		if !f.indexed[len(f.indexed)-1] {
 			continue
 		}
 		f.index = append(f.index, c.ce)
@@ -854,7 +869,8 @@ func (f filter) matches(row []value.Value) (bool, error) {
 		return false, nil
 	}
 	if f.fallible {
-		// Without a conjunct that can fail, the index conditions are evaluated with the rest.
+		// Without a conjunct that can fail, the index conditions are evaluated with the rest, and
+		// with one, they are evaluated first and only once.
 		for _, c := range f.index {
 			v, err := c.value(row)
 			if err != nil {
@@ -866,6 +882,9 @@ func (f filter) matches(row []value.Value) (bool, error) {
 		}
 	}
 	for i, c := range f.conds {
+		if f.fallible && f.indexed[i] {
+			continue
+		}
 		v, err := c.value(row)
 		if err != nil {
 			return false, f.failed(row, i, err)

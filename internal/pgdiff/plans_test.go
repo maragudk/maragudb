@@ -100,6 +100,8 @@ func TestIndexConditions(t *testing.T) {
 			"SELECT i FROM plan_i WHERE (10 / j > 1 AND i = 2) OR (j + 1 > 0 AND i = 2)",
 			"SELECT i FROM plan_i WHERE (10 / j > 1 AND i = 2) OR (i = 2 AND j + 1 > 0 AND i = 2)",
 			"SELECT i FROM plan_i WHERE (10 / j > 1 AND i = 2) OR i = 2",
+			"SELECT i FROM plan_i WHERE (i BETWEEN 2 AND 3 AND 10 / j >= 0) OR (i >= 2 AND i <= 3 AND j + 1 > 0)",
+			"SELECT i FROM plan_i WHERE (i = 2 AND i = 2 AND 10 / j > 1) OR (i = 2 AND i = 2 AND j + 1 > 0)",
 			"SELECT i FROM plan_i WHERE ((10 / j > 1 AND i = 2) OR (j + 1 > 0 AND i = 2)) AND (NULL OR j - 1 > 0)",
 			"UPDATE plan_i SET j = j WHERE NULL OR (j - 1 > 0 AND i IN (2, 3))",
 			"SELECT i FROM plan_i WHERE TRUE OR CAST(CAST('x' AS text) AS bigint) = NULL",
@@ -116,6 +118,10 @@ func TestIndexConditions(t *testing.T) {
 			"SELECT i FROM plan_i WHERE CAST(CAST('x' AS text) AS bigint) = NULL OR NULL",
 			"SELECT i FROM plan_i WHERE (NULL AND CAST(CAST('x' AS text) AS bigint) = 1) OR i = 2",
 			"SELECT i FROM plan_i WHERE CAST(CAST('x' AS text) AS bigint) = NULL OR TRUE",
+			// An AND with a NULL argument is false in a WHERE clause, but not a constant, so the
+			// constants of the next conjunct are folded too.
+			"SELECT i FROM plan_i WHERE ((j = 1 AND NULL) OR NULL) AND 1 / 0 = 1",
+			"SELECT i FROM plan_i WHERE ((j = 1 AND NULL) OR FALSE) AND 1 / 0 = 1",
 			// And it checks the types of every argument first.
 			"SELECT i FROM plan_i WHERE CAST('\\x' AS bytea) IN ('\\x', s || coalesce('\\x'))",
 			"SELECT i FROM plan_i WHERE i OR TRUE",
