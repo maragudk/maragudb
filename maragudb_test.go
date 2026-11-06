@@ -867,22 +867,27 @@ func TestRequestBudgets_Joins(t *testing.T) {
 						if table == "p" {
 							fmt.Fprintf(&b, "(%d, 'name-%d')", j, j)
 						} else {
-							// Every parent has a child, and the parent of the query has more.
-							fmt.Fprintf(&b, "(%d, %d)", j, j)
+							// Most children have no parent, which makes them as many as the parents
+							// without a foreign key check each, and fills the index with them.
+							pid := "NULL"
+							if j%10 == 0 {
+								pid = fmt.Sprint(j)
+							}
+							fmt.Fprintf(&b, "(%d, %s)", j, pid)
 						}
 					}
 					mustExec(t, db, b.String())
 				}
 			}
-			for k := range children - 1 {
-				mustExec(t, db, "INSERT INTO c VALUES ($1, $2)", n+k, n/2)
+			for k := range children {
+				mustExec(t, db, "INSERT INTO c VALUES ($1, $2)", n+k, n/2+1)
 			}
 			is.NotError(t, maragudb.Compact(t.Context(), db))
 
 			cold := w.open(maragudb.Options{MemoryCacheBytes: new(int64)})
 			s, err := maragudb.Stats(t.Context(), cold)
 			is.NotError(t, err)
-			rows, err := cold.QueryContext(t.Context(), "SELECT p.name, c.id FROM p JOIN c ON c.pid = p.id WHERE p.id = $1", n/2)
+			rows, err := cold.QueryContext(t.Context(), "SELECT p.name, c.id FROM p JOIN c ON c.pid = p.id WHERE p.id = $1", n/2+1)
 			is.NotError(t, err)
 			found := 0
 			for rows.Next() {
