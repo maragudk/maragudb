@@ -296,12 +296,19 @@ func (s *Session) Execute(ctx context.Context, st *Statement, params []value.Val
 	// Autocommit: a statement outside a transaction retries on conflict.
 	_, readOnly := st.ast.(*ast.Select)
 	const maxAttempts = 32
+	// conflicted is set once an attempt ran and lost its commit to a concurrent one.
+	conflicted := false
 	for attempt := 1; ; attempt++ {
 		if err := s.begin(ctx, readOnly); err != nil {
 			return nil, Result{}, err
 		}
 		rows, res, err := s.run(ctx, st, params)
 		if err != nil {
+			unique := conflicted && errors.Is(err, ErrDuplicateKey)
+			assert.Sometimes(unique, "a unique violation occurs only because of a concurrent commit", nil)
+			if unique {
+				reach.Hit(ctx, reach.UniqueAfterConflict)
+			}
 			s.rollback()
 			return nil, Result{}, err
 		}
@@ -320,6 +327,7 @@ func (s *Session) Execute(ctx context.Context, st *Statement, params []value.Val
 		}
 		if errors.Is(err, engine.ErrConflict) {
 			reach.Hit(ctx, reach.AutocommitRetry)
+			conflicted = true
 		}
 		s.log.Debug("retrying statement after conflict", "attempt", attempt, "error", err)
 	}

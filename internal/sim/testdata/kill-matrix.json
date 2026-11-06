@@ -8,7 +8,9 @@
     "list-append through SQL, no maintainers",
     "list-append through SQL, 2 maintainers",
     "bank through SQL, no maintainers",
-    "bank through SQL, 2 maintainers"
+    "bank through SQL, 2 maintainers",
+    "unique through SQL, no maintainers",
+    "unique through SQL, 2 maintainers"
   ],
   "mutants": [
     {
@@ -72,6 +74,16 @@
           "cell": "bank through SQL, 2 maintainers",
           "status": "undetected",
           "reason": "an unconditional manifest write drops whole concurrent commits, a dropped transfer conserves money, and the bank checker only checks totals"
+        },
+        {
+          "cell": "unique through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "an unconditional manifest write drops whole concurrent commits, which leaves a consistent state in which no value repeats, and the unique workload does not check that acknowledged writes survive"
+        },
+        {
+          "cell": "unique through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "an unconditional manifest write drops whole concurrent commits, which leaves a consistent state in which no value repeats, and the unique workload does not check that acknowledged writes survive"
         }
       ]
     },
@@ -135,6 +147,19 @@
           "checkers": [
             "grace period"
           ]
+        },
+        {
+          "cell": "unique through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "without maintainers nothing is ever deleted, so no reader can lose an object"
+        },
+        {
+          "cell": "unique through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "grace period"
+          ]
         }
       ]
     },
@@ -195,6 +220,19 @@
           "cell": "bank through SQL, 2 maintainers",
           "status": "undetected",
           "reason": "a stale snapshot makes a transfer conflict or read an older consistent state, which conserves money"
+        },
+        {
+          "cell": "unique through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "a stale snapshot is an older consistent state in which no value repeats, and a write from it conflicts at commit; without maintainers no reader loses an object either"
+        },
+        {
+          "cell": "unique through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 6,
+          "checkers": [
+            "grace period"
+          ]
         }
       ]
     },
@@ -255,6 +293,16 @@
           "cell": "bank through SQL, 2 maintainers",
           "status": "undetected",
           "reason": "an acknowledged transfer that never landed is missing as a whole, which conserves money"
+        },
+        {
+          "cell": "unique through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "an acknowledged write that never landed is missing as a whole, which leaves a consistent state, and the unique workload does not check that acknowledged writes survive"
+        },
+        {
+          "cell": "unique through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "an acknowledged write that never landed is missing as a whole, which leaves a consistent state, and the unique workload does not check that acknowledged writes survive"
         }
       ]
     },
@@ -281,12 +329,12 @@
         {
           "cell": "bank through the engine, no maintainers",
           "status": "undetected",
-          "reason": "resurrected balances are a consistent older state, which conserves money"
+          "reason": "without maintainers nothing compacts, so there is never a rebase"
         },
         {
           "cell": "bank through the engine, 2 maintainers",
           "status": "undetected",
-          "reason": "resurrected balances are a consistent older state, which conserves money"
+          "reason": "resurrected balances are a consistent older state, which conserves money, and the engine workload has no index"
         },
         {
           "cell": "list-append through SQL, no maintainers",
@@ -305,12 +353,28 @@
         {
           "cell": "bank through SQL, no maintainers",
           "status": "undetected",
-          "reason": "resurrected balances are a consistent older state, which conserves money"
+          "reason": "without maintainers nothing compacts, so there is never a rebase"
         },
         {
           "cell": "bank through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 2,
+          "checkers": [
+            "index consistency"
+          ]
+        },
+        {
+          "cell": "unique through SQL, no maintainers",
           "status": "undetected",
-          "reason": "resurrected balances are a consistent older state, which conserves money"
+          "reason": "without maintainers nothing compacts, so there is never a rebase"
+        },
+        {
+          "cell": "unique through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "index consistency"
+          ]
         }
       ]
     },
@@ -371,6 +435,22 @@
           "checkers": [
             "bank"
           ]
+        },
+        {
+          "cell": "unique through SQL, no maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "index consistency"
+          ]
+        },
+        {
+          "cell": "unique through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "index consistency"
+          ]
         }
       ]
     },
@@ -427,6 +507,218 @@
           "cell": "bank through SQL, 2 maintainers",
           "status": "undetected",
           "reason": "the bank workload writes only in explicit transactions, so no autocommit statement is ever retried, and a doubled transfer conserves money anyway"
+        },
+        {
+          "cell": "unique through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "a retried insert fails on its own primary key, and a retried move or delete finds its row moved or gone, so a statement applied twice leaves a consistent state"
+        },
+        {
+          "cell": "unique through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "a retried insert fails on its own primary key, and a retried move or delete finds its row moved or gone, so a statement applied twice leaves a consistent state"
+        }
+      ]
+    },
+    {
+      "id": "MUT-INDEX-STALE-DELETE",
+      "name": "stale index entries after an UPDATE or DELETE",
+      "replay": "index-stale-delete",
+      "description": "`exec.Mutations.IndexStaleDelete` leaves the old index entries of a row that an UPDATE changes or a DELETE removes.",
+      "results": [
+        {
+          "cell": "list-append through the engine, no maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "list-append through the engine, 2 maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "bank through the engine, no maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "bank through the engine, 2 maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "list-append through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "the tables of the list-append workload have no index besides the primary key"
+        },
+        {
+          "cell": "list-append through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "the tables of the list-append workload have no index besides the primary key"
+        },
+        {
+          "cell": "bank through SQL, no maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "index consistency"
+          ]
+        },
+        {
+          "cell": "bank through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "index consistency"
+          ]
+        },
+        {
+          "cell": "unique through SQL, no maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "index consistency"
+          ]
+        },
+        {
+          "cell": "unique through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "index consistency"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "MUT-UNIQUE-NO-CHECK",
+      "name": "no unique check",
+      "replay": "unique-no-check",
+      "description": "`exec.Mutations.UniqueNoCheck` skips the check that no other row has a row's values in a unique index.",
+      "results": [
+        {
+          "cell": "list-append through the engine, no maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "list-append through the engine, 2 maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "bank through the engine, no maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "bank through the engine, 2 maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "list-append through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "the workload has no unique index besides the primary key"
+        },
+        {
+          "cell": "list-append through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "the workload has no unique index besides the primary key"
+        },
+        {
+          "cell": "bank through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "the workload has no unique index besides the primary key"
+        },
+        {
+          "cell": "bank through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "the workload has no unique index besides the primary key"
+        },
+        {
+          "cell": "unique through SQL, no maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "unique",
+            "index consistency"
+          ]
+        },
+        {
+          "cell": "unique through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "unique",
+            "index consistency"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "MUT-UNIQUE-OWN-WRITES",
+      "name": "a unique check that misses the statement's own writes",
+      "replay": "unique-own-writes",
+      "description": "`exec.Mutations.UniqueOwnWrites` makes the unique check read the transaction without the statement's own writes, so that an INSERT of two rows with the same value lets both in.",
+      "results": [
+        {
+          "cell": "list-append through the engine, no maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "list-append through the engine, 2 maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "bank through the engine, no maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "bank through the engine, 2 maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "list-append through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "the workload has no unique index besides the primary key"
+        },
+        {
+          "cell": "list-append through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "the workload has no unique index besides the primary key"
+        },
+        {
+          "cell": "bank through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "the workload has no unique index besides the primary key"
+        },
+        {
+          "cell": "bank through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "the workload has no unique index besides the primary key"
+        },
+        {
+          "cell": "unique through SQL, no maintainers",
+          "status": "detected",
+          "seed": 4,
+          "checkers": [
+            "index consistency",
+            "unique"
+          ]
+        },
+        {
+          "cell": "unique through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 4,
+          "checkers": [
+            "unique",
+            "index consistency"
+          ]
         }
       ]
     },
@@ -473,6 +765,16 @@
         },
         {
           "cell": "bank through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "the workloads never update primary key columns, so no row moves ahead of the scan"
+        },
+        {
+          "cell": "unique through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "the workloads never update primary key columns, so no row moves ahead of the scan"
+        },
+        {
+          "cell": "unique through SQL, 2 maintainers",
           "status": "undetected",
           "reason": "the workloads never update primary key columns, so no row moves ahead of the scan"
         }

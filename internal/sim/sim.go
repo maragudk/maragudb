@@ -34,11 +34,17 @@ const (
 	ListAppend Workload = iota
 	// Bank keeps account balances; transactions transfer money and audits read every account.
 	Bank
+	// Unique keeps rows with a unique column, which transactions insert, move, and delete
+	// concurrently, and audits check. It runs only through SQL.
+	Unique
 )
 
 func (w Workload) String() string {
-	if w == Bank {
+	switch w {
+	case Bank:
 		return "bank"
+	case Unique:
+		return "unique"
 	}
 	return "list-append"
 }
@@ -151,6 +157,8 @@ type Result struct {
 	Audits   []history.BankAudit
 	Final    map[string][]int64
 	Balances map[string]int64
+	// Users are the final rows of the unique workload.
+	Users []string
 	// Anomalies found, each an [*Anomaly].
 	Anomalies []error
 	Stats     Stats
@@ -178,6 +186,9 @@ type Stats struct {
 	Unavailable int
 	// FailedReads counts reads in client transactions that failed for any reason.
 	FailedReads int
+	// UniqueViolations counts the statements of the unique workload that failed because they
+	// would have repeated a unique value.
+	UniqueViolations int
 	// MaintenanceSteps counts the clients' maintenance steps, MaintenanceAttempts the ones that
 	// found work and got past the lease, MaintenanceRuns the ones that changed the database,
 	// and MergesStarted the compactions that began merging in those steps. LeaseAcquisitions
@@ -203,6 +214,7 @@ func (s *Stats) Add(o Stats) {
 	s.LiveUnknown += o.LiveUnknown
 	s.Unavailable += o.Unavailable
 	s.FailedReads += o.FailedReads
+	s.UniqueViolations += o.UniqueViolations
 	s.MaintenanceSteps += o.MaintenanceSteps
 	s.MaintenanceAttempts += o.MaintenanceAttempts
 	s.MaintenanceRuns += o.MaintenanceRuns
@@ -226,6 +238,12 @@ const (
 	CheckerWorkload = "workload invariants"
 	// CheckerFinalRead fails when the final state cannot be read back.
 	CheckerFinalRead = "final read"
+	// CheckerUnique finds two rows with the same value of a unique column, in a snapshot that a
+	// reader saw or in the final state.
+	CheckerUnique = "unique"
+	// CheckerIndex finds an index that does not match its table: in the final state of the
+	// store, with [exec.CheckIndexes], or through a lookup that finds other rows than the table.
+	CheckerIndex = "index consistency"
 )
 
 // Anomaly found in a run, with the checker that found it.
@@ -335,6 +353,9 @@ func Run(cfg Config) Result {
 		}
 	}
 
+	if cfg.Workload == Unique && !cfg.SQL {
+		panic("sim: the unique workload runs only through SQL")
+	}
 	switch {
 	case cfg.SQL:
 		r.seedSQL()
@@ -344,7 +365,7 @@ func Run(cfg Config) Result {
 	}
 	r.activeClients = cfg.Clients
 	for i := range cfg.Clients {
-		c := &client{run: r, id: i, rng: rand.New(rand.NewPCG(cfg.Seed, uint64(i)+1)), disk: cache.NewMemory(0)}
+		c := &client{run: r, id: i, rng: rand.New(rand.NewPCG(cfg.Seed, uint64(i)+1)), disk: cache.NewMemory(0), freed: map[string]bool{}}
 		r.clients = append(r.clients, c)
 		r.goTask(fmt.Sprint("client", i), c.loop)
 	}
@@ -361,7 +382,8 @@ func Run(cfg Config) Result {
 	var balances map[string]int64
 	var err error
 	if cfg.SQL {
-		final, balances, err = r.readFinalSQL()
+		final, balances, res.Users, err = r.readFinalSQL()
+		r.checkIndexes()
 	} else {
 		final, balances, err = r.readFinal()
 	}
@@ -407,7 +429,7 @@ func (r *run) digest(res Result) string {
 	for _, a := range res.Audits {
 		fmt.Fprintf(&b, "audit %d: %v\n", a.TxID, a.Balances)
 	}
-	fmt.Fprintf(&b, "final: %v\nbalances: %v\nobjects: %v\nstats: %+v\n", res.Final, res.Balances, r.fake.Keys(), res.Stats)
+	fmt.Fprintf(&b, "final: %v\nbalances: %v\nusers: %v\nobjects: %v\nstats: %+v\n", res.Final, res.Balances, res.Users, r.fake.Keys(), res.Stats)
 	return b.String()
 }
 
@@ -570,6 +592,8 @@ type client struct {
 	// crashedInCommit is true from a crash during a commit's writes until the restarted client
 	// commits again.
 	crashedInCommit bool
+	// freed are the unique values that the client's committed writes freed.
+	freed map[string]bool
 }
 
 func (c *client) loop(ctx context.Context) {
@@ -601,6 +625,8 @@ func (c *client) loop(ctx context.Context) {
 		}
 		pctx := s3fake.WithProcess(ctx, c.proc)
 		switch {
+		case c.run.cfg.Workload == Unique:
+			c.uniqueSQL(pctx)
 		case c.run.cfg.SQL && c.run.cfg.Workload == ListAppend:
 			c.listAppendSQL(pctx)
 		case c.run.cfg.SQL:

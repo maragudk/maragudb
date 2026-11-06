@@ -63,8 +63,11 @@ func (r *run) seedSQL() {
 		switch r.cfg.Workload {
 		case Bank:
 			r.total = int64(r.cfg.Keys) * initialBalance
-			if _, err := db.ExecContext(ctx, "CREATE TABLE accounts (id bigint PRIMARY KEY, balance bigint NOT NULL)"); err != nil {
-				panic(err)
+			// The index on the balances makes every transfer move index entries.
+			for _, q := range []string{"CREATE TABLE accounts (id bigint PRIMARY KEY, balance bigint NOT NULL)", "CREATE INDEX accounts_balance ON accounts (balance)"} {
+				if _, err := db.ExecContext(ctx, q); err != nil {
+					panic(err)
+				}
 			}
 			for i := range r.cfg.Keys {
 				if _, err := db.ExecContext(ctx, "INSERT INTO accounts VALUES ($1, $2)", i, initialBalance); err != nil {
@@ -77,15 +80,22 @@ func (r *run) seedSQL() {
 					panic(err)
 				}
 			}
+		case Unique:
+			for _, q := range UniqueTablesSQL() {
+				if _, err := db.ExecContext(ctx, q); err != nil {
+					panic(err)
+				}
+			}
 		}
 	})
 	r.sched.Run()
 }
 
-// readFinalSQL reads every list or account with a fresh, fault-free, cache-free process.
-func (r *run) readFinalSQL() (map[string][]int64, map[string]int64, error) {
+// readFinalSQL reads every list, account, or user with a fresh, fault-free, cache-free process.
+func (r *run) readFinalSQL() (map[string][]int64, map[string]int64, []string, error) {
 	var lists map[string][]int64
 	var balances map[string]int64
+	var users []string
 	var err error
 	r.goTask("final", func(ctx context.Context) {
 		var db *sql.DB
@@ -95,6 +105,8 @@ func (r *run) readFinalSQL() (map[string][]int64, map[string]int64, error) {
 		}
 		defer func() { _ = db.Close() }()
 		switch r.cfg.Workload {
+		case Unique:
+			users, err = r.readFinalUnique(ctx, db)
 		case ListAppend:
 			lists = map[string][]int64{}
 			var rows *sql.Rows
@@ -159,7 +171,7 @@ func (r *run) readFinalSQL() (map[string][]int64, map[string]int64, error) {
 		}
 	})
 	r.sched.Run()
-	return lists, balances, err
+	return lists, balances, users, err
 }
 
 // outcomeSQL classifies the error of a commit or an autocommit statement. Only

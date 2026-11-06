@@ -10,10 +10,10 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 ## At a glance
 
-- 30 acceptance criteria (`AC-`), 20 key invariants (`INV-`), 17 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
-- 8 mutants (`MUT-`), deliberate bugs, of which 7 are detected by the simulator's checkers within 20 seeds.
-- 13 interesting states (`STATE-`) that the simulator's fixed corpus must reach.
-- 139 declarations of coverage in the tests.
+- 32 acceptance criteria (`AC-`), 22 key invariants (`INV-`), 18 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
+- 11 mutants (`MUT-`), deliberate bugs, of which 10 are detected by the simulator's checkers within 20 seeds.
+- 15 interesting states (`STATE-`) that the simulator's fixed corpus must reach.
+- 155 declarations of coverage in the tests.
 
 ## Acceptance criteria
 
@@ -43,7 +43,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/s3fake` `TestClient_Faults/a_lost_ack_hides_a_precondition_failure_too`: a lost acknowledgement also hides a precondition failure, so the client cannot tell what happened
 - `internal/s3fake` `TestClient_Faults/lost_acks_are_applied_but_reported_as_errors`: a lost acknowledgement applies the write and still reports an error
 - `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus, with injected errors, latency, lost acknowledgements, outages, and crashes, finds no anomalies with any checker and exercises every fault
-- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, and lost acknowledgements resolved both ways
+- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, and unique violations that only a concurrent commit causes
 
 ### `AC-1.4`
 
@@ -52,7 +52,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/s3fake` `TestClient_Faults/a_crashed_process_cannot_make_further_requests`: a crashed process fails every later request, and other processes are unaffected
 - `internal/s3fake` `TestClient_Faults/crashes_happen_both_before_and_after_apply`: over 50 seeds, crashes happen both before and after the write is applied
 - `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus, with injected errors, latency, lost acknowledgements, outages, and crashes, finds no anomalies with any checker and exercises every fault
-- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, and lost acknowledgements resolved both ways
+- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, and unique violations that only a concurrent commit causes
 
 ### `AC-1.5`
 
@@ -139,6 +139,9 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/pgdiff` `TestErrorClasses`: every maragudb error class fails with its mapped SQLSTATE code on Postgres for the same statement
 - `internal/pgdiff` `TestIndexConditions/evaluates_the_other_conditions_only_on_the_rows_that_the_primary_key_conditions_select,_as_Postgres_does_with_an_index_scan`: with sequential scans off, Postgres evaluates the other WHERE conditions only on the rows that the conditions on the primary key index select: comparisons and IN of constants on any key column, a boolean key column, and key equalities implied by equalities with a constant; maragudb accepts such statements and gives the same results
 - `internal/pgdiff` `TestIndexConditions/takes_the_index_conditions_out_of_an_OR_as_Postgres_does_when_it_drops_constants_and_common_conditions_from_the_OR`: in a WHERE clause, Postgres drops the arguments of an OR that are FALSE or NULL constants and takes the conditions common to every argument out of the OR, which can make them index conditions; maragudb does the same and gives the same results
+- `internal/pgdiff` `TestIndexPlans/evaluates_the_other_conditions_only_on_the_rows_that_every_index_scan_Postgres_could_pick_skips,_and_otherwise_on_every_row`: with several indexes, a condition that can fail is evaluated on the rows that any index scan Postgres could pick reads: those of each index's certain conditions, and every row when an index without them could serve a condition or ORDER BY; maragudb gives Postgres's result when every such scan agrees, and rejects the statement otherwise
+- `internal/pgdiff` `TestIndexes/names_indexes_as_Postgres_does,_in_the_namespace_of_tables,_with_the_same_errors`: CREATE INDEX, DROP INDEX, and UNIQUE constraints name their indexes as Postgres does, tables and indexes share one namespace, and every clash, missing name, and wrong kind of relation fails with the class of Postgres's error
+- `internal/pgdiff` `TestRunner_Run/accepts_different_errors_that_agree_once_Postgres_visits_the_rows_in_key_order_instead_of_the_order_of_an_index`: when Postgres reads the rows through an index in the order of its entries and reports another row's error than maragudb, which reads them in key order, the rerun in key order marks the other indexes invalid, so that Postgres agrees
 - `internal/pgdiff` `TestRunner_Run/reports_errors_of_different_classes_as_a_mismatch`: a statement that fails on both sides for different reasons is a mismatch
 
 ### `AC-4.4`
@@ -167,6 +170,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 - `.` `TestMaintenance/keeps_the_commit_and_warm-read_budgets_in_steady_state`: with background maintenance, an INSERT and a warm SELECT keep their request budgets
 - `.` `TestRequestBudgets/an_autocommit_INSERT_makes_one_conditional_GET_and_two_PUTs_regardless_of_database_size`: an autocommit INSERT makes one conditional GET and two PUTs at every database size
+- `.` `TestRequestBudgets_Indexes/a_commit_that_changes_indexed_columns_makes_one_conditional_GET_and_two_PUTs_regardless_of_database_size`: an autocommit UPDATE that changes the columns of two indexes, and so deletes and writes entries of both, makes one conditional GET and two PUTs at every database size
 - `internal/engine` `TestRequestBudgets/a_commit_uses_two_PUTs_and_one_GET_regardless_of_database_size`: a commit makes one conditional GET, one PUT, and one conditional PUT at 100 to 100,000 keys
 
 ### `AC-5.2`
@@ -184,6 +188,18 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `.` `TestRequestBudgets/a_SELECT_by_primary_key_with_a_cold_cache_makes_a_logarithmic_number_of_GETs`: a SELECT by primary key with a cold cache makes a logarithmic number of GETs
 - `internal/engine` `TestRequestBudgets/a_point_lookup_with_a_cold_cache_uses_a_logarithmic_number_of_GETs`: a cold point lookup makes one freshness check and at most one GET per tree level, 1 + log16(n), at 100 to 100,000 keys
 - `internal/engine` `TestSegment/a_point_lookup_fetches_at_most_one_block_per_tree_level,_logarithmic_in_entry_count`: a point lookup in a random segment fetches at most one block per tree level
+
+### `AC-5.5`
+
+> S3 request budgets: A point lookup through a secondary index with a cold cache uses O(log n) GETs.
+
+- `.` `TestRequestBudgets_Indexes/a_point_lookup_through_a_unique_index_with_a_cold_cache_makes_a_logarithmic_number_of_GETs`: a SELECT by a unique secondary index with a cold cache makes a logarithmic number of GETs: one descent each for the table definition, the index entry, and the row
+
+### `AC-5.6`
+
+> S3 request budgets: A commit that changes indexed columns still uses O(1) PUTs, independent of database size and of the number of indexes.
+
+- `.` `TestRequestBudgets_Indexes/a_commit_that_changes_indexed_columns_makes_one_conditional_GET_and_two_PUTs_regardless_of_database_size`: an autocommit UPDATE that changes the columns of two indexes, and so deletes and writes entries of both, makes one conditional GET and two PUTs at every database size
 
 ### `AC-5.4`
 
@@ -383,6 +399,11 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/pgdiff` `TestCasts/text_casts_to_every_type,_and_back_to_text,_the_same_as_Postgres,_or_are_rejected_as_unsupported`: hegel-drawn text near valid input for bigint, double precision, boolean, bytea, and timestamptz casts to the type and back to text with the same result or the same error class as Postgres, unless maragudb rejects it as unsupported
 - `internal/pgdiff` `TestIndexConditions/evaluates_the_other_conditions_only_on_the_rows_that_the_primary_key_conditions_select,_as_Postgres_does_with_an_index_scan`: with sequential scans off, Postgres evaluates the other WHERE conditions only on the rows that the conditions on the primary key index select: comparisons and IN of constants on any key column, a boolean key column, and key equalities implied by equalities with a constant; maragudb accepts such statements and gives the same results
 - `internal/pgdiff` `TestIndexConditions/takes_the_index_conditions_out_of_an_OR_as_Postgres_does_when_it_drops_constants_and_common_conditions_from_the_OR`: in a WHERE clause, Postgres drops the arguments of an OR that are FALSE or NULL constants and takes the conditions common to every argument out of the OR, which can make them index conditions; maragudb does the same and gives the same results
+- `internal/pgdiff` `TestIndexPlans/Postgres_takes_the_certain_conditions_on_an_indexed_column_as_conditions_of_the_scan_of_the_index,_and_picks_between_indexes`: EXPLAIN on Postgres 18 with sequential scans off shows that comparisons, IN, and boolean conditions on any column of a secondary index are conditions of its scan, that it picks between the primary key and another index with conditions, and that it scans a whole index in order for ORDER BY
+- `internal/pgdiff` `TestIndexPlans/evaluates_the_other_conditions_only_on_the_rows_that_every_index_scan_Postgres_could_pick_skips,_and_otherwise_on_every_row`: with several indexes, a condition that can fail is evaluated on the rows that any index scan Postgres could pick reads: those of each index's certain conditions, and every row when an index without them could serve a condition or ORDER BY; maragudb gives Postgres's result when every such scan agrees, and rejects the statement otherwise
+- `internal/pgdiff` `TestIndexes/enforces_UNIQUE_as_Postgres_does,_with_NULLs_distinct_or_not,_and_fails_a_unique_index_on_duplicated_rows`: inserts, updates, and CREATE UNIQUE INDEX that would give two rows the same values of a unique index fail with SQLSTATE 23505 on both, NULLs collide only with NULLS NOT DISTINCT, and the rows are the same on both afterwards
+- `internal/pgdiff` `TestIndexes/fails_a_cycle_of_unique_values_in_an_UPDATE_as_Postgres_does_in_every_order,_and_rejects_a_chain`: an UPDATE whose rows swap the values of a unique index or of the primary key fails with SQLSTATE 23505 on both, an UPDATE that moves a chain of rows onto the values the next one leaves is rejected, and one that moves rows onto free values succeeds on both
+- `internal/pgdiff` `TestIndexes/names_indexes_as_Postgres_does,_in_the_namespace_of_tables,_with_the_same_errors`: CREATE INDEX, DROP INDEX, and UNIQUE constraints name their indexes as Postgres does, tables and indexes share one namespace, and every clash, missing name, and wrong kind of relation fails with the class of Postgres's error
 - `internal/pgdiff` `TestParameters/a_parameter_of_every_Go_type_in_every_context_gives_the_same_result_as_Postgres_with_pgx,_or_is_rejected_as_unsupported`: hegel-drawn Go values bound as parameters in contexts that infer different types give the same result or error class as Postgres with pgx, or fail on both when pgx refuses to encode them, unless maragudb rejects them as unsupported
 - `internal/sql/exec` `TestSession_Insert/applies_Postgres's_assignment_casts`: an INSERT applies the assignment casts Postgres has: a quoted literal as the column's type, numeric and float literals rounded into bigint, integers widened to double precision, and any value written into text
 - `internal/sql/exec` `TestSession_Select/accepts_a_WHERE_clause_only_when_its_outcome_is_the_same_in_every_order_Postgres_could_pick_on_the_rows_its_primary_key_index_selects`: a WHERE clause whose outcome on a row depends on the order Postgres evaluates its conditions in, including the equalities its equivalence classes imply, is ErrUnsupported, and so is a LIKE on a key column that can fail; the other conditions are evaluated only on the rows that the primary key conditions select, and every other WHERE clause fails exactly when Postgres fails in every order
@@ -390,7 +411,8 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/sql/exec` `TestSession_Select/evaluates_expressions_like_Postgres`: expressions evaluate as in Postgres: integer literals are 32-bit, numeric literals adapt to double precision, quoted literals take the type their context demands, || writes any type next to text, and casts use Postgres's text formats
 - `internal/sql/exec` `TestSession_Select/follows_Postgres_in_the_details_of_analysis`: an IN whose constant elements have no common type compares them one at a time, a CASE operand of unknown type is text, +1 in ORDER BY is no position, ORDER BY a name is ambiguous only between different expressions, and a read-only transaction reports analysis errors before it refuses a write
 - `internal/sql/exec` `TestSession_Transactions/a_failed_statement_aborts_the_transaction_until_it_ends,_as_in_Postgres`: after a failed statement every statement of the transaction fails with ErrTxAborted, COMMIT rolls it back, and ROLLBACK ends it
-- `internal/sql/exec` `TestSession_Update/moves_rows_when_the_primary_key_changes,_and_rejects_a_move_whose_outcome_depends_on_row_order`: an UPDATE of primary key columns succeeds or fails as in Postgres in every row order, and a row that moves onto a key another row moves away from is ErrUnsupported
+- `internal/sql/exec` `TestSession_Unique/rejects_a_row_whose_values_another_row_has,_in_one_statement_or_across_statements,_and_allows_NULLs`: inserts and updates that would give two rows the same non-NULL values of a unique index fail with ErrDuplicateKey, within one statement, across statements of a transaction, and against committed rows, and NULLs never collide unless NULLS NOT DISTINCT
+- `internal/sql/exec` `TestSession_Update/moves_rows_when_the_primary_key_changes,_and_rejects_a_move_whose_outcome_depends_on_row_order`: an UPDATE of primary key columns succeeds or fails as in Postgres in every row order, and a chain of rows that move onto keys that other rows move away from is ErrUnsupported, and a cycle of them ErrDuplicateKey
 - `internal/sqllogictest` `TestRegressions/NOT_of_a_comparison_of_an_expression_with_itself_is_NULL_where_the_expression_is`: the statements of the sqllogictest corpus that found differences from Postgres give the same results on both sides
 
 ### `INV-UNSUPPORTED`
@@ -424,6 +446,27 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 - `internal/engine` `TestOpen/logs_creation_and_commits_to_the_given_logger`: the engine logs database creation and commits to the given slog logger
 
+### `INV-INDEX-CONSISTENT`
+
+> After any committed history, every index holds exactly the entries derived from its table's rows.
+
+- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus, with the unique workload under the same faults, finds no two rows with the same unique value in any snapshot a reader saw or in the final state, and after every run through SQL every index of the store matches its table, and lookups through the indexes find the rows of the table
+- `internal/sql/exec` `TestMutations_Indexes/IndexStaleDelete_leaves_entries_that_CheckIndexes_finds`: with the mutant, an UPDATE or DELETE leaves its old index entries, which the index check finds
+- `internal/sql/exec` `TestSession_IndexesMatchModel/random_writes_on_a_table_with_indexes_match_a_model,_and_every_index_matches_its_table_after_every_statement`: random inserts, updates, deletes, and index creations and drops on a table with unique and other indexes give the rows and the unique violations of a model, the indexes match the table after every statement, and lookups through every index return the rows of the model
+- `internal/sql/value` `TestEncodeIndexKey/byte_order_of_composite_index_keys_equals_the_order_of_every_column_with_its_direction_and_NULL_placement`: the index key encoding sorts composite keys of every type, ascending or descending, with NULLs first or last, in the order Postgres sorts the index
+
+### `INV-UNIQUE`
+
+> No committed state ever has two rows with equal non-NULL values in a UNIQUE index.
+
+- `internal/pgdiff` `TestIndexes/enforces_UNIQUE_as_Postgres_does,_with_NULLs_distinct_or_not,_and_fails_a_unique_index_on_duplicated_rows`: inserts, updates, and CREATE UNIQUE INDEX that would give two rows the same values of a unique index fail with SQLSTATE 23505 on both, NULLs collide only with NULLS NOT DISTINCT, and the rows are the same on both afterwards
+- `internal/pgdiff` `TestIndexes/fails_a_cycle_of_unique_values_in_an_UPDATE_as_Postgres_does_in_every_order,_and_rejects_a_chain`: an UPDATE whose rows swap the values of a unique index or of the primary key fails with SQLSTATE 23505 on both, an UPDATE that moves a chain of rows onto the values the next one leaves is rejected, and one that moves rows onto free values succeeds on both
+- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus, with the unique workload under the same faults, finds no two rows with the same unique value in any snapshot a reader saw or in the final state, and after every run through SQL every index of the store matches its table, and lookups through the indexes find the rows of the table
+- `internal/sql/exec` `TestMutations_Indexes/UniqueNoCheck_and_UniqueOwnWrites_let_duplicates_in`: with either mutant, a unique index lets two rows have the same values, which the index check finds
+- `internal/sql/exec` `TestSession_IndexesMatchModel/random_writes_on_a_table_with_indexes_match_a_model,_and_every_index_matches_its_table_after_every_statement`: random inserts, updates, deletes, and index creations and drops on a table with unique and other indexes give the rows and the unique violations of a model, the indexes match the table after every statement, and lookups through every index return the rows of the model
+- `internal/sql/exec` `TestSession_Unique/rejects_a_row_whose_values_another_row_has,_in_one_statement_or_across_statements,_and_allows_NULLs`: inserts and updates that would give two rows the same non-NULL values of a unique index fail with ErrDuplicateKey, within one statement, across statements of a transaction, and against committed rows, and NULLs never collide unless NULLS NOT DISTINCT
+- `internal/sql/exec` `TestSession_Unique/rejects_an_UPDATE_whose_outcome_depends_on_the_order_Postgres_visits_the_rows,_and_fails_a_cycle_of_moves`: an UPDATE whose rows move onto unique values that other rows of it leave is rejected when they form a chain, whose outcome depends on the order, and fails with ErrDuplicateKey when they form a cycle, which fails in every order
+
 ## Unsupported statements
 
 ### `UNS-NUMERIC`
@@ -454,7 +497,13 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 > Other schema statements and constraints.
 
-- `internal/pgdiff` `TestUnsupported/UNS-DDL_other_schema_statements_and_constraints`: schema statements other than CREATE TABLE and DROP TABLE, and constraints other than PRIMARY KEY and NOT NULL, are rejected, and Postgres accepts them
+- `internal/pgdiff` `TestUnsupported/UNS-DDL_other_schema_statements_and_constraints`: schema statements other than CREATE TABLE, DROP TABLE, CREATE INDEX, and DROP INDEX, and constraints other than PRIMARY KEY, UNIQUE, and NOT NULL, are rejected, and Postgres accepts them
+
+### `UNS-INDEX`
+
+> Other forms of indexes.
+
+- `internal/pgdiff` `TestUnsupported/UNS-INDEX_other_forms_of_indexes_and_of_their_constraints`: indexes on expressions, partial indexes, INCLUDE, USING, CONCURRENTLY, ON ONLY, operator classes, COLLATE, storage parameters, tablespaces, ALTER INDEX, several indexes in one DROP INDEX, and DEFERRABLE and NOT DEFERRABLE constraints are rejected, and Postgres accepts them
 
 ### `UNS-STATEMENTS`
 
@@ -510,15 +559,16 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 ### `UNS-PLAN-DEPENDENT-WHERE`
 
-> A LIKE on a key column whose pattern can fail.
+> A LIKE on an indexed column whose pattern can fail.
 
-- `internal/pgdiff` `TestUnsupported/UNS-PLAN-DEPENDENT-WHERE_a_LIKE_on_a_key_column_whose_pattern_can_fail`: a LIKE on a primary key column whose pattern can fail is rejected, because Postgres scans the index for its prefix and evaluates it only on those rows, and Postgres accepts it when no row there fails
+- `internal/pgdiff` `TestUnsupported/UNS-PLAN-DEPENDENT-WHERE_a_LIKE_on_an_indexed_column_whose_pattern_can_fail`: a LIKE on a column of the primary key or of another index whose pattern can fail is rejected, because Postgres scans the index for its prefix and evaluates it only on those rows, and Postgres accepts it when no row there fails
 - `internal/sql/exec` `TestSession_Select/accepts_a_WHERE_clause_only_when_its_outcome_is_the_same_in_every_order_Postgres_could_pick_on_the_rows_its_primary_key_index_selects`: a WHERE clause whose outcome on a row depends on the order Postgres evaluates its conditions in, including the equalities its equivalence classes imply, is ErrUnsupported, and so is a LIKE on a key column that can fail; the other conditions are evaluated only on the rows that the primary key conditions select, and every other WHERE clause fails exactly when Postgres fails in every order
 
 ### `UNS-ORDER-DEPENDENT-WHERE`
 
 > A condition that fails on a row that another condition rejects.
 
+- `internal/pgdiff` `TestIndexPlans/evaluates_the_other_conditions_only_on_the_rows_that_every_index_scan_Postgres_could_pick_skips,_and_otherwise_on_every_row`: with several indexes, a condition that can fail is evaluated on the rows that any index scan Postgres could pick reads: those of each index's certain conditions, and every row when an index without them could serve a condition or ORDER BY; maragudb gives Postgres's result when every such scan agrees, and rejects the statement otherwise
 - `internal/pgdiff` `TestUnsupported/UNS-ORDER-DEPENDENT-WHERE_a_condition_that_fails_on_a_row_that_another_condition_rejects`: a WHERE clause with a condition that fails on a row that another condition rejects is rejected, because whether Postgres fails depends on the order it picks, and Postgres accepts it in the order it picks here
 - `internal/sql/exec` `TestSession_Select/accepts_a_WHERE_clause_only_when_its_outcome_is_the_same_in_every_order_Postgres_could_pick_on_the_rows_its_primary_key_index_selects`: a WHERE clause whose outcome on a row depends on the order Postgres evaluates its conditions in, including the equalities its equivalence classes imply, is ErrUnsupported, and so is a LIKE on a key column that can fail; the other conditions are evaluated only on the rows that the primary key conditions select, and every other WHERE clause fails exactly when Postgres fails in every order
 
@@ -533,8 +583,10 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 > An UPDATE that moves a row onto a key that another row leaves.
 
-- `internal/pgdiff` `TestUnsupported/UNS-KEY-UPDATE-ORDER_an_UPDATE_that_moves_a_key_onto_one_it_moves_away`: an UPDATE that moves a row onto the primary key of a row that the same statement moves away is rejected, because Postgres checks the key row by row in storage order, and Postgres accepts it when it stores the rows in the right order
-- `internal/sql/exec` `TestSession_Update/moves_rows_when_the_primary_key_changes,_and_rejects_a_move_whose_outcome_depends_on_row_order`: an UPDATE of primary key columns succeeds or fails as in Postgres in every row order, and a row that moves onto a key another row moves away from is ErrUnsupported
+- `internal/pgdiff` `TestIndexes/fails_a_cycle_of_unique_values_in_an_UPDATE_as_Postgres_does_in_every_order,_and_rejects_a_chain`: an UPDATE whose rows swap the values of a unique index or of the primary key fails with SQLSTATE 23505 on both, an UPDATE that moves a chain of rows onto the values the next one leaves is rejected, and one that moves rows onto free values succeeds on both
+- `internal/pgdiff` `TestUnsupported/UNS-KEY-UPDATE-ORDER_an_UPDATE_that_moves_a_key_onto_one_it_moves_away`: an UPDATE that moves a row onto the primary key, or the values of a unique index, of a row that the same statement moves away is rejected, because Postgres checks the key row by row in the order it visits the rows, and Postgres accepts it when it stores the rows in the right order
+- `internal/sql/exec` `TestSession_Unique/rejects_an_UPDATE_whose_outcome_depends_on_the_order_Postgres_visits_the_rows,_and_fails_a_cycle_of_moves`: an UPDATE whose rows move onto unique values that other rows of it leave is rejected when they form a chain, whose outcome depends on the order, and fails with ErrDuplicateKey when they form a cycle, which fails in every order
+- `internal/sql/exec` `TestSession_Update/moves_rows_when_the_primary_key_changes,_and_rejects_a_move_whose_outcome_depends_on_row_order`: an UPDATE of primary key columns succeeds or fails as in Postgres in every row order, and a chain of rows that move onto keys that other rows move away from is ErrUnsupported, and a cycle of them ErrDuplicateKey
 
 ## Remaining differences from Postgres
 
@@ -550,14 +602,17 @@ Every mutant runs in every simulator configuration below, with seeds 1 to 20, un
 
 | Mutant | Detected in | First seed | Checkers |
 |---|---|---|---|
-| `MUT-COMMIT-WITHOUT-CAS` commit without CAS | 4 of 8 configurations | 1 | durability, final read, list-append |
-| `MUT-GC-IGNORE-GRACE` GC ignoring the grace period | 4 of 8 configurations | 1 | final read, grace period, list-append |
-| `MUT-SKIP-FRESHNESS` serving the cache without a freshness check | 4 of 8 configurations | 1 | list-append |
-| `MUT-ACK-BEFORE-CONFIRM` acking before the write is confirmed | 4 of 8 configurations | 1 | durability |
-| `MUT-COMPACTED-AHEAD` the compacted segment ahead of newer ones after a rebase | 2 of 8 configurations | 1 | durability, list-append |
-| `MUT-FRESH-SNAPSHOT` a fresh snapshot per statement | 4 of 4 configurations | 1 | bank, list-append |
-| `MUT-RETRY-UNKNOWN` retrying an autocommit statement after an unknown commit outcome | 2 of 4 configurations | 1 | durability, list-append |
-| `MUT-UPDATE-SEES-OWN-WRITES` an UPDATE that revisits the rows it wrote | 0 of 4 configurations | none |  |
+| `MUT-COMMIT-WITHOUT-CAS` commit without CAS | 4 of 10 configurations | 1 | durability, final read, list-append |
+| `MUT-GC-IGNORE-GRACE` GC ignoring the grace period | 5 of 10 configurations | 1 | final read, grace period, list-append |
+| `MUT-SKIP-FRESHNESS` serving the cache without a freshness check | 5 of 10 configurations | 1 | grace period, list-append |
+| `MUT-ACK-BEFORE-CONFIRM` acking before the write is confirmed | 4 of 10 configurations | 1 | durability |
+| `MUT-COMPACTED-AHEAD` the compacted segment ahead of newer ones after a rebase | 4 of 10 configurations | 1 | durability, index consistency, list-append |
+| `MUT-FRESH-SNAPSHOT` a fresh snapshot per statement | 6 of 6 configurations | 1 | bank, index consistency, list-append |
+| `MUT-RETRY-UNKNOWN` retrying an autocommit statement after an unknown commit outcome | 2 of 6 configurations | 1 | durability, list-append |
+| `MUT-INDEX-STALE-DELETE` stale index entries after an UPDATE or DELETE | 4 of 6 configurations | 1 | index consistency |
+| `MUT-UNIQUE-NO-CHECK` no unique check | 2 of 6 configurations | 1 | index consistency, unique |
+| `MUT-UNIQUE-OWN-WRITES` a unique check that misses the statement's own writes | 2 of 6 configurations | 4 | index consistency, unique |
+| `MUT-UPDATE-SEES-OWN-WRITES` an UPDATE that revisits the rows it wrote | 0 of 6 configurations | none |  |
 
 ### `MUT-COMMIT-WITHOUT-CAS`
 
@@ -573,6 +628,8 @@ Every mutant runs in every simulator configuration below, with seeds 1 to 20, un
 | list-append through SQL, 2 maintainers | detected with seed 1 by durability, list-append |
 | bank through SQL, no maintainers | cannot detect: an unconditional manifest write drops whole concurrent commits, a dropped transfer conserves money, and the bank checker only checks totals |
 | bank through SQL, 2 maintainers | cannot detect: an unconditional manifest write drops whole concurrent commits, a dropped transfer conserves money, and the bank checker only checks totals |
+| unique through SQL, no maintainers | cannot detect: an unconditional manifest write drops whole concurrent commits, which leaves a consistent state in which no value repeats, and the unique workload does not check that acknowledged writes survive |
+| unique through SQL, 2 maintainers | cannot detect: an unconditional manifest write drops whole concurrent commits, which leaves a consistent state in which no value repeats, and the unique workload does not check that acknowledged writes survive |
 
 Targeted tests:
 
@@ -593,6 +650,8 @@ Targeted tests:
 | list-append through SQL, 2 maintainers | detected with seed 2 by grace period, final read, list-append |
 | bank through SQL, no maintainers | cannot detect: without maintainers nothing is ever deleted, so no reader can lose an object |
 | bank through SQL, 2 maintainers | detected with seed 2 by grace period |
+| unique through SQL, no maintainers | cannot detect: without maintainers nothing is ever deleted, so no reader can lose an object |
+| unique through SQL, 2 maintainers | detected with seed 1 by grace period |
 
 Targeted tests:
 
@@ -612,6 +671,8 @@ Targeted tests:
 | list-append through SQL, 2 maintainers | detected with seed 1 by list-append |
 | bank through SQL, no maintainers | cannot detect: a stale snapshot makes a transfer conflict or read an older consistent state, which conserves money |
 | bank through SQL, 2 maintainers | cannot detect: a stale snapshot makes a transfer conflict or read an older consistent state, which conserves money |
+| unique through SQL, no maintainers | cannot detect: a stale snapshot is an older consistent state in which no value repeats, and a write from it conflicts at commit; without maintainers no reader loses an object either |
+| unique through SQL, 2 maintainers | detected with seed 6 by grace period |
 
 ### `MUT-ACK-BEFORE-CONFIRM`
 
@@ -627,6 +688,8 @@ Targeted tests:
 | list-append through SQL, 2 maintainers | detected with seed 1 by durability |
 | bank through SQL, no maintainers | cannot detect: an acknowledged transfer that never landed is missing as a whole, which conserves money |
 | bank through SQL, 2 maintainers | cannot detect: an acknowledged transfer that never landed is missing as a whole, which conserves money |
+| unique through SQL, no maintainers | cannot detect: an acknowledged write that never landed is missing as a whole, which leaves a consistent state, and the unique workload does not check that acknowledged writes survive |
+| unique through SQL, 2 maintainers | cannot detect: an acknowledged write that never landed is missing as a whole, which leaves a consistent state, and the unique workload does not check that acknowledged writes survive |
 
 Targeted tests:
 
@@ -640,12 +703,14 @@ Targeted tests:
 |---|---|
 | list-append through the engine, no maintainers | cannot detect: without maintainers nothing compacts, so there is never a rebase |
 | list-append through the engine, 2 maintainers | detected with seed 1 by durability, list-append |
-| bank through the engine, no maintainers | cannot detect: resurrected balances are a consistent older state, which conserves money |
-| bank through the engine, 2 maintainers | cannot detect: resurrected balances are a consistent older state, which conserves money |
+| bank through the engine, no maintainers | cannot detect: without maintainers nothing compacts, so there is never a rebase |
+| bank through the engine, 2 maintainers | cannot detect: resurrected balances are a consistent older state, which conserves money, and the engine workload has no index |
 | list-append through SQL, no maintainers | cannot detect: without maintainers nothing compacts, so there is never a rebase |
 | list-append through SQL, 2 maintainers | detected with seed 1 by durability, list-append |
-| bank through SQL, no maintainers | cannot detect: resurrected balances are a consistent older state, which conserves money |
-| bank through SQL, 2 maintainers | cannot detect: resurrected balances are a consistent older state, which conserves money |
+| bank through SQL, no maintainers | cannot detect: without maintainers nothing compacts, so there is never a rebase |
+| bank through SQL, 2 maintainers | detected with seed 2 by index consistency |
+| unique through SQL, no maintainers | cannot detect: without maintainers nothing compacts, so there is never a rebase |
+| unique through SQL, 2 maintainers | detected with seed 1 by index consistency |
 
 Targeted tests:
 
@@ -666,6 +731,8 @@ Targeted tests:
 | list-append through SQL, 2 maintainers | detected with seed 1 by list-append |
 | bank through SQL, no maintainers | detected with seed 1 by bank |
 | bank through SQL, 2 maintainers | detected with seed 1 by bank |
+| unique through SQL, no maintainers | detected with seed 1 by index consistency |
+| unique through SQL, 2 maintainers | detected with seed 1 by index consistency |
 
 Targeted tests:
 
@@ -685,10 +752,75 @@ Targeted tests:
 | list-append through SQL, 2 maintainers | detected with seed 2 by durability, list-append |
 | bank through SQL, no maintainers | cannot detect: the bank workload writes only in explicit transactions, so no autocommit statement is ever retried, and a doubled transfer conserves money anyway |
 | bank through SQL, 2 maintainers | cannot detect: the bank workload writes only in explicit transactions, so no autocommit statement is ever retried, and a doubled transfer conserves money anyway |
+| unique through SQL, no maintainers | cannot detect: a retried insert fails on its own primary key, and a retried move or delete finds its row moved or gone, so a statement applied twice leaves a consistent state |
+| unique through SQL, 2 maintainers | cannot detect: a retried insert fails on its own primary key, and a retried move or delete finds its row moved or gone, so a statement applied twice leaves a consistent state |
 
 Targeted tests:
 
 - `internal/sql/exec` `TestMutations/RetryAfterUnknownCommit_applies_a_statement_twice`: with the mutant, an autocommit UPDATE whose outcome was unknown is applied twice
+
+### `MUT-INDEX-STALE-DELETE`
+
+`exec.Mutations.IndexStaleDelete` leaves the old index entries of a row that an UPDATE changes or a DELETE removes.
+
+| Configuration | Result |
+|---|---|
+| list-append through the engine, no maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
+| list-append through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
+| bank through the engine, no maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
+| bank through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
+| list-append through SQL, no maintainers | cannot detect: the tables of the list-append workload have no index besides the primary key |
+| list-append through SQL, 2 maintainers | cannot detect: the tables of the list-append workload have no index besides the primary key |
+| bank through SQL, no maintainers | detected with seed 1 by index consistency |
+| bank through SQL, 2 maintainers | detected with seed 1 by index consistency |
+| unique through SQL, no maintainers | detected with seed 1 by index consistency |
+| unique through SQL, 2 maintainers | detected with seed 1 by index consistency |
+
+Targeted tests:
+
+- `internal/sql/exec` `TestMutations_Indexes/IndexStaleDelete_leaves_entries_that_CheckIndexes_finds`: with the mutant, an UPDATE or DELETE leaves its old index entries, which the index check finds
+
+### `MUT-UNIQUE-NO-CHECK`
+
+`exec.Mutations.UniqueNoCheck` skips the check that no other row has a row's values in a unique index.
+
+| Configuration | Result |
+|---|---|
+| list-append through the engine, no maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
+| list-append through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
+| bank through the engine, no maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
+| bank through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
+| list-append through SQL, no maintainers | cannot detect: the workload has no unique index besides the primary key |
+| list-append through SQL, 2 maintainers | cannot detect: the workload has no unique index besides the primary key |
+| bank through SQL, no maintainers | cannot detect: the workload has no unique index besides the primary key |
+| bank through SQL, 2 maintainers | cannot detect: the workload has no unique index besides the primary key |
+| unique through SQL, no maintainers | detected with seed 1 by unique, index consistency |
+| unique through SQL, 2 maintainers | detected with seed 1 by unique, index consistency |
+
+Targeted tests:
+
+- `internal/sql/exec` `TestMutations_Indexes/UniqueNoCheck_and_UniqueOwnWrites_let_duplicates_in`: with either mutant, a unique index lets two rows have the same values, which the index check finds
+
+### `MUT-UNIQUE-OWN-WRITES`
+
+`exec.Mutations.UniqueOwnWrites` makes the unique check read the transaction without the statement's own writes, so that an INSERT of two rows with the same value lets both in.
+
+| Configuration | Result |
+|---|---|
+| list-append through the engine, no maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
+| list-append through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
+| bank through the engine, no maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
+| bank through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
+| list-append through SQL, no maintainers | cannot detect: the workload has no unique index besides the primary key |
+| list-append through SQL, 2 maintainers | cannot detect: the workload has no unique index besides the primary key |
+| bank through SQL, no maintainers | cannot detect: the workload has no unique index besides the primary key |
+| bank through SQL, 2 maintainers | cannot detect: the workload has no unique index besides the primary key |
+| unique through SQL, no maintainers | detected with seed 4 by index consistency, unique |
+| unique through SQL, 2 maintainers | detected with seed 4 by unique, index consistency |
+
+Targeted tests:
+
+- `internal/sql/exec` `TestMutations_Indexes/UniqueNoCheck_and_UniqueOwnWrites_let_duplicates_in`: with either mutant, a unique index lets two rows have the same values, which the index check finds
 
 ### `MUT-UPDATE-SEES-OWN-WRITES`
 
@@ -704,6 +836,8 @@ Targeted tests:
 | list-append through SQL, 2 maintainers | cannot detect: the workloads never update primary key columns, so no row moves ahead of the scan |
 | bank through SQL, no maintainers | cannot detect: the workloads never update primary key columns, so no row moves ahead of the scan |
 | bank through SQL, 2 maintainers | cannot detect: the workloads never update primary key columns, so no row moves ahead of the scan |
+| unique through SQL, no maintainers | cannot detect: the workloads never update primary key columns, so no row moves ahead of the scan |
+| unique through SQL, 2 maintainers | cannot detect: the workloads never update primary key columns, so no row moves ahead of the scan |
 
 Targeted tests:
 
@@ -728,7 +862,9 @@ The fixed simulator corpus must reach every state at least once, or its test fai
 | `STATE-CRASH-MID-COMMIT-RECOVERED` | a client crashes in the middle of a commit, restarts, and commits again | "a client that crashed during a commit recovers and commits" |
 | `STATE-CRASH-MID-COMPACTION` | a process crashes in the middle of a compaction | "a process crashes during a compaction" |
 | `STATE-CRASH-MID-GC` | a process crashes in the middle of a GC pass | "a process crashes during a GC pass" |
+| `STATE-UNIQUE-AFTER-CONFLICT` | an autocommit statement that passed its unique checks loses its commit to a concurrent one, and its retry fails with a unique violation that the concurrent commit causes | "a unique violation occurs only because of a concurrent commit" |
+| `STATE-UNIQUE-VALUE-REUSED` | a client inserts a row with a unique value that its own committed UPDATE or DELETE freed | "a unique value that a committed write freed is taken again" |
 
 Verified by:
 
-- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, and lost acknowledgements resolved both ways
+- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, and unique violations that only a concurrent commit causes

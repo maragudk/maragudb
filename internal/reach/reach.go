@@ -30,6 +30,8 @@ const (
 	CrashMidCommitRecovered State = "STATE-CRASH-MID-COMMIT-RECOVERED"
 	CrashMidCompaction      State = "STATE-CRASH-MID-COMPACTION"
 	CrashMidGC              State = "STATE-CRASH-MID-GC"
+	UniqueAfterConflict     State = "STATE-UNIQUE-AFTER-CONFLICT"
+	UniqueValueReused       State = "STATE-UNIQUE-VALUE-REUSED"
 )
 
 // Declared state, with what it means and the message of the Antithesis assertion that marks it.
@@ -55,6 +57,8 @@ func Declarations() []Declared {
 		{CrashMidCommitRecovered, "a client crashes in the middle of a commit, restarts, and commits again", "a client that crashed during a commit recovers and commits"},
 		{CrashMidCompaction, "a process crashes in the middle of a compaction", "a process crashes during a compaction"},
 		{CrashMidGC, "a process crashes in the middle of a GC pass", "a process crashes during a GC pass"},
+		{UniqueAfterConflict, "an autocommit statement that passed its unique checks loses its commit to a concurrent one, and its retry fails with a unique violation that the concurrent commit causes", "a unique violation occurs only because of a concurrent commit"},
+		{UniqueValueReused, "a client inserts a row with a unique value that its own committed UPDATE or DELETE freed", "a unique value that a committed write freed is taken again"},
 	}
 }
 

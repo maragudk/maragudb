@@ -68,6 +68,23 @@ func corpus() []sim.Config {
 		cfg.Maintainers = int(seed / 12 % 2)
 		cfgs = append(cfgs, cfg)
 	}
+	// Concurrent writers of a unique column through SQL, with background maintenance in every
+	// mode, and some with heavier faults and more contention.
+	for seed := uint64(500); seed < 530; seed++ {
+		cfg := sim.DefaultConfig(seed)
+		cfg.Workload = sim.Unique
+		cfg.SQL = true
+		cfg.Maintenance = sim.MaintenanceMode(seed % 4)
+		if seed%3 == 0 {
+			cfg.Clients = 10
+			cfg.ErrorRate = 0.15
+			cfg.LostAckRate = 0.15
+			cfg.CrashRate = 0.03
+			cfg.Maintainers = 2
+			cfg.GracePeriod = 500 * time.Millisecond
+		}
+		cfgs = append(cfgs, cfg)
+	}
 	// The same through the SQL layer and the database/sql driver.
 	for seed := uint64(300); seed < 330; seed++ {
 		for _, w := range []sim.Workload{sim.ListAppend, sim.Bank} {
@@ -132,11 +149,12 @@ func maintenanceName(m sim.MaintenanceMode) string {
 func TestSimulator(t *testing.T) {
 	t.Run("corpus finds no anomalies", func(t *testing.T) {
 		verify.Covers(t, "the fixed corpus, with injected errors, latency, lost acknowledgements, outages, and crashes, finds no anomalies with any checker and exercises every fault", "AC-1.1", "AC-1.2", "AC-1.3", "AC-1.4", "AC-1.5", "AC-1.7", "AC-1.8", "AC-3.1", "AC-3.2", "AC-6.2", "INV-MULTI-WRITER", "INV-STRICT-SERIALIZABLE", "INV-CACHE-LOSS", "INV-S3-ONLY")
-		verify.Covers(t, "the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, and lost acknowledgements resolved both ways",
+		verify.Covers(t, "the fixed corpus, with the unique workload under the same faults, finds no two rows with the same unique value in any snapshot a reader saw or in the final state, and after every run through SQL every index of the store matches its table, and lookups through the indexes find the rows of the table", "INV-UNIQUE", "INV-INDEX-CONSISTENT")
+		verify.Covers(t, "the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, and unique violations that only a concurrent commit causes",
 			"AC-1.3", "AC-1.4", "STATE-LOST-ACK-LANDED", "STATE-LOST-ACK-CONFLICT", "STATE-LIVE-UNKNOWN", "STATE-AUTOCOMMIT-RETRY",
 			"STATE-COMPACTION-REBASE", "STATE-GC-REBASE", "STATE-LEASE-TAKEOVER", "STATE-LEASE-OVERLAP",
 			"STATE-SNAPSHOT-EXPIRED-REFUSED", "STATE-BLOCK-READ-RETRY-SUCCEEDED", "STATE-CRASH-MID-COMMIT-RECOVERED",
-			"STATE-CRASH-MID-COMPACTION", "STATE-CRASH-MID-GC")
+			"STATE-CRASH-MID-COMPACTION", "STATE-CRASH-MID-GC", "STATE-UNIQUE-AFTER-CONFLICT", "STATE-UNIQUE-VALUE-REUSED")
 		var totals sim.Stats
 		batch := simBatch{name: "corpus"}
 		reached := map[string]int{}
@@ -169,6 +187,7 @@ func TestSimulator(t *testing.T) {
 		is.True(t, totals.Crashes > 50, "crashes")
 		is.True(t, totals.Compactions > 50, "compactions")
 		is.True(t, totals.Deleted > 50, "deleted objects")
+		is.True(t, totals.UniqueViolations > 200, "unique violations")
 	})
 
 	t.Run("compaction succeeds against steady writers by rebasing on their commits", func(t *testing.T) {
@@ -312,10 +331,13 @@ func TestSimulator(t *testing.T) {
 		seed, err := strconv.ParseUint(seedVar, 10, 64)
 		is.NotError(t, err)
 		cfg := sim.DefaultConfig(seed)
-		if os.Getenv("MARAGUDB_WORKLOAD") == "bank" {
+		switch os.Getenv("MARAGUDB_WORKLOAD") {
+		case "bank":
 			cfg.Workload = sim.Bank
+		case "unique":
+			cfg.Workload = sim.Unique
 		}
-		cfg.SQL = os.Getenv("MARAGUDB_API") == "sql"
+		cfg.SQL = os.Getenv("MARAGUDB_API") == "sql" || cfg.Workload == sim.Unique
 		cfg.Maintainers = 2
 		if os.Getenv("MARAGUDB_CORPUS") != "" {
 			found := false
@@ -385,8 +407,8 @@ func TestSimulator(t *testing.T) {
 		for time.Now().Before(deadline) {
 			seed := rng.Uint64()
 			cfg := sim.DefaultConfig(seed)
-			cfg.Workload = sim.Workload(rng.IntN(2))
-			cfg.SQL = rng.IntN(2) == 0
+			cfg.Workload = sim.Workload(rng.IntN(3))
+			cfg.SQL = rng.IntN(2) == 0 || cfg.Workload == sim.Unique
 			cfg.Clients = 2 + rng.IntN(12)
 			cfg.TxPerClient = 10 + rng.IntN(60)
 			cfg.Keys = 1 + rng.IntN(6)
@@ -478,11 +500,14 @@ func (c cell) String() string {
 	return fmt.Sprintf("%v through %s, %s", c.workload, api, maintainers)
 }
 
-// cells of the kill matrix, in order.
+// cells of the kill matrix, in order. The unique workload runs only through SQL.
 func cells() []cell {
 	var cs []cell
 	for _, sql := range []bool{false, true} {
-		for _, w := range []sim.Workload{sim.ListAppend, sim.Bank} {
+		for _, w := range []sim.Workload{sim.ListAppend, sim.Bank, sim.Unique} {
+			if w == sim.Unique && !sql {
+				continue
+			}
 			for _, maintainers := range []int{0, 2} {
 				cs = append(cs, cell{workload: w, sql: sql, maintainers: maintainers})
 			}
@@ -498,6 +523,8 @@ const (
 	noCompaction      = "without maintainers nothing compacts, so there is never a rebase"
 	sqlOnly           = "the mutant is in the SQL layer, which the engine workloads do not use"
 	noAutocommitWrite = "the bank workload writes only in explicit transactions, so no autocommit statement is ever retried, and a doubled transfer conserves money anyway"
+	noSecondaryIndex  = "the tables of the list-append workload have no index besides the primary key"
+	noUniqueIndex     = "the workload has no unique index besides the primary key"
 )
 
 // mutants in the kill matrix.
@@ -520,6 +547,15 @@ func mutants() []mutant {
 		}
 		return out
 	}
+	workloadCells := func(w sim.Workload, reason string) map[cell]string {
+		m := map[cell]string{}
+		for _, c := range cells() {
+			if c.workload == w && c.sql {
+				m[c] = reason
+			}
+		}
+		return m
+	}
 	noMaintainers := func(reason string) map[cell]string {
 		m := map[cell]string{}
 		for _, c := range cells() {
@@ -534,7 +570,7 @@ func mutants() []mutant {
 			id: "MUT-COMMIT-WITHOUT-CAS", replay: "cas", name: "commit without CAS",
 			description: "`engine.Mutations.CommitWithoutCAS` writes the manifest unconditionally, so a commit can overwrite a concurrent one.",
 			mutations:   engine.Mutations{CommitWithoutCAS: true},
-			cannot:      bankCells(bankConserves),
+			cannot:      merge(bankCells(bankConserves), workloadCells(sim.Unique, "an unconditional manifest write drops whole concurrent commits, which leaves a consistent state in which no value repeats, and the unique workload does not check that acknowledged writes survive")),
 			checkers:    []string{sim.CheckerListAppend},
 		},
 		{
@@ -548,21 +584,22 @@ func mutants() []mutant {
 			id: "MUT-SKIP-FRESHNESS", replay: "freshness", name: "serving the cache without a freshness check",
 			description: "`engine.Mutations.SkipFreshnessCheck` starts transactions from the cached manifest without asking the store, so a transaction can miss commits acknowledged before it began.",
 			mutations:   engine.Mutations{SkipFreshnessCheck: true},
-			cannot:      bankCells("a stale snapshot makes a transfer conflict or read an older consistent state, which conserves money"),
+			cannot: merge(bankCells("a stale snapshot makes a transfer conflict or read an older consistent state, which conserves money"),
+				map[cell]string{{workload: sim.Unique, sql: true}: "a stale snapshot is an older consistent state in which no value repeats, and a write from it conflicts at commit; without maintainers no reader loses an object either"}),
 			checkers:    []string{sim.CheckerListAppend},
 		},
 		{
 			id: "MUT-ACK-BEFORE-CONFIRM", replay: "ack", name: "acking before the write is confirmed",
 			description: "`engine.Mutations.AckBeforeConfirm` reports a commit as successful without waiting for the store's answer.",
 			mutations:   engine.Mutations{AckBeforeConfirm: true},
-			cannot:      bankCells("an acknowledged transfer that never landed is missing as a whole, which conserves money"),
+			cannot:      merge(bankCells("an acknowledged transfer that never landed is missing as a whole, which conserves money"), workloadCells(sim.Unique, "an acknowledged write that never landed is missing as a whole, which leaves a consistent state, and the unique workload does not check that acknowledged writes survive")),
 			checkers:    []string{sim.CheckerDurability},
 		},
 		{
 			id: "MUT-COMPACTED-AHEAD", replay: "compacted-ahead", name: "the compacted segment ahead of newer ones after a rebase",
 			description: "`engine.Mutations.CompactedSegmentAhead` puts the compacted segment ahead of the segments committed during the compaction when it rebases, so that old values shadow newer ones.",
 			mutations:   engine.Mutations{CompactedSegmentAhead: true},
-			cannot:      merge(noMaintainers(noCompaction), bankCells("resurrected balances are a consistent older state, which conserves money")),
+			cannot:      merge(noMaintainers(noCompaction), map[cell]string{{workload: sim.Bank, maintainers: 2}: "resurrected balances are a consistent older state, which conserves money, and the engine workload has no index"}),
 			checkers:    []string{sim.CheckerListAppend},
 		},
 		{
@@ -575,8 +612,29 @@ func mutants() []mutant {
 			id: "MUT-RETRY-UNKNOWN", replay: "retry-unknown", name: "retrying an autocommit statement after an unknown commit outcome",
 			description:  "`exec.Mutations.RetryAfterUnknownCommit` retries an autocommit statement whose commit outcome is unknown, which can apply it twice.",
 			sqlMutations: exec.Mutations{RetryAfterUnknownCommit: true},
-			cannot:       bankCells(noAutocommitWrite),
+			cannot:       merge(bankCells(noAutocommitWrite), workloadCells(sim.Unique, "a retried insert fails on its own primary key, and a retried move or delete finds its row moved or gone, so a statement applied twice leaves a consistent state")),
 			checkers:     []string{sim.CheckerDurability},
+		},
+		{
+			id: "MUT-INDEX-STALE-DELETE", replay: "index-stale-delete", name: "stale index entries after an UPDATE or DELETE",
+			description:  "`exec.Mutations.IndexStaleDelete` leaves the old index entries of a row that an UPDATE changes or a DELETE removes.",
+			sqlMutations: exec.Mutations{IndexStaleDelete: true},
+			cannot:       workloadCells(sim.ListAppend, noSecondaryIndex),
+			checkers:     []string{sim.CheckerIndex},
+		},
+		{
+			id: "MUT-UNIQUE-NO-CHECK", replay: "unique-no-check", name: "no unique check",
+			description:  "`exec.Mutations.UniqueNoCheck` skips the check that no other row has a row's values in a unique index.",
+			sqlMutations: exec.Mutations{UniqueNoCheck: true},
+			cannot:       merge(workloadCells(sim.ListAppend, noUniqueIndex), workloadCells(sim.Bank, noUniqueIndex)),
+			checkers:     []string{sim.CheckerUnique, sim.CheckerIndex},
+		},
+		{
+			id: "MUT-UNIQUE-OWN-WRITES", replay: "unique-own-writes", name: "a unique check that misses the statement's own writes",
+			description:  "`exec.Mutations.UniqueOwnWrites` makes the unique check read the transaction without the statement's own writes, so that an INSERT of two rows with the same value lets both in.",
+			sqlMutations: exec.Mutations{UniqueOwnWrites: true},
+			cannot:       merge(workloadCells(sim.ListAppend, noUniqueIndex), workloadCells(sim.Bank, noUniqueIndex)),
+			checkers:     []string{sim.CheckerIndex},
 		},
 		{
 			id: "MUT-UPDATE-SEES-OWN-WRITES", replay: "update-sees-own-writes", name: "an UPDATE that revisits the rows it wrote",
@@ -639,9 +697,9 @@ func TestMutants(t *testing.T) {
 					caught[name] = true
 				}
 				if r.Status == verify.Detected && c.maintainers == 0 && !slices.ContainsFunc(r.Checkers, func(name string) bool {
-					return name == sim.CheckerListAppend || name == sim.CheckerDurability || name == sim.CheckerBank
+					return name == sim.CheckerListAppend || name == sim.CheckerDurability || name == sim.CheckerBank || name == sim.CheckerUnique || name == sim.CheckerIndex
 				}) {
-					t.Errorf("%v: without maintainers, a history checker must find the mutant, but only %v did", c, r.Checkers)
+					t.Errorf("%v: without maintainers, a history or invariant checker must find the mutant, but only %v did", c, r.Checkers)
 				}
 				reason, cannot := m.cannot[c]
 				switch {
