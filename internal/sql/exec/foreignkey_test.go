@@ -3,6 +3,7 @@ package exec_test
 import (
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"strings"
 	"testing"
 
@@ -152,5 +153,26 @@ func TestSession_ForeignKeysKeepInvariants(t *testing.T) {
 		for _, kind := range []string{"ok", exec.ErrForeignKey.Error(), exec.ErrCheck.Error(), exec.ErrRestrict.Error()} {
 			is.True(t, outcomes[kind] > 20, kind)
 		}
+	})
+}
+
+func TestSession_ForeignKeyCascades(t *testing.T) {
+	t.Run("cascades down a chain of rows far deeper than the stack would allow for a recursion per row", func(t *testing.T) {
+		verify.Covers(t, "an ON DELETE CASCADE down a self-referencing chain of 10,000 rows deletes the whole chain with the stack limited to 1 MiB, so a cascade never recurses once per row", "INV-FK")
+		s := newSession(t)
+		mustExec(t, s, "CREATE TABLE n (id bigint PRIMARY KEY, pid bigint REFERENCES n ON DELETE CASCADE)")
+		mustExec(t, s, "CREATE INDEX n_pid ON n (pid)")
+		var values strings.Builder
+		values.WriteString("(1, NULL)")
+		for i := 2; i <= 10_000; i++ {
+			fmt.Fprintf(&values, ", (%d, %d)", i, i-1)
+		}
+		mustExec(t, s, "INSERT INTO n VALUES "+values.String())
+		// Running out of stack is fatal and cannot be recovered, so the limit makes the test
+		// binary fail when the cascade recurses.
+		defer debug.SetMaxStack(debug.SetMaxStack(1 << 20))
+		res := mustExec(t, s, "DELETE FROM n WHERE id = 2")
+		is.Equal(t, int64(1), res.RowsAffected)
+		is.Equal(t, "1 NULL", query(t, s, "SELECT * FROM n"))
 	})
 }

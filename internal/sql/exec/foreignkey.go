@@ -295,12 +295,16 @@ func (s *Session) queue(ev rowEvent) {
 // fire the queued events in order, as Postgres fires its referential triggers at the end of a
 // statement. For each row, it acts on the rows that reference the old row, by the foreign keys in
 // the order they were created, and then checks the row's own foreign keys, in that order, as
-// Postgres orders the triggers by name. An action is a statement of its own, whose events fire
-// when it ends, before the next event of the statement that caused it.
+// Postgres orders the triggers by name. An action is a statement of its own, but Postgres runs it
+// without firing its triggers when it ends: they join the queue of the statement that caused it,
+// behind the events already there. So the queue is a worklist, which also keeps a cascade down a
+// long chain of rows from growing the stack.
 func (s *Session) fire(ctx context.Context) error {
-	events := s.events
-	s.events = nil
-	for _, ev := range events {
+	defer func() { s.events = nil }()
+	for i := 0; i < len(s.events); i++ {
+		ev := s.events[i]
+		// The event is done with, and its rows can be collected once the queue has moved on.
+		s.events[i] = rowEvent{}
 		if ev.old != nil {
 			for _, r := range ev.t.ReferencedBy {
 				if err := s.act(ctx, ev, r); err != nil {
@@ -309,8 +313,8 @@ func (s *Session) fire(ctx context.Context) error {
 			}
 		}
 		if ev.row != nil {
-			for i := range ev.t.ForeignKeys {
-				if err := s.checkReference(ctx, ev, &ev.t.ForeignKeys[i]); err != nil {
+			for j := range ev.t.ForeignKeys {
+				if err := s.checkReference(ctx, ev, &ev.t.ForeignKeys[j]); err != nil {
 					return err
 				}
 			}
@@ -402,12 +406,10 @@ func (s *Session) act(ctx context.Context, ev rowEvent, r reference) error {
 			return err
 		}
 	}
-	if err := s.fire(ctx); err != nil {
-		return err
-	}
 	if action == ast.SetDefault {
 		// A row whose default is the old key still references it, and the check of its foreign
-		// key saw no change, so Postgres checks the old key as NO ACTION does.
+		// key will see no change, so Postgres checks the old key as NO ACTION does, at once,
+		// before the events of the rows it updated.
 		return restrict(true)
 	}
 	return nil

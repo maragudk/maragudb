@@ -1,6 +1,8 @@
 package pgdiff_test
 
 import (
+	"fmt"
+	"strings"
 	"testing"
 
 	"maragu.dev/is"
@@ -10,7 +12,7 @@ import (
 )
 
 // constraintTables are the tables of the constraint tests, which every test drops first.
-var constraintTables = []string{"cd", "cd2", "cc", "cc2", "cp", "cf", "cf2", "cg", "ch", "cq", "cr", "cs", "cs2"}
+var constraintTables = []string{"cd", "cd2", "cc", "cc2", "cp", "cf", "cf2", "cg", "ch", "cq", "cr", "cs", "cs2", "cn"}
 
 // newConstraintSession compares statements on fresh tables named in [constraintTables].
 func newConstraintSession(t *testing.T) *pgdiff.Session {
@@ -328,6 +330,48 @@ func TestForeignKeys(t *testing.T) {
 			outcome{sql: "CREATE TABLE cd (id bigint PRIMARY KEY, x bigint REFERENCES cf ON DELETE SET NULL, y bigint REFERENCES cp ON DELETE CASCADE)"},
 			outcome{sql: "DELETE FROM cp WHERE id = 3", rejected: true},
 			outcome{sql: "DELETE FROM cf WHERE id = 3"},
+		)
+	})
+
+	t.Run("fires the events of an action after the other events of the statement, as Postgres does", func(t *testing.T) {
+		verify.Covers(t, "the rows that an action deletes or updates fire their own actions and checks only after every other action and check of the statement that is queued before them, because Postgres queues them behind the statement's, so a cascade's RESTRICT comes after the NOT NULL of a SET NULL on another table", "INV-FK", "INV-PG-SUBSET")
+		s := newConstraintSession(t)
+		expect(t, s,
+			outcome{sql: "CREATE TABLE cp (id bigint PRIMARY KEY)"},
+			outcome{sql: "CREATE TABLE cf (id bigint PRIMARY KEY, pid bigint REFERENCES cp ON DELETE CASCADE)"},
+			outcome{sql: "CREATE TABLE cg (id bigint PRIMARY KEY, fid bigint REFERENCES cf ON DELETE RESTRICT)"},
+			outcome{sql: "CREATE TABLE ch (id bigint PRIMARY KEY, pid bigint NOT NULL REFERENCES cp ON DELETE SET NULL)"},
+			outcome{sql: "INSERT INTO cp VALUES (1), (2)"},
+			outcome{sql: "INSERT INTO cf VALUES (10, 1), (20, 2)"},
+			outcome{sql: "INSERT INTO cg VALUES (100, 10)"},
+			outcome{sql: "INSERT INTO ch VALUES (30, 1)"},
+			outcome{sql: "DELETE FROM cp WHERE id = 1", code: "23502"},
+			outcome{sql: "DELETE FROM cp WHERE id = 2"},
+			outcome{sql: "SELECT * FROM cf ORDER BY id"},
+		)
+	})
+
+	t.Run("cascades down a chain of 10,000 rows", func(t *testing.T) {
+		verify.Covers(t, "a self-referencing ON DELETE CASCADE down a chain of 10,000 rows deletes the whole chain, as in Postgres", "INV-FK", "INV-PG-SUBSET")
+		s := newConstraintSession(t)
+		const n = 10_000
+		var values strings.Builder
+		for i := 1; i <= n; i++ {
+			if i > 1 {
+				values.WriteString(", ")
+			}
+			if i == 1 {
+				values.WriteString("(1, NULL)")
+				continue
+			}
+			fmt.Fprintf(&values, "(%d, %d)", i, i-1)
+		}
+		expect(t, s,
+			outcome{sql: "CREATE TABLE cn (id bigint PRIMARY KEY, pid bigint REFERENCES cn ON DELETE CASCADE)"},
+			outcome{sql: "CREATE INDEX cn_pid ON cn (pid)"},
+			outcome{sql: "INSERT INTO cn VALUES " + values.String()},
+			outcome{sql: "DELETE FROM cn WHERE id = 2"},
+			outcome{sql: "SELECT * FROM cn"},
 		)
 	})
 }

@@ -460,9 +460,65 @@ func verb(st ast.Statement) string {
 type kvstore struct {
 	tx      *engine.Tx
 	pending map[string]pendingEntry
-	// keys in write order, so that writes apply deterministically, and sorted in key order, for
-	// [kvstore.scanLatest].
-	keys, sorted []string
+	// keys in write order, so that writes apply deterministically.
+	keys []string
+	// sorted are the keys in key order, for [kvstore.scanLatest].
+	sorted sortedKeys
+}
+
+// sortedKeys is a set of distinct keys in sorted runs, each at most half as long as the run
+// before it, so that adding a key takes amortized logarithmic time, as in a binary counter, and
+// finding the keys of a range takes a binary search in each of the logarithmically many runs.
+type sortedKeys struct {
+	runs [][]string
+}
+
+// add a key that the set does not have.
+func (s *sortedKeys) add(key string) {
+	run := []string{key}
+	for len(s.runs) > 0 && len(s.runs[len(s.runs)-1]) <= len(run) {
+		last := s.runs[len(s.runs)-1]
+		s.runs = s.runs[:len(s.runs)-1]
+		merged := make([]string, 0, len(last)+len(run))
+		i, j := 0, 0
+		for i < len(last) && j < len(run) {
+			if last[i] < run[j] {
+				merged = append(merged, last[i])
+				i++
+			} else {
+				merged = append(merged, run[j])
+				j++
+			}
+		}
+		run = append(append(merged, last[i:]...), run[j:]...)
+	}
+	s.runs = append(s.runs, run)
+}
+
+// between returns the keys in [start, end), in order.
+func (s *sortedKeys) between(start, end string) []string {
+	var parts [][]string
+	total := 0
+	for _, run := range s.runs {
+		lo, _ := slices.BinarySearch(run, start)
+		hi, _ := slices.BinarySearch(run, end)
+		if lo < hi {
+			parts = append(parts, run[lo:hi])
+			total += hi - lo
+		}
+	}
+	switch len(parts) {
+	case 0:
+		return nil
+	case 1:
+		return parts[0]
+	}
+	out := make([]string, 0, total)
+	for _, p := range parts {
+		out = append(out, p...)
+	}
+	slices.Sort(out)
+	return out
 }
 
 type pendingEntry struct {
@@ -498,8 +554,7 @@ func (k *kvstore) set(key []byte, e pendingEntry) {
 	}
 	if _, ok := k.pending[string(key)]; !ok {
 		k.keys = append(k.keys, string(key))
-		i, _ := slices.BinarySearch(k.sorted, string(key))
-		k.sorted = slices.Insert(k.sorted, i, string(key))
+		k.sorted.add(string(key))
 	}
 	k.pending[string(key)] = e
 }
@@ -536,9 +591,7 @@ func (k *kvstore) wrote(key []byte) bool {
 func (k *kvstore) scanLatest(ctx context.Context, start, end []byte, txOnly bool, fn func(key, value []byte) bool) error {
 	var pending []string
 	if !txOnly {
-		lo, _ := slices.BinarySearch(k.sorted, string(start))
-		hi, _ := slices.BinarySearch(k.sorted, string(end))
-		pending = k.sorted[lo:hi]
+		pending = k.sorted.between(string(start), string(end))
 	}
 	it := k.tx.Scan(ctx, start, end)
 	more := it.Next()
@@ -573,5 +626,5 @@ func (k *kvstore) scanLatest(ctx context.Context, start, end []byte, txOnly bool
 func (k *kvstore) discard() {
 	k.pending = nil
 	k.keys = nil
-	k.sorted = nil
+	k.sorted = sortedKeys{}
 }
