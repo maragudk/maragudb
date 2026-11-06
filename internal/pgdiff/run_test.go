@@ -16,6 +16,7 @@ import (
 	"maragu.dev/maragudb/internal/s3fake"
 	"maragu.dev/maragudb/internal/s3test"
 	"maragu.dev/maragudb/internal/sql/ast"
+	"maragu.dev/maragudb/internal/sql/parser"
 	"maragu.dev/maragudb/internal/sql/value"
 	"maragu.dev/maragudb/internal/verify"
 )
@@ -72,7 +73,7 @@ func TestRunner_Run(t *testing.T) {
 		is.Equal(t, 1, rep.Reordered)
 		is.Equal(t, 1, rep.ErrorClasses["transaction aborted/25P02"], "the insert after the failure is ignored")
 		is.Equal(t, 1, rep.Transactions)
-		is.Equal(t, 6, rep.OK+rep.Errors, "every statement runs on both sides, and the last finds the table empty")
+		is.Equal(t, 7, rep.OK+rep.Errors, "the table and every statement run on both sides, and the last finds the table empty")
 	})
 
 	t.Run("also inside a read-only transaction, whose rows are the committed ones", func(t *testing.T) {
@@ -113,6 +114,38 @@ func TestRunner_Run(t *testing.T) {
 		is.True(t, err != nil && strings.Contains(err.Error(), "postgres SQLSTATE 25P02, maragudb out of range"), fmt.Sprint(err))
 	})
 
+	t.Run("creates a referenced table first, checks the state of both after every write, and ends a case whose table fails or is rejected", func(t *testing.T) {
+		r := newRunner(t)
+		parent, err := parser.Parse("CREATE TABLE p (c0 bigint PRIMARY KEY)")
+		is.NotError(t, err)
+		child, err := parser.Parse("CREATE TABLE t (c0 bigint PRIMARY KEY, c1 bigint REFERENCES p ON DELETE CASCADE, ts timestamptz DEFAULT now())")
+		is.NotError(t, err)
+		var stmts []ast.Statement
+		for _, q := range []string{"INSERT INTO p VALUES (1), (2)", "INSERT INTO t VALUES (1, 1), (2, 2), (3, NULL)", "DELETE FROM p WHERE c0 = 1", "INSERT INTO t VALUES (4, 1)", "SELECT c0, ts <= now() FROM t ORDER BY c0"} {
+			st, err := parser.Parse(q)
+			is.NotError(t, err, q)
+			stmts = append(stmts, st)
+		}
+		rep, err := r.Run(t.Context(), pgdiff.Case{Parent: parent.(*ast.CreateTable), Create: child.(*ast.CreateTable), NowColumn: "ts", Statements: stmts})
+		is.NotError(t, err)
+		is.Equal(t, 7, rep.Executed)
+		is.Equal(t, 1, rep.ErrorClasses["foreign key/23503"])
+		is.Equal(t, 8, rep.Checks, "both tables after each of the four writes")
+
+		rejected, err := parser.Parse("CREATE TABLE t (c0 bigint PRIMARY KEY CHECK (1 / 0 > c0))")
+		is.NotError(t, err)
+		rep, err = r.Run(t.Context(), pgdiff.Case{Create: rejected.(*ast.CreateTable), Statements: stmts[:1]})
+		is.NotError(t, err)
+		is.Equal(t, 1, rep.Rejected)
+		is.Equal(t, 0, rep.Executed)
+
+		failed, err := parser.Parse("CREATE TABLE t (c0 bigint PRIMARY KEY REFERENCES nope)")
+		is.NotError(t, err)
+		rep, err = r.Run(t.Context(), pgdiff.Case{Create: failed.(*ast.CreateTable), Statements: stmts[:1]})
+		is.NotError(t, err)
+		is.Equal(t, 1, rep.Errors)
+	})
+
 	t.Run("skips a rejected statement on Postgres, and aborts the transaction there instead", func(t *testing.T) {
 		verify.Covers(t, "a statement that maragudb rejects as unsupported is counted as rejected and not run on Postgres, and inside a transaction both transactions end up aborted", "AC-4.5")
 		r := newRunner(t)
@@ -120,7 +153,7 @@ func TestRunner_Run(t *testing.T) {
 		rep, err := r.Run(t.Context(), pgdiff.Case{Create: create, Statements: []ast.Statement{insert, unsupported, &ast.Begin{}, unsupported, insert, &ast.Rollback{}}})
 		is.NotError(t, err)
 		is.Equal(t, 2, rep.Rejected)
-		is.Equal(t, 4, rep.Executed)
+		is.Equal(t, 5, rep.Executed, "the table and four statements")
 		is.Equal(t, 1, rep.ErrorClasses["transaction aborted/25P02"], "the insert after the rejection fails on both")
 		is.Equal(t, 1, len(rep.RejectedFor))
 	})
