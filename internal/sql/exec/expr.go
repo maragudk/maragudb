@@ -430,9 +430,9 @@ func (b *binder) decimalTo(e *cexpr, t value.Type) (*cexpr, error) {
 	}}, e)
 }
 
-// errDecimalArithmetic is the error of arithmetic on numeric, which is not supported.
-func errDecimalArithmetic() error {
-	return fmt.Errorf("%w: arithmetic on numeric, the type of SUM and AVG of integers, is not supported; cast it to bigint or double precision first, such as SUM(x)::bigint", ErrUnsupported)
+// errDecimalFunction is the error of the function name of numeric, which is not supported.
+func errDecimalFunction(name string) error {
+	return fmt.Errorf("%w: %s of numeric, the type of SUM and AVG of integers and of arithmetic on them, is not supported; cast it to bigint or double precision first, such as %s(SUM(x)::bigint)", ErrUnsupported, name, name)
 }
 
 // numeric reports whether t is one of the numeric types, by Postgres's categories.
@@ -667,9 +667,7 @@ func (b *binder) unary(e *ast.Unary) (*cexpr, error) {
 			return nil, fmt.Errorf("%w: operator is not unique: %s unknown", ErrType, sym)
 		case value.Numeric:
 			return nil, fmt.Errorf("%w: the numeric type is not supported, write the sign as part of the literal or cast the literal to double precision or bigint", ErrUnsupported)
-		case value.Decimal:
-			return nil, errDecimalArithmetic()
-		case value.Int4, value.Int, value.Float:
+		case value.Int4, value.Int, value.Float, value.Decimal:
 		default:
 			return nil, fmt.Errorf("%w: operator does not exist: %s %v", ErrType, sym, x.typ)
 		}
@@ -677,7 +675,7 @@ func (b *binder) unary(e *ast.Unary) (*cexpr, error) {
 			return b.fold(&cexpr{typ: x.typ, eval: x.value}, x)
 		}
 		t := x.typ
-		return b.fold(&cexpr{typ: t, fallible: t != value.Float, eval: func(row []value.Value) (value.Value, error) {
+		return b.fold(&cexpr{typ: t, fallible: t == value.Int4 || t == value.Int, eval: func(row []value.Value) (value.Value, error) {
 			v, err := x.value(row)
 			if err != nil || v.Null {
 				return v, err
@@ -685,6 +683,8 @@ func (b *binder) unary(e *ast.Unary) (*cexpr, error) {
 			switch t {
 			case value.Float:
 				return value.NewFloat(-v.F), nil
+			case value.Decimal:
+				return value.DecimalNeg(v), nil
 			case value.Int4:
 				if v.I == math.MinInt32 {
 					return value.Value{}, fmt.Errorf("%w: integer out of range", ErrOutOfRange)
@@ -732,9 +732,6 @@ func (b *binder) binary(e *ast.Binary) (*cexpr, error) {
 		}
 		if e.Op == ast.Mod && t == value.Float {
 			return nil, fmt.Errorf("%w: operator does not exist: double precision %% double precision", ErrType)
-		}
-		if t == value.Decimal {
-			return nil, errDecimalArithmetic()
 		}
 		resultType = t
 		op = arithmetic(e.Op, t)
@@ -929,8 +926,11 @@ func comparison(op ast.BinaryOp) func(a, b value.Value) (value.Value, error) {
 // underflow to zero are errors unless an operand already was infinite or zero.
 func arithmetic(op ast.BinaryOp, t value.Type) func(a, b value.Value) (value.Value, error) {
 	return func(a, b value.Value) (value.Value, error) {
-		if t == value.Float {
+		switch t {
+		case value.Float:
 			return floatArithmetic(op, a.F, b.F)
+		case value.Decimal:
+			return decimalArithmetic(op, a, b)
 		}
 		x, y := a.I, b.I
 		var r int64
@@ -972,6 +972,32 @@ func arithmetic(op ast.BinaryOp, t value.Type) func(a, b value.Value) (value.Val
 		}
 		return value.Value{Type: t, I: r}, nil
 	}
+}
+
+// decimalArithmetic on two numerics, exact except for the rounding of division and of a product
+// with more than 16383 digits after the point, as Postgres's numeric operators.
+func decimalArithmetic(op ast.BinaryOp, a, b value.Value) (value.Value, error) {
+	var v value.Value
+	var err error
+	switch op {
+	case ast.Add:
+		v, err = value.DecimalAdd(a, b)
+	case ast.Sub:
+		v, err = value.DecimalSub(a, b)
+	case ast.Mul:
+		v, err = value.DecimalMul(a, b)
+	case ast.Div:
+		v, err = value.DecimalQuo(a, b)
+	case ast.Mod:
+		v, err = value.DecimalRem(a, b)
+	}
+	switch {
+	case errors.Is(err, value.ErrDivisionByZero):
+		return value.Value{}, ErrDivisionByZero
+	case err != nil:
+		return value.Value{}, castError(err)
+	}
+	return v, nil
 }
 
 func floatArithmetic(op ast.BinaryOp, x, y float64) (value.Value, error) {
@@ -1565,7 +1591,7 @@ func (b *binder) call(e *ast.Call) (*cexpr, error) {
 		case value.Numeric:
 			return nil, fmt.Errorf("%w: the numeric type is not supported, cast the literal to double precision or bigint", ErrUnsupported)
 		case value.Decimal:
-			return nil, errDecimalArithmetic()
+			return nil, errDecimalFunction("abs")
 		case value.Int4, value.Int, value.Float:
 		default:
 			return nil, fmt.Errorf("%w: function abs(%v) does not exist", ErrType, x.typ)

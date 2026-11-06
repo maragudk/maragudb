@@ -203,7 +203,7 @@ func (b *binder) aggregate(e *ast.Call) (*cexpr, error) {
 		return nil, fmt.Errorf("%w: aggregate function calls cannot be nested", ErrGrouping)
 	case agg.arg != nil && agg.arg.typ == value.Decimal:
 		// A numeric argument is only the result of another aggregate, which is an error above.
-		return nil, errDecimalArithmetic()
+		return nil, errDecimalFunction(e.Name)
 	case b.agg == nil:
 		clause := cmp.Or(b.aggClause, "this clause")
 		return nil, fmt.Errorf("%w: aggregate functions are not allowed in %s", ErrGrouping, clause)

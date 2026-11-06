@@ -100,19 +100,20 @@ func TestUnsupported(t *testing.T) {
 	const create = "CREATE TABLE dev (i bigint PRIMARY KEY, j bigint, s text)"
 	rows := "INSERT INTO dev VALUES (2, 5, 'b'), (1, 0, 'a')"
 
-	t.Run("UNS-NUMERIC numeric literals outside double precision and bigint contexts, and arithmetic on numeric", func(t *testing.T) {
-		verify.Covers(t, "numeric literals that Postgres keeps as numeric, such as SELECT 1.5 or a literal beyond the bigint range, arithmetic on the numeric results of SUM and AVG, and quoted literals read as numeric are rejected, and Postgres accepts them", "UNS-NUMERIC")
+	t.Run("UNS-NUMERIC numeric literals outside double precision and bigint contexts, and functions of numeric", func(t *testing.T) {
+		verify.Covers(t, "numeric literals that Postgres keeps as numeric, such as SELECT 1.5 or a literal beyond the bigint range, also next to the numeric results of SUM and AVG and of arithmetic on them, functions of such results, and quoted literals read as numeric are rejected, and Postgres accepts them", "UNS-NUMERIC")
 		rejects(t, create,
 			example{SQL: "SELECT 1.5"},
 			example{SQL: "SELECT 1 + 1.5"},
 			example{SQL: "SELECT 9223372036854775808"},
 			example{SQL: "SELECT i FROM dev WHERE i = 1.5"},
 			example{SQL: "SELECT 1.5 + 1.5"},
-			example{SQL: "SELECT sum(j) + 1 FROM dev"},
-			example{SQL: "SELECT -sum(j) FROM dev"},
-			example{SQL: "SELECT avg(j) * 2 FROM dev"},
+			example{SQL: "SELECT sum(j) * 1.5 FROM dev"},
+			example{SQL: "SELECT -sum(j) + 9223372036854775808 FROM dev"},
 			example{SQL: "SELECT abs(avg(j)) FROM dev"},
+			example{SQL: "SELECT abs(sum(j) / 2) FROM dev"},
 			example{SQL: "SELECT sum(j) = '5' FROM dev"},
+			example{SQL: "SELECT avg(j) * 2 > '5' FROM dev"},
 			example{SQL: "SELECT avg(j) > 1.5 FROM dev"},
 			example{SQL: "SELECT sum(1.5) FROM dev"},
 		)

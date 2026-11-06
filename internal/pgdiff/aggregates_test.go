@@ -1,13 +1,16 @@
 package pgdiff_test
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
 
+	"hegel.dev/go/hegel"
 	"maragu.dev/is"
 
 	"maragu.dev/maragudb/internal/pgdiff"
+	"maragu.dev/maragudb/internal/sql/value"
 	"maragu.dev/maragudb/internal/verify"
 )
 
@@ -81,14 +84,12 @@ func TestAggregates(t *testing.T) {
 			outcome{sql: "SELECT count() FROM ga", code: "42809"},
 			outcome{sql: "SELECT now(*)", code: "42809"},
 			outcome{sql: "SELECT sum(1.5)", rejected: true},
-			outcome{sql: "SELECT sum(v) + 1 FROM ga", rejected: true},
-			outcome{sql: "SELECT -sum(v) FROM ga", rejected: true},
 			outcome{sql: "SELECT sum(v) = '1' FROM ga", rejected: true},
 		)
 	})
 
 	t.Run("compares, sorts, casts, and outputs numeric results as Postgres does", func(t *testing.T) {
-		verify.Covers(t, "the numeric results of SUM and AVG of integers compare with each other, with integers, and with floats through Postgres's implicit casts, sort, take part in DISTINCT, IS NULL, CASE, COALESCE, NULLIF, and ||, and cast to bigint with rounding half away from zero and overflow errors, to double precision, and to text, while arithmetic on them is rejected", "INV-PG-SUBSET", "INV-TYPES")
+		verify.Covers(t, "the numeric results of SUM and AVG of integers compare with each other, with integers, and with floats through Postgres's implicit casts, sort, take part in DISTINCT, IS NULL, CASE, COALESCE, NULLIF, and ||, and cast to bigint with rounding half away from zero and overflow errors, to double precision, and to text, while functions of them are rejected", "INV-PG-SUBSET", "INV-TYPES")
 		s := newAggSession(t)
 		expect(t, s,
 			outcome{sql: "SELECT g, avg(v) > 10, avg(v) = 15, sum(v) >= 30::bigint, avg(v) < 7.5::float8, sum(v) IN (30, 5), sum(v) BETWEEN 1 AND 100 FROM ga GROUP BY g"},
@@ -104,11 +105,172 @@ func TestAggregates(t *testing.T) {
 			outcome{sql: "SELECT avg(v)::boolean FROM ga", code: "42846"},
 			outcome{sql: "SELECT length(sum(v)) FROM ga", code: "42883"},
 			outcome{sql: "SELECT sum(v) LIKE '1%' FROM ga", code: "42883"},
-			outcome{sql: "SELECT avg(v) * 2 FROM ga", rejected: true},
 			outcome{sql: "SELECT abs(avg(v)) FROM ga", rejected: true},
 			outcome{sql: "SELECT avg(v) = 1.5 FROM ga", rejected: true},
 		)
 	})
+
+	t.Run("computes arithmetic on numeric results with Postgres's values, scales, and errors", func(t *testing.T) {
+		verify.Covers(t, "unary minus and plus and +, -, *, /, and % on the numeric results of SUM and AVG of integers, with each other and with integer and bigint operands, give Postgres's values and scales, division by zero (22012), and out of range errors (22003), and their results compare, sort, group, and cast as other numerics; with a double precision operand the numeric converts to double precision", "INV-PG-SUBSET", "INV-TYPES")
+		s := newAggSession(t)
+		expect(t, s,
+			outcome{sql: "SELECT g, -sum(v), +sum(v), - - avg(v), -avg(v) FROM ga GROUP BY g ORDER BY g"},
+			outcome{sql: "SELECT g, sum(v) + 1, 1 + sum(v), sum(v) - 2147483648, sum(v) * 3, avg(v) * avg(v), sum(v) + avg(v), avg(v) - avg(v) FROM ga GROUP BY g ORDER BY g"},
+			outcome{sql: "SELECT g, sum(v) / 2, sum(v) / 3, 1 / avg(v), avg(v) / avg(v), sum(v) / count(*), sum(v) / -7, avg(v) / 1000000 FROM ga WHERE g < 3 GROUP BY g ORDER BY g"},
+			outcome{sql: "SELECT g, sum(v) % 3, -sum(v) % 3, sum(v) % -3, avg(v) % 4, sum(v) % avg(v), 100 % avg(v) FROM ga WHERE g < 3 GROUP BY g ORDER BY g"},
+			outcome{sql: "SELECT g, sum(v) * sum(v) * sum(v), sum(v) / 0.5::float8, avg(v) + 0.25::float8, -avg(v) * 2::float8 FROM ga GROUP BY g ORDER BY g"},
+			outcome{sql: "SELECT sum(v) / 0 FROM ga", code: "22012"},
+			outcome{sql: "SELECT sum(v) % 0 FROM ga", code: "22012"},
+			outcome{sql: "SELECT g, sum(v) / (count(*) - 2) FROM ga GROUP BY g", code: "22012"},
+			outcome{sql: "SELECT avg(v) / sum(v - v) FROM ga WHERE g = 1", code: "22012"},
+			outcome{sql: "SELECT sum(v) / 0 FROM ge"},
+			outcome{sql: "SELECT -sum(v), sum(v) * 2, avg(v) / 3 FROM ge"},
+			outcome{sql: "SELECT sum(v) + NULL, NULL / avg(v), -sum(NULL::bigint) FROM ga"},
+			outcome{sql: "SELECT (sum(v) * 2)::bigint FROM ga WHERE g = 3", code: "22003"},
+			outcome{sql: "SELECT (avg(v) * 3)::bigint, (avg(v) / 7)::float8, (sum(v) % 7)::text, 'x' || -sum(v) FROM ga WHERE g < 3 GROUP BY g ORDER BY 1"},
+			outcome{sql: "SELECT g FROM ga GROUP BY g HAVING sum(v) / 2 > 7 ORDER BY g"},
+			outcome{sql: "SELECT g, avg(v) * 2 FROM ga GROUP BY g ORDER BY avg(v) * 2 DESC NULLS FIRST, g"},
+			outcome{sql: "SELECT g, -sum(v) AS n FROM ga GROUP BY g ORDER BY n, g"},
+			outcome{sql: "SELECT avg(v) * 2 = sum(v), sum(v) / 2 = avg(v), -sum(v) < avg(v), sum(v) + 1 > 30 FROM ga GROUP BY g"},
+			outcome{sql: "SELECT coalesce(sum(v) / 4, 0), CASE WHEN g = 1 THEN avg(v) * 2 ELSE -sum(v) END FROM ga GROUP BY g"},
+			outcome{sql: "SELECT - CASE WHEN true THEN 5 ELSE sum(v) END / 0 FROM ga", code: "22012"},
+			outcome{sql: "SELECT coalesce(5, sum(v)) / 0 FROM ge", code: "22012"},
+			outcome{sql: "SELECT coalesce(5, sum(v)) % 0 FROM ga WHERE false GROUP BY g", code: "22012"},
+			outcome{sql: "SELECT CASE WHEN false THEN sum(v) / 0 ELSE 1 END FROM ga"},
+			outcome{sql: "SELECT sum(v) / 0 FROM ge GROUP BY v"},
+			outcome{sql: "SELECT g, sum(v) / 0 FROM ga WHERE g = 2 AND v IS NULL GROUP BY g"},
+			outcome{sql: "SELECT g, -sum(v), +avg(v) FROM ga GROUP BY g ORDER BY g LIMIT 2"},
+			outcome{sql: "SELECT g, sum(v) / 4 FROM ga GROUP BY g ORDER BY g LIMIT 2", rejected: true},
+			outcome{sql: "SELECT DISTINCT sum(v) * 0 FROM ga GROUP BY g"},
+			outcome{sql: "SELECT DISTINCT avg(v) * 0 FROM ga GROUP BY g", rejected: true},
+			outcome{sql: "SELECT DISTINCT sum(v) * 0, (avg(v) * 0)::text FROM ga GROUP BY g"},
+			outcome{sql: "SELECT ga.g, sum(gb.w) * 10 / avg(ga.v), -count(*) * avg(gb.w) FROM ga JOIN gb ON ga.id = gb.aid GROUP BY ga.g ORDER BY ga.g"},
+			outcome{sql: "SELECT sum(v) / 1.5 FROM ga", rejected: true},
+			outcome{sql: "SELECT sum(v) + 9223372036854775808 FROM ga", rejected: true},
+			outcome{sql: "SELECT avg(v) * '2' FROM ga", rejected: true},
+			outcome{sql: "SELECT abs(-sum(v)) FROM ga", rejected: true},
+			outcome{sql: "SELECT sum(v) % 2::float8 FROM ga", code: "42883"},
+			outcome{sql: "SELECT -sum(s) FROM ga", code: "42883"},
+		)
+	})
+
+	t.Run("divides numerics to Postgres's scale of at most 1000 digits, multiplies to at most 16383, and converts tiny and huge numerics to double precision with Postgres's out of range errors", func(t *testing.T) {
+		verify.Covers(t, "repeated division and multiplication of numeric aggregate results give Postgres's text at the limits of scale, a quotient of scale 1000 and a product rounded half away from zero to scale 16383, and a numeric that rounds to zero or infinity as double precision fails with 22003", "INV-PG-SUBSET", "INV-TYPES")
+		s := newAggSession(t)
+		// sum(v) of g = 3 is 18446744073709551614, so each division by it removes about 19
+		// digits from the quotient.
+		const big = "9223372036854775807"
+		tiny := "avg(v)" + strings.Repeat(" / "+big, 20)
+		huge := "sum(v)" + strings.Repeat(" * "+big, 15)
+		expect(t, s,
+			outcome{sql: fmt.Sprintf("SELECT %s FROM ga WHERE g = 3", tiny)},
+			outcome{sql: fmt.Sprintf("SELECT (%s) * (%s) FROM ga WHERE g = 3", tiny, tiny)},
+			outcome{sql: fmt.Sprintf("SELECT %s FROM ga WHERE g = 3", strings.Repeat("avg(v) * ", 30)+"avg(v)")},
+			outcome{sql: fmt.Sprintf("SELECT %s FROM ga WHERE g = 3", "avg(v)"+strings.Repeat(" / "+big, 60))},
+			outcome{sql: fmt.Sprintf("SELECT %s FROM ga WHERE g = 3", strings.Repeat("("+tiny+") * ", 16)+"("+tiny+")")},
+			outcome{sql: fmt.Sprintf("SELECT %s FROM ga WHERE g = 3", strings.Repeat("("+tiny+" * 1"+strings.Repeat("0", 18)+strings.Repeat(" * 1"+strings.Repeat("0", 18), 19)+") * ", 16)+"("+tiny+")")},
+			outcome{sql: fmt.Sprintf("SELECT (%s)::float8 FROM ga WHERE g = 3", tiny), code: "22003"},
+			outcome{sql: fmt.Sprintf("SELECT (%s) * 10000 < 1::float8 FROM ga WHERE g = 3", tiny), code: "22003"},
+			outcome{sql: fmt.Sprintf("SELECT (%s)::float8 FROM ga WHERE g = 3", huge)},
+			outcome{sql: fmt.Sprintf("SELECT (%s * %s)::float8 FROM ga WHERE g = 3", huge, huge), code: "22003"},
+			outcome{sql: fmt.Sprintf("SELECT %s + 0.5::float8 FROM ga WHERE g = 3", "avg(v)"+strings.Repeat(" / "+big, 16))},
+		)
+	})
+}
+
+func TestNumericArithmetic(t *testing.T) {
+	t.Run("adds, subtracts, multiplies, divides, takes remainders of, and negates numerics as Postgres does", func(t *testing.T) {
+		verify.Covers(t, "hegel-drawn numerics, with trailing zeros, zeros of every scale, and values at the limits of scale and of digits before the point, give the same text or error class as Postgres for -a, a + b, a - b, a * b, a / b, and a % b, including the scale that select_div_scale picks, rounding half away from zero, the 16383 digits of a product, and the 131072 digits before the point", "INV-PG-SUBSET", "INV-TYPES")
+		db := pgdiff.Postgres(t)
+		ops := []struct {
+			sym string
+			f   func(a, b value.Value) (value.Value, error)
+		}{
+			{"+", value.DecimalAdd}, {"-", value.DecimalSub}, {"*", value.DecimalMul}, {"/", value.DecimalQuo}, {"%", value.DecimalRem},
+			{"neg", func(a, _ value.Value) (value.Value, error) { return value.DecimalNeg(a), nil }},
+		}
+		hegel.Test(t, func(ht *hegel.T) {
+			a, b := drawNumeric(ht), drawNumeric(ht)
+			op := hegel.Draw(ht, hegel.SampledFrom(ops))
+			switch hegel.Draw(ht, hegel.Integers(0, 9)) {
+			case 0:
+				// A product of two numerics of about 8190 digits after the point, which has about
+				// 16383.
+				a, b, op = tinyNumeric(ht, 8190), tinyNumeric(ht, 8190), ops[2]
+			case 1:
+				// Quotients that end in a 5 just past their scale, which round away from zero.
+				b, op = hegel.Draw(ht, hegel.SampledFrom([]string{"2", "-2", "8", "0.2", "-0.02", "20000", "0.00002"})), ops[3]
+			}
+			query := "SELECT ($1::numeric " + op.sym + " $2::numeric)::text"
+			if op.sym == "neg" {
+				query = "SELECT (-$1::numeric)::text WHERE $2::text IS NOT NULL"
+			}
+			ht.Note(fmt.Sprintf("%s with $1 = %.80s (%d characters), $2 = %.80s (%d characters)", query, a, len(a), b, len(b)))
+			var pg string
+			pgErr := db.QueryRowContext(t.Context(), query, a, b).Scan(&pg)
+			got, err := op.f(value.NewDecimal(a), value.NewDecimal(b))
+			switch {
+			case errors.Is(err, value.ErrDivisionByZero):
+				is.Equal(ht, "22012", pgdiff.SQLState(pgErr), fmt.Sprint(pgErr))
+			case errors.Is(err, value.ErrOutOfRange):
+				is.Equal(ht, "22003", pgdiff.SQLState(pgErr), fmt.Sprint(pgErr))
+			case err != nil:
+				ht.Fatalf("maragudb: %v", err)
+			case pgErr != nil:
+				ht.Fatalf("maragudb %.80s, postgres %v", got.S, pgErr)
+			case got.S != pg:
+				ht.Fatalf("maragudb %.200s (%d characters), postgres %.200s (%d characters)", got.S, len(got.S), pg, len(pg))
+			}
+		}, hegel.WithTestCases(castCases()))
+	})
+}
+
+// tinyNumeric is a numeric with about zeros zeros after the point before up to six digits.
+func tinyNumeric(ht *hegel.T, zeros int) string {
+	zeros += hegel.Draw(ht, hegel.Integers(-4, 4))
+	s := "0." + strings.Repeat("0", zeros) + hegel.Draw(ht, hegel.Text().Alphabet("0123456789").MinSize(1).MaxSize(6))
+	if hegel.Draw(ht, hegel.Booleans()) && strings.Trim(s, "0.") != "" {
+		s = "-" + s
+	}
+	return s
+}
+
+// drawNumeric is the text of a numeric as Postgres outputs it: mostly up to 40 digits with up
+// to 25 after the point, often with trailing zeros, and now and then a value of a special
+// shape, such as a zero of some scale, a value with more than 1000 or about 8190 digits after
+// the point, or one with about 131072 digits before it.
+func drawNumeric(ht *hegel.T) string {
+	var whole, frac string
+	switch hegel.Draw(ht, hegel.Integers(0, 19)) {
+	case 0, 1, 2:
+		pair := hegel.Draw(ht, hegel.SampledFrom([][2]string{
+			{"0", ""}, {"0", "00"}, {"0", "5"}, {"1", ""}, {"2", ""}, {"3", "0000"}, {"9999", ""}, {"10000", ""}, {"123456789012345678901", ""}, {"0", "0001"}, {"0", "00001"}, {"1", "00000000000000000000"}, {"9223372036854775807", ""},
+		}))
+		whole, frac = pair[0], pair[1]
+	case 3:
+		return tinyNumeric(ht, hegel.Draw(ht, hegel.SampledFrom([]int{990, 1001, 1100, 8180, 8190, 8192})))
+	case 4:
+		whole = "9" + strings.Repeat(hegel.Draw(ht, hegel.SampledFrom([]string{"0", "9"})), hegel.Draw(ht, hegel.SampledFrom([]int{131060, 131070, 131071})))
+	default:
+		digits := hegel.Draw(ht, hegel.Text().Alphabet("0123456789").MinSize(1).MaxSize(40))
+		scale := hegel.Draw(ht, hegel.Integers(0, min(25, len(digits))))
+		whole, frac = digits[:len(digits)-scale], digits[len(digits)-scale:]
+		if hegel.Draw(ht, hegel.Booleans()) {
+			frac += strings.Repeat("0", hegel.Draw(ht, hegel.Integers(1, 20)))
+		}
+	}
+	whole = strings.TrimLeft(whole, "0")
+	if whole == "" {
+		whole = "0"
+	}
+	s := whole
+	if frac != "" {
+		s += "." + frac
+	}
+	if hegel.Draw(ht, hegel.Booleans()) && strings.Trim(s, "0.") != "" {
+		s = "-" + s
+	}
+	return s
 }
 
 func TestGroupBy(t *testing.T) {
