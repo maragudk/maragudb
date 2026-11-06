@@ -108,6 +108,9 @@ func (s *Session) addForeignKeys(ctx context.Context, t *table, st *ast.CreateTa
 				return err
 			}
 		}
+		if f.OnUpdate != ast.NoAction && f.OnUpdate != ast.Restrict {
+			return fmt.Errorf("%w: ON UPDATE %s is not supported, only NO ACTION and RESTRICT", ErrUnsupported, f.OnUpdate)
+		}
 		fk := foreignKey{Name: name, Parent: parent.Name, OnDelete: f.OnDelete, OnUpdate: f.OnUpdate}
 		columnsOf := func(tt *table, names []string) ([]int, error) {
 			var out []int

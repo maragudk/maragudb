@@ -174,17 +174,44 @@ func (r *Runner) Run(ctx context.Context, c Case) (Report, error) {
 		return rep, err
 	}
 	defer func() { _ = m.Close() }()
-	if _, err := r.PG.ExecContext(ctx, "DROP TABLE IF EXISTS "+tableName); err != nil {
-		return rep, fmt.Errorf("postgres: %w", err)
-	}
-	create := ast.Render(c.Create)
-	if _, err := r.PG.ExecContext(ctx, create); err != nil {
-		return rep, fmt.Errorf("postgres: %s: %w", create, err)
-	}
-	if _, err := m.ExecContext(ctx, create); err != nil {
-		return rep, fmt.Errorf("maragudb: %s: %w", create, err)
+	for _, name := range []string{tableName, parentName} {
+		if _, err := r.PG.ExecContext(ctx, "DROP TABLE IF EXISTS "+name+" CASCADE"); err != nil {
+			return rep, fmt.Errorf("postgres: %w", err)
+		}
 	}
 	s := &sides{keys: map[string][]string{tableName: c.Create.PrimaryKey}}
+	checks := []*ast.Select{stateCheck(c.Create, c.NowColumn)}
+	tables := []*ast.CreateTable{c.Create}
+	if c.Parent != nil {
+		tables = []*ast.CreateTable{c.Parent, c.Create}
+		s.keys[parentName] = c.Parent.PrimaryKey
+		checks = append(checks, stateCheck(c.Parent, ""))
+	}
+	for _, t := range tables {
+		create := ast.Render(t)
+		rep.Statements++
+		if _, err := m.ExecContext(ctx, create); errors.Is(err, maragudb.ErrUnsupported) {
+			// A table that maragudb rejects, such as one with a CHECK whose constant part fails,
+			// ends the case.
+			rep.Rejected++
+			rep.RejectedFor[rejectionReason(err)]++
+			return rep, nil
+		} else if err != nil {
+			// A table that both databases reject ends the case.
+			_, pgErr := r.PG.ExecContext(ctx, create)
+			if !SameClass(err, pgErr) {
+				return rep, &Mismatch{Statement: create, Postgres: fmt.Sprint(pgErr), Maragudb: err.Error(), Detail: "creating the table"}
+			}
+			rep.Executed++
+			rep.Errors++
+			return rep, nil
+		}
+		if _, err := r.PG.ExecContext(ctx, create); err != nil {
+			return rep, &Mismatch{Statement: create, Postgres: err.Error(), Maragudb: "ok", Detail: "creating the table"}
+		}
+		rep.Executed++
+		rep.OK++
+	}
 	if s.pg, err = r.PG.Conn(ctx); err != nil {
 		return rep, fmt.Errorf("postgres: %w", err)
 	}
@@ -198,10 +225,6 @@ func (r *Runner) Run(ctx context.Context, c Case) (Report, error) {
 			_, _ = s.pg.ExecContext(context.Background(), "ROLLBACK")
 		}
 	}()
-	stateCheck := &ast.Select{Items: []ast.SelectItem{{Star: true}}, From: tableName}
-	for _, k := range c.Create.PrimaryKey {
-		stateCheck.OrderBy = append(stateCheck.OrderBy, ast.OrderItem{Expr: &ast.ColumnRef{Name: k}})
-	}
 	for _, st := range c.Statements {
 		rep.Statements++
 		o, err := s.compare(ctx, ast.Render(st), st, &rep)
@@ -214,11 +237,13 @@ func (r *Runner) Run(ctx context.Context, c Case) (Report, error) {
 		switch st.(type) {
 		case *ast.Select, *ast.Begin, *ast.Commit, *ast.Rollback:
 		default:
-			var check Report
-			if _, err := s.compare(ctx, ast.Render(stateCheck), stateCheck, &check); err != nil {
-				return rep, fmt.Errorf("state after %s: %w", ast.Render(st), err)
+			for _, check := range checks {
+				var r Report
+				if _, err := s.compare(ctx, ast.Render(check), check, &r); err != nil {
+					return rep, fmt.Errorf("state after %s: %w", ast.Render(st), err)
+				}
+				rep.Checks++
 			}
-			rep.Checks++
 		}
 	}
 	if s.inTx {
@@ -228,6 +253,23 @@ func (r *Runner) Run(ctx context.Context, c Case) (Report, error) {
 		}
 	}
 	return rep, nil
+}
+
+// stateCheck selects every row of the table in key order, with the column whose default is now()
+// compared with now() instead of as it is.
+func stateCheck(t *ast.CreateTable, nowColumn string) *ast.Select {
+	sel := &ast.Select{From: t.Name}
+	for _, c := range t.Columns {
+		var e ast.Expr = &ast.ColumnRef{Name: c.Name}
+		if c.Name == nowColumn {
+			e = &ast.Binary{Op: ast.Le, Left: e, Right: &ast.Call{Name: "now"}}
+		}
+		sel.Items = append(sel.Items, ast.SelectItem{Expr: e, Alias: c.Name})
+	}
+	for _, k := range t.PrimaryKey {
+		sel.OrderBy = append(sel.OrderBy, ast.OrderItem{Expr: &ast.ColumnRef{Name: k}})
+	}
+	return sel
 }
 
 type result struct {

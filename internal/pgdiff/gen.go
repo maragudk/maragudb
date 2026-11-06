@@ -17,14 +17,22 @@ import (
 
 // Case is one generated scenario: a table, its initial rows, and statements to run on it.
 type Case struct {
+	// Parent is a table that Create references with a foreign key, created before it, or nil.
+	Parent *ast.CreateTable
 	Create *ast.CreateTable
-	// Statements run in order after the table is created. Mutations are followed by a state
+	// NowColumn is the column of Create whose default is now(), whose values differ between the
+	// two databases and are compared only with now(), or "".
+	NowColumn string
+	// Statements run in order after the tables are created. Mutations are followed by a state
 	// check on both sides.
 	Statements []ast.Statement
 }
 
-// Table name used by every case.
-const tableName = "t"
+// Tables used by the cases.
+const (
+	tableName  = "t"
+	parentName = "p"
+)
 
 var allTypes = []value.Type{value.Int, value.Float, value.Bool, value.String, value.Bytes, value.Time}
 
@@ -42,6 +50,13 @@ type gen struct {
 	indexed [][]string
 	// indexes are the names of the indexes the case created with a name.
 	indexes []string
+	// parent is the generator of the table that the table references, which shares the source,
+	// or nil.
+	parent *gen
+	// nowColumn is the column whose default is now(), or "".
+	nowColumn string
+	// rows are the rows that INSERTs of the table wrote, or tried to.
+	rows [][]ast.Expr
 }
 
 // Source of the generator's choices.
@@ -135,8 +150,18 @@ func (s randSource) Bytes(max int) []byte {
 // Generate a case.
 func Generate(src Source) Case {
 	g := &gen{src: src, cols: map[value.Type][]string{}}
+	var parent *ast.CreateTable
+	if g.bool() {
+		g.parent = &gen{src: src, cols: map[value.Type][]string{}}
+		g.parent.parentSchema()
+		parent = g.parent.table
+	}
 	g.schema()
-	c := Case{Create: g.table}
+	g.constraints()
+	c := Case{Parent: parent, Create: g.table, NowColumn: g.nowColumn}
+	if g.parent != nil {
+		c.Statements = append(c.Statements, g.parent.insert(g.draw(1, 5)))
+	}
 	c.Statements = append(c.Statements, g.insert(g.draw(0, 6)))
 	// Indexes on the rows, so that later statements use them, and so that a unique index on rows
 	// that repeat its values fails.
@@ -194,6 +219,9 @@ func (g *gen) rarely(n int) bool {
 func (g *gen) schema() {
 	n := g.draw(1, 5)
 	t := &ast.CreateTable{Name: tableName}
+	if g.table != nil {
+		t.Name = g.table.Name
+	}
 	for i := range n {
 		typ := pick(g, allTypes)
 		name := fmt.Sprint("c", i)
@@ -235,11 +263,141 @@ func (g *gen) schema() {
 
 // indexColumns are one or two columns for an index, now and then the same one twice.
 func (g *gen) indexColumns() []string {
-	cols := []string{g.table.Columns[g.draw(0, len(g.table.Columns)-1)].Name}
+	names := g.columnNames()
+	cols := []string{pick(g, names)}
 	if g.bool() {
-		cols = append(cols, g.table.Columns[g.draw(0, len(g.table.Columns)-1)].Name)
+		cols = append(cols, pick(g, names))
 	}
 	return cols
+}
+
+// columnNames of the table, without the column whose default is now(), whose values the
+// statements do not read.
+func (g *gen) columnNames() []string {
+	var names []string
+	for _, c := range g.table.Columns {
+		if c.Name != g.nowColumn {
+			names = append(names, c.Name)
+		}
+	}
+	return names
+}
+
+// parentSchema is a table that the table of the case references: a primary key of one or two
+// columns, mostly bigint, so that the referencing values match it often, and now and then a
+// unique constraint.
+func (g *gen) parentSchema() {
+	t := &ast.CreateTable{Name: parentName}
+	g.table = t
+	for i := range g.draw(1, 3) {
+		typ := value.Int
+		if i > 0 || g.rarely(4) {
+			typ = pick(g, []value.Type{value.Int, value.Bool, value.String})
+		}
+		name := fmt.Sprint("c", i)
+		t.Columns = append(t.Columns, ast.ColumnDef{Name: name, Type: typ, NotNull: g.rarely(4)})
+		g.cols[typ] = append(g.cols[typ], name)
+	}
+	t.PrimaryKey = []string{"c0"}
+	if len(t.Columns) > 1 && g.rarely(3) {
+		t.PrimaryKey = append(t.PrimaryKey, "c1")
+	}
+	if len(t.Columns) > 1 && g.rarely(3) {
+		u := ast.UniqueConstraint{Columns: []string{t.Columns[len(t.Columns)-1].Name}}
+		t.Unique = append(t.Unique, u)
+	}
+	if g.rarely(5) {
+		g.table.Checks = append(g.table.Checks, ast.CheckConstraint{Expr: g.check()})
+	}
+	g.indexed = [][]string{t.PrimaryKey}
+	for _, u := range t.Unique {
+		g.indexed = append(g.indexed, u.Columns)
+	}
+}
+
+// constraints adds defaults, a column whose default is now(), CHECK constraints, and foreign
+// keys, to the parent table and to the table itself.
+func (g *gen) constraints() {
+	t := g.table
+	for i, c := range t.Columns {
+		if !g.isKey(c.Name) && g.rarely(4) {
+			t.Columns[i].Default = g.literal(c.Type)
+		}
+	}
+	if g.rarely(3) {
+		g.nowColumn = "ts"
+		def := pick(g, []ast.Expr{&ast.Call{Name: "now"}, &ast.Call{Name: "current_timestamp", Keyword: true}, &ast.Call{Name: "transaction_timestamp"}})
+		t.Columns = append(t.Columns, ast.ColumnDef{Name: g.nowColumn, Type: value.Time, NotNull: g.rarely(3), Default: def})
+	}
+	for range g.draw(0, 2) {
+		if !g.rarely(3) {
+			break
+		}
+		c := ast.CheckConstraint{Expr: g.check()}
+		if g.rarely(4) {
+			c.Name = fmt.Sprint("k", 3+len(t.Checks))
+		}
+		t.Checks = append(t.Checks, c)
+	}
+	if g.parent != nil {
+		if fk, ok := g.foreignKey(g.parent); ok {
+			t.ForeignKeys = append(t.ForeignKeys, fk)
+		}
+	}
+	if len(t.PrimaryKey) == 1 && g.rarely(3) {
+		if fk, ok := g.foreignKey(g); ok {
+			t.ForeignKeys = append(t.ForeignKeys, fk)
+		}
+	}
+}
+
+// check is the expression of a CHECK constraint, which mostly cannot fail, because the outcome
+// of one that fails depends on its row, and one whose constant part fails is not supported.
+func (g *gen) check() ast.Expr {
+	return g.expr(value.Bool, scope{columns: true, safe: !g.rarely(4), null: true}, 1)
+}
+
+// foreignKey of the table to the primary key of the table of p, or to a unique constraint of it,
+// on columns of the same types, which it adds where the table has none, with random actions. It
+// reports false when the referenced columns have a type that a foreign key cannot have.
+func (g *gen) foreignKey(p *gen) (ast.ForeignKey, bool) {
+	fk := ast.ForeignKey{Table: p.table.Name}
+	ref := p.table.PrimaryKey
+	if len(p.table.Unique) > 0 && g.bool() {
+		ref = p.table.Unique[0].Columns
+		fk.RefColumns = ref
+	}
+	for _, r := range ref {
+		typ := p.column(r).Type
+		if typ == value.Float {
+			return fk, false
+		}
+		var candidates []string
+		for _, name := range g.cols[typ] {
+			if !slices.Contains(fk.Columns, name) && (p != g || !slices.Contains(ref, name)) {
+				candidates = append(candidates, name)
+			}
+		}
+		if len(candidates) == 0 || g.rarely(4) {
+			name := fmt.Sprint("f", len(g.table.Columns))
+			g.table.Columns = append(g.table.Columns, ast.ColumnDef{Name: name, Type: typ})
+			g.cols[typ] = append(g.cols[typ], name)
+			candidates = []string{name}
+		}
+		fk.Columns = append(fk.Columns, pick(g, candidates))
+	}
+	if p != g && g.rarely(5) {
+		fk.RefColumns = ref
+	}
+	fk.OnDelete = ast.Action(g.draw(0, 4))
+	if (fk.OnDelete == ast.SetNull || fk.OnDelete == ast.SetDefault) && len(fk.Columns) > 1 && g.rarely(3) {
+		fk.SetColumns = fk.Columns[:1]
+	}
+	fk.OnUpdate = ast.Action(g.draw(0, 1))
+	if g.rarely(6) {
+		fk.Name = fmt.Sprint("k", 6+len(g.table.ForeignKeys))
+	}
+	return fk, true
 }
 
 // indexName for a new index, one of a few, so that names clash now and then, also with the
@@ -252,7 +410,7 @@ func (g *gen) indexName() string {
 
 // createIndex of one or two columns, with a name or without.
 func (g *gen) createIndex() *ast.CreateIndex {
-	ci := &ast.CreateIndex{Table: tableName, Unique: g.bool(), NullsNotDistinct: g.rarely(5)}
+	ci := &ast.CreateIndex{Table: g.table.Name, Unique: g.bool(), NullsNotDistinct: g.rarely(5)}
 	if g.rarely(20) {
 		ci.Table = pick(g, []string{"nope", "t_pkey"})
 	}
@@ -588,10 +746,15 @@ func (g *gen) anyType() value.Type {
 	return pick(g, allTypes)
 }
 
-// row of literal values for every column, respecting NOT NULL most of the time.
+// row of literal values for every column, respecting NOT NULL most of the time, with DEFAULT for
+// the column whose default is now() and now and then for another column.
 func (g *gen) row() []ast.Expr {
 	row := make([]ast.Expr, len(g.table.Columns))
 	for i, c := range g.table.Columns {
+		if c.Name == g.nowColumn && !g.rarely(8) || c.Default != nil && g.rarely(3) || g.rarely(40) {
+			row[i] = &ast.Default{}
+			continue
+		}
 		if !c.NotNull && !g.isKey(c.Name) && g.draw(0, 4) == 0 {
 			row[i] = &ast.Literal{Value: value.NewNull(value.Unknown)}
 			continue
@@ -607,10 +770,11 @@ func (g *gen) row() []ast.Expr {
 }
 
 func (g *gen) insert(n int) *ast.Insert {
-	ins := &ast.Insert{Table: tableName}
+	ins := &ast.Insert{Table: g.table.Name}
 	seen := map[string]bool{}
 	for range max(n, 1) {
 		row := g.row()
+		g.references(row)
 		// Rows mostly get distinct keys, so that inserts mostly succeed.
 		key := g.rowKey(row)
 		for try := 0; seen[key] && try < 3; try++ {
@@ -619,8 +783,31 @@ func (g *gen) insert(n int) *ast.Insert {
 		}
 		seen[key] = true
 		ins.Rows = append(ins.Rows, row)
+		g.rows = append(g.rows, row)
 	}
 	return ins
+}
+
+// references gives the columns of each foreign key of the table, most of the time, the values of
+// a row that an earlier INSERT of the referenced table wrote, so that the reference mostly holds.
+func (g *gen) references(row []ast.Expr) {
+	for _, fk := range g.table.ForeignKeys {
+		ref := g
+		if fk.Table == parentName {
+			ref = g.parent
+		}
+		if len(ref.rows) == 0 || g.rarely(4) {
+			continue
+		}
+		refColumns := fk.RefColumns
+		if len(refColumns) == 0 {
+			refColumns = ref.table.PrimaryKey
+		}
+		from := pick(g, ref.rows)
+		for i, c := range fk.Columns {
+			row[g.indexOf(c)] = from[ref.indexOf(refColumns[i])]
+		}
+	}
 }
 
 // rowKey renders the key columns of a row of literals.
@@ -724,6 +911,18 @@ func (g *gen) indexOf(name string) int {
 }
 
 func (g *gen) statement() ast.Statement {
+	if g.parent != nil && g.rarely(3) {
+		// A write of the referenced table, whose foreign key checks and actions act on this
+		// one.
+		switch g.draw(0, 2) {
+		case 0:
+			return g.parent.insert(g.draw(1, 3))
+		case 1:
+			return g.parent.update()
+		default:
+			return &ast.Delete{Table: parentName, Where: g.parent.where(scope{columns: true})}
+		}
+	}
 	if g.rarely(8) {
 		if len(g.indexes) > 0 && g.rarely(3) || g.rarely(6) {
 			return g.dropIndex()
@@ -734,44 +933,67 @@ func (g *gen) statement() ast.Statement {
 	case 0:
 		return g.insert(g.draw(1, 3))
 	case 1:
-		u := &ast.Update{Table: tableName}
-		var nonKey []string
-		for _, c := range g.table.Columns {
-			if !g.isKey(c.Name) {
-				nonKey = append(nonKey, c.Name)
-			}
-		}
-		targets := nonKey
-		if len(nonKey) == 0 || g.rarely(5) {
-			// An update of key columns, whose outcome may depend on the order of the rows.
-			targets = g.table.PrimaryKey
-		}
-		seen := map[string]bool{}
-		for range g.draw(1, 2) {
-			name := pick(g, targets)
-			if seen[name] {
-				continue
-			}
-			seen[name] = true
-			u.Set = append(u.Set, ast.Assignment{Column: name, Value: g.expr(g.column(name).Type, scope{columns: true, null: !g.isKey(name)}, 0)})
-		}
-		u.Where = g.where(scope{columns: true})
-		return u
+		return g.update()
 	case 2:
-		return &ast.Delete{Table: tableName, Where: g.where(scope{columns: true})}
+		return &ast.Delete{Table: g.table.Name, Where: g.where(scope{columns: true})}
 	default:
 		return g.selectStmt()
 	}
 }
 
+// update of one or two columns, mostly not of the key.
+func (g *gen) update() *ast.Update {
+	u := &ast.Update{Table: g.table.Name}
+	var nonKey []string
+	for _, name := range g.columnNames() {
+		if !g.isKey(name) {
+			nonKey = append(nonKey, name)
+		}
+	}
+	targets := nonKey
+	// The referenced table updates its key more often, which its foreign keys check.
+	if len(nonKey) == 0 || g.rarely(5) || g.table.Name == parentName && g.bool() {
+		// An update of key columns, whose outcome may depend on the order of the rows.
+		targets = g.table.PrimaryKey
+	}
+	seen := map[string]bool{}
+	for range g.draw(1, 2) {
+		name := pick(g, targets)
+		if seen[name] {
+			continue
+		}
+		seen[name] = true
+		var e ast.Expr = &ast.Default{}
+		if !g.rarely(8) {
+			e = g.expr(g.column(name).Type, scope{columns: true, null: !g.isKey(name)}, 0)
+		}
+		u.Set = append(u.Set, ast.Assignment{Column: name, Value: e})
+	}
+	if g.nowColumn != "" && g.rarely(6) {
+		u.Set = append(u.Set, ast.Assignment{Column: g.nowColumn, Value: &ast.Default{}})
+	}
+	u.Where = g.where(scope{columns: true})
+	return u
+}
+
 func (g *gen) selectStmt() *ast.Select {
-	s := &ast.Select{From: tableName}
+	s := &ast.Select{From: g.table.Name}
 	limited := g.draw(0, 2) == 0
 	sc := scope{columns: true, safe: limited && !g.rarely(8)}
 	n := g.draw(1, 3)
 	for i := range n {
 		if g.draw(0, 3) == 0 {
-			s.Items = append(s.Items, ast.SelectItem{Star: true})
+			if g.nowColumn == "" {
+				s.Items = append(s.Items, ast.SelectItem{Star: true})
+				continue
+			}
+			// The values of the column whose default is now() differ between the databases, so
+			// they are only compared with now().
+			s.Items = append(s.Items, ast.SelectItem{Expr: &ast.Binary{Op: pick(g, []ast.BinaryOp{ast.Le, ast.Eq}), Left: &ast.ColumnRef{Name: g.nowColumn}, Right: &ast.Call{Name: "now"}}})
+			continue
+		}
+		if g.rarely(30) {
+			s.Items = append(s.Items, ast.SelectItem{Expr: &ast.Binary{Op: ast.Eq, Left: &ast.Call{Name: "now"}, Right: pick(g, []ast.Expr{&ast.Call{Name: "current_timestamp", Keyword: true}, &ast.Call{Name: "transaction_timestamp"}, &ast.Call{Name: "now"}})}})
 			continue
 		}
 		item := ast.SelectItem{Expr: g.expr(g.anyType(), sc.withNull(true), 0)}
@@ -787,7 +1009,7 @@ func (g *gen) selectStmt() *ast.Select {
 		case 0:
 			o.Expr = &ast.Literal{Value: value.NewInt4(int32(g.draw(1, g.outputs(s))))}
 		case 1:
-			o.Expr = &ast.ColumnRef{Name: g.table.Columns[g.draw(0, len(g.table.Columns)-1)].Name}
+			o.Expr = &ast.ColumnRef{Name: pick(g, g.columnNames())}
 		default:
 			o.Expr = g.expr(g.anyType(), sc, 1)
 		}
