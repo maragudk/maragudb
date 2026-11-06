@@ -13,19 +13,28 @@ import (
 
 // filter is a bound WHERE clause: its top-level conjuncts, which a row must all satisfy.
 //
-// Postgres evaluates the conjuncts of a WHERE clause in an order its planner picks, by
-// estimated cost and with equalities on constants last, and stops at the first that is not
-// true. When one conjunct fails on a row that another conjunct rejects, whether the statement
-// fails therefore depends on that order. The filter does not reproduce the order. It evaluates
-// the conjuncts in the order they are written, and when the outcome on a row would differ
-// between orders, it reports [errOrderDependent] instead, so that a statement it accepts gives
-// the same outcome as in Postgres in every order.
+// The filter behaves as Postgres does when it scans the table through its primary key index,
+// which it does whenever a conjunct can use the index and sequential scans are off: the index
+// conditions select the rows, and Postgres evaluates the other conjuncts only on those. A row
+// that an index condition rejects is skipped, whatever the other conjuncts would do on it.
+//
+// Postgres evaluates the other conjuncts in an order its planner picks, by estimated cost and
+// with equalities on constants last, and stops at the first that is not true. When one
+// conjunct fails on a row that another conjunct rejects, whether the statement fails therefore
+// depends on that order. The filter does not reproduce the order. It evaluates the conjuncts in
+// the order they are written, and when the outcome on a row would differ between orders, it
+// reports [errOrderDependent] instead, so that a statement it accepts gives the same outcome as
+// in Postgres in every order.
 type filter struct {
 	conds []*cexpr
 	// conjuncts are the conditions as written, for messages.
 	conjuncts []ast.Expr
 	// fallible is set when a conjunct can fail on a row.
 	fallible bool
+	// index are the conditions that Postgres uses as conditions of the scan of the primary key
+	// index, from [binder.indexCondition] and [binder.impliedIndexConditions]. None of them can
+	// fail.
+	index []*cexpr
 	// implied are equalities that follow from the equalities among the conjuncts, which
 	// Postgres's planner derives through its equivalence classes and may evaluate instead of
 	// the written ones. They never change which rows match, but one of them can reject a row on
@@ -38,8 +47,8 @@ type filter struct {
 	// contain a stable function. Postgres evaluates them once, when the statement runs, before it
 	// reads any row.
 	gates []*cexpr
-	// keyed are the conjuncts that compare a primary key column with a constant, which narrow
-	// the scan.
+	// keyed are the index conditions that compare a primary key column with a constant, which
+	// narrow the scan.
 	keyed []keyed
 	// unsupported is set when the outcome of the clause depends on the plan Postgres picks. It is
 	// reported only after the whole statement is bound and folded, so that an error that
@@ -236,6 +245,10 @@ func (b *binder) where(e ast.Expr) (filter, error) {
 		f.conds = append(f.conds, c.ce)
 		f.conjuncts = append(f.conjuncts, c.expr)
 		f.fallible = f.fallible || c.ce.fallible
+		if !b.indexCondition(c) {
+			continue
+		}
+		f.index = append(f.index, c.ce)
 		if k, ok, err := b.keyComparison(c.expr); err != nil {
 			return filter{}, err
 		} else if ok && k.known {
@@ -246,7 +259,13 @@ func (b *binder) where(e ast.Expr) (filter, error) {
 	if err != nil {
 		return filter{}, err
 	}
-	f.unsupported = b.planIndependent(clauses, classes)
+	index, keyed, err := b.impliedIndexConditions(classes)
+	if err != nil {
+		return filter{}, err
+	}
+	f.index = append(f.index, index...)
+	f.keyed = append(f.keyed, keyed...)
+	f.unsupported = b.infallibleIndexConditions(clauses)
 	if f.fallible {
 		if f.implied, err = b.implied(classes); err != nil {
 			return filter{}, err
@@ -344,57 +363,102 @@ func (b *binder) implied(classes [][]*member) ([]*cexpr, error) {
 	return out, nil
 }
 
-// planIndependent checks that the outcome of a WHERE clause cannot depend on whether Postgres
-// scans the table or uses the primary key index. An index scan evaluates the other conditions
-// only on the rows that the conditions on primary key columns find, so a condition that can fail
-// on a row may never see that row in one plan and fail on it in another. The conditions on key
-// columns include those that Postgres derives from equalities, such as id = 5 from id = n and
-// n = 5.
-func (b *binder) planIndependent(clauses []clause, classes [][]*member) error {
-	var keyCond string
+// infallibleIndexConditions checks that no conjunct that Postgres could take as a condition of
+// the scan of the primary key index can fail. Such a condition is evaluated on the rows of the
+// index, and in a form that Postgres derives from it: for a LIKE with a fixed prefix, a range of
+// the prefix, or an equality when the pattern has no wildcard. Which rows it fails on then
+// depends on that form, and the LIKE itself is evaluated on fewer rows than [filter.matches]
+// would evaluate it on.
+func (b *binder) infallibleIndexConditions(clauses []clause) error {
 	for _, c := range clauses {
-		if b.indexable(c.expr) {
-			if c.ce.fallible {
-				return fmt.Errorf("%w: whether %s fails depends on the plan Postgres picks, because an index scan evaluates it only on the rows the primary key index finds; write the pattern without a trailing escape character, or compare the column as an expression", ErrUnsupported, ast.RenderExpr(c.expr))
-			}
-			if keyCond == "" {
-				keyCond = ast.RenderExpr(c.expr)
-			}
-		}
-	}
-	if keyCond == "" {
-		keyCond = b.impliedKeyCondition(classes)
-	}
-	if keyCond == "" {
-		return nil
-	}
-	for _, c := range clauses {
-		if c.ce.fallible {
-			return fmt.Errorf("%w: whether %s fails depends on the plan Postgres picks, because an index scan evaluates it only on the rows that the primary key condition %s finds, and a sequential scan on every row; write CASE WHEN %s THEN %s END",
-				ErrUnsupported, ast.RenderExpr(c.expr), keyCond, keyCond, ast.RenderExpr(c.expr))
+		if c.ce.fallible && b.indexable(c.expr) {
+			return fmt.Errorf("%w: whether %s fails depends on the plan Postgres picks, because an index scan evaluates it only on the rows the primary key index finds; write the pattern without a trailing escape character, or compare the column as an expression", ErrUnsupported, ast.RenderExpr(c.expr))
 		}
 	}
 	return nil
 }
 
-// impliedKeyCondition returns an equality between a primary key column and a constant that
-// follows from the equivalence classes, or "" when there is none.
-func (b *binder) impliedKeyCondition(classes [][]*member) string {
+// indexCondition reports whether Postgres 18, with sequential scans off, always uses a conjunct
+// as a condition of its scan of the primary key index, so that it evaluates the other conjuncts
+// only on the rows the conjunct accepts. That is the case for a conjunct that cannot fail and is
+// one of:
+//   - a comparison with =, <, <=, >, or >= of any primary key column with an expression that
+//     reads no columns, compared in the column's own type, such as id = 1 or 5 < id;
+//   - an IN of such expressions on a key column, which is an array comparison, such as
+//     id IN (1, 2);
+//   - a boolean key column, or NOT of one, which Postgres takes as k = true and k = false.
+//
+// Postgres puts every such conjunct into the conditions of every scan it considers on the index,
+// a plain index scan, an index-only scan, or a bitmap scan, and with sequential scans off it
+// always picks one of those over the sequential scan. Other conjuncts that can use the index are
+// not always conditions of the scan, because the scan Postgres picks depends on costs: an OR of
+// key conditions is a bitmap OR, or for equalities on one column an array comparison, but may
+// also be checked on every row of an index scan in key order; and a LIKE is checked on the rows
+// of the range of its prefix. Those are evaluated like any other conjunct, which is never less
+// strict than Postgres, because a row that they reject is [errOrderDependent] when another
+// conjunct fails on it.
+func (b *binder) indexCondition(c clause) bool {
+	if c.ce.fallible {
+		return false
+	}
+	switch x := c.expr.(type) {
+	case *ast.Binary:
+		_, ok, err := b.keyComparison(x)
+		return err == nil && ok
+	case *ast.In:
+		return b.keyIn(x)
+	case *ast.ColumnRef:
+		return b.booleanKey(x)
+	case *ast.Unary:
+		return x.Op == ast.Not && b.booleanKey(x.Expr)
+	}
+	return false
+}
+
+// booleanKey reports whether e is a primary key column of type boolean.
+func (b *binder) booleanKey(e ast.Expr) bool {
+	col, ok := b.keyColumn(e)
+	return ok && b.table.Columns[col].Type == value.Bool
+}
+
+// impliedIndexConditions returns an equality between a primary key column and a constant for
+// every key column in an equivalence class that also has a constant, such as id = 5 from
+// id = n and n = 5. Postgres derives these equalities from the class, and takes them as
+// conditions of the scan of the primary key index. It also returns those whose constant is
+// known, to narrow the scan.
+func (b *binder) impliedIndexConditions(classes [][]*member) ([]*cexpr, []keyed, error) {
+	var index []*cexpr
+	var known []keyed
 	for _, class := range classes {
-		var col, constant *member
+		var constant *member
 		for _, m := range class {
-			if i, ok := b.keyColumn(m.expr); ok && m.ce.typ == b.table.Columns[i].Type && col == nil {
-				col = m
-			}
-			if !m.ce.refs && constant == nil {
+			if !m.ce.refs && !m.ce.fallible {
 				constant = m
+				break
 			}
 		}
-		if col != nil && constant != nil {
-			return ast.RenderExpr(&ast.Binary{Op: ast.Eq, Left: col.expr, Right: constant.expr})
+		if constant == nil {
+			continue
+		}
+		for _, m := range class {
+			col, ok := b.keyColumn(m.expr)
+			if !ok || m.ce.typ != b.table.Columns[col].Type {
+				continue
+			}
+			ce, err := b.bindPruned(&ast.Binary{Op: ast.Eq, Left: m.expr, Right: constant.expr})
+			if err != nil {
+				return nil, nil, err
+			}
+			if ce.fallible {
+				continue
+			}
+			index = append(index, ce)
+			if constant.ce.folded {
+				known = append(known, keyed{col: col, op: ast.Eq, k: constant.ce.val, known: true})
+			}
 		}
 	}
-	return ""
+	return index, known, nil
 }
 
 // indexable reports whether Postgres could evaluate a conjunct as a condition on the primary
@@ -409,23 +473,7 @@ func (b *binder) indexable(e ast.Expr) bool {
 		k, ok, err := b.keyComparison(e)
 		return err == nil && ok && (!k.known || !k.k.Null)
 	case *ast.In:
-		col, ok := b.keyColumn(x.Expr)
-		if !ok || x.Not {
-			return false
-		}
-		for _, item := range x.List {
-			if readsColumns(item) {
-				return false
-			}
-			ce, err := b.bindPruned(item)
-			if err != nil {
-				return false
-			}
-			if _, err := b.coerce(ce, b.table.Columns[col].Type); err != nil {
-				return false
-			}
-		}
-		return true
+		return b.keyIn(x)
 	case *ast.Like:
 		col, ok := b.keyColumn(x.Expr)
 		if !ok || b.table.Columns[col].Type != value.String {
@@ -441,6 +489,28 @@ func (b *binder) indexable(e ast.Expr) bool {
 		return exact || prefix != ""
 	}
 	return false
+}
+
+// keyIn reports whether e is an IN of expressions that read no columns on a primary key column,
+// compared in the column's own type, which Postgres compares with an array.
+func (b *binder) keyIn(e *ast.In) bool {
+	col, ok := b.keyColumn(e.Expr)
+	if !ok || e.Not {
+		return false
+	}
+	for _, item := range e.List {
+		if readsColumns(item) {
+			return false
+		}
+		ce, err := b.bindPruned(item)
+		if err != nil {
+			return false
+		}
+		if _, err := b.coerce(ce, b.table.Columns[col].Type); err != nil {
+			return false
+		}
+	}
+	return true
 }
 
 // keyColumn returns the index of the primary key column that e names, if it does.
@@ -584,15 +654,28 @@ func (t *table) plan(f filter) access {
 	return a
 }
 
-// matches reports whether a row satisfies every conjunct. When a conjunct fails on the row, the
-// error is the statement's only when every other conjunct holds or fails too, because Postgres
-// then fails on the row in every order; when another conjunct, or an equality that the
-// conjuncts imply, rejects the row, Postgres may evaluate that one first and skip the row, so
-// the error is [errOrderDependent]. Likewise, a row that a conjunct rejects is
-// [errOrderDependent] when a later conjunct would fail on it.
+// matches reports whether a row satisfies every conjunct. A row that an index condition rejects
+// does not match, and no other conjunct is evaluated on it, because Postgres never reads it.
+// When a conjunct fails on the row, the error is the statement's only when every other
+// conjunct holds or fails too, because Postgres then fails on the row in every order; when
+// another conjunct, or an equality that the conjuncts imply, rejects the row, Postgres may
+// evaluate that one first and skip the row, so the error is [errOrderDependent]. Likewise, a
+// row that a conjunct rejects is [errOrderDependent] when a later conjunct would fail on it.
 func (f filter) matches(row []value.Value) (bool, error) {
 	if f.never {
 		return false, nil
+	}
+	if f.fallible {
+		// Without a conjunct that can fail, the index conditions are evaluated with the rest.
+		for _, c := range f.index {
+			v, err := c.value(row)
+			if err != nil {
+				return false, err
+			}
+			if v.Null || !v.B {
+				return false, nil
+			}
+		}
 	}
 	for i, c := range f.conds {
 		v, err := c.value(row)

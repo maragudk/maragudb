@@ -500,8 +500,8 @@ func TestSession_Select(t *testing.T) {
 		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT NULL BETWEEN 1 AND 1 / 0"))
 	})
 
-	t.Run("accepts a WHERE clause only when its outcome is the same in every order and plan Postgres could pick", func(t *testing.T) {
-		verify.Covers(t, "a WHERE clause whose outcome on a row depends on the order Postgres evaluates its conditions in, including the equalities its equivalence classes imply, is ErrUnsupported, and so is a condition that can fail next to a primary key condition that an index scan could use; every other WHERE clause fails exactly when Postgres fails in every order", "INV-PG-SUBSET", "UNS-ORDER-DEPENDENT-WHERE", "UNS-PLAN-DEPENDENT-WHERE")
+	t.Run("accepts a WHERE clause only when its outcome is the same in every order Postgres could pick on the rows its primary key index selects", func(t *testing.T) {
+		verify.Covers(t, "a WHERE clause whose outcome on a row depends on the order Postgres evaluates its conditions in, including the equalities its equivalence classes imply, is ErrUnsupported, and so is a LIKE on a key column that can fail; the other conditions are evaluated only on the rows that the primary key conditions select, and every other WHERE clause fails exactly when Postgres fails in every order", "INV-PG-SUBSET", "UNS-ORDER-DEPENDENT-WHERE", "UNS-PLAN-DEPENDENT-WHERE")
 		s := newSession(t)
 		mustExec(t, s, "CREATE TABLE w (id bigint PRIMARY KEY, n bigint, m bigint, s text)")
 		mustExec(t, s, "INSERT INTO w VALUES (1, 1, 0, 'a'), (2, 7, 5, 'b\\'), (3, 9223372036854775806, 5, 'c')")
@@ -517,17 +517,11 @@ func TestSession_Select(t *testing.T) {
 			// The equivalence class of n = 1 / m and 1 / m = 7 implies n = 7, which rejects the row
 			// where 1 / m fails.
 			"SELECT id FROM w WHERE n = 1 / m AND 1 / m = 7",
-			// An index scan would evaluate the condition that can fail on fewer rows.
-			"SELECT id FROM w WHERE id = 2 AND 1 / m = 1",
-			"SELECT id FROM w WHERE id > 1 AND 1 / m = 0",
-			"SELECT id FROM w WHERE NOT (id <= 1) AND 1 / m = 0",
-			"SELECT id FROM w WHERE id IN (2, 3) AND 1 / m = 0",
-			"SELECT id FROM w WHERE (id = 1 OR id = 2) AND 1 / m = 1",
-			"SELECT id FROM w WHERE id = n AND n = 2 AND 1 / m = 1",
-			"SELECT id FROM w WHERE s LIKE s AND id > 1",
-			"UPDATE w SET n = 1 WHERE s LIKE s AND id > 1",
-			"DELETE FROM w WHERE s LIKE s AND id > 1",
-			"SELECT m FROM w WHERE s LIKE 'b\\' AND id = 1",
+			// An OR of key conditions is no index condition, so it rejects a row like any other
+			// condition, also when Postgres would never read the row.
+			"SELECT id FROM w WHERE (id = 2 OR id = 3) AND 1 / m = 0",
+			// A key column in an expression is no index condition either.
+			"SELECT id FROM w WHERE id + 0 > 1 AND 1 / m = 0",
 		} {
 			err := queryErr(t, s, sql)
 			is.Error(t, exec.ErrUnsupported, err, sql)
@@ -536,8 +530,46 @@ func TestSession_Select(t *testing.T) {
 		mustExec(t, s, "CREATE TABLE wk (s text PRIMARY KEY, m bigint)")
 		mustExec(t, s, "INSERT INTO wk VALUES ('a', 0), ('b', 5)")
 		is.Error(t, exec.ErrUnsupported, queryErr(t, s, "SELECT s FROM wk WHERE s LIKE 'b\\'"), "a LIKE that can fail is an index condition itself")
-		is.Error(t, exec.ErrUnsupported, queryErr(t, s, "SELECT s FROM wk WHERE s LIKE s AND s LIKE 'b%'"))
+		is.Equal(t, `"b"`, query(t, s, "SELECT s FROM wk WHERE s LIKE s AND s LIKE 'b%'"), "a LIKE with a prefix is no index condition, but evaluated like any other")
 		is.Equal(t, "a\nb", strings.ReplaceAll(query(t, s, "SELECT s FROM wk WHERE s LIKE s"), `"`, ""), "a LIKE whose pattern is not a constant is no index condition")
+
+		// The conditions on the primary key select the rows, and the others are evaluated only on
+		// those, as in an index scan.
+		for sql, want := range map[string]string{
+			"SELECT id FROM w WHERE id = 2 AND 1 / m = 0":                  "2",
+			"SELECT id FROM w WHERE 1 / m = 0 AND id = 2":                  "2",
+			"SELECT id FROM w WHERE 2 = id AND 1 / m = 1":                  "",
+			"SELECT id FROM w WHERE id > 1 AND 1 / m = 0":                  "2\n3",
+			"SELECT id FROM w WHERE NOT (id <= 1) AND 1 / m = 0":           "2\n3",
+			"SELECT id FROM w WHERE id BETWEEN 2 AND 3 AND 1 / m = 0":      "2\n3",
+			"SELECT id FROM w WHERE id IN (2, 3) AND 1 / m = 0":            "2\n3",
+			"SELECT id FROM w WHERE id IN (2, 3) AND id < 3 AND 1 / m = 0": "2",
+			"SELECT id FROM w WHERE id = n AND n = 2 AND 1 / m = 1":        "",
+			"SELECT id FROM w WHERE n = id AND id = m - 3 AND m - 3 = 2":   "",
+			"SELECT id FROM w WHERE id = 2 AND id = 3 AND 1 / m = 1":       "",
+			"SELECT id FROM w WHERE id < 1 AND n * 2 > 0":                  "",
+			"SELECT m FROM w WHERE s LIKE 'b\\' AND id = 1":                "",
+		} {
+			is.Equal(t, want, query(t, s, sql), sql)
+		}
+		is.Error(t, exec.ErrInvalid, queryErr(t, s, "SELECT id FROM w WHERE s LIKE s AND id > 1"), "a condition fails on a row that the key selects")
+		is.Error(t, exec.ErrInvalid, queryErr(t, s, "UPDATE w SET n = 1 WHERE s LIKE s AND id > 1"))
+		is.Error(t, exec.ErrInvalid, queryErr(t, s, "DELETE FROM w WHERE s LIKE s AND id IN (1, 2)"))
+		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT id FROM w WHERE (id = 1 OR id = 2) AND 1 / m = 1"), "a row that an OR selects fails in every order")
+		is.Error(t, exec.ErrOutOfRange, queryErr(t, s, "SELECT id FROM w WHERE id = 3 AND n * 2 > 0"))
+		is.Equal(t, int64(1), mustExec(t, s, "UPDATE w SET n = n - $1 WHERE id = $2 AND n - $1 >= 0", int64(7), int64(2)).RowsAffected)
+		is.Equal(t, int64(0), mustExec(t, s, "UPDATE w SET n = n - $1 WHERE id = $2 AND n - $1 >= 0", int64(7), int64(2)).RowsAffected, "the balance is too low now")
+		is.Equal(t, int64(0), mustExec(t, s, "UPDATE w SET n = n + $1 WHERE id = $2 AND n + $1 > 0", int64(7), int64(4)).RowsAffected, "no row has the key")
+		mustExec(t, s, "UPDATE w SET n = 7 WHERE id = 2")
+		mustExec(t, s, "CREATE TABLE wb (k boolean PRIMARY KEY, m bigint)")
+		mustExec(t, s, "INSERT INTO wb VALUES (TRUE, 5), (FALSE, 0)")
+		is.Equal(t, "5", query(t, s, "SELECT m FROM wb WHERE k AND 1 / m = 0"), "a boolean key column is an index condition")
+		is.Equal(t, "", query(t, s, "SELECT m FROM wb WHERE NOT k AND 1 / (m - 5) = 1"), "and so is its negation")
+		mustExec(t, s, "CREATE TABLE wab (a bigint, b bigint, m bigint, PRIMARY KEY (a, b))")
+		mustExec(t, s, "INSERT INTO wab VALUES (1, 1, 5), (1, 2, 0), (2, 1, 5), (2, 2, 0)")
+		is.Equal(t, "1 1\n2 1", query(t, s, "SELECT a, b FROM wab WHERE b = 1 AND 1 / m = 0"), "a condition on a later key column is an index condition too")
+		is.Equal(t, "2 1", query(t, s, "SELECT a, b FROM wab WHERE a > 1 AND b < 2 AND 1 / m = 0"))
+		is.Equal(t, "1 1", query(t, s, "SELECT a, b FROM wab WHERE a = b AND b = 1 AND 1 / m = 0"))
 
 		is.Equal(t, "", query(t, s, "SELECT id FROM w WHERE CASE WHEN m <> 0 THEN 1 / m = 1 END"), "CASE fixes the order")
 		is.Equal(t, "2", query(t, s, "SELECT id FROM w WHERE id = 2 AND n = 7"), "conditions that cannot fail combine freely")
@@ -546,6 +578,7 @@ func TestSession_Select(t *testing.T) {
 		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT id FROM w WHERE n = 1 AND m = 0 AND 1 / m = 1"))
 		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT id FROM w WHERE n = 1 / m AND 1 / m = 1"), "the implied n = 1 holds on the failing row")
 		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT id FROM w WHERE id + 0 >= 1 AND 1 / m = 0"), "a key column in an expression is no index condition")
+		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "SELECT id FROM w WHERE id::float8 >= 1 AND 1 / m = 0"), "nor is a key column compared in another type")
 		is.Error(t, exec.ErrOutOfRange, queryErr(t, s, "SELECT id FROM w WHERE n * 2 = 0"), "a single condition is evaluated on every row")
 		is.Error(t, exec.ErrInvalid, queryErr(t, s, "SELECT id FROM w WHERE s LIKE 'b\\'"), "a trailing escape on a column that is not a key is evaluated like any other condition")
 		is.Error(t, exec.ErrOutOfRange, queryErr(t, s, "SELECT id FROM w WHERE m <> 0 AND 1 / m >= 0 AND n * 2 > 0"), "a row that fails in every order wins over an earlier row whose outcome depends on the order")

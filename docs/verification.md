@@ -13,7 +13,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - 30 acceptance criteria (`AC-`), 20 key invariants (`INV-`), 17 classes of unsupported statements (`UNS-`), and 0 remaining differences from Postgres (`DEV-`), each verified by at least one test.
 - 8 mutants (`MUT-`), deliberate bugs, of which 7 are detected by the simulator's checkers within 20 seeds.
 - 13 interesting states (`STATE-`) that the simulator's fixed corpus must reach.
-- 136 declarations of coverage in the tests.
+- 137 declarations of coverage in the tests.
 
 ## Acceptance criteria
 
@@ -137,6 +137,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 - `internal/pgdiff` `TestDifferential/generated_statements_give_the_same_results_on_Postgres_and_maragudb`: hegel-generated schemas, rows, transactions, and statements, written once as Postgres SQL, give the same results, column names, affected-row counts, and transaction states on both sides, ordered exactly when ORDER BY decides the order and as multisets otherwise, and fail on both sides with the same error class, except for statements that maragudb rejects as unsupported, which Postgres skips
 - `internal/pgdiff` `TestErrorClasses`: every maragudb error class fails with its mapped SQLSTATE code on Postgres for the same statement
+- `internal/pgdiff` `TestIndexConditions/evaluates_the_other_conditions_only_on_the_rows_that_the_primary_key_conditions_select,_as_Postgres_does_with_an_index_scan`: with sequential scans off, Postgres evaluates the other WHERE conditions only on the rows that the conditions on the primary key index select: comparisons and IN of constants on any key column, a boolean key column, and key equalities implied by equalities with a constant; maragudb accepts such statements and gives the same results
 - `internal/pgdiff` `TestRunner_Run/reports_errors_of_different_classes_as_a_mismatch`: a statement that fails on both sides for different reasons is a mismatch
 
 ### `AC-4.4`
@@ -379,9 +380,10 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `.` `TestTx/a_statement_that_does_not_parse_aborts_the_transaction,_as_in_Postgres`: a syntax error or an unsupported statement in an explicit transaction aborts it, so a later commit rolls everything back
 - `internal/pgdiff` `TestCasts/every_value_casts_to_every_type_the_same_as_Postgres,_or_is_rejected_as_unsupported`: hegel-drawn values of every supported type, and integer and numeric literals, cast to every supported type and back to text with the same result or error class as Postgres, unless maragudb rejects the cast as unsupported
 - `internal/pgdiff` `TestCasts/text_casts_to_every_type,_and_back_to_text,_the_same_as_Postgres,_or_are_rejected_as_unsupported`: hegel-drawn text near valid input for bigint, double precision, boolean, bytea, and timestamptz casts to the type and back to text with the same result or the same error class as Postgres, unless maragudb rejects it as unsupported
+- `internal/pgdiff` `TestIndexConditions/evaluates_the_other_conditions_only_on_the_rows_that_the_primary_key_conditions_select,_as_Postgres_does_with_an_index_scan`: with sequential scans off, Postgres evaluates the other WHERE conditions only on the rows that the conditions on the primary key index select: comparisons and IN of constants on any key column, a boolean key column, and key equalities implied by equalities with a constant; maragudb accepts such statements and gives the same results
 - `internal/pgdiff` `TestParameters/a_parameter_of_every_Go_type_in_every_context_gives_the_same_result_as_Postgres_with_pgx,_or_is_rejected_as_unsupported`: hegel-drawn Go values bound as parameters in contexts that infer different types give the same result or error class as Postgres with pgx, or fail on both when pgx refuses to encode them, unless maragudb rejects them as unsupported
 - `internal/sql/exec` `TestSession_Insert/applies_Postgres's_assignment_casts`: an INSERT applies the assignment casts Postgres has: a quoted literal as the column's type, numeric and float literals rounded into bigint, integers widened to double precision, and any value written into text
-- `internal/sql/exec` `TestSession_Select/accepts_a_WHERE_clause_only_when_its_outcome_is_the_same_in_every_order_and_plan_Postgres_could_pick`: a WHERE clause whose outcome on a row depends on the order Postgres evaluates its conditions in, including the equalities its equivalence classes imply, is ErrUnsupported, and so is a condition that can fail next to a primary key condition that an index scan could use; every other WHERE clause fails exactly when Postgres fails in every order
+- `internal/sql/exec` `TestSession_Select/accepts_a_WHERE_clause_only_when_its_outcome_is_the_same_in_every_order_Postgres_could_pick_on_the_rows_its_primary_key_index_selects`: a WHERE clause whose outcome on a row depends on the order Postgres evaluates its conditions in, including the equalities its equivalence classes imply, is ErrUnsupported, and so is a LIKE on a key column that can fail; the other conditions are evaluated only on the rows that the primary key conditions select, and every other WHERE clause fails exactly when Postgres fails in every order
 - `internal/sql/exec` `TestSession_Select/does_not_fold_the_stable_conversions_between_timestamptz_and_text,_as_Postgres_does_not,_and_rejects_one_that_can_fail`: a conversion between timestamptz and text is evaluated when the statement runs, so a CASE does not prune on it and a WHERE condition on it is evaluated once before rows are read, and one without columns that can fail is ErrUnsupported
 - `internal/sql/exec` `TestSession_Select/evaluates_expressions_like_Postgres`: expressions evaluate as in Postgres: integer literals are 32-bit, numeric literals adapt to double precision, quoted literals take the type their context demands, || writes any type next to text, and casts use Postgres's text formats
 - `internal/sql/exec` `TestSession_Select/follows_Postgres_in_the_details_of_analysis`: an IN whose constant elements have no common type compares them one at a time, a CASE operand of unknown type is text, +1 in ORDER BY is no position, ORDER BY a name is ambiguous only between different expressions, and a read-only transaction reports analysis errors before it refuses a write
@@ -506,17 +508,17 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 ### `UNS-PLAN-DEPENDENT-WHERE`
 
-> A condition that can fail next to a primary key condition.
+> A LIKE on a key column whose pattern can fail.
 
-- `internal/pgdiff` `TestUnsupported/UNS-PLAN-DEPENDENT-WHERE_a_condition_that_can_fail_next_to_a_primary_key_condition`: a WHERE condition that can fail next to a condition an index scan on the primary key could use, or a LIKE on a key column that can fail, is rejected, and Postgres accepts it when no row fails
-- `internal/sql/exec` `TestSession_Select/accepts_a_WHERE_clause_only_when_its_outcome_is_the_same_in_every_order_and_plan_Postgres_could_pick`: a WHERE clause whose outcome on a row depends on the order Postgres evaluates its conditions in, including the equalities its equivalence classes imply, is ErrUnsupported, and so is a condition that can fail next to a primary key condition that an index scan could use; every other WHERE clause fails exactly when Postgres fails in every order
+- `internal/pgdiff` `TestUnsupported/UNS-PLAN-DEPENDENT-WHERE_a_LIKE_on_a_key_column_whose_pattern_can_fail`: a LIKE on a primary key column whose pattern can fail is rejected, because Postgres scans the index for its prefix and evaluates it only on those rows, and Postgres accepts it when no row there fails
+- `internal/sql/exec` `TestSession_Select/accepts_a_WHERE_clause_only_when_its_outcome_is_the_same_in_every_order_Postgres_could_pick_on_the_rows_its_primary_key_index_selects`: a WHERE clause whose outcome on a row depends on the order Postgres evaluates its conditions in, including the equalities its equivalence classes imply, is ErrUnsupported, and so is a LIKE on a key column that can fail; the other conditions are evaluated only on the rows that the primary key conditions select, and every other WHERE clause fails exactly when Postgres fails in every order
 
 ### `UNS-ORDER-DEPENDENT-WHERE`
 
 > A condition that fails on a row that another condition rejects.
 
 - `internal/pgdiff` `TestUnsupported/UNS-ORDER-DEPENDENT-WHERE_a_condition_that_fails_on_a_row_that_another_condition_rejects`: a WHERE clause with a condition that fails on a row that another condition rejects is rejected, because whether Postgres fails depends on the order it picks, and Postgres accepts it in the order it picks here
-- `internal/sql/exec` `TestSession_Select/accepts_a_WHERE_clause_only_when_its_outcome_is_the_same_in_every_order_and_plan_Postgres_could_pick`: a WHERE clause whose outcome on a row depends on the order Postgres evaluates its conditions in, including the equalities its equivalence classes imply, is ErrUnsupported, and so is a condition that can fail next to a primary key condition that an index scan could use; every other WHERE clause fails exactly when Postgres fails in every order
+- `internal/sql/exec` `TestSession_Select/accepts_a_WHERE_clause_only_when_its_outcome_is_the_same_in_every_order_Postgres_could_pick_on_the_rows_its_primary_key_index_selects`: a WHERE clause whose outcome on a row depends on the order Postgres evaluates its conditions in, including the equalities its equivalence classes imply, is ErrUnsupported, and so is a LIKE on a key column that can fail; the other conditions are evaluated only on the rows that the primary key conditions select, and every other WHERE clause fails exactly when Postgres fails in every order
 
 ### `UNS-STABLE-CONSTANT`
 
