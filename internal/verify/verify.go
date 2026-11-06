@@ -45,6 +45,7 @@ type Fact struct {
 	Reached    map[string]int `json:"reached"`
 	Diff       *Diff          `json:"diff,omitempty"`
 	Ratchet    *Ratchet       `json:"ratchet,omitempty"`
+	Corpus     *Corpus        `json:"corpus,omitempty"`
 	Budget     *Budget        `json:"budget,omitempty"`
 	Latency    *Latency       `json:"latency,omitempty"`
 	Antithesis *Antithesis    `json:"antithesis,omitempty"`
@@ -125,6 +126,32 @@ type Ratchet struct {
 	Statements int `json:"statements"`
 	Executed   int `json:"executed"`
 	Baseline   int `json:"baseline"`
+}
+
+// Corpus is a run of files of the SQLite sqllogictest corpus on Postgres and maragudb.
+type Corpus struct {
+	// Name of the run, such as "make test subset" or "full corpus".
+	Name  string `json:"name"`
+	Files int    `json:"files"`
+	// Statements of the files that apply to Postgres, of which Executed ran on both sides,
+	// Rejected were rejected by maragudb as unsupported, and Skipped were not run, because they
+	// refer to a table whose creation was rejected or failed. SetupFailed of the executed
+	// statements are the corpus's setup, which failed on Postgres, and on maragudb in the same
+	// way.
+	Statements  int `json:"statements"`
+	Executed    int `json:"executed"`
+	Rejected    int `json:"rejected"`
+	Skipped     int `json:"skipped"`
+	SetupFailed int `json:"setupFailed"`
+	Mismatches  int `json:"mismatches"`
+	// Baseline is the sum of the committed baselines of the files, and BelowBaseline counts the
+	// files that executed fewer statements than theirs.
+	Baseline      int `json:"baseline"`
+	BelowBaseline int `json:"belowBaseline"`
+	// RejectedFor, SetupFailedFor, and SkippedFor count the statements by reason.
+	RejectedFor    map[string]int `json:"rejectedFor,omitempty"`
+	SetupFailedFor map[string]int `json:"setupFailedFor,omitempty"`
+	SkippedFor     map[string]int `json:"skippedFor,omitempty"`
 }
 
 // Budget is a measured S3 request count against its limit.

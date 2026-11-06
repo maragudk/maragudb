@@ -99,6 +99,7 @@ func Render(facts []Fact, c Catalog) string {
 	reachedRecorded := false
 	var diff *Diff
 	var ratchet *Ratchet
+	var corpora []*Corpus
 	var budgets []Fact
 	var latencies []Fact
 	var antithesis []Fact
@@ -156,6 +157,8 @@ func Render(facts []Fact, c Catalog) string {
 			diff.Transactions += f.Diff.Transactions
 		case f.Ratchet != nil:
 			ratchet = f.Ratchet
+		case f.Corpus != nil:
+			corpora = append(corpora, f.Corpus)
 		case f.Budget != nil:
 			budgets = append(budgets, f)
 		case f.Latency != nil:
@@ -262,6 +265,13 @@ func Render(facts []Fact, c Catalog) string {
 	} else {
 		fmt.Fprintf(&b, "| Differential ratchet | %d cases with a fixed seed: %d of %d statements executed (%s), baseline %d |\n", ratchet.Cases, ratchet.Executed, ratchet.Statements, percent(ratchet.Executed, ratchet.Statements), ratchet.Baseline)
 	}
+	if len(corpora) == 0 {
+		b.WriteString("| sqllogictest corpus | not run |\n")
+	}
+	for _, c := range corpora {
+		fmt.Fprintf(&b, "| sqllogictest %s | %d files, %d statements: %d executed on both sides (%s), %d rejected as unsupported (%s), %d skipped because they depend on a table whose creation was rejected or failed; %d setup statements failed on Postgres and maragudb alike; **%d mismatches**; %d files below their baseline of executed statements, which sums to %d |\n",
+			c.Name, c.Files, c.Statements, c.Executed, percent(c.Executed, c.Statements), c.Rejected, percent(c.Rejected, c.Statements), c.Skipped, c.SetupFailed, c.Mismatches, c.BelowBaseline, c.Baseline)
+	}
 	if len(budgets) == 0 {
 		b.WriteString("| Request budgets | not run |\n")
 	} else {
@@ -347,6 +357,18 @@ func Render(facts []Fact, c Catalog) string {
 		}
 		b.WriteString("\n</details>\n")
 	}
+	for _, c := range corpora {
+		fmt.Fprintf(&b, "\n<details><summary>sqllogictest %s: reasons</summary>\n\n| Outcome | Reason | Statements |\n|---|---|---|\n", c.Name)
+		for _, group := range []struct {
+			name   string
+			counts map[string]int
+		}{{"rejected", c.RejectedFor}, {"setup failed on Postgres", c.SetupFailedFor}, {"skipped", c.SkippedFor}} {
+			for _, kv := range topReasons(group.counts, 15) {
+				fmt.Fprintf(&b, "| %s | `%s` | %d |\n", group.name, strings.ReplaceAll(kv.reason, "|", "\\|"), kv.n)
+			}
+		}
+		b.WriteString("\n</details>\n")
+	}
 	if len(budgets) > 0 {
 		b.WriteString("\n<details><summary>Request budgets</summary>\n\n| Measurement | Database size | Requests | Budget |\n|---|---|---|---|\n")
 		for _, f := range budgets {
@@ -373,6 +395,34 @@ func Render(facts []Fact, c Catalog) string {
 		b.WriteString("\n</details>\n")
 	}
 	return b.String()
+}
+
+type reasonCount struct {
+	reason string
+	n      int
+}
+
+// topReasons are the n most common reasons, most common first, with the rest summed up as
+// "other reasons".
+func topReasons(counts map[string]int, n int) []reasonCount {
+	var out []reasonCount
+	for k, v := range counts {
+		out = append(out, reasonCount{k, v})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].n != out[j].n {
+			return out[i].n > out[j].n
+		}
+		return out[i].reason < out[j].reason
+	})
+	if len(out) > n {
+		rest := 0
+		for _, kv := range out[n:] {
+			rest += kv.n
+		}
+		out = append(out[:n], reasonCount{fmt.Sprintf("%d other reasons", len(out)-n), rest})
+	}
+	return out
 }
 
 // better of two results for one ID: a failure shows over everything, and a pass over a skip.

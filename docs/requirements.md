@@ -92,6 +92,7 @@ These apply to every section, for the SQL surface that exists at that point.
    - Both systems must agree on whether a statement succeeds or fails, and on the error class when both fail. `AC-4.3`
    - Every class of statement that maragudb rejects with `ErrUnsupported` is listed in `docs/unsupported.md` with a stable `UNS-` ID and a test that shows Postgres accepting it and maragudb rejecting it. Any remaining difference from Postgres is listed there too, with a `DEV-` ID and its own test. `AC-4.4`
    - A statement that maragudb rejects with `ErrUnsupported` is not run on Postgres, and the harness counts it as rejected. With a fixed seed, at least 70% of the generated statements run on both systems, and the number that do never drops below a committed baseline. `AC-4.5`
+   - The SQLite sqllogictest corpus runs live on both systems under the same rules, with Postgres as the only oracle. A fixed set of its files runs in `make test` and the full corpus in `make soak`. For each file, the number of statements that run on both systems never drops below a committed baseline. `AC-4.6`
 5. **S3 request budgets.** These are deterministic and are checked against the fake S3 via `Stats()`:
    - A commit uses O(1) PUTs, independent of database size. `AC-5.1`
    - A transaction with a warm cache uses one conditional GET (or HEAD) for the freshness check, plus nothing else for cached data. `AC-5.2`

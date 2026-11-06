@@ -43,11 +43,28 @@ verification:
 replay:
 	MARAGUDB_SEED=$(SEED) MARAGUDB_WORKLOAD=$(WORKLOAD) MARAGUDB_API=$(API) MARAGUDB_CORPUS=$(CORPUS) MARAGUDB_MAINTAINERS=$(MAINTAINERS) MARAGUDB_MAINTENANCE=$(MAINTENANCE) MARAGUDB_MUTATION=$(MUTATION) go test ./internal/sim -run 'TestSimulator/replay' -count 1 -v
 
-# Run the simulator with random seeds and configurations for SOAK_DURATION (default 5m).
+# Run the simulator with random seeds and configurations for SOAK_DURATION (default 5m), and
+# then the full sqllogictest corpus.
 SOAK_DURATION ?= 5m
 .PHONY: soak
 soak:
 	MARAGUDB_SOAK=1 MARAGUDB_SOAK_DURATION=$(SOAK_DURATION) go test ./internal/sim -run 'TestSimulator/soak' -count 1 -v -timeout 0
+	$(MAKE) sqllogictest
+
+# Run the SQLite sqllogictest corpus on Postgres and maragudb: all of it, or with
+# SQLLOGICTEST_FILES the files that match comma-separated globs, such as
+# SQLLOGICTEST_FILES='index/between/**,random/expr/slt_good_1*.test'. The corpus is downloaded
+# into the user cache directory on first use.
+.PHONY: sqllogictest
+sqllogictest:
+	MARAGUDB_SQLLOGICTEST=full MARAGUDB_SQLLOGICTEST_FILES='$(SQLLOGICTEST_FILES)' go test ./internal/sqllogictest -run 'TestCorpus' -count 1 -v -timeout 0
+
+# Rewrite the baseline in /internal/sqllogictest/testdata/baseline.json: the number of
+# statements of each corpus file that run on both sides, for the whole corpus or for
+# SQLLOGICTEST_FILES. Commit a higher count; the test fails when a file's count drops.
+.PHONY: sqllogictest-ratchet
+sqllogictest-ratchet:
+	MARAGUDB_SQLLOGICTEST=full MARAGUDB_SQLLOGICTEST_FILES='$(SQLLOGICTEST_FILES)' go test ./internal/sqllogictest -run 'TestCorpus' -count 1 -v -timeout 0 -args -update
 
 # Rewrite the ratchet baseline in /internal/pgdiff/testdata/ratchet.json: the number of
 # statements that a fixed-seed differential run executes on both sides. Commit a higher count;

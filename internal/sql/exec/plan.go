@@ -73,7 +73,9 @@ func conjuncts(e ast.Expr) []ast.Expr {
 }
 
 // simplify the top of an expression as Postgres's planner does before it splits a WHERE clause
-// into conjuncts.
+// into conjuncts. The result is true exactly when e is, but it may be false where e is NULL,
+// which is the same in a WHERE clause; so an operand of NOT is never simplified, but negated
+// with [negate].
 func simplify(e ast.Expr) ast.Expr {
 	switch x := e.(type) {
 	case *ast.Between:
@@ -92,7 +94,7 @@ func simplify(e ast.Expr) ast.Expr {
 		}
 	case *ast.Unary:
 		if x.Op == ast.Not {
-			return negate(simplify(x.Expr))
+			return negate(x.Expr)
 		}
 	case *ast.Binary:
 		switch x.Op {
@@ -106,7 +108,8 @@ func simplify(e ast.Expr) ast.Expr {
 				return boolEquality(x.Right, b, x.Op == ast.Eq)
 			}
 			if x.Op == ast.Eq && ast.RenderExpr(x.Left) == ast.RenderExpr(x.Right) {
-				// X = X is X IS NOT NULL for a strict operator.
+				// X = X is X IS NOT NULL for a strict operator, where X is not NULL; where it is,
+				// the one is NULL and the other false.
 				return &ast.IsNull{Expr: x.Left, Not: true}
 			}
 		}
@@ -125,15 +128,15 @@ func boolLiteral(e ast.Expr) (bool, bool) {
 // boolEquality simplifies x = b and x <> b for a boolean constant b, as Postgres does: x = TRUE
 // is x, x = FALSE is NOT x, and <> the other way round.
 func boolEquality(x ast.Expr, b, eq bool) ast.Expr {
-	x = simplify(x)
 	if b == eq {
-		return x
+		return simplify(x)
 	}
 	return negate(x)
 }
 
 // negate an expression as Postgres's negate_clause does: through AND and OR with De Morgan's
-// laws, by flipping comparison operators, LIKE, and IS NULL, and by dropping a double NOT.
+// laws, by flipping comparison operators, LIKE, and IS NULL, and by dropping a double NOT. Like
+// [simplify], the result is true exactly when NOT e is.
 func negate(e ast.Expr) ast.Expr {
 	switch x := e.(type) {
 	case *ast.Literal:
@@ -157,14 +160,22 @@ func negate(e ast.Expr) ast.Expr {
 		return &ast.Like{Expr: x.Expr, Pattern: x.Pattern, Not: !x.Not}
 	case *ast.IsNull:
 		return &ast.IsNull{Expr: x.Expr, Not: !x.Not}
-	case *ast.Between, *ast.In:
-		if simplified := simplify(x); simplified != e {
-			return negate(simplified)
+	case *ast.Between:
+		d, _ := desugar(x)
+		return negate(d)
+	case *ast.In:
+		if len(x.List) == 1 {
+			op := ast.Ne
+			if x.Not {
+				op = ast.Eq
+			}
+			return simplify(&ast.Binary{Op: op, Left: x.Expr, Right: x.List[0]})
+		}
+		if d, ok := desugar(x); ok {
+			return negate(d)
 		}
 		// An IN of constants stays an array comparison, whose negation is NOT IN.
-		if in, ok := x.(*ast.In); ok {
-			return &ast.In{Expr: in.Expr, List: in.List, Not: !in.Not}
-		}
+		return &ast.In{Expr: x.Expr, List: x.List, Not: !x.Not}
 	}
 	return &ast.Unary{Op: ast.Not, Expr: e}
 }

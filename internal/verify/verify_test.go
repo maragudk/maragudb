@@ -278,6 +278,25 @@ func TestRender(t *testing.T) {
 		}
 	})
 
+	t.Run("shows the sqllogictest corpus runs and their reasons", func(t *testing.T) {
+		facts := []verify.Fact{
+			{Package: "s", PID: 1, Start: &verify.Start{}},
+			{Package: "s", PID: 1, Test: "TestCorpus", Corpus: &verify.Corpus{Name: "make test subset", Files: 2, Statements: 100, Executed: 60, Rejected: 30, Skipped: 10, SetupFailed: 3, Baseline: 55,
+				RejectedFor: map[string]int{"DISTINCT_is_not_supported": 20, "a|b": 10}, SkippedFor: map[string]int{"rejected: UNIQUE": 10}}},
+			{Package: "s", PID: 1, End: &verify.End{Code: 0}},
+		}
+		report := verify.Render(facts, c)
+		for _, want := range []string{
+			"| sqllogictest make test subset | 2 files, 100 statements: 60 executed on both sides (60%), 30 rejected as unsupported (30%), 10 skipped because they depend on a table whose creation was rejected or failed; 3 setup statements failed on Postgres and maragudb alike; **0 mismatches**; 0 files below their baseline of executed statements, which sums to 55 |",
+			"| rejected | `DISTINCT_is_not_supported` | 20 |",
+			"| rejected | `a\\|b` | 10 |",
+			"| skipped | `rejected: UNIQUE` | 10 |",
+		} {
+			is.True(t, strings.Contains(report, want), fmt.Sprintf("report contains %q:\n%s", want, report))
+		}
+		is.True(t, strings.Contains(verify.Render(nil, c), "| sqllogictest corpus | not run |"), "not run")
+	})
+
 	t.Run("uses only the latest run of a package", func(t *testing.T) {
 		facts := []verify.Fact{
 			{Package: "a", PID: 1, Start: &verify.Start{}},

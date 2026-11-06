@@ -11,11 +11,13 @@ Nobody reviews this code manually. Automated tests are the only quality gate, so
 ## Commands
 
 - `make test` runs the full test suite, including the fixed simulator seed corpus.
-- `make soak` runs the longer simulator soak.
+- `make soak` runs the longer simulator soak and then the full sqllogictest corpus.
 - `make replay SEED=<n>` replays one simulator seed.
 - `make verification` regenerates the mutant kill matrix and /docs/verification.md, which must then show no diff.
 - `make report` renders the verification report of the last `make test` and `make antithesis`.
 - `make pgdiff PGDIFF_CASES=<n>` runs the Postgres differential harness with n cases.
 - `make ratchet` rewrites the baseline of statements that the differential harness executes on both sides.
+- `make sqllogictest` runs the SQLite sqllogictest corpus on Postgres and maragudb. `SQLLOGICTEST_FILES=<globs>` picks files, such as `index/between/**`.
+- `make sqllogictest-ratchet` rewrites the per-file baseline of corpus statements that run on both sides, for the whole corpus or for `SQLLOGICTEST_FILES`.
 - `make lint` runs golangci-lint.
 - `make fmt` formats the code.

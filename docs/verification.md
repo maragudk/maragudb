@@ -10,10 +10,10 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 ## At a glance
 
-- 29 acceptance criteria (`AC-`), 20 key invariants (`INV-`), 17 classes of unsupported statements (`UNS-`), and 0 remaining differences from Postgres (`DEV-`), each verified by at least one test.
+- 30 acceptance criteria (`AC-`), 20 key invariants (`INV-`), 17 classes of unsupported statements (`UNS-`), and 0 remaining differences from Postgres (`DEV-`), each verified by at least one test.
 - 8 mutants (`MUT-`), deliberate bugs, of which 7 are detected by the simulator's checkers within 20 seeds.
 - 13 interesting states (`STATE-`) that the simulator's fixed corpus must reach.
-- 134 declarations of coverage in the tests.
+- 136 declarations of coverage in the tests.
 
 ## Acceptance criteria
 
@@ -152,6 +152,12 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 - `internal/pgdiff` `TestDifferential/the_generator_mostly_produces_SQL_that_maragudb_accepts,_and_no_less_than_the_committed_baseline`: with a fixed seed, at least 70% of the generated statements run on both sides, and no fewer than the baseline in testdata/ratchet.json
 - `internal/pgdiff` `TestRunner_Run/skips_a_rejected_statement_on_Postgres,_and_aborts_the_transaction_there_instead`: a statement that maragudb rejects as unsupported is counted as rejected and not run on Postgres, and inside a transaction both transactions end up aborted
+
+### `AC-4.6`
+
+> Differential testing against Postgres: The SQLite sqllogictest corpus runs live on both systems under the same rules, with Postgres as the only oracle. A fixed set of its files runs in make test and the full corpus in make soak. For each file, the number of statements that run on both systems never drops below a committed baseline.
+
+- `internal/sqllogictest` `TestCorpus/the_statements_of_the_corpus_give_the_same_results_on_Postgres_and_maragudb,_and_no_file_executes_fewer_of_them_than_its_baseline`: the SQLite sqllogictest corpus, rewritten once and run as the same text on both sides, gives the same results, column names, affected-row counts, and error classes on Postgres and maragudb, except for statements that maragudb rejects as unsupported, and every file executes at least its committed baseline of statements on both sides
 
 ### `AC-5.1`
 
@@ -381,6 +387,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/sql/exec` `TestSession_Select/follows_Postgres_in_the_details_of_analysis`: an IN whose constant elements have no common type compares them one at a time, a CASE operand of unknown type is text, +1 in ORDER BY is no position, ORDER BY a name is ambiguous only between different expressions, and a read-only transaction reports analysis errors before it refuses a write
 - `internal/sql/exec` `TestSession_Transactions/a_failed_statement_aborts_the_transaction_until_it_ends,_as_in_Postgres`: after a failed statement every statement of the transaction fails with ErrTxAborted, COMMIT rolls it back, and ROLLBACK ends it
 - `internal/sql/exec` `TestSession_Update/moves_rows_when_the_primary_key_changes,_and_rejects_a_move_whose_outcome_depends_on_row_order`: an UPDATE of primary key columns succeeds or fails as in Postgres in every row order, and a row that moves onto a key another row moves away from is ErrUnsupported
+- `internal/sqllogictest` `TestRegressions/NOT_of_a_comparison_of_an_expression_with_itself_is_NULL_where_the_expression_is`: the statements of the sqllogictest corpus that found differences from Postgres give the same results on both sides
 
 ### `INV-UNSUPPORTED`
 
