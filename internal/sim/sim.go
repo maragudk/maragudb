@@ -37,6 +37,10 @@ const (
 	// Unique keeps rows with a unique column, which transactions insert, move, and delete
 	// concurrently, and audits check. It runs only through SQL.
 	Unique
+	// ForeignKey keeps tables that reference each other and themselves, with CHECK constraints,
+	// which transactions insert into, update, and delete from concurrently, also through foreign
+	// key actions, and audits check. It runs only through SQL.
+	ForeignKey
 )
 
 func (w Workload) String() string {
@@ -45,6 +49,8 @@ func (w Workload) String() string {
 		return "bank"
 	case Unique:
 		return "unique"
+	case ForeignKey:
+		return "foreign-key"
 	}
 	return "list-append"
 }
@@ -157,7 +163,7 @@ type Result struct {
 	Audits   []history.BankAudit
 	Final    map[string][]int64
 	Balances map[string]int64
-	// Users are the final rows of the unique workload.
+	// Users are the final rows of the unique workload, or of the foreign key workload.
 	Users []string
 	// Anomalies found, each an [*Anomaly].
 	Anomalies []error
@@ -189,6 +195,9 @@ type Stats struct {
 	// UniqueViolations counts the statements of the unique workload that failed because they
 	// would have repeated a unique value.
 	UniqueViolations int
+	// ForeignKeyViolations and CheckViolations count the statements of the foreign key workload
+	// that failed because of a foreign key or a CHECK.
+	ForeignKeyViolations, CheckViolations int
 	// MaintenanceSteps counts the clients' maintenance steps, MaintenanceAttempts the ones that
 	// found work and got past the lease, MaintenanceRuns the ones that changed the database,
 	// and MergesStarted the compactions that began merging in those steps. LeaseAcquisitions
@@ -215,6 +224,8 @@ func (s *Stats) Add(o Stats) {
 	s.Unavailable += o.Unavailable
 	s.FailedReads += o.FailedReads
 	s.UniqueViolations += o.UniqueViolations
+	s.ForeignKeyViolations += o.ForeignKeyViolations
+	s.CheckViolations += o.CheckViolations
 	s.MaintenanceSteps += o.MaintenanceSteps
 	s.MaintenanceAttempts += o.MaintenanceAttempts
 	s.MaintenanceRuns += o.MaintenanceRuns
@@ -244,6 +255,15 @@ const (
 	// CheckerIndex finds an index that does not match its table: in the final state of the
 	// store, with [exec.CheckIndexes], or through a lookup that finds other rows than the table.
 	CheckerIndex = "index consistency"
+	// CheckerForeignKey finds a row whose foreign key references a missing row, in a snapshot
+	// that a reader saw, or in the final state of the store, with [exec.CheckConstraints].
+	CheckerForeignKey = "foreign key"
+	// CheckerCheck finds a row that violates a CHECK constraint, in a snapshot that a reader saw,
+	// or in the final state of the store, with [exec.CheckConstraints].
+	CheckerCheck = "check constraint"
+	// CheckerRealTime finds a reader that misses a commit acknowledged before it began, through
+	// a counter that only grows.
+	CheckerRealTime = "real-time order"
 )
 
 // Anomaly found in a run, with the checker that found it.
@@ -311,6 +331,9 @@ type run struct {
 	// looked at.
 	clients     []*client
 	overlapping bool
+	// ticked is the highest value of the counter of the foreign key workload that an
+	// acknowledged commit wrote.
+	ticked int64
 }
 
 // goTask starts a scheduled task whose context counts the states it reaches.
@@ -353,8 +376,8 @@ func Run(cfg Config) Result {
 		}
 	}
 
-	if cfg.Workload == Unique && !cfg.SQL {
-		panic("sim: the unique workload runs only through SQL")
+	if (cfg.Workload == Unique || cfg.Workload == ForeignKey) && !cfg.SQL {
+		panic(fmt.Sprintf("sim: the %v workload runs only through SQL", cfg.Workload))
 	}
 	switch {
 	case cfg.SQL:
@@ -384,6 +407,7 @@ func Run(cfg Config) Result {
 	if cfg.SQL {
 		final, balances, res.Users, err = r.readFinalSQL()
 		r.checkIndexes()
+		r.checkConstraints()
 	} else {
 		final, balances, err = r.readFinal()
 	}
@@ -627,6 +651,8 @@ func (c *client) loop(ctx context.Context) {
 		switch {
 		case c.run.cfg.Workload == Unique:
 			c.uniqueSQL(pctx)
+		case c.run.cfg.Workload == ForeignKey:
+			c.foreignKeySQL(pctx)
 		case c.run.cfg.SQL && c.run.cfg.Workload == ListAppend:
 			c.listAppendSQL(pctx)
 		case c.run.cfg.SQL:

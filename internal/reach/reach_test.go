@@ -47,6 +47,6 @@ func TestDeclarations(t *testing.T) {
 			is.True(t, d.Description != "", string(d.State))
 			is.True(t, d.Assertion != "", string(d.State))
 		}
-		is.Equal(t, 15, len(seen))
+		is.Equal(t, 17, len(seen))
 	})
 }

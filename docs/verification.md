@@ -11,9 +11,9 @@ Each entry names the test's package, the test's name, and what the test asserts,
 ## At a glance
 
 - 33 acceptance criteria (`AC-`), 24 key invariants (`INV-`), 23 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
-- 11 mutants (`MUT-`), deliberate bugs, of which 10 are detected by the simulator's checkers within 20 seeds.
-- 15 interesting states (`STATE-`) that the simulator's fixed corpus must reach.
-- 170 declarations of coverage in the tests.
+- 15 mutants (`MUT-`), deliberate bugs, of which 14 are detected by the simulator's checkers within 20 seeds.
+- 17 interesting states (`STATE-`) that the simulator's fixed corpus must reach.
+- 171 declarations of coverage in the tests.
 
 ## Acceptance criteria
 
@@ -43,7 +43,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/s3fake` `TestClient_Faults/a_lost_ack_hides_a_precondition_failure_too`: a lost acknowledgement also hides a precondition failure, so the client cannot tell what happened
 - `internal/s3fake` `TestClient_Faults/lost_acks_are_applied_but_reported_as_errors`: a lost acknowledgement applies the write and still reports an error
 - `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus, with injected errors, latency, lost acknowledgements, outages, and crashes, finds no anomalies with any checker and exercises every fault
-- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, and unique violations that only a concurrent commit causes
+- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, and unique and foreign key violations that only a concurrent commit causes
 
 ### `AC-1.4`
 
@@ -52,7 +52,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/s3fake` `TestClient_Faults/a_crashed_process_cannot_make_further_requests`: a crashed process fails every later request, and other processes are unaffected
 - `internal/s3fake` `TestClient_Faults/crashes_happen_both_before_and_after_apply`: over 50 seeds, crashes happen both before and after the write is applied
 - `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus, with injected errors, latency, lost acknowledgements, outages, and crashes, finds no anomalies with any checker and exercises every fault
-- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, and unique violations that only a concurrent commit causes
+- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, and unique and foreign key violations that only a concurrent commit causes
 
 ### `AC-1.5`
 
@@ -90,7 +90,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/s3fake` `TestClient_Faults/the_same_seed_produces_the_same_outcomes`: the same seed produces the same fault outcomes, final keys, and virtual time
 - `internal/sched` `TestScheduler/produces_the_same_trace_on_every_run`: the scheduler produces the same trace of task steps on every run
 - `internal/sim` `TestSimulator/replay`: a seed in MARAGUDB_SEED replays with a full trace, from make replay; skipped otherwise
-- `internal/sim` `TestSimulator/the_same_seed_produces_the_same_history`: the same seed gives a byte-identical history, final state, and statistics, through the engine and SQL, in every maintenance mode
+- `internal/sim` `TestSimulator/the_same_seed_produces_the_same_history`: the same seed gives a byte-identical history, final state, and statistics, through the engine and SQL, in every maintenance mode, also for the foreign key workload, whose now() comes from the virtual clock
 
 ### `AC-2`
 
@@ -491,6 +491,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 > No committed row ever violates a CHECK constraint of its table.
 
 - `internal/pgdiff` `TestChecks/checks_CHECK_constraints_in_the_order_of_their_names,_after_NOT_NULL_and_before_the_keys,_as_Postgres_does`: an INSERT or UPDATE evaluates the NOT NULL constraints, then the CHECK constraints in the order of their names, failing at the first that is false or fails itself, and then the primary key and the unique indexes, row by row, so it fails with the same class as Postgres, and NULL passes a CHECK
+- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus, with the foreign key workload under the same faults, finds no reference to a missing row and no row that violates a CHECK in any snapshot a reader saw, and after every run through SQL every foreign key and CHECK of the store holds
 - `internal/sql/exec` `TestSession_ForeignKeysKeepInvariants/random_writes_on_referenced,_referencing,_and_self-referencing_tables_keep_every_foreign_key_and_check,_with_and_without_an_index_on_the_referencing_columns`: random inserts, updates, and deletes, in and out of transactions, on a parent, a child with a random ON DELETE action, and a self-referencing table never leave a row whose foreign key has no parent or a row that violates a CHECK, and a session whose child has an index on its referencing columns gives the same outcomes and rows as one without
 
 ### `INV-FK`
@@ -500,6 +501,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/pgdiff` `TestForeignKeys/cascades_through_chains_of_tables_and_trees,_and_rejects_actions_whose_outcome_depends_on_their_order`: ON DELETE CASCADE, SET NULL, and SET DEFAULT go through chains of tables and down self-referencing trees as in Postgres, the rows they change are checked like any other, and a DELETE whose actions could give another outcome in another order is rejected
 - `internal/pgdiff` `TestForeignKeys/checks_a_self-referencing_table_at_the_end_of_the_statement,_as_Postgres_does`: a self-referencing table is checked at the end of each statement, so an UPDATE that moves parents and children together passes, one that moves only the parents fails, a cycle of references can be inserted in one statement, and deleting a whole tree passes where deleting part of it fails
 - `internal/pgdiff` `TestForeignKeys/checks_foreign_keys_and_fires_their_actions_as_Postgres_does`: an insert or update of a row whose foreign key has no NULL and no parent row fails with 23503 at the end of the statement, a delete or key update of a referenced row fails with 23503 for NO ACTION and 23001 for RESTRICT, or deletes, sets to NULL, or sets to the defaults the referencing rows, with the rows the same on both afterwards
+- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus, with the foreign key workload under the same faults, finds no reference to a missing row and no row that violates a CHECK in any snapshot a reader saw, and after every run through SQL every foreign key and CHECK of the store holds
 - `internal/sql/exec` `TestSession_ForeignKeysKeepInvariants/random_writes_on_referenced,_referencing,_and_self-referencing_tables_keep_every_foreign_key_and_check,_with_and_without_an_index_on_the_referencing_columns`: random inserts, updates, and deletes, in and out of transactions, on a parent, a child with a random ON DELETE action, and a self-referencing table never leave a row whose foreign key has no parent or a row that violates a CHECK, and a session whose child has an index on its referencing columns gives the same outcomes and rows as one without
 
 ## Unsupported statements
@@ -668,17 +670,21 @@ Every mutant runs in every simulator configuration below, with seeds 1 to 20, un
 
 | Mutant | Detected in | First seed | Checkers |
 |---|---|---|---|
-| `MUT-COMMIT-WITHOUT-CAS` commit without CAS | 4 of 10 configurations | 1 | durability, final read, list-append |
-| `MUT-GC-IGNORE-GRACE` GC ignoring the grace period | 5 of 10 configurations | 1 | final read, grace period, list-append |
-| `MUT-SKIP-FRESHNESS` serving the cache without a freshness check | 5 of 10 configurations | 1 | grace period, list-append |
-| `MUT-ACK-BEFORE-CONFIRM` acking before the write is confirmed | 4 of 10 configurations | 1 | durability |
-| `MUT-COMPACTED-AHEAD` the compacted segment ahead of newer ones after a rebase | 4 of 10 configurations | 1 | durability, index consistency, list-append |
-| `MUT-FRESH-SNAPSHOT` a fresh snapshot per statement | 6 of 6 configurations | 1 | bank, index consistency, list-append |
-| `MUT-RETRY-UNKNOWN` retrying an autocommit statement after an unknown commit outcome | 2 of 6 configurations | 1 | durability, list-append |
-| `MUT-INDEX-STALE-DELETE` stale index entries after an UPDATE or DELETE | 4 of 6 configurations | 1 | index consistency |
-| `MUT-UNIQUE-NO-CHECK` no unique check | 2 of 6 configurations | 1 | index consistency, unique |
-| `MUT-UNIQUE-OWN-WRITES` a unique check that misses the statement's own writes | 2 of 6 configurations | 5 | index consistency, unique |
-| `MUT-UPDATE-SEES-OWN-WRITES` an UPDATE that revisits the rows it wrote | 0 of 6 configurations | none |  |
+| `MUT-COMMIT-WITHOUT-CAS` commit without CAS | 6 of 12 configurations | 1 | durability, final read, list-append, real-time order |
+| `MUT-GC-IGNORE-GRACE` GC ignoring the grace period | 6 of 12 configurations | 1 | final read, grace period, list-append |
+| `MUT-SKIP-FRESHNESS` serving the cache without a freshness check | 7 of 12 configurations | 1 | grace period, list-append, real-time order |
+| `MUT-ACK-BEFORE-CONFIRM` acking before the write is confirmed | 6 of 12 configurations | 1 | durability, real-time order |
+| `MUT-COMPACTED-AHEAD` the compacted segment ahead of newer ones after a rebase | 5 of 12 configurations | 1 | durability, index consistency, list-append, real-time order |
+| `MUT-FRESH-SNAPSHOT` a fresh snapshot per statement | 8 of 8 configurations | 1 | bank, foreign key, index consistency, list-append |
+| `MUT-RETRY-UNKNOWN` retrying an autocommit statement after an unknown commit outcome | 2 of 8 configurations | 1 | durability, list-append |
+| `MUT-INDEX-STALE-DELETE` stale index entries after an UPDATE or DELETE | 6 of 8 configurations | 1 | index consistency |
+| `MUT-UNIQUE-NO-CHECK` no unique check | 2 of 8 configurations | 1 | index consistency, unique |
+| `MUT-UNIQUE-OWN-WRITES` a unique check that misses the statement's own writes | 2 of 8 configurations | 5 | index consistency, unique |
+| `MUT-FK-NO-CHILD-CHECK` no check of a referencing row | 2 of 8 configurations | 1 | foreign key |
+| `MUT-FK-NO-PARENT-CHECK` no check or action on the referencing rows | 2 of 8 configurations | 1 | foreign key |
+| `MUT-FK-OWN-WRITES` foreign key lookups that miss the statement's own writes | 2 of 8 configurations | 1 | foreign key |
+| `MUT-CHECK-SKIP-UPDATE` CHECK on INSERT only | 2 of 8 configurations | 1 | check constraint |
+| `MUT-UPDATE-SEES-OWN-WRITES` an UPDATE that revisits the rows it wrote | 0 of 8 configurations | none |  |
 
 ### `MUT-COMMIT-WITHOUT-CAS`
 
@@ -696,6 +702,8 @@ Every mutant runs in every simulator configuration below, with seeds 1 to 20, un
 | bank through SQL, 2 maintainers | cannot detect: an unconditional manifest write drops whole concurrent commits, a dropped transfer conserves money, and the bank checker only checks totals |
 | unique through SQL, no maintainers | cannot detect: an unconditional manifest write drops whole concurrent commits, which leaves a consistent state in which no value repeats, and the unique workload does not check that acknowledged writes survive |
 | unique through SQL, 2 maintainers | cannot detect: an unconditional manifest write drops whole concurrent commits, which leaves a consistent state in which no value repeats, and the unique workload does not check that acknowledged writes survive |
+| foreign-key through SQL, no maintainers | detected with seed 1 by real-time order |
+| foreign-key through SQL, 2 maintainers | detected with seed 3 by real-time order |
 
 Targeted tests:
 
@@ -718,6 +726,8 @@ Targeted tests:
 | bank through SQL, 2 maintainers | detected with seed 2 by grace period |
 | unique through SQL, no maintainers | cannot detect: without maintainers nothing is ever deleted, so no reader can lose an object |
 | unique through SQL, 2 maintainers | detected with seed 1 by grace period |
+| foreign-key through SQL, no maintainers | cannot detect: without maintainers nothing is ever deleted, so no reader can lose an object |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by grace period |
 
 Targeted tests:
 
@@ -739,6 +749,8 @@ Targeted tests:
 | bank through SQL, 2 maintainers | cannot detect: a stale snapshot makes a transfer conflict or read an older consistent state, which conserves money |
 | unique through SQL, no maintainers | cannot detect: a stale snapshot is an older consistent state in which no value repeats, and a write from it conflicts at commit; without maintainers no reader loses an object either |
 | unique through SQL, 2 maintainers | detected with seed 5 by grace period |
+| foreign-key through SQL, no maintainers | detected with seed 2 by real-time order |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by real-time order |
 
 ### `MUT-ACK-BEFORE-CONFIRM`
 
@@ -756,6 +768,8 @@ Targeted tests:
 | bank through SQL, 2 maintainers | cannot detect: an acknowledged transfer that never landed is missing as a whole, which conserves money |
 | unique through SQL, no maintainers | cannot detect: an acknowledged write that never landed is missing as a whole, which leaves a consistent state, and the unique workload does not check that acknowledged writes survive |
 | unique through SQL, 2 maintainers | cannot detect: an acknowledged write that never landed is missing as a whole, which leaves a consistent state, and the unique workload does not check that acknowledged writes survive |
+| foreign-key through SQL, no maintainers | detected with seed 2 by real-time order |
+| foreign-key through SQL, 2 maintainers | detected with seed 2 by real-time order |
 
 Targeted tests:
 
@@ -777,6 +791,8 @@ Targeted tests:
 | bank through SQL, 2 maintainers | detected with seed 2 by index consistency |
 | unique through SQL, no maintainers | cannot detect: without maintainers nothing compacts, so there is never a rebase |
 | unique through SQL, 2 maintainers | detected with seed 2 by index consistency |
+| foreign-key through SQL, no maintainers | cannot detect: without maintainers nothing compacts, so there is never a rebase |
+| foreign-key through SQL, 2 maintainers | detected with seed 3 by real-time order |
 
 Targeted tests:
 
@@ -799,6 +815,8 @@ Targeted tests:
 | bank through SQL, 2 maintainers | detected with seed 1 by bank |
 | unique through SQL, no maintainers | detected with seed 1 by index consistency |
 | unique through SQL, 2 maintainers | detected with seed 1 by index consistency |
+| foreign-key through SQL, no maintainers | detected with seed 8 by foreign key |
+| foreign-key through SQL, 2 maintainers | detected with seed 2 by foreign key |
 
 Targeted tests:
 
@@ -820,6 +838,8 @@ Targeted tests:
 | bank through SQL, 2 maintainers | cannot detect: the bank workload writes only in explicit transactions, so no autocommit statement is ever retried, and a doubled transfer conserves money anyway |
 | unique through SQL, no maintainers | cannot detect: a retried insert fails on its own primary key, and a retried move or delete finds its row moved or gone, so a statement applied twice leaves a consistent state |
 | unique through SQL, 2 maintainers | cannot detect: a retried insert fails on its own primary key, and a retried move or delete finds its row moved or gone, so a statement applied twice leaves a consistent state |
+| foreign-key through SQL, no maintainers | cannot detect: a retried statement is checked again against every foreign key and check, so even one applied twice, such as an increment, leaves a consistent state, and the counter is incremented only in transactions, which are never retried |
+| foreign-key through SQL, 2 maintainers | cannot detect: a retried statement is checked again against every foreign key and check, so even one applied twice, such as an increment, leaves a consistent state, and the counter is incremented only in transactions, which are never retried |
 
 Targeted tests:
 
@@ -841,6 +861,8 @@ Targeted tests:
 | bank through SQL, 2 maintainers | detected with seed 1 by index consistency |
 | unique through SQL, no maintainers | detected with seed 1 by index consistency |
 | unique through SQL, 2 maintainers | detected with seed 1 by index consistency |
+| foreign-key through SQL, no maintainers | detected with seed 1 by index consistency |
+| foreign-key through SQL, 2 maintainers | detected with seed 2 by index consistency |
 
 Targeted tests:
 
@@ -862,6 +884,8 @@ Targeted tests:
 | bank through SQL, 2 maintainers | cannot detect: the workload has no unique index besides the primary key |
 | unique through SQL, no maintainers | detected with seed 1 by unique, index consistency |
 | unique through SQL, 2 maintainers | detected with seed 1 by unique, index consistency |
+| foreign-key through SQL, no maintainers | cannot detect: the workload has no unique index besides the primary key |
+| foreign-key through SQL, 2 maintainers | cannot detect: the workload has no unique index besides the primary key |
 
 Targeted tests:
 
@@ -883,10 +907,88 @@ Targeted tests:
 | bank through SQL, 2 maintainers | cannot detect: the workload has no unique index besides the primary key |
 | unique through SQL, no maintainers | detected with seed 5 by unique, index consistency |
 | unique through SQL, 2 maintainers | detected with seed 9 by unique, index consistency |
+| foreign-key through SQL, no maintainers | cannot detect: the workload has no unique index besides the primary key |
+| foreign-key through SQL, 2 maintainers | cannot detect: the workload has no unique index besides the primary key |
 
 Targeted tests:
 
 - `internal/sql/exec` `TestMutations_Indexes/UniqueNoCheck_and_UniqueOwnWrites_let_duplicates_in`: with either mutant, a unique index lets two rows have the same values, which the index check finds
+
+### `MUT-FK-NO-CHILD-CHECK`
+
+`exec.Mutations.ForeignKeyNoChildCheck` skips the check that an inserted or updated row has the row its foreign key references.
+
+| Configuration | Result |
+|---|---|
+| list-append through the engine, no maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
+| list-append through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
+| bank through the engine, no maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
+| bank through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
+| list-append through SQL, no maintainers | cannot detect: the workload has no foreign keys |
+| list-append through SQL, 2 maintainers | cannot detect: the workload has no foreign keys |
+| bank through SQL, no maintainers | cannot detect: the workload has no foreign keys |
+| bank through SQL, 2 maintainers | cannot detect: the workload has no foreign keys |
+| unique through SQL, no maintainers | cannot detect: the workload has no foreign keys |
+| unique through SQL, 2 maintainers | cannot detect: the workload has no foreign keys |
+| foreign-key through SQL, no maintainers | detected with seed 1 by foreign key |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by foreign key |
+
+### `MUT-FK-NO-PARENT-CHECK`
+
+`exec.Mutations.ForeignKeyNoParentCheck` skips the checks and the actions on the rows that reference a deleted row or an updated key.
+
+| Configuration | Result |
+|---|---|
+| list-append through the engine, no maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
+| list-append through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
+| bank through the engine, no maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
+| bank through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
+| list-append through SQL, no maintainers | cannot detect: the workload has no foreign keys |
+| list-append through SQL, 2 maintainers | cannot detect: the workload has no foreign keys |
+| bank through SQL, no maintainers | cannot detect: the workload has no foreign keys |
+| bank through SQL, 2 maintainers | cannot detect: the workload has no foreign keys |
+| unique through SQL, no maintainers | cannot detect: the workload has no foreign keys |
+| unique through SQL, 2 maintainers | cannot detect: the workload has no foreign keys |
+| foreign-key through SQL, no maintainers | detected with seed 1 by foreign key |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by foreign key |
+
+### `MUT-FK-OWN-WRITES`
+
+`exec.Mutations.ForeignKeyOwnWrites` makes the lookups of foreign keys read the transaction without the statement's own writes, so that an UPDATE that moves a row away and points another row at its old key passes.
+
+| Configuration | Result |
+|---|---|
+| list-append through the engine, no maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
+| list-append through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
+| bank through the engine, no maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
+| bank through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
+| list-append through SQL, no maintainers | cannot detect: the workload has no foreign keys |
+| list-append through SQL, 2 maintainers | cannot detect: the workload has no foreign keys |
+| bank through SQL, no maintainers | cannot detect: the workload has no foreign keys |
+| bank through SQL, 2 maintainers | cannot detect: the workload has no foreign keys |
+| unique through SQL, no maintainers | cannot detect: the workload has no foreign keys |
+| unique through SQL, 2 maintainers | cannot detect: the workload has no foreign keys |
+| foreign-key through SQL, no maintainers | detected with seed 1 by foreign key |
+| foreign-key through SQL, 2 maintainers | detected with seed 2 by foreign key |
+
+### `MUT-CHECK-SKIP-UPDATE`
+
+`exec.Mutations.CheckSkipUpdate` checks the CHECK constraints of a row only when it is inserted, not when an UPDATE or a foreign key action changes it.
+
+| Configuration | Result |
+|---|---|
+| list-append through the engine, no maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
+| list-append through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
+| bank through the engine, no maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
+| bank through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
+| list-append through SQL, no maintainers | cannot detect: the workload has no CHECK constraints |
+| list-append through SQL, 2 maintainers | cannot detect: the workload has no CHECK constraints |
+| bank through SQL, no maintainers | cannot detect: the workload has no CHECK constraints |
+| bank through SQL, 2 maintainers | cannot detect: the workload has no CHECK constraints |
+| unique through SQL, no maintainers | cannot detect: the workload has no CHECK constraints |
+| unique through SQL, 2 maintainers | cannot detect: the workload has no CHECK constraints |
+| foreign-key through SQL, no maintainers | detected with seed 5 by check constraint |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by check constraint |
 
 ### `MUT-UPDATE-SEES-OWN-WRITES`
 
@@ -898,12 +1000,14 @@ Targeted tests:
 | list-append through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
 | bank through the engine, no maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
 | bank through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
-| list-append through SQL, no maintainers | cannot detect: the workloads never update primary key columns, so no row moves ahead of the scan |
-| list-append through SQL, 2 maintainers | cannot detect: the workloads never update primary key columns, so no row moves ahead of the scan |
-| bank through SQL, no maintainers | cannot detect: the workloads never update primary key columns, so no row moves ahead of the scan |
-| bank through SQL, 2 maintainers | cannot detect: the workloads never update primary key columns, so no row moves ahead of the scan |
-| unique through SQL, no maintainers | cannot detect: the workloads never update primary key columns, so no row moves ahead of the scan |
-| unique through SQL, 2 maintainers | cannot detect: the workloads never update primary key columns, so no row moves ahead of the scan |
+| list-append through SQL, no maintainers | cannot detect: the workload never updates primary key columns, so no row moves ahead of the scan |
+| list-append through SQL, 2 maintainers | cannot detect: the workload never updates primary key columns, so no row moves ahead of the scan |
+| bank through SQL, no maintainers | cannot detect: the workload never updates primary key columns, so no row moves ahead of the scan |
+| bank through SQL, 2 maintainers | cannot detect: the workload never updates primary key columns, so no row moves ahead of the scan |
+| unique through SQL, no maintainers | cannot detect: the workload never updates primary key columns, so no row moves ahead of the scan |
+| unique through SQL, 2 maintainers | cannot detect: the workload never updates primary key columns, so no row moves ahead of the scan |
+| foreign-key through SQL, no maintainers | cannot detect: the only UPDATE of a primary key moves one node to a new key, and when it revisits that row, its CASE leaves a row with the new key as it is |
+| foreign-key through SQL, 2 maintainers | cannot detect: the only UPDATE of a primary key moves one node to a new key, and when it revisits that row, its CASE leaves a row with the new key as it is |
 
 Targeted tests:
 
@@ -930,7 +1034,9 @@ The fixed simulator corpus must reach every state at least once, or its test fai
 | `STATE-CRASH-MID-GC` | a process crashes in the middle of a GC pass | "a process crashes during a GC pass" |
 | `STATE-UNIQUE-AFTER-CONFLICT` | an autocommit statement that passed its unique checks loses its commit to a concurrent one, and its retry fails with a unique violation that the concurrent commit causes | "a unique violation occurs only because of a concurrent commit" |
 | `STATE-UNIQUE-VALUE-REUSED` | a client inserts a row with a unique value that its own committed UPDATE or DELETE freed | "a unique value that a committed write freed is taken again" |
+| `STATE-FK-AFTER-CONFLICT` | an autocommit statement that passed its foreign key checks loses its commit to a concurrent one, and its retry fails with a foreign key violation that the concurrent commit causes | "a foreign key violation occurs only because of a concurrent commit" |
+| `STATE-FK-CASCADE-TABLES` | one statement's ON DELETE CASCADE actions delete rows in more than one table | "a cascade deletes rows in more than one table" |
 
 Verified by:
 
-- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, and unique violations that only a concurrent commit causes
+- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, and unique and foreign key violations that only a concurrent commit causes

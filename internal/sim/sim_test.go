@@ -85,6 +85,23 @@ func corpus() []sim.Config {
 		}
 		cfgs = append(cfgs, cfg)
 	}
+	// Concurrent writers of tables with foreign keys and checks through SQL, with background
+	// maintenance in every mode, and some with heavier faults and more contention.
+	for seed := uint64(600); seed < 630; seed++ {
+		cfg := sim.DefaultConfig(seed)
+		cfg.Workload = sim.ForeignKey
+		cfg.SQL = true
+		cfg.Maintenance = sim.MaintenanceMode(seed % 4)
+		if seed%3 == 0 {
+			cfg.Clients = 10
+			cfg.ErrorRate = 0.15
+			cfg.LostAckRate = 0.15
+			cfg.CrashRate = 0.03
+			cfg.Maintainers = 2
+			cfg.GracePeriod = 500 * time.Millisecond
+		}
+		cfgs = append(cfgs, cfg)
+	}
 	// The same through the SQL layer and the database/sql driver.
 	for seed := uint64(300); seed < 330; seed++ {
 		for _, w := range []sim.Workload{sim.ListAppend, sim.Bank} {
@@ -150,11 +167,13 @@ func TestSimulator(t *testing.T) {
 	t.Run("corpus finds no anomalies", func(t *testing.T) {
 		verify.Covers(t, "the fixed corpus, with injected errors, latency, lost acknowledgements, outages, and crashes, finds no anomalies with any checker and exercises every fault", "AC-1.1", "AC-1.2", "AC-1.3", "AC-1.4", "AC-1.5", "AC-1.7", "AC-1.8", "AC-3.1", "AC-3.2", "AC-6.2", "INV-MULTI-WRITER", "INV-STRICT-SERIALIZABLE", "INV-CACHE-LOSS", "INV-S3-ONLY")
 		verify.Covers(t, "the fixed corpus, with the unique workload under the same faults, finds no two rows with the same unique value in any snapshot a reader saw or in the final state, and after every run through SQL every index of the store matches its table, and lookups through the indexes find the rows of the table", "INV-UNIQUE", "INV-INDEX-CONSISTENT")
-		verify.Covers(t, "the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, and unique violations that only a concurrent commit causes",
+		verify.Covers(t, "the fixed corpus, with the foreign key workload under the same faults, finds no reference to a missing row and no row that violates a CHECK in any snapshot a reader saw, and after every run through SQL every foreign key and CHECK of the store holds", "INV-FK", "INV-CHECK")
+		verify.Covers(t, "the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, and unique and foreign key violations that only a concurrent commit causes",
 			"AC-1.3", "AC-1.4", "STATE-LOST-ACK-LANDED", "STATE-LOST-ACK-CONFLICT", "STATE-LIVE-UNKNOWN", "STATE-AUTOCOMMIT-RETRY",
 			"STATE-COMPACTION-REBASE", "STATE-GC-REBASE", "STATE-LEASE-TAKEOVER", "STATE-LEASE-OVERLAP",
 			"STATE-SNAPSHOT-EXPIRED-REFUSED", "STATE-BLOCK-READ-RETRY-SUCCEEDED", "STATE-CRASH-MID-COMMIT-RECOVERED",
-			"STATE-CRASH-MID-COMPACTION", "STATE-CRASH-MID-GC", "STATE-UNIQUE-AFTER-CONFLICT", "STATE-UNIQUE-VALUE-REUSED")
+			"STATE-CRASH-MID-COMPACTION", "STATE-CRASH-MID-GC", "STATE-UNIQUE-AFTER-CONFLICT", "STATE-UNIQUE-VALUE-REUSED",
+			"STATE-FK-AFTER-CONFLICT", "STATE-FK-CASCADE-TABLES")
 		var totals sim.Stats
 		batch := simBatch{name: "corpus"}
 		reached := map[string]int{}
@@ -188,6 +207,8 @@ func TestSimulator(t *testing.T) {
 		is.True(t, totals.Compactions > 50, "compactions")
 		is.True(t, totals.Deleted > 50, "deleted objects")
 		is.True(t, totals.UniqueViolations > 200, "unique violations")
+		is.True(t, totals.ForeignKeyViolations > 200, "foreign key violations")
+		is.True(t, totals.CheckViolations > 50, "check violations")
 	})
 
 	t.Run("compaction succeeds against steady writers by rebasing on their commits", func(t *testing.T) {
@@ -275,7 +296,7 @@ func TestSimulator(t *testing.T) {
 	})
 
 	t.Run("the same seed produces the same history", func(t *testing.T) {
-		verify.Covers(t, "the same seed gives a byte-identical history, final state, and statistics, through the engine and SQL, in every maintenance mode", "AC-1.9")
+		verify.Covers(t, "the same seed gives a byte-identical history, final state, and statistics, through the engine and SQL, in every maintenance mode, also for the foreign key workload, whose now() comes from the virtual clock", "AC-1.9")
 		for _, useSQL := range []bool{false, true} {
 			for _, w := range []sim.Workload{sim.ListAppend, sim.Bank} {
 				cfg := sim.DefaultConfig(7)
@@ -292,6 +313,16 @@ func TestSimulator(t *testing.T) {
 				}
 				is.True(t, len(first.History) > 0)
 			}
+		}
+		cfg := sim.DefaultConfig(7)
+		cfg.Workload = sim.ForeignKey
+		cfg.SQL = true
+		cfg.Maintainers = 2
+		cfg.Maintenance = sim.MaintenanceLease
+		first := sim.Run(cfg)
+		again := sim.Run(cfg)
+		if first.Digest != again.Digest {
+			t.Fatalf("%v: digests differ:\n%s", cfg.Name(), diff(first.Digest, again.Digest))
 		}
 	})
 
@@ -336,8 +367,10 @@ func TestSimulator(t *testing.T) {
 			cfg.Workload = sim.Bank
 		case "unique":
 			cfg.Workload = sim.Unique
+		case "foreign-key":
+			cfg.Workload = sim.ForeignKey
 		}
-		cfg.SQL = os.Getenv("MARAGUDB_API") == "sql" || cfg.Workload == sim.Unique
+		cfg.SQL = os.Getenv("MARAGUDB_API") == "sql" || cfg.Workload == sim.Unique || cfg.Workload == sim.ForeignKey
 		cfg.Maintainers = 2
 		if os.Getenv("MARAGUDB_CORPUS") != "" {
 			found := false
@@ -407,8 +440,8 @@ func TestSimulator(t *testing.T) {
 		for time.Now().Before(deadline) {
 			seed := rng.Uint64()
 			cfg := sim.DefaultConfig(seed)
-			cfg.Workload = sim.Workload(rng.IntN(3))
-			cfg.SQL = rng.IntN(2) == 0 || cfg.Workload == sim.Unique
+			cfg.Workload = sim.Workload(rng.IntN(4))
+			cfg.SQL = rng.IntN(2) == 0 || cfg.Workload == sim.Unique || cfg.Workload == sim.ForeignKey
 			cfg.Clients = 2 + rng.IntN(12)
 			cfg.TxPerClient = 10 + rng.IntN(60)
 			cfg.Keys = 1 + rng.IntN(6)
@@ -500,12 +533,12 @@ func (c cell) String() string {
 	return fmt.Sprintf("%v through %s, %s", c.workload, api, maintainers)
 }
 
-// cells of the kill matrix, in order. The unique workload runs only through SQL.
+// cells of the kill matrix, in order. The unique and foreign key workloads run only through SQL.
 func cells() []cell {
 	var cs []cell
 	for _, sql := range []bool{false, true} {
-		for _, w := range []sim.Workload{sim.ListAppend, sim.Bank, sim.Unique} {
-			if w == sim.Unique && !sql {
+		for _, w := range []sim.Workload{sim.ListAppend, sim.Bank, sim.Unique, sim.ForeignKey} {
+			if (w == sim.Unique || w == sim.ForeignKey) && !sql {
 				continue
 			}
 			for _, maintainers := range []int{0, 2} {
@@ -525,6 +558,8 @@ const (
 	noAutocommitWrite = "the bank workload writes only in explicit transactions, so no autocommit statement is ever retried, and a doubled transfer conserves money anyway"
 	noSecondaryIndex  = "the tables of the list-append workload have no index besides the primary key"
 	noUniqueIndex     = "the workload has no unique index besides the primary key"
+	noForeignKey      = "the workload has no foreign keys"
+	noCheck           = "the workload has no CHECK constraints"
 )
 
 // mutants in the kill matrix.
@@ -612,8 +647,9 @@ func mutants() []mutant {
 			id: "MUT-RETRY-UNKNOWN", replay: "retry-unknown", name: "retrying an autocommit statement after an unknown commit outcome",
 			description:  "`exec.Mutations.RetryAfterUnknownCommit` retries an autocommit statement whose commit outcome is unknown, which can apply it twice.",
 			sqlMutations: exec.Mutations{RetryAfterUnknownCommit: true},
-			cannot:       merge(bankCells(noAutocommitWrite), workloadCells(sim.Unique, "a retried insert fails on its own primary key, and a retried move or delete finds its row moved or gone, so a statement applied twice leaves a consistent state")),
-			checkers:     []string{sim.CheckerDurability},
+			cannot: merge(bankCells(noAutocommitWrite), workloadCells(sim.Unique, "a retried insert fails on its own primary key, and a retried move or delete finds its row moved or gone, so a statement applied twice leaves a consistent state"),
+				workloadCells(sim.ForeignKey, "a retried statement is checked again against every foreign key and check, so even one applied twice, such as an increment, leaves a consistent state, and the counter is incremented only in transactions, which are never retried")),
+			checkers: []string{sim.CheckerDurability},
 		},
 		{
 			id: "MUT-INDEX-STALE-DELETE", replay: "index-stale-delete", name: "stale index entries after an UPDATE or DELETE",
@@ -626,15 +662,43 @@ func mutants() []mutant {
 			id: "MUT-UNIQUE-NO-CHECK", replay: "unique-no-check", name: "no unique check",
 			description:  "`exec.Mutations.UniqueNoCheck` skips the check that no other row has a row's values in a unique index.",
 			sqlMutations: exec.Mutations{UniqueNoCheck: true},
-			cannot:       merge(workloadCells(sim.ListAppend, noUniqueIndex), workloadCells(sim.Bank, noUniqueIndex)),
+			cannot:       merge(workloadCells(sim.ListAppend, noUniqueIndex), workloadCells(sim.Bank, noUniqueIndex), workloadCells(sim.ForeignKey, noUniqueIndex)),
 			checkers:     []string{sim.CheckerUnique, sim.CheckerIndex},
 		},
 		{
 			id: "MUT-UNIQUE-OWN-WRITES", replay: "unique-own-writes", name: "a unique check that misses the statement's own writes",
 			description:  "`exec.Mutations.UniqueOwnWrites` makes the unique check read the transaction without the statement's own writes, so that an INSERT of two rows with the same value lets both in.",
 			sqlMutations: exec.Mutations{UniqueOwnWrites: true},
-			cannot:       merge(workloadCells(sim.ListAppend, noUniqueIndex), workloadCells(sim.Bank, noUniqueIndex)),
+			cannot:       merge(workloadCells(sim.ListAppend, noUniqueIndex), workloadCells(sim.Bank, noUniqueIndex), workloadCells(sim.ForeignKey, noUniqueIndex)),
 			checkers:     []string{sim.CheckerIndex},
+		},
+		{
+			id: "MUT-FK-NO-CHILD-CHECK", replay: "fk-no-child-check", name: "no check of a referencing row",
+			description:  "`exec.Mutations.ForeignKeyNoChildCheck` skips the check that an inserted or updated row has the row its foreign key references.",
+			sqlMutations: exec.Mutations{ForeignKeyNoChildCheck: true},
+			cannot:       merge(workloadCells(sim.ListAppend, noForeignKey), workloadCells(sim.Bank, noForeignKey), workloadCells(sim.Unique, noForeignKey)),
+			checkers:     []string{sim.CheckerForeignKey},
+		},
+		{
+			id: "MUT-FK-NO-PARENT-CHECK", replay: "fk-no-parent-check", name: "no check or action on the referencing rows",
+			description:  "`exec.Mutations.ForeignKeyNoParentCheck` skips the checks and the actions on the rows that reference a deleted row or an updated key.",
+			sqlMutations: exec.Mutations{ForeignKeyNoParentCheck: true},
+			cannot:       merge(workloadCells(sim.ListAppend, noForeignKey), workloadCells(sim.Bank, noForeignKey), workloadCells(sim.Unique, noForeignKey)),
+			checkers:     []string{sim.CheckerForeignKey},
+		},
+		{
+			id: "MUT-FK-OWN-WRITES", replay: "fk-own-writes", name: "foreign key lookups that miss the statement's own writes",
+			description:  "`exec.Mutations.ForeignKeyOwnWrites` makes the lookups of foreign keys read the transaction without the statement's own writes, so that an UPDATE that moves a row away and points another row at its old key passes.",
+			sqlMutations: exec.Mutations{ForeignKeyOwnWrites: true},
+			cannot:       merge(workloadCells(sim.ListAppend, noForeignKey), workloadCells(sim.Bank, noForeignKey), workloadCells(sim.Unique, noForeignKey)),
+			checkers:     []string{sim.CheckerForeignKey},
+		},
+		{
+			id: "MUT-CHECK-SKIP-UPDATE", replay: "check-skip-update", name: "CHECK on INSERT only",
+			description:  "`exec.Mutations.CheckSkipUpdate` checks the CHECK constraints of a row only when it is inserted, not when an UPDATE or a foreign key action changes it.",
+			sqlMutations: exec.Mutations{CheckSkipUpdate: true},
+			cannot:       merge(workloadCells(sim.ListAppend, noCheck), workloadCells(sim.Bank, noCheck), workloadCells(sim.Unique, noCheck)),
+			checkers:     []string{sim.CheckerCheck},
 		},
 		{
 			id: "MUT-UPDATE-SEES-OWN-WRITES", replay: "update-sees-own-writes", name: "an UPDATE that revisits the rows it wrote",
@@ -643,7 +707,10 @@ func mutants() []mutant {
 			cannot: func() map[cell]string {
 				m := map[cell]string{}
 				for _, c := range cells() {
-					m[c] = "the workloads never update primary key columns, so no row moves ahead of the scan"
+					m[c] = "the workload never updates primary key columns, so no row moves ahead of the scan"
+					if c.workload == sim.ForeignKey {
+						m[c] = "the only UPDATE of a primary key moves one node to a new key, and when it revisits that row, its CASE leaves a row with the new key as it is"
+					}
 				}
 				return m
 			}(),
@@ -697,7 +764,7 @@ func TestMutants(t *testing.T) {
 					caught[name] = true
 				}
 				if r.Status == verify.Detected && c.maintainers == 0 && !slices.ContainsFunc(r.Checkers, func(name string) bool {
-					return name == sim.CheckerListAppend || name == sim.CheckerDurability || name == sim.CheckerBank || name == sim.CheckerUnique || name == sim.CheckerIndex
+					return name == sim.CheckerListAppend || name == sim.CheckerDurability || name == sim.CheckerBank || name == sim.CheckerUnique || name == sim.CheckerIndex || name == sim.CheckerForeignKey || name == sim.CheckerCheck || name == sim.CheckerRealTime
 				}) {
 					t.Errorf("%v: without maintainers, a history or invariant checker must find the mutant, but only %v did", c, r.Checkers)
 				}

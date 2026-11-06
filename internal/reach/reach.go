@@ -61,6 +61,8 @@ func Declarations() []Declared {
 		{CrashMidGC, "a process crashes in the middle of a GC pass", "a process crashes during a GC pass"},
 		{UniqueAfterConflict, "an autocommit statement that passed its unique checks loses its commit to a concurrent one, and its retry fails with a unique violation that the concurrent commit causes", "a unique violation occurs only because of a concurrent commit"},
 		{UniqueValueReused, "a client inserts a row with a unique value that its own committed UPDATE or DELETE freed", "a unique value that a committed write freed is taken again"},
+		{ForeignKeyAfterConflict, "an autocommit statement that passed its foreign key checks loses its commit to a concurrent one, and its retry fails with a foreign key violation that the concurrent commit causes", "a foreign key violation occurs only because of a concurrent commit"},
+		{ForeignKeyCascadeTables, "one statement's ON DELETE CASCADE actions delete rows in more than one table", "a cascade deletes rows in more than one table"},
 	}
 }
 

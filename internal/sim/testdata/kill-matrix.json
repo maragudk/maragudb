@@ -10,7 +10,9 @@
     "bank through SQL, no maintainers",
     "bank through SQL, 2 maintainers",
     "unique through SQL, no maintainers",
-    "unique through SQL, 2 maintainers"
+    "unique through SQL, 2 maintainers",
+    "foreign-key through SQL, no maintainers",
+    "foreign-key through SQL, 2 maintainers"
   ],
   "mutants": [
     {
@@ -84,6 +86,22 @@
           "cell": "unique through SQL, 2 maintainers",
           "status": "undetected",
           "reason": "an unconditional manifest write drops whole concurrent commits, which leaves a consistent state in which no value repeats, and the unique workload does not check that acknowledged writes survive"
+        },
+        {
+          "cell": "foreign-key through SQL, no maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "real-time order"
+          ]
+        },
+        {
+          "cell": "foreign-key through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 3,
+          "checkers": [
+            "real-time order"
+          ]
         }
       ]
     },
@@ -155,6 +173,19 @@
         },
         {
           "cell": "unique through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "grace period"
+          ]
+        },
+        {
+          "cell": "foreign-key through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "without maintainers nothing is ever deleted, so no reader can lose an object"
+        },
+        {
+          "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
           "seed": 1,
           "checkers": [
@@ -233,6 +264,22 @@
           "checkers": [
             "grace period"
           ]
+        },
+        {
+          "cell": "foreign-key through SQL, no maintainers",
+          "status": "detected",
+          "seed": 2,
+          "checkers": [
+            "real-time order"
+          ]
+        },
+        {
+          "cell": "foreign-key through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "real-time order"
+          ]
         }
       ]
     },
@@ -303,6 +350,22 @@
           "cell": "unique through SQL, 2 maintainers",
           "status": "undetected",
           "reason": "an acknowledged write that never landed is missing as a whole, which leaves a consistent state, and the unique workload does not check that acknowledged writes survive"
+        },
+        {
+          "cell": "foreign-key through SQL, no maintainers",
+          "status": "detected",
+          "seed": 2,
+          "checkers": [
+            "real-time order"
+          ]
+        },
+        {
+          "cell": "foreign-key through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 2,
+          "checkers": [
+            "real-time order"
+          ]
         }
       ]
     },
@@ -374,6 +437,19 @@
           "seed": 2,
           "checkers": [
             "index consistency"
+          ]
+        },
+        {
+          "cell": "foreign-key through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "without maintainers nothing compacts, so there is never a rebase"
+        },
+        {
+          "cell": "foreign-key through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 3,
+          "checkers": [
+            "real-time order"
           ]
         }
       ]
@@ -451,6 +527,22 @@
           "checkers": [
             "index consistency"
           ]
+        },
+        {
+          "cell": "foreign-key through SQL, no maintainers",
+          "status": "detected",
+          "seed": 8,
+          "checkers": [
+            "foreign key"
+          ]
+        },
+        {
+          "cell": "foreign-key through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 2,
+          "checkers": [
+            "foreign key"
+          ]
         }
       ]
     },
@@ -517,6 +609,16 @@
           "cell": "unique through SQL, 2 maintainers",
           "status": "undetected",
           "reason": "a retried insert fails on its own primary key, and a retried move or delete finds its row moved or gone, so a statement applied twice leaves a consistent state"
+        },
+        {
+          "cell": "foreign-key through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "a retried statement is checked again against every foreign key and check, so even one applied twice, such as an increment, leaves a consistent state, and the counter is incremented only in transactions, which are never retried"
+        },
+        {
+          "cell": "foreign-key through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "a retried statement is checked again against every foreign key and check, so even one applied twice, such as an increment, leaves a consistent state, and the counter is incremented only in transactions, which are never retried"
         }
       ]
     },
@@ -587,6 +689,22 @@
           "checkers": [
             "index consistency"
           ]
+        },
+        {
+          "cell": "foreign-key through SQL, no maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "index consistency"
+          ]
+        },
+        {
+          "cell": "foreign-key through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 2,
+          "checkers": [
+            "index consistency"
+          ]
         }
       ]
     },
@@ -653,6 +771,16 @@
             "unique",
             "index consistency"
           ]
+        },
+        {
+          "cell": "foreign-key through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "the workload has no unique index besides the primary key"
+        },
+        {
+          "cell": "foreign-key through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "the workload has no unique index besides the primary key"
         }
       ]
     },
@@ -719,6 +847,312 @@
             "unique",
             "index consistency"
           ]
+        },
+        {
+          "cell": "foreign-key through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "the workload has no unique index besides the primary key"
+        },
+        {
+          "cell": "foreign-key through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "the workload has no unique index besides the primary key"
+        }
+      ]
+    },
+    {
+      "id": "MUT-FK-NO-CHILD-CHECK",
+      "name": "no check of a referencing row",
+      "replay": "fk-no-child-check",
+      "description": "`exec.Mutations.ForeignKeyNoChildCheck` skips the check that an inserted or updated row has the row its foreign key references.",
+      "results": [
+        {
+          "cell": "list-append through the engine, no maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "list-append through the engine, 2 maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "bank through the engine, no maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "bank through the engine, 2 maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "list-append through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "the workload has no foreign keys"
+        },
+        {
+          "cell": "list-append through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "the workload has no foreign keys"
+        },
+        {
+          "cell": "bank through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "the workload has no foreign keys"
+        },
+        {
+          "cell": "bank through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "the workload has no foreign keys"
+        },
+        {
+          "cell": "unique through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "the workload has no foreign keys"
+        },
+        {
+          "cell": "unique through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "the workload has no foreign keys"
+        },
+        {
+          "cell": "foreign-key through SQL, no maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "foreign key"
+          ]
+        },
+        {
+          "cell": "foreign-key through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "foreign key"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "MUT-FK-NO-PARENT-CHECK",
+      "name": "no check or action on the referencing rows",
+      "replay": "fk-no-parent-check",
+      "description": "`exec.Mutations.ForeignKeyNoParentCheck` skips the checks and the actions on the rows that reference a deleted row or an updated key.",
+      "results": [
+        {
+          "cell": "list-append through the engine, no maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "list-append through the engine, 2 maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "bank through the engine, no maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "bank through the engine, 2 maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "list-append through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "the workload has no foreign keys"
+        },
+        {
+          "cell": "list-append through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "the workload has no foreign keys"
+        },
+        {
+          "cell": "bank through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "the workload has no foreign keys"
+        },
+        {
+          "cell": "bank through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "the workload has no foreign keys"
+        },
+        {
+          "cell": "unique through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "the workload has no foreign keys"
+        },
+        {
+          "cell": "unique through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "the workload has no foreign keys"
+        },
+        {
+          "cell": "foreign-key through SQL, no maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "foreign key"
+          ]
+        },
+        {
+          "cell": "foreign-key through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "foreign key"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "MUT-FK-OWN-WRITES",
+      "name": "foreign key lookups that miss the statement's own writes",
+      "replay": "fk-own-writes",
+      "description": "`exec.Mutations.ForeignKeyOwnWrites` makes the lookups of foreign keys read the transaction without the statement's own writes, so that an UPDATE that moves a row away and points another row at its old key passes.",
+      "results": [
+        {
+          "cell": "list-append through the engine, no maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "list-append through the engine, 2 maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "bank through the engine, no maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "bank through the engine, 2 maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "list-append through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "the workload has no foreign keys"
+        },
+        {
+          "cell": "list-append through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "the workload has no foreign keys"
+        },
+        {
+          "cell": "bank through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "the workload has no foreign keys"
+        },
+        {
+          "cell": "bank through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "the workload has no foreign keys"
+        },
+        {
+          "cell": "unique through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "the workload has no foreign keys"
+        },
+        {
+          "cell": "unique through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "the workload has no foreign keys"
+        },
+        {
+          "cell": "foreign-key through SQL, no maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "foreign key"
+          ]
+        },
+        {
+          "cell": "foreign-key through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 2,
+          "checkers": [
+            "foreign key"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "MUT-CHECK-SKIP-UPDATE",
+      "name": "CHECK on INSERT only",
+      "replay": "check-skip-update",
+      "description": "`exec.Mutations.CheckSkipUpdate` checks the CHECK constraints of a row only when it is inserted, not when an UPDATE or a foreign key action changes it.",
+      "results": [
+        {
+          "cell": "list-append through the engine, no maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "list-append through the engine, 2 maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "bank through the engine, no maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "bank through the engine, 2 maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "list-append through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "the workload has no CHECK constraints"
+        },
+        {
+          "cell": "list-append through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "the workload has no CHECK constraints"
+        },
+        {
+          "cell": "bank through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "the workload has no CHECK constraints"
+        },
+        {
+          "cell": "bank through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "the workload has no CHECK constraints"
+        },
+        {
+          "cell": "unique through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "the workload has no CHECK constraints"
+        },
+        {
+          "cell": "unique through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "the workload has no CHECK constraints"
+        },
+        {
+          "cell": "foreign-key through SQL, no maintainers",
+          "status": "detected",
+          "seed": 5,
+          "checkers": [
+            "check constraint"
+          ]
+        },
+        {
+          "cell": "foreign-key through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "check constraint"
+          ]
         }
       ]
     },
@@ -751,32 +1185,42 @@
         {
           "cell": "list-append through SQL, no maintainers",
           "status": "undetected",
-          "reason": "the workloads never update primary key columns, so no row moves ahead of the scan"
+          "reason": "the workload never updates primary key columns, so no row moves ahead of the scan"
         },
         {
           "cell": "list-append through SQL, 2 maintainers",
           "status": "undetected",
-          "reason": "the workloads never update primary key columns, so no row moves ahead of the scan"
+          "reason": "the workload never updates primary key columns, so no row moves ahead of the scan"
         },
         {
           "cell": "bank through SQL, no maintainers",
           "status": "undetected",
-          "reason": "the workloads never update primary key columns, so no row moves ahead of the scan"
+          "reason": "the workload never updates primary key columns, so no row moves ahead of the scan"
         },
         {
           "cell": "bank through SQL, 2 maintainers",
           "status": "undetected",
-          "reason": "the workloads never update primary key columns, so no row moves ahead of the scan"
+          "reason": "the workload never updates primary key columns, so no row moves ahead of the scan"
         },
         {
           "cell": "unique through SQL, no maintainers",
           "status": "undetected",
-          "reason": "the workloads never update primary key columns, so no row moves ahead of the scan"
+          "reason": "the workload never updates primary key columns, so no row moves ahead of the scan"
         },
         {
           "cell": "unique through SQL, 2 maintainers",
           "status": "undetected",
-          "reason": "the workloads never update primary key columns, so no row moves ahead of the scan"
+          "reason": "the workload never updates primary key columns, so no row moves ahead of the scan"
+        },
+        {
+          "cell": "foreign-key through SQL, no maintainers",
+          "status": "undetected",
+          "reason": "the only UPDATE of a primary key moves one node to a new key, and when it revisits that row, its CASE leaves a row with the new key as it is"
+        },
+        {
+          "cell": "foreign-key through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "the only UPDATE of a primary key moves one node to a new key, and when it revisits that row, its CASE leaves a row with the new key as it is"
         }
       ]
     }

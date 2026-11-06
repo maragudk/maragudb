@@ -34,12 +34,13 @@ verification:
 	go test ./internal/sim -run 'TestMutants' -count 1 -args -update
 	go test ./internal/verify -run 'TestVerification' -count 1 -args -update
 
-# Replay one simulator seed with a full trace. Optional: WORKLOAD=bank or WORKLOAD=unique, which
-# runs through SQL, API=sql, CORPUS=1 to use the corpus configuration of that seed, workload,
-# and API, MAINTAINERS=<n> (default 2), MAINTENANCE=lease|none|overlap, and MUTATION=<name>,
-# where the names are in the kill matrix in docs/verification.md: cas, gc, freshness, ack,
-# compacted-ahead, fresh-snapshot, retry-unknown, index-stale-delete, unique-no-check,
-# unique-own-writes, and update-sees-own-writes.
+# Replay one simulator seed with a full trace. Optional: WORKLOAD=bank, WORKLOAD=unique, or
+# WORKLOAD=foreign-key, the last two of which run through SQL, API=sql, CORPUS=1 to use the
+# corpus configuration of that seed, workload, and API, MAINTAINERS=<n> (default 2),
+# MAINTENANCE=lease|none|overlap, and MUTATION=<name>, where the names are in the kill matrix in
+# docs/verification.md: cas, gc, freshness, ack, compacted-ahead, fresh-snapshot, retry-unknown,
+# index-stale-delete, unique-no-check, unique-own-writes, fk-no-child-check, fk-no-parent-check,
+# fk-own-writes, check-skip-update, and update-sees-own-writes.
 .PHONY: replay
 replay:
 	MARAGUDB_SEED=$(SEED) MARAGUDB_WORKLOAD=$(WORKLOAD) MARAGUDB_API=$(API) MARAGUDB_CORPUS=$(CORPUS) MARAGUDB_MAINTAINERS=$(MAINTAINERS) MARAGUDB_MAINTENANCE=$(MAINTENANCE) MARAGUDB_MUTATION=$(MUTATION) go test ./internal/sim -run 'TestSimulator/replay' -count 1 -v

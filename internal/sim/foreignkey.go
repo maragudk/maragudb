@@ -1,0 +1,437 @@
+package sim
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"math/rand/v2"
+	"slices"
+	"strings"
+
+	"maragu.dev/maragudb/internal/engine"
+	"maragu.dev/maragudb/internal/history"
+	"maragu.dev/maragudb/internal/sql/exec"
+)
+
+// The foreign key workload keeps parents, their children, the children's toys, and a tree of
+// nodes that each may have an owner among the parents, with ids from small pools so that clients
+// collide. Children cascade with their parent and toys with their child, a node's children lose
+// their parent when it is deleted, and an owner cannot be deleted. Every table has a CHECK.
+// Clients insert, update, and delete rows of every table, with keys that may be missing or
+// concurrently deleted, and with values that violate the checks now and then, as autocommit
+// statements and in transactions. Readers check that no snapshot has a reference to a missing
+// row or a row that violates a check. A counter that transactions increment shows that a reader
+// sees every commit acknowledged before it began.
+
+// ForeignKeyTablesSQL are the statements that create the tables of the foreign key workload.
+func ForeignKeyTablesSQL() []string {
+	return []string{
+		"CREATE TABLE parents (id bigint PRIMARY KEY, n bigint NOT NULL DEFAULT 0 CHECK (n >= 0), created timestamptz NOT NULL DEFAULT now())",
+		"CREATE TABLE children (id bigint PRIMARY KEY, pid bigint REFERENCES parents ON DELETE CASCADE, n bigint NOT NULL DEFAULT 0, CHECK (n >= 0 AND n < 20))",
+		"CREATE INDEX children_pid ON children (pid)",
+		"CREATE TABLE toys (id bigint PRIMARY KEY, cid bigint NOT NULL REFERENCES children ON DELETE CASCADE, label text NOT NULL DEFAULT 'toy' CHECK (label <> ''))",
+		"CREATE TABLE nodes (id bigint PRIMARY KEY, pid bigint REFERENCES nodes ON DELETE SET NULL, owner bigint REFERENCES parents ON DELETE RESTRICT, CHECK (pid <> id))",
+		"CREATE TABLE ticks (id bigint PRIMARY KEY, n bigint NOT NULL)",
+		"INSERT INTO ticks VALUES (0, 0)",
+	}
+}
+
+// fkKey is a key from the pool of the foreign key workload, which has 2 * keys of them.
+func (c *client) fkKey() int64 {
+	return int64(c.rng.IntN(2 * c.run.cfg.Keys))
+}
+
+// hotParent is the parent 0 half the time, and otherwise a key of the pool, so that clients
+// insert children of a parent that other clients delete and insert again.
+func (c *client) hotParent() int64 {
+	if c.rng.IntN(2) == 0 {
+		return 0
+	}
+	return c.fkKey()
+}
+
+// nullableKey is a key, or now and then NULL, which references nothing.
+func (c *client) nullableKey() any {
+	if c.rng.IntN(6) == 0 {
+		return nil
+	}
+	return c.fkKey()
+}
+
+func (c *client) foreignKeySQL(ctx context.Context) {
+	h := history.Tx{Client: c.id, Invoke: c.run.stamp()}
+	var err error
+	switch c.rng.IntN(19) {
+	case 0, 1:
+		c.auditForeignKeys(ctx, h)
+		return
+	case 16:
+		_, err = c.sql.ExecContext(ctx, "INSERT INTO children (id, pid) VALUES ($1, 0)", c.value())
+	case 17:
+		_, err = c.sql.ExecContext(ctx, "DELETE FROM parents WHERE id = 0")
+	case 18:
+		_, err = c.sql.ExecContext(ctx, "INSERT INTO parents (id) VALUES (0)")
+	case 2:
+		_, err = c.sql.ExecContext(ctx, "INSERT INTO parents (id, n) VALUES ($1, $2)", c.hotParent(), c.rng.IntN(6)-1)
+	case 3:
+		if c.rng.IntN(2) == 0 {
+			_, err = c.sql.ExecContext(ctx, "INSERT INTO children (id, pid) VALUES ($1, $2)", c.value(), c.hotParent())
+			break
+		}
+		_, err = c.sql.ExecContext(ctx, "INSERT INTO children VALUES ($1, $2, $3)", c.fkKey(), c.nullableKey(), c.rng.IntN(21)-1)
+	case 4, 5:
+		_, err = c.sql.ExecContext(ctx, "UPDATE children SET pid = $1, n = n + $2 WHERE id = $3", c.nullableKey(), c.rng.IntN(7)-3, c.fkKey())
+	case 6:
+		_, err = c.sql.ExecContext(ctx, "UPDATE parents SET n = n + $1 WHERE id = $2", c.rng.IntN(5)-2, c.fkKey())
+	case 7:
+		_, err = c.sql.ExecContext(ctx, "DELETE FROM parents WHERE id = $1", c.hotParent())
+	case 8:
+		_, err = c.sql.ExecContext(ctx, "INSERT INTO toys (id, cid, label) VALUES ($1, $2, $3)", c.fkKey(), c.fkKey(), []string{"ball", "", "kite"}[c.rng.IntN(3)])
+	case 9, 10:
+		// A node, or a node and a child of it in one statement, mostly without references
+		// elsewhere, so that the tree grows, and now and then with a parent and an owner that may
+		// be missing.
+		var pid, owner any
+		if c.rng.IntN(3) == 0 {
+			pid, owner = c.nullableKey(), c.nullableKey()
+		}
+		if c.rng.IntN(2) == 0 {
+			_, err = c.sql.ExecContext(ctx, "INSERT INTO nodes VALUES ($1, $2, $3)", c.fkKey(), pid, owner)
+		} else {
+			_, err = c.sql.ExecContext(ctx, "INSERT INTO nodes VALUES ($1, $2, $3), ($4, $1, NULL)", c.fkKey(), pid, owner, c.fkKey())
+		}
+	case 11:
+		a, b, other := c.fkKey(), c.fkKey(), c.fkKey()
+		_, err = c.sql.ExecContext(ctx, moveNode, a, b, other)
+	case 12:
+		err = c.moveNodeTx(ctx)
+	case 13:
+		_, err = c.sql.ExecContext(ctx, []string{"DELETE FROM nodes WHERE id = $1", "DELETE FROM children WHERE id = $1", "UPDATE nodes SET owner = NULL WHERE owner = $1"}[c.rng.IntN(3)], c.fkKey())
+	case 14:
+		err = c.foreignKeyTx(ctx)
+	case 15:
+		err = c.tick(ctx)
+	}
+	switch {
+	case errors.Is(err, exec.ErrForeignKey), errors.Is(err, exec.ErrRestrict):
+		c.run.stats.ForeignKeyViolations++
+	case errors.Is(err, exec.ErrCheck):
+		c.run.stats.CheckViolations++
+	}
+	h.Complete = c.run.stamp()
+	h.Outcome = c.outcomeSQL(ctx, err)
+	if err != nil {
+		h.Err = err.Error()
+	}
+	c.record(h)
+}
+
+// tick increments the counter in a transaction, and records its new value when the commit is
+// acknowledged.
+func (c *client) tick(ctx context.Context) error {
+	tx, err := c.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var n int64
+	if err := tx.QueryRowContext(ctx, "SELECT n FROM ticks WHERE id = 0").Scan(&n); err != nil {
+		return err
+	}
+	c.pause(ctx)
+	if _, err := tx.ExecContext(ctx, "UPDATE ticks SET n = $1 WHERE id = 0", n+1); err != nil {
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	c.run.ticked = max(c.run.ticked, n+1)
+	return nil
+}
+
+// moveNode moves the node $1 to the key $2 and points the node $3 at the key it leaves, which
+// fails whenever the moved node existed and $3 is another existing node, because that node then
+// references a missing key. Only the statement's own writes show it.
+const moveNode = "UPDATE nodes SET id = CASE WHEN id = $1 THEN $2 ELSE id END, pid = CASE WHEN id = $3 THEN $1 ELSE pid END WHERE id IN ($1, $3)"
+
+// moveNodeTx inserts two nodes with fresh keys and then runs [moveNode] on them, which fails, in
+// a transaction.
+func (c *client) moveNodeTx(ctx context.Context) error {
+	tx, err := c.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	a, other := c.value(), c.value()
+	if _, err := tx.ExecContext(ctx, "INSERT INTO nodes VALUES ($1, NULL, NULL), ($2, NULL, NULL)", a, other); err != nil {
+		return err
+	}
+	c.pause(ctx)
+	if _, err := tx.ExecContext(ctx, moveNode, a, c.value(), other); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// foreignKeyTx deletes a parent and then inserts a child of it, which fails, or inserts a parent
+// and two children of it with fresh keys, and gives one child a toy, in a transaction.
+func (c *client) foreignKeyTx(ctx context.Context) error {
+	tx, err := c.sql.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	parent := c.fkKey()
+	if c.rng.IntN(4) == 0 {
+		if _, err := tx.ExecContext(ctx, "DELETE FROM parents WHERE id = $1", parent); err != nil {
+			return err
+		}
+		c.pause(ctx)
+		if _, err := tx.ExecContext(ctx, "INSERT INTO children (id, pid) VALUES ($1, $2)", c.fkKey(), parent); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+	if _, err := tx.ExecContext(ctx, "INSERT INTO parents (id) VALUES ($1)", parent); err != nil {
+		return err
+	}
+	c.pause(ctx)
+	child := c.value()
+	if _, err := tx.ExecContext(ctx, "INSERT INTO children (id, pid, n) VALUES ($1, $2, $3), ($4, $2, DEFAULT)", child, parent, c.rng.IntN(5), c.value()); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, "INSERT INTO toys (id, cid) VALUES ($1, $2)", c.value(), child); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// fkRows are the rows of the foreign key workload, each table's rendered.
+type fkRows struct {
+	parents  map[int64]int64
+	children map[int64][2]sql.NullInt64
+	toys     map[int64]toy
+	nodes    map[int64][2]sql.NullInt64
+}
+
+type toy struct {
+	cid   int64
+	label string
+}
+
+// readForeignKeyRows reads every row of every table of the foreign key workload, a table at a
+// time, calling between before each.
+func readForeignKeyRows(ctx context.Context, q querier, between func()) (fkRows, error) {
+	r := fkRows{parents: map[int64]int64{}, children: map[int64][2]sql.NullInt64{}, toys: map[int64]toy{}, nodes: map[int64][2]sql.NullInt64{}}
+	read := func(query string, scan func(rows *sql.Rows) error) error {
+		between()
+		rows, err := q.QueryContext(ctx, query)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = rows.Close() }()
+		for rows.Next() {
+			if err := scan(rows); err != nil {
+				return err
+			}
+		}
+		return rows.Err()
+	}
+	err := read("SELECT id, n FROM parents", func(rows *sql.Rows) error {
+		var id, n int64
+		err := rows.Scan(&id, &n)
+		r.parents[id] = n
+		return err
+	})
+	if err != nil {
+		return r, err
+	}
+	err = read("SELECT id, pid, n FROM children", func(rows *sql.Rows) error {
+		var id int64
+		var pid, n sql.NullInt64
+		err := rows.Scan(&id, &pid, &n)
+		r.children[id] = [2]sql.NullInt64{pid, n}
+		return err
+	})
+	if err != nil {
+		return r, err
+	}
+	err = read("SELECT id, cid, label FROM toys", func(rows *sql.Rows) error {
+		var id int64
+		var t toy
+		err := rows.Scan(&id, &t.cid, &t.label)
+		r.toys[id] = t
+		return err
+	})
+	if err != nil {
+		return r, err
+	}
+	err = read("SELECT id, pid, owner FROM nodes", func(rows *sql.Rows) error {
+		var id int64
+		var pid, owner sql.NullInt64
+		err := rows.Scan(&id, &pid, &owner)
+		r.nodes[id] = [2]sql.NullInt64{pid, owner}
+		return err
+	})
+	return r, err
+}
+
+// danglingReference is the first reference to a missing row in r, or "".
+func (r fkRows) danglingReference() string {
+	for _, id := range sortedKeys(r.children) {
+		if pid := r.children[id][0]; pid.Valid {
+			if _, ok := r.parents[pid.Int64]; !ok {
+				return fmt.Sprintf("child %d references the missing parent %d", id, pid.Int64)
+			}
+		}
+	}
+	for _, id := range sortedKeys(r.toys) {
+		if _, ok := r.children[r.toys[id].cid]; !ok {
+			return fmt.Sprintf("toy %d references the missing child %d", id, r.toys[id].cid)
+		}
+	}
+	for _, id := range sortedKeys(r.nodes) {
+		n := r.nodes[id]
+		if n[0].Valid {
+			if _, ok := r.nodes[n[0].Int64]; !ok {
+				return fmt.Sprintf("node %d references the missing node %d", id, n[0].Int64)
+			}
+		}
+		if n[1].Valid {
+			if _, ok := r.parents[n[1].Int64]; !ok {
+				return fmt.Sprintf("node %d is owned by the missing parent %d", id, n[1].Int64)
+			}
+		}
+	}
+	return ""
+}
+
+// checkViolation is the first row of r that violates a CHECK of its table, or "".
+func (r fkRows) checkViolation() string {
+	for _, id := range sortedKeys(r.parents) {
+		if r.parents[id] < 0 {
+			return fmt.Sprintf("parent %d has n = %d, below 0", id, r.parents[id])
+		}
+	}
+	for _, id := range sortedKeys(r.children) {
+		if n := r.children[id][1]; n.Valid && (n.Int64 < 0 || n.Int64 >= 20) {
+			return fmt.Sprintf("child %d has n = %d, outside [0, 20)", id, n.Int64)
+		}
+	}
+	for _, id := range sortedKeys(r.toys) {
+		if r.toys[id].label == "" {
+			return fmt.Sprintf("toy %d has an empty label", id)
+		}
+	}
+	for _, id := range sortedKeys(r.nodes) {
+		if pid := r.nodes[id][0]; pid.Valid && pid.Int64 == id {
+			return fmt.Sprintf("node %d is its own parent", id)
+		}
+	}
+	return ""
+}
+
+// String renders the rows, for the digest.
+func (r fkRows) String() string {
+	var b strings.Builder
+	for _, id := range sortedKeys(r.parents) {
+		fmt.Fprintf(&b, "p%d=%d ", id, r.parents[id])
+	}
+	for _, id := range sortedKeys(r.children) {
+		fmt.Fprintf(&b, "c%d=%v ", id, r.children[id])
+	}
+	for _, id := range sortedKeys(r.toys) {
+		fmt.Fprintf(&b, "t%d=%v ", id, r.toys[id])
+	}
+	for _, id := range sortedKeys(r.nodes) {
+		fmt.Fprintf(&b, "n%d=%v ", id, r.nodes[id])
+	}
+	return b.String()
+}
+
+func sortedKeys[V any](m map[int64]V) []int64 {
+	keys := make([]int64, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	return keys
+}
+
+// auditForeignKeys reads every row in a read-only transaction, a table at a time in one snapshot,
+// pausing now and then, and checks that no reference is to a missing row and no row violates a check.
+func (c *client) auditForeignKeys(ctx context.Context, h history.Tx) {
+	startedAt := c.run.sched.Now()
+	ticked := c.run.ticked
+	tx, err := c.sql.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return
+	}
+	defer func() { _ = tx.Rollback() }()
+	rows, err := readForeignKeyRows(ctx, tx, func() { c.pause(ctx) })
+	if err != nil {
+		c.readErrorSQL(ctx, startedAt, err)
+		return
+	}
+	var n int64
+	if err := tx.QueryRowContext(ctx, "SELECT n FROM ticks WHERE id = 0").Scan(&n); err != nil {
+		c.readErrorSQL(ctx, startedAt, err)
+		return
+	}
+	if n < ticked {
+		c.run.anomaly(CheckerRealTime, "client %d: the counter is %d, but a commit acknowledged before the read began set it to %d", c.id, n, ticked)
+	}
+	c.run.checkForeignKeyRows(rows, fmt.Sprintf("client %d", c.id))
+	h.Complete = c.run.stamp()
+	h.Outcome = history.OK
+	c.record(h)
+}
+
+// checkForeignKeyRows reports the dangling references and check violations of rows.
+func (r *run) checkForeignKeyRows(rows fkRows, who string) {
+	if d := rows.danglingReference(); d != "" {
+		r.anomaly(CheckerForeignKey, "%s: %s", who, d)
+	}
+	if v := rows.checkViolation(); v != "" {
+		r.anomaly(CheckerCheck, "%s: %s", who, v)
+	}
+}
+
+// readFinalForeignKeys reads every row with a fresh, fault-free, cache-free process, and checks
+// the final state like an audit does.
+func (r *run) readFinalForeignKeys(ctx context.Context, db *sql.DB) ([]string, error) {
+	rows, err := readForeignKeyRows(ctx, db, func() {})
+	if err != nil {
+		return nil, err
+	}
+	r.checkForeignKeyRows(rows, "final state")
+	return []string{rows.String()}, nil
+}
+
+// checkConstraints checks every foreign key and check of the final state of the store, reading
+// it with a fresh, fault-free, cache-free process.
+func (r *run) checkConstraints() {
+	var err error
+	r.goTask("constraint check", func(ctx context.Context) {
+		var db *engine.DB
+		db, err = engine.Open(ctx, engine.Options{Client: r.fake.WithoutFaults(), Prefix: "db", Now: r.sched.Now, Sleep: r.sched.Sleep, MemoryCacheBytes: new(int64), Rand: rand.New(rand.NewPCG(r.cfg.Seed, 0xc4ec))})
+		if err != nil {
+			return
+		}
+		var tx *engine.Tx
+		if tx, err = db.BeginReadOnly(ctx); err != nil {
+			return
+		}
+		err = exec.CheckConstraints(ctx, tx)
+	})
+	r.sched.Run()
+	switch {
+	case errors.Is(err, exec.ErrDanglingReference):
+		r.anomaly(CheckerForeignKey, "final state: %v", err)
+	case errors.Is(err, exec.ErrCheckViolated):
+		r.anomaly(CheckerCheck, "final state: %v", err)
+	case err != nil:
+		r.anoms = append(r.anoms, &Anomaly{Checker: CheckerFinalRead, Err: fmt.Errorf("checking the constraints: %w", err)})
+	}
+}

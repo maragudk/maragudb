@@ -86,6 +86,12 @@ func (r *run) seedSQL() {
 					panic(err)
 				}
 			}
+		case ForeignKey:
+			for _, q := range ForeignKeyTablesSQL() {
+				if _, err := db.ExecContext(ctx, q); err != nil {
+					panic(err)
+				}
+			}
 		}
 	})
 	r.sched.Run()
@@ -107,6 +113,8 @@ func (r *run) readFinalSQL() (map[string][]int64, map[string]int64, []string, er
 		switch r.cfg.Workload {
 		case Unique:
 			users, err = r.readFinalUnique(ctx, db)
+		case ForeignKey:
+			users, err = r.readFinalForeignKeys(ctx, db)
 		case ListAppend:
 			lists = map[string][]int64{}
 			var rows *sql.Rows
