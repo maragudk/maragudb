@@ -275,9 +275,8 @@ func (s *sides) compare(ctx context.Context, text string, st ast.Statement, rep 
 		rep.Errors++
 		executed.Err = pg.err
 		if !SameClass(mg.err, pg.err) {
-			if s.readOnly {
-				// A read-only transaction cannot store the rows again, and the writes in it fail
-				// before they read rows.
+			if s.readOnly && !query {
+				// The writes in a read-only transaction fail before they read rows.
 				return executed, mismatch(fmt.Sprintf("both failed, for different reasons: postgres SQLSTATE %s, maragudb %s", SQLState(pg.err), className(mg.err)))
 			}
 			// Different rows can fail for different reasons, and maragudb visits rows in key order
@@ -422,16 +421,23 @@ var (
 // in primary key order so that a scan visits them in that order, and returns the statement's
 // error, which is nil if it succeeded. Nothing it does is kept. Inside a transaction, it rolls
 // back to the savepoint taken before the statement, reruns it, and aborts the transaction
-// again.
+// again. A read-only transaction cannot store the rows again, but it has written nothing
+// either, so its rows are the committed ones: the rerun ends it, runs in a transaction of its
+// own, and then begins a transaction that it aborts, which behaves like the aborted read-only
+// one until it ends.
 func (s *sides) inKeyOrder(ctx context.Context, text, table string, query bool) (error, error) {
 	var keys []string
 	for _, k := range s.keys[table] {
 		keys = append(keys, ast.RenderExpr(&ast.ColumnRef{Name: k}))
 	}
 	tableName := ast.RenderExpr(&ast.ColumnRef{Name: table})
+	inTx := s.inTx && !s.readOnly
 	steps := []string{"BEGIN"}
-	if s.inTx {
+	switch {
+	case inTx:
 		steps = []string{"ROLLBACK TO SAVEPOINT pgdiff"}
+	case s.inTx:
+		steps = []string{"ROLLBACK", "BEGIN"}
 	}
 	steps = append(steps,
 		"CREATE TEMP TABLE sorted ON COMMIT DROP AS SELECT * FROM "+tableName,
@@ -444,12 +450,17 @@ func (s *sides) inKeyOrder(ctx context.Context, text, table string, query bool) 
 		}
 	}
 	err := run(ctx, s.pg, text, query).err
-	end := "ROLLBACK"
-	if s.inTx {
-		end = "ROLLBACK TO SAVEPOINT pgdiff"
+	end := []string{"ROLLBACK"}
+	switch {
+	case inTx:
+		end = []string{"ROLLBACK TO SAVEPOINT pgdiff"}
+	case s.inTx:
+		end = []string{"ROLLBACK", "BEGIN"}
 	}
-	if _, rerr := s.pg.ExecContext(ctx, end); rerr != nil {
-		return nil, fmt.Errorf("postgres: %s: %w", end, rerr)
+	for _, q := range end {
+		if _, rerr := s.pg.ExecContext(ctx, q); rerr != nil {
+			return nil, fmt.Errorf("postgres: %s: %w", q, rerr)
+		}
 	}
 	if s.inTx {
 		if res := run(ctx, s.pg, "SELECT 1 / 0", true); SQLState(res.err) != "22012" {
