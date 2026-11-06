@@ -530,25 +530,30 @@ func TestSession_Select(t *testing.T) {
 		mustExec(t, s, "CREATE TABLE wk (s text PRIMARY KEY, m bigint)")
 		mustExec(t, s, "INSERT INTO wk VALUES ('a', 0), ('b', 5)")
 		is.Error(t, exec.ErrUnsupported, queryErr(t, s, "SELECT s FROM wk WHERE s LIKE 'b\\'"), "a LIKE that can fail is an index condition itself")
+		is.Error(t, exec.ErrUnsupported, queryErr(t, s, "SELECT s FROM wk WHERE NULL OR s LIKE 'b\\'"), "also in an OR whose other argument is NULL, which Postgres drops")
+		is.Error(t, exec.ErrUnsupported, queryErr(t, s, "SELECT s FROM wk WHERE (s LIKE 'b\\' AND m > 0) OR (m < 9 AND s LIKE 'b\\')"), "and when it is common to every argument of an OR, which Postgres takes out")
 		is.Equal(t, `"b"`, query(t, s, "SELECT s FROM wk WHERE s LIKE s AND s LIKE 'b%'"), "a LIKE with a prefix is no index condition, but evaluated like any other")
 		is.Equal(t, "a\nb", strings.ReplaceAll(query(t, s, "SELECT s FROM wk WHERE s LIKE s"), `"`, ""), "a LIKE whose pattern is not a constant is no index condition")
 
 		// The conditions on the primary key select the rows, and the others are evaluated only on
 		// those, as in an index scan.
 		for sql, want := range map[string]string{
-			"SELECT id FROM w WHERE id = 2 AND 1 / m = 0":                  "2",
-			"SELECT id FROM w WHERE 1 / m = 0 AND id = 2":                  "2",
-			"SELECT id FROM w WHERE 2 = id AND 1 / m = 1":                  "",
-			"SELECT id FROM w WHERE id > 1 AND 1 / m = 0":                  "2\n3",
-			"SELECT id FROM w WHERE NOT (id <= 1) AND 1 / m = 0":           "2\n3",
-			"SELECT id FROM w WHERE id BETWEEN 2 AND 3 AND 1 / m = 0":      "2\n3",
-			"SELECT id FROM w WHERE id IN (2, 3) AND 1 / m = 0":            "2\n3",
-			"SELECT id FROM w WHERE id IN (2, 3) AND id < 3 AND 1 / m = 0": "2",
-			"SELECT id FROM w WHERE id = n AND n = 2 AND 1 / m = 1":        "",
-			"SELECT id FROM w WHERE n = id AND id = m - 3 AND m - 3 = 2":   "",
-			"SELECT id FROM w WHERE id = 2 AND id = 3 AND 1 / m = 1":       "",
-			"SELECT id FROM w WHERE id < 1 AND n * 2 > 0":                  "",
-			"SELECT m FROM w WHERE s LIKE 'b\\' AND id = 1":                "",
+			"SELECT id FROM w WHERE id = 2 AND 1 / m = 0":                             "2",
+			"SELECT id FROM w WHERE 1 / m = 0 AND id = 2":                             "2",
+			"SELECT id FROM w WHERE 2 = id AND 1 / m = 1":                             "",
+			"SELECT id FROM w WHERE id > 1 AND 1 / m = 0":                             "2\n3",
+			"SELECT id FROM w WHERE NOT (id <= 1) AND 1 / m = 0":                      "2\n3",
+			"SELECT id FROM w WHERE id BETWEEN 2 AND 3 AND 1 / m = 0":                 "2\n3",
+			"SELECT id FROM w WHERE id IN (2, 3) AND 1 / m = 0":                       "2\n3",
+			"SELECT id FROM w WHERE id IN (2, 3) AND id < 3 AND 1 / m = 0":            "2",
+			"SELECT id FROM w WHERE id = n AND n = 2 AND 1 / m = 1":                   "",
+			"SELECT id FROM w WHERE n = id AND id = m - 3 AND m - 3 = 2":              "",
+			"SELECT id FROM w WHERE id = 2 AND id = 3 AND 1 / m = 1":                  "",
+			"SELECT id FROM w WHERE id < 1 AND n * 2 > 0":                             "",
+			"SELECT m FROM w WHERE s LIKE 'b\\' AND id = 1":                           "",
+			"SELECT id FROM w WHERE NULL OR (1 / m = 0 AND id = 2)":                   "2",
+			"SELECT id FROM w WHERE (1 / m = 0 AND id = 2) OR (id = 2 AND n * 2 > 0)": "2",
+			"SELECT id FROM w WHERE (1 / m = 0 AND id = 2) OR id = 2":                 "2",
 		} {
 			is.Equal(t, want, query(t, s, sql), sql)
 		}

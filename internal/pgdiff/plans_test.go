@@ -88,6 +88,46 @@ func TestIndexConditions(t *testing.T) {
 			is.Equal(t, e.fail, o.Err != nil, fmt.Sprintf("%s: fails on both: %v", e.sql, o.Err))
 		}
 	})
+
+	t.Run("takes the index conditions out of an OR as Postgres does when it drops constants and common conditions from the OR", func(t *testing.T) {
+		verify.Covers(t, "in a WHERE clause, Postgres drops the arguments of an OR that are FALSE or NULL constants and takes the conditions common to every argument out of the OR, which can make them index conditions; maragudb does the same and gives the same results", "INV-PG-SUBSET", "AC-4.3")
+		s := newPlanSession(t)
+		for _, sql := range []string{
+			"SELECT i FROM plan_i WHERE NULL OR (10 / j > 1 AND i = 2)",
+			"SELECT i FROM plan_i WHERE FALSE OR 1 = 2 OR (10 / j > 1 AND i = 2)",
+			"SELECT i FROM plan_i WHERE (NULL AND 10 / j > 0) OR (10 / j > 1 AND i = 2)",
+			"SELECT i FROM plan_i WHERE NOT (NULL AND i <> 2) AND 10 / j > 1",
+			"SELECT i FROM plan_i WHERE (10 / j > 1 AND i = 2) OR (j + 1 > 0 AND i = 2)",
+			"SELECT i FROM plan_i WHERE (10 / j > 1 AND i = 2) OR (i = 2 AND j + 1 > 0 AND i = 2)",
+			"SELECT i FROM plan_i WHERE (10 / j > 1 AND i = 2) OR i = 2",
+			"SELECT i FROM plan_i WHERE ((10 / j > 1 AND i = 2) OR (j + 1 > 0 AND i = 2)) AND (NULL OR j - 1 > 0)",
+			"UPDATE plan_i SET j = j WHERE NULL OR (j - 1 > 0 AND i IN (2, 3))",
+			"SELECT i FROM plan_i WHERE TRUE OR CAST(CAST('x' AS text) AS bigint) = NULL",
+			"SELECT i FROM plan_i WHERE (FALSE AND CAST(CAST('x' AS text) AS bigint) = 1) OR i = 2",
+		} {
+			var rep pgdiff.Report
+			o, err := s.Exec(t.Context(), sql, &rep)
+			is.NotError(t, err, sql)
+			is.True(t, o.Executed, fmt.Sprintf("%s: rejected: %s", sql, o.Rejection))
+			is.True(t, o.Err == nil, fmt.Sprintf("%s: %v", sql, o.Err))
+		}
+		// Postgres folds every argument before the one that decides, and reports its error.
+		for _, sql := range []string{
+			"SELECT i FROM plan_i WHERE CAST(CAST('x' AS text) AS bigint) = NULL OR NULL",
+			"SELECT i FROM plan_i WHERE (NULL AND CAST(CAST('x' AS text) AS bigint) = 1) OR i = 2",
+			"SELECT i FROM plan_i WHERE CAST(CAST('x' AS text) AS bigint) = NULL OR TRUE",
+			// And it checks the types of every argument first.
+			"SELECT i FROM plan_i WHERE CAST('\\x' AS bytea) IN ('\\x', s || coalesce('\\x'))",
+			"SELECT i FROM plan_i WHERE i OR TRUE",
+			"SELECT i FROM plan_i WHERE CAST(NULL AS bigint) OR TRUE",
+			"SELECT i FROM plan_i WHERE FALSE AND (TRUE OR j)",
+		} {
+			var rep pgdiff.Report
+			o, err := s.Exec(t.Context(), sql, &rep)
+			is.NotError(t, err, sql)
+			is.True(t, o.Executed && o.Err != nil, fmt.Sprintf("%s fails on both", sql))
+		}
+	})
 }
 
 // newPlanSession compares statements on the tables in [planTables].

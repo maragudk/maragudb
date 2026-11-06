@@ -178,6 +178,194 @@ func negate(e ast.Expr) ast.Expr {
 	return &ast.Unary{Op: ast.Not, Expr: e}
 }
 
+// whereConjuncts of a WHERE clause as Postgres sees them after it simplifies and canonicalizes
+// the clause: the [conjuncts], each in its [binder.canonicalQual] form, which may split it into
+// more conjuncts.
+func (b *binder) whereConjuncts(e ast.Expr) []ast.Expr {
+	var out []ast.Expr
+	for _, c := range conjuncts(e) {
+		if canon, ok := b.canonicalQual(c); ok {
+			c = canon
+		}
+		if bin, ok := c.(*ast.Binary); ok && bin.Op == ast.And {
+			out = append(out, b.whereConjuncts(c)...)
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// canonicalQual rewrites a conjunct as Postgres's canonicalize_qual does with a WHERE clause
+// after it folds constants. Through AND and OR, an argument that is a constant decides the
+// result or drops out, where NULL counts as FALSE, as it does for a WHERE clause; and the
+// conditions that every argument of an OR has in common are taken out of the OR, so that
+// (a AND b) OR (a AND c) becomes a AND (b OR c), and (a AND b) OR a becomes a. The result is
+// true exactly when e is. It matters because a condition taken out of an OR can be an index
+// condition.
+//
+// Postgres checks the types of every argument, and then folds the arguments from the left, and
+// stops at the first FALSE of an AND and the first TRUE of an OR. When an argument is mistyped,
+// or folding an argument before that raises an error, the statement fails with it, so
+// canonicalQual reports false, and e must be bound as it is to report the error.
+func (b *binder) canonicalQual(e ast.Expr) (ast.Expr, bool) {
+	bin, ok := e.(*ast.Binary)
+	if !ok || bin.Op != ast.And && bin.Op != ast.Or {
+		return e, true
+	}
+	// decides is the constant that decides the result, and drops the one that drops out; NULL
+	// drops out too.
+	decides := bin.Op == ast.Or
+	var args []ast.Expr
+	sawNull := false
+	all := flatten(e, bin.Op)
+	for _, a := range all {
+		a, ok := b.canonicalQual(a)
+		if !ok {
+			return e, false
+		}
+		c := b.constantOf(a)
+		switch {
+		case c == constantFailed:
+			return e, false
+		case c == constantNull:
+			sawNull = true
+			continue
+		case c == constantTrue && decides, c == constantFalse && !decides:
+			if !b.typeChecks(all) {
+				return e, false
+			}
+			return &ast.Literal{Value: value.NewBool(c == constantTrue)}, true
+		case c != notConstant:
+			continue
+		}
+		args = append(args, flatten(a, bin.Op)...)
+	}
+	if bin.Op == ast.And {
+		switch {
+		case sawNull:
+			return &ast.Literal{Value: value.NewBool(false)}, true
+		case len(args) == 0:
+			return &ast.Literal{Value: value.NewBool(true)}, true
+		}
+		return join(args, ast.And), true
+	}
+	return b.factorOr(args), true
+}
+
+// typeChecks reports whether every expression binds as a boolean, without folding.
+func (b *binder) typeChecks(es []ast.Expr) bool {
+	for _, e := range es {
+		ce, err := b.bindPruned(e)
+		if err != nil {
+			return false
+		}
+		if ce, err = resolve(ce, value.Bool); err != nil || ce.typ != value.Bool {
+			return false
+		}
+	}
+	return true
+}
+
+// constness is what [binder.constantOf] finds an expression to be.
+type constness int
+
+const (
+	notConstant constness = iota
+	constantTrue
+	constantFalse
+	constantNull
+	// constantFailed is an expression whose folding raises an error.
+	constantFailed
+)
+
+// constantOf binds e to tell whether it folds to a constant, and which. The binding records
+// nothing in the binder.
+func (b *binder) constantOf(e ast.Expr) constness {
+	foldErr, foldPhase, stableErr := b.foldErr, b.foldPhase, b.stableErr
+	b.foldErr, b.stableErr = nil, nil
+	ce, err := b.bind(e)
+	if err == nil {
+		ce, err = resolve(ce, value.Bool)
+	}
+	failed := err != nil || b.foldErr != nil || ce.typ != value.Bool
+	b.foldErr, b.foldPhase, b.stableErr = foldErr, foldPhase, stableErr
+	switch {
+	case failed:
+		// Binding the conjunct reports the error.
+		return constantFailed
+	case !ce.folded:
+		return notConstant
+	case ce.val.Null:
+		return constantNull
+	case ce.val.B:
+		return constantTrue
+	}
+	return constantFalse
+}
+
+// factorOr is the OR of args with the conditions that every argument has in common taken out, as
+// Postgres's process_duplicate_ors does: each argument is the AND of its conjuncts, those of the
+// shortest argument that every argument has are the winners, and the result is the AND of the
+// winners and the OR of what is left of each argument, or of the winners alone when nothing is
+// left of one argument.
+func (b *binder) factorOr(args []ast.Expr) ast.Expr {
+	switch len(args) {
+	case 0:
+		return &ast.Literal{Value: value.NewBool(false)}
+	case 1:
+		return args[0]
+	}
+	arms := make([][]ast.Expr, len(args))
+	ref := 0
+	for i, a := range args {
+		arms[i] = flatten(a, ast.And)
+		if len(arms[i]) < len(arms[ref]) {
+			ref = i
+		}
+	}
+	// Postgres compares the conditions as trees, which [binder.canonical] approximates.
+	contains := func(es []ast.Expr, e ast.Expr) bool {
+		r := b.canonical(e)
+		return slices.ContainsFunc(es, func(x ast.Expr) bool { return b.canonical(x) == r })
+	}
+	var winners []ast.Expr
+	for _, c := range arms[ref] {
+		if !slices.ContainsFunc(arms, func(arm []ast.Expr) bool { return !contains(arm, c) }) {
+			winners = append(winners, c)
+		}
+	}
+	if len(winners) == 0 {
+		return join(args, ast.Or)
+	}
+	var rest []ast.Expr
+	for _, arm := range arms {
+		left := slices.DeleteFunc(slices.Clone(arm), func(c ast.Expr) bool { return contains(winners, c) })
+		if len(left) == 0 {
+			return join(winners, ast.And)
+		}
+		rest = append(rest, join(left, ast.And))
+	}
+	return join(append(winners, join(rest, ast.Or)), ast.And)
+}
+
+// flatten the arguments of nested op, which is AND or OR, into one list.
+func flatten(e ast.Expr, op ast.BinaryOp) []ast.Expr {
+	if b, ok := e.(*ast.Binary); ok && b.Op == op {
+		return append(flatten(b.Left, op), flatten(b.Right, op)...)
+	}
+	return []ast.Expr{e}
+}
+
+// join expressions with op, which is AND or OR, from the left.
+func join(es []ast.Expr, op ast.BinaryOp) ast.Expr {
+	out := es[0]
+	for _, e := range es[1:] {
+		out = &ast.Binary{Op: op, Left: out, Right: e}
+	}
+	return out
+}
+
 var negated = map[ast.BinaryOp]ast.BinaryOp{ast.Eq: ast.Ne, ast.Ne: ast.Eq, ast.Lt: ast.Ge, ast.Ge: ast.Lt, ast.Gt: ast.Le, ast.Le: ast.Gt}
 
 // clause is one conjunct of a WHERE clause, bound.
@@ -196,7 +384,7 @@ func (b *binder) where(e ast.Expr) (filter, error) {
 	var clauses []clause
 	pruned := false
 	null := false
-	for _, c := range conjuncts(e) {
+	for _, c := range b.whereConjuncts(e) {
 		var ce *cexpr
 		var err error
 		if pruned {
