@@ -28,18 +28,23 @@ func TestMain(m *testing.M) {
 
 func newFileRunner(t *testing.T) *fileRunner {
 	t.Helper()
-	return &fileRunner{pg: pgdiff.Postgres(t), newMaragudb: func() (*sql.DB, error) {
-		// Background maintenance checks for work often, and garbage collection deletes the
-		// segments that compaction replaced after a few seconds instead of an hour, so that a file
-		// of thousands of commits neither reads through hundreds of segments nor writes a manifest
-		// whose list of garbage grows with every compaction. No statement of the corpus runs for
-		// nearly as long as the grace period, which would fail it with ErrSnapshotExpired.
-		c, err := maragudb.NewConnector(maragudb.Options{Store: s3test.NewStore(s3fake.New()), MaintenanceInterval: new(20 * time.Millisecond), GCGracePeriod: new(5 * time.Second)}, "s3://bucket/sqllogictest")
+	return &fileRunner{pg: pgdiff.Postgres(t), newMaragudb: openMaragudb(5 * time.Second)}
+}
+
+// openMaragudb opens a fresh maragudb whose garbage collection deletes the segments that
+// compaction replaced after the grace period. Background maintenance checks for work often, so
+// that a file of thousands of commits neither reads through hundreds of segments nor, with a
+// short grace period, writes a manifest whose list of garbage grows with every compaction. A
+// statement that runs for longer than the grace period fails with ErrSnapshotExpired, which no
+// statement of the make test subset comes near, while some of the full corpus run for seconds.
+func openMaragudb(grace time.Duration) func() (*sql.DB, error) {
+	return func() (*sql.DB, error) {
+		c, err := maragudb.NewConnector(maragudb.Options{Store: s3test.NewStore(s3fake.New()), MaintenanceInterval: new(20 * time.Millisecond), GCGracePeriod: new(grace)}, "s3://bucket/sqllogictest")
 		if err != nil {
 			return nil, err
 		}
 		return sql.OpenDB(c), nil
-	}}
+	}
 }
 
 // runScript runs a test file given as text, and fails on harness errors.
@@ -313,6 +318,9 @@ SELECT col0 FROM tab0 WHERE col2 = col2
 
 var update = flag.Bool("update", false, "rewrite the baseline in testdata/baseline.json for the files that run")
 
+// subsetName is the name of the files of [subset] in reports.
+const subsetName = "make test subset"
+
 // subset of the corpus that `make test` runs: a file of each kind of the index and random
 // directories, the select files with tables of their own, and the evidence files.
 var subset = []string{
@@ -322,7 +330,9 @@ var subset = []string{
 	"index/in/10/slt_good_0.test",
 	"index/orderby/10/slt_good_0.test",
 	"index/random/10/slt_good_0.test",
+	"random/aggregates/slt_good_0.test",
 	"random/expr/slt_good_0.test",
+	"random/groupby/slt_good_0.test",
 	"random/select/slt_good_0.test",
 	"select1.test",
 }
@@ -342,7 +352,7 @@ func TestCorpus(t *testing.T) {
 		verify.Covers(t, "the SQLite sqllogictest corpus, rewritten once and run as the same text on both sides, gives the same results, column names, affected-row counts, and error classes on Postgres and maragudb, except for statements that maragudb rejects as unsupported, and every file executes at least its committed baseline of statements on both sides", "AC-4.6")
 		c, err := loadCorpus(t.Context())
 		is.NotError(t, err)
-		name, globs := "make test subset", strings.Join(subset, ",")
+		name, globs := subsetName, strings.Join(subset, ",")
 		switch {
 		case os.Getenv("MARAGUDB_SQLLOGICTEST_FILES") != "":
 			globs = os.Getenv("MARAGUDB_SQLLOGICTEST_FILES")
@@ -362,7 +372,11 @@ func TestCorpus(t *testing.T) {
 		}
 
 		start := time.Now()
-		reports, err := newFileRunner(t).runFiles(t.Context(), c, files, runtime.GOMAXPROCS(0))
+		r := newFileRunner(t)
+		if name != subsetName {
+			r.newMaragudb = openMaragudb(time.Hour)
+		}
+		reports, err := r.runFiles(t.Context(), c, files, runtime.GOMAXPROCS(0))
 		is.NotError(t, err)
 		total := newFileReport()
 		fact := verify.Corpus{Name: name, Files: len(files)}
@@ -417,7 +431,7 @@ func TestCorpus(t *testing.T) {
 		// The run must exercise real behavior, or agreement means nothing.
 		is.True(t, total.Executed > 0, "statements run on both sides")
 		is.True(t, total.Rows > 0, "rows are returned")
-		if name != "make test subset" {
+		if name != subsetName {
 			return
 		}
 		is.True(t, total.Executed > total.Statements/2, "most statements run on both sides")
