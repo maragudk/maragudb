@@ -1,6 +1,7 @@
 package value
 
 import (
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
@@ -22,22 +23,161 @@ func DecimalFromInt(i int64) Value { return NewDecimal(strconv.FormatInt(i, 10))
 func DecimalFromBig(n *big.Int) Value { return NewDecimal(n.String()) }
 
 // Postgres's numeric stores its digits in base 10000, and chooses the scale of a quotient from
-// the weights of the digits of its operands.
+// the weights of the digits of its operands. A numeric has at most 131072 digits before the
+// point and at most 16383 after it.
 const (
 	decDigits        = 4
 	nbase            = 10000
 	minSigDigits     = 16
 	maxDisplayScale  = 1000
 	minDisplayScale  = 0
+	maxDecimalScale  = 16383
+	maxDecimalDigits = 131072
 	decimalSignMinus = '-'
 )
+
+// ErrDivisionByZero is a numeric division or modulo by zero.
+var ErrDivisionByZero = errors.New("division by zero")
+
+// decimal is a numeric as the integer n and its scale: the value n / 10^scale, written with
+// scale digits after the point.
+type decimal struct {
+	n     *big.Int
+	scale int
+}
+
+// parseDecimal reads the text of a [Decimal] value.
+func parseDecimal(s string) decimal {
+	whole, frac, _ := strings.Cut(s, ".")
+	n, ok := new(big.Int).SetString(whole+frac, 10)
+	if !ok {
+		panic(fmt.Sprintf("value: bad numeric %q", s))
+	}
+	return decimal{n: n, scale: len(frac)}
+}
+
+// value of the numeric, or [ErrOutOfRange] when it has more digits before the point than
+// Postgres's numeric holds.
+func (d decimal) value() (Value, error) {
+	digits := new(big.Int).Abs(d.n).String()
+	if len(digits)-d.scale > maxDecimalDigits {
+		return Value{}, fmt.Errorf("%w: value overflows numeric format", ErrOutOfRange)
+	}
+	return NewDecimal(decimalText(digits, d.scale, d.n.Sign() < 0)), nil
+}
+
+// rescale to a scale at least that of d, exactly.
+func (d decimal) rescale(scale int) *big.Int {
+	return new(big.Int).Mul(d.n, pow10(scale-d.scale))
+}
+
+func pow10(n int) *big.Int {
+	return new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(n)), nil)
+}
+
+// quoRound is num / den rounded half away from zero, as Postgres's round_var rounds.
+func quoRound(num, den *big.Int) *big.Int {
+	q, r := new(big.Int).QuoRem(num, den, new(big.Int))
+	if r.Abs(r).Lsh(r, 1).CmpAbs(den) >= 0 {
+		if (num.Sign() < 0) != (den.Sign() < 0) {
+			q.Sub(q, big.NewInt(1))
+		} else {
+			q.Add(q, big.NewInt(1))
+		}
+	}
+	return q
+}
+
+// DecimalNeg is -a, which keeps the scale of a, and of zero is zero.
+func DecimalNeg(a Value) Value {
+	switch {
+	case strings.HasPrefix(a.S, "-"):
+		return NewDecimal(a.S[1:])
+	case strings.Trim(a.S, "0.") == "":
+		return a
+	}
+	return NewDecimal("-" + a.S)
+}
+
+// DecimalAdd is a + b, exact, with the larger of their scales, as Postgres's add_var.
+func DecimalAdd(a, b Value) (Value, error) {
+	x, y := parseDecimal(a.S), parseDecimal(b.S)
+	scale := max(x.scale, y.scale)
+	n := x.rescale(scale)
+	return decimal{n: n.Add(n, y.rescale(scale)), scale: scale}.value()
+}
+
+// DecimalSub is a - b, exact, with the larger of their scales, as Postgres's sub_var.
+func DecimalSub(a, b Value) (Value, error) {
+	x, y := parseDecimal(a.S), parseDecimal(b.S)
+	scale := max(x.scale, y.scale)
+	n := x.rescale(scale)
+	return decimal{n: n.Sub(n, y.rescale(scale)), scale: scale}.value()
+}
+
+// DecimalMul is a * b, exact with the sum of their scales, rounded half away from zero to a
+// scale of 16383 when that sum is larger, as Postgres's numeric_mul.
+func DecimalMul(a, b Value) (Value, error) {
+	x, y := parseDecimal(a.S), parseDecimal(b.S)
+	d := decimal{n: new(big.Int).Mul(x.n, y.n), scale: x.scale + y.scale}
+	if d.scale > maxDecimalScale {
+		d = decimal{n: quoRound(d.n, pow10(d.scale-maxDecimalScale)), scale: maxDecimalScale}
+	}
+	return d.value()
+}
+
+// DecimalQuo is a / b, rounded half away from zero to the scale that Postgres's
+// select_div_scale picks, or [ErrDivisionByZero].
+func DecimalQuo(a, b Value) (Value, error) {
+	return quotient(parseDecimal(a.S), parseDecimal(b.S))
+}
+
+// DecimalRem is a % b, which is a - trunc(a / b) * b, exact, with the sign of a and the larger
+// of their scales, as Postgres's mod_var, or [ErrDivisionByZero].
+func DecimalRem(a, b Value) (Value, error) {
+	x, y := parseDecimal(a.S), parseDecimal(b.S)
+	if y.n.Sign() == 0 {
+		return Value{}, ErrDivisionByZero
+	}
+	scale := max(x.scale, y.scale)
+	n := x.rescale(scale)
+	return decimal{n: n.Rem(n, y.rescale(scale)), scale: scale}.value()
+}
 
 // DecimalDiv is the quotient of two integers as numeric, as Postgres's numeric division
 // computes it: rounded half away from zero to the scale that select_div_scale picks, which
 // gives at least 16 significant digits. The divisor must not be zero.
 func DecimalDiv(dividend, divisor *big.Int) Value {
-	w1, d1 := baseWeight(dividend)
-	w2, d2 := baseWeight(divisor)
+	v, err := quotient(decimal{n: dividend}, decimal{n: divisor})
+	if err != nil {
+		panic(fmt.Sprintf("value: %v / %v: %v", dividend, divisor, err))
+	}
+	return v
+}
+
+// quotient x / y as Postgres's numeric_div: rounded half away from zero to the scale of
+// [divScale].
+func quotient(x, y decimal) (Value, error) {
+	if y.n.Sign() == 0 {
+		return Value{}, ErrDivisionByZero
+	}
+	scale := divScale(x, y)
+	// x / y * 10^scale = x.n * 10^(scale - x.scale + y.scale) / y.n.
+	num, den := new(big.Int).Set(x.n), new(big.Int).Set(y.n)
+	if e := scale - x.scale + y.scale; e >= 0 {
+		num.Mul(num, pow10(e))
+	} else {
+		den.Mul(den, pow10(-e))
+	}
+	return decimal{n: quoRound(num, den), scale: scale}.value()
+}
+
+// divScale is the scale of x / y that Postgres's select_div_scale picks: enough for at least
+// 16 significant digits, by the weights and first digits of the operands in base 10000, and at
+// least the scale of either operand, within [0, 1000].
+func divScale(x, y decimal) int {
+	w1, d1 := x.firstDigit()
+	w2, d2 := y.firstDigit()
 	// The weight of the quotient, assuming the dividend is the smaller when the first digits
 	// are equal.
 	qweight := w1 - w2
@@ -45,42 +185,35 @@ func DecimalDiv(dividend, divisor *big.Int) Value {
 		qweight--
 	}
 	scale := minSigDigits - qweight*decDigits
-	scale = max(scale, minDisplayScale)
-	scale = min(scale, maxDisplayScale)
-
-	num := new(big.Int).Abs(dividend)
-	num.Mul(num, new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(scale)), nil))
-	den := new(big.Int).Abs(divisor)
-	q, r := new(big.Int).QuoRem(num, den, new(big.Int))
-	// Half away from zero.
-	if r.Lsh(r, 1).Cmp(den) >= 0 {
-		q.Add(q, big.NewInt(1))
-	}
-	negative := (dividend.Sign() < 0) != (divisor.Sign() < 0) && q.Sign() != 0
-	return NewDecimal(decimalText(q, scale, negative))
+	scale = max(scale, x.scale, y.scale, minDisplayScale)
+	return min(scale, maxDisplayScale)
 }
 
-// baseWeight of an integer's first digit in base 10000, which is 0 for the units, and that
-// digit. Zero has weight 0 and first digit 0.
-func baseWeight(n *big.Int) (int, int64) {
-	a := new(big.Int).Abs(n)
-	if a.Sign() == 0 {
+// firstDigit of a numeric in base 10000, whose digits Postgres aligns at the point, and its
+// weight, which is 0 for the units and -1 for the first four digits after the point. Zero has
+// weight 0 and first digit 0.
+func (d decimal) firstDigit() (int, int64) {
+	if d.n.Sign() == 0 {
 		return 0, 0
 	}
-	digits := len(a.String())
-	weight := (digits - 1) / decDigits
-	first := new(big.Int).Quo(a, new(big.Int).Exp(big.NewInt(nbase), big.NewInt(int64(weight)), nil))
+	// Pad the scale to whole base-10000 digits.
+	pad := (decDigits - d.scale%decDigits) % decDigits
+	a := new(big.Int).Abs(d.n)
+	a.Mul(a, pow10(pad))
+	top := (len(a.String()) - 1) / decDigits
+	weight := top - (d.scale+pad)/decDigits
+	first := a.Quo(a, new(big.Int).Exp(big.NewInt(nbase), big.NewInt(int64(top)), nil))
 	return weight, first.Int64()
 }
 
-// decimalText of the unscaled magnitude q with scale digits after the point.
-func decimalText(q *big.Int, scale int, negative bool) string {
-	digits := q.String()
+// decimalText of a numeric of the magnitude digits, unscaled, with scale digits after the
+// point. Zero has no sign.
+func decimalText(digits string, scale int, negative bool) string {
 	if len(digits) <= scale {
 		digits = strings.Repeat("0", scale-len(digits)+1) + digits
 	}
 	var b strings.Builder
-	if negative {
+	if negative && strings.Trim(digits, "0") != "" {
 		b.WriteByte(decimalSignMinus)
 	}
 	b.WriteString(digits[:len(digits)-scale])
@@ -144,10 +277,11 @@ func DecimalKey(s string) string {
 }
 
 // DecimalToFloat converts a numeric to double precision as Postgres does, through its text,
-// which rounds to the nearest double.
+// which rounds to the nearest double, and is out of range when that is infinite, or zero for a
+// numeric that is not.
 func DecimalToFloat(s string) (float64, error) {
 	f, err := strconv.ParseFloat(s, 64)
-	if err != nil || math.IsInf(f, 0) {
+	if err != nil || math.IsInf(f, 0) || f == 0 && strings.Trim(s, "-0.") != "" {
 		return 0, fmt.Errorf("%w: %q is out of range for type double precision", ErrOutOfRange, s)
 	}
 	return f, nil
