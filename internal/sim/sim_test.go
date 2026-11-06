@@ -7,10 +7,14 @@ import (
 	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"runtime"
+	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"maragu.dev/is"
@@ -25,6 +29,85 @@ import (
 func TestMain(m *testing.M) {
 	verify.Main(m)
 }
+
+// slots bound the simulations that run at once, across all tests, to the number of CPUs. A run
+// shares nothing with another run, and its scheduler runs one task at a time, so runs in parallel
+// give the same results as runs one after another.
+var slots = make(chan struct{}, runtime.GOMAXPROCS(0))
+
+// runSim runs a simulation when a slot is free. A panic in the run names the configuration, since
+// the run may be in a goroutine of its own, which the panic does not otherwise tie to a test.
+func runSim(cfg sim.Config) sim.Result {
+	slots <- struct{}{}
+	defer func() { <-slots }()
+	defer func() {
+		if p := recover(); p != nil {
+			cfg.Trace = nil
+			panic(fmt.Sprintf("%v, seed %d, configuration %+v: %v\n%s", cfg.Name(), cfg.Seed, cfg, p, debug.Stack()))
+		}
+	}()
+	return sim.Run(cfg)
+}
+
+// runAll the configurations in parallel, and return their results in the same order.
+func runAll(cfgs []sim.Config) []sim.Result {
+	results := make([]sim.Result, len(cfgs))
+	var wg sync.WaitGroup
+	for i, cfg := range cfgs {
+		wg.Go(func() {
+			results[i] = runSim(cfg)
+		})
+	}
+	wg.Wait()
+	return results
+}
+
+// corpusSummary sums the runs of the corpus. It keeps the whole result only of a failed run, so
+// that the histories of the corpus are not held while the other tests run.
+type corpusSummary struct {
+	runs              int
+	elapsed           time.Duration
+	totals, sqlTotals sim.Stats
+	batch             simBatch
+	reached           map[string]int
+	failed            []sim.Result
+}
+
+// corpusResults of the whole corpus, run once for the tests that check it.
+var corpusResults = sync.OnceValue(func() corpusSummary {
+	start := time.Now()
+	cfgs := corpus()
+	s := corpusSummary{runs: len(cfgs), batch: simBatch{name: "corpus"}, reached: map[string]int{}}
+	failed := make([]*sim.Result, len(cfgs))
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for i, cfg := range cfgs {
+		wg.Go(func() {
+			res := runSim(cfg)
+			mu.Lock()
+			defer mu.Unlock()
+			if res.Failed() {
+				failed[i] = &res
+			}
+			s.totals.Add(res.Stats)
+			if cfg.SQL {
+				s.sqlTotals.Add(res.Stats)
+			}
+			s.batch.add(res)
+			for state, n := range res.Reached {
+				s.reached[string(state)] += n
+			}
+		})
+	}
+	wg.Wait()
+	for _, res := range failed {
+		if res != nil {
+			s.failed = append(s.failed, *res)
+		}
+	}
+	s.elapsed = time.Since(start)
+	return s
+})
 
 // corpus of fixed seeds and configurations run in `make test`.
 func corpus() []sim.Config {
@@ -164,6 +247,8 @@ func maintenanceName(m sim.MaintenanceMode) string {
 }
 
 func TestSimulator(t *testing.T) {
+	t.Parallel()
+
 	t.Run("corpus finds no anomalies", func(t *testing.T) {
 		verify.Covers(t, "the fixed corpus, with injected errors, latency, lost acknowledgements, outages, and crashes, finds no anomalies with any checker and exercises every fault", "AC-1.1", "AC-1.2", "AC-1.3", "AC-1.4", "AC-1.5", "AC-1.7", "AC-1.8", "AC-3.1", "AC-3.2", "AC-6.2", "INV-MULTI-WRITER", "INV-STRICT-SERIALIZABLE", "INV-CACHE-LOSS", "INV-S3-ONLY")
 		verify.Covers(t, "the fixed corpus, with the unique workload under the same faults, finds no two rows with the same unique value in any snapshot a reader saw or in the final state, and after every run through SQL every index of the store matches its table, and lookups through the indexes find the rows of the table", "INV-UNIQUE", "INV-INDEX-CONSISTENT")
@@ -174,24 +259,15 @@ func TestSimulator(t *testing.T) {
 			"STATE-SNAPSHOT-EXPIRED-REFUSED", "STATE-BLOCK-READ-RETRY-SUCCEEDED", "STATE-CRASH-MID-COMMIT-RECOVERED",
 			"STATE-CRASH-MID-COMPACTION", "STATE-CRASH-MID-GC", "STATE-UNIQUE-AFTER-CONFLICT", "STATE-UNIQUE-VALUE-REUSED",
 			"STATE-FK-AFTER-CONFLICT", "STATE-FK-CASCADE-TABLES")
-		var totals sim.Stats
-		batch := simBatch{name: "corpus"}
-		reached := map[string]int{}
-		start := time.Now()
-		for _, cfg := range corpus() {
-			res := sim.Run(cfg)
-			if res.Failed() {
-				failReport(t, res)
-			}
-			totals.Add(res.Stats)
-			batch.add(res)
-			for s, n := range res.Reached {
-				reached[string(s)] += n
-			}
+		t.Parallel()
+		c := corpusResults()
+		for _, res := range c.failed {
+			failReport(t, res)
 		}
-		batch.record(t)
+		totals, reached := c.totals, c.reached
+		c.batch.record(t)
 		verify.Record(t, verify.Fact{Reached: reached})
-		t.Logf("corpus of %d runs in %v: %+v", len(corpus()), time.Since(start).Round(time.Millisecond), totals)
+		t.Logf("corpus of %d runs in %v: %+v", c.runs, c.elapsed.Round(time.Millisecond), totals)
 		for _, d := range reach.Declarations() {
 			t.Logf("reached %v %d times", d.State, reached[string(d.State)])
 			is.True(t, reached[string(d.State)] > 0, fmt.Sprintf("the corpus reaches %v: %s", d.State, d.Description))
@@ -213,13 +289,17 @@ func TestSimulator(t *testing.T) {
 
 	t.Run("compaction succeeds against steady writers by rebasing on their commits", func(t *testing.T) {
 		verify.Covers(t, "at least 90 percent of compactions succeed against fault-free steady writers, so storage stays bounded under load", "AC-6.1")
-		var totals sim.Stats
+		t.Parallel()
+		var cfgs []sim.Config
 		for seed := uint64(1); seed <= 40; seed++ {
 			cfg := sim.DefaultConfig(seed)
 			cfg.ErrorRate, cfg.LostAckRate, cfg.CrashRate, cfg.OutageRate = 0, 0, 0, 0
 			cfg.Clients = 8
 			cfg.TxPerClient = 40
-			res := sim.Run(cfg)
+			cfgs = append(cfgs, cfg)
+		}
+		var totals sim.Stats
+		for _, res := range runAll(cfgs) {
 			if res.Failed() {
 				failReport(t, res)
 			}
@@ -234,8 +314,10 @@ func TestSimulator(t *testing.T) {
 
 	t.Run("every checker passes with the lease working, disabled, and overlapping", func(t *testing.T) {
 		verify.Covers(t, "every checker passes with background maintenance under a working lease, without the lease, and with overlapping leases", "INV-MULTI-WRITER")
-		for _, mode := range []sim.MaintenanceMode{sim.MaintenanceLease, sim.MaintenanceNoLease, sim.MaintenanceOverlap} {
-			var totals sim.Stats
+		t.Parallel()
+		modes := []sim.MaintenanceMode{sim.MaintenanceLease, sim.MaintenanceNoLease, sim.MaintenanceOverlap}
+		var cfgs []sim.Config
+		for _, mode := range modes {
 			for seed := uint64(1); seed <= 12; seed++ {
 				for _, useSQL := range []bool{false, true} {
 					cfg := sim.DefaultConfig(seed)
@@ -243,12 +325,21 @@ func TestSimulator(t *testing.T) {
 					cfg.SQL = useSQL
 					cfg.Maintenance = mode
 					cfg.Maintainers = 0
-					res := sim.Run(cfg)
-					if res.Failed() {
-						failReport(t, res)
-					}
-					totals.Add(res.Stats)
+					cfgs = append(cfgs, cfg)
 				}
+			}
+		}
+		results := runAll(cfgs)
+		for _, mode := range modes {
+			var totals sim.Stats
+			for _, res := range results {
+				if res.Config.Maintenance != mode {
+					continue
+				}
+				if res.Failed() {
+					failReport(t, res)
+				}
+				totals.Add(res.Stats)
 			}
 			t.Logf("maintenance %v: %+v", mode, totals)
 			is.True(t, totals.Compactions > 20, "compactions")
@@ -269,8 +360,9 @@ func TestSimulator(t *testing.T) {
 	})
 
 	t.Run("the lease makes the work of a trigger happen about once instead of once per client", func(t *testing.T) {
-		run := func(mode sim.MaintenanceMode) sim.Stats {
-			var totals sim.Stats
+		t.Parallel()
+		var cfgs []sim.Config
+		for _, mode := range []sim.MaintenanceMode{sim.MaintenanceLease, sim.MaintenanceNoLease} {
 			for seed := uint64(1); seed <= 20; seed++ {
 				cfg := sim.DefaultConfig(seed)
 				cfg.ErrorRate, cfg.LostAckRate, cfg.CrashRate, cfg.OutageRate = 0, 0, 0, 0
@@ -278,7 +370,16 @@ func TestSimulator(t *testing.T) {
 				cfg.TxPerClient = 40
 				cfg.Maintainers = 0
 				cfg.Maintenance = mode
-				res := sim.Run(cfg)
+				cfgs = append(cfgs, cfg)
+			}
+		}
+		results := runAll(cfgs)
+		sum := func(mode sim.MaintenanceMode) sim.Stats {
+			var totals sim.Stats
+			for _, res := range results {
+				if res.Config.Maintenance != mode {
+					continue
+				}
 				if res.Failed() {
 					failReport(t, res)
 				}
@@ -287,7 +388,7 @@ func TestSimulator(t *testing.T) {
 			t.Logf("8 clients, maintenance %v: %d merges started for %d compactions, %d GC runs, %d deletes, %d attempts", mode, totals.MergesStarted, totals.Compactions, totals.GCs, totals.Deleted, totals.MaintenanceAttempts)
 			return totals
 		}
-		lease, none := run(sim.MaintenanceLease), run(sim.MaintenanceNoLease)
+		lease, none := sum(sim.MaintenanceLease), sum(sim.MaintenanceNoLease)
 		is.True(t, lease.Compactions > 50, "compactions")
 		is.True(t, lease.MergesStarted <= lease.Compactions*11/10, "with the lease, almost every merge that starts is the one that lands")
 		is.True(t, none.MergesStarted >= 2*lease.MergesStarted, "without the lease, clients merge the same segments concurrently")
@@ -297,6 +398,10 @@ func TestSimulator(t *testing.T) {
 
 	t.Run("the same seed produces the same history", func(t *testing.T) {
 		verify.Covers(t, "the same seed gives a byte-identical history, final state, and statistics, through the engine and SQL, in every maintenance mode, also for the foreign key workload, whose now() comes from the virtual clock", "AC-1.9")
+		t.Parallel()
+		// Every configuration runs four times, all at once, so that runs which shared any state
+		// would differ.
+		var cfgs []sim.Config
 		for _, useSQL := range []bool{false, true} {
 			for _, w := range []sim.Workload{sim.ListAppend, sim.Bank} {
 				cfg := sim.DefaultConfig(7)
@@ -304,14 +409,7 @@ func TestSimulator(t *testing.T) {
 				cfg.SQL = useSQL
 				cfg.Maintainers = 2
 				cfg.Maintenance = sim.MaintenanceMode(1 + int(w) + 2*len(fmt.Sprint(useSQL))%3)
-				first := sim.Run(cfg)
-				for range 3 {
-					again := sim.Run(cfg)
-					if first.Digest != again.Digest {
-						t.Fatalf("%v: digests differ:\n%s", cfg.Name(), diff(first.Digest, again.Digest))
-					}
-				}
-				is.True(t, len(first.History) > 0)
+				cfgs = append(cfgs, cfg, cfg, cfg, cfg)
 			}
 		}
 		cfg := sim.DefaultConfig(7)
@@ -319,23 +417,23 @@ func TestSimulator(t *testing.T) {
 		cfg.SQL = true
 		cfg.Maintainers = 2
 		cfg.Maintenance = sim.MaintenanceLease
-		first := sim.Run(cfg)
-		again := sim.Run(cfg)
-		if first.Digest != again.Digest {
-			t.Fatalf("%v: digests differ:\n%s", cfg.Name(), diff(first.Digest, again.Digest))
+		cfgs = append(cfgs, cfg, cfg, cfg, cfg)
+		results := runAll(cfgs)
+		for i := 0; i < len(results); i += 4 {
+			first := results[i]
+			for _, again := range results[i+1 : i+4] {
+				if first.Digest != again.Digest {
+					t.Fatalf("%v: digests differ:\n%s", first.Config.Name(), diff(first.Digest, again.Digest))
+				}
+			}
+			is.True(t, len(first.History) > 0)
 		}
 	})
 
 	t.Run("the SQL workloads exercise the same paths as the engine workloads", func(t *testing.T) {
 		verify.Covers(t, "the SQL corpus exercises commits, conflicts, unknown outcomes, outages, crashes, compactions, and deletes", "AC-1.5")
-		var totals sim.Stats
-		for _, cfg := range corpus() {
-			if !cfg.SQL {
-				continue
-			}
-			res := sim.Run(cfg)
-			totals.Add(res.Stats)
-		}
+		t.Parallel()
+		totals := corpusResults().sqlTotals
 		t.Logf("SQL corpus: %+v", totals)
 		is.True(t, totals.Commits > 500, "commits")
 		is.True(t, totals.Conflicts > 100, "conflicts")
@@ -348,8 +446,8 @@ func TestSimulator(t *testing.T) {
 	})
 
 	t.Run("different seeds produce different histories", func(t *testing.T) {
-		a := sim.Run(sim.DefaultConfig(1))
-		b := sim.Run(sim.DefaultConfig(2))
+		a := runSim(sim.DefaultConfig(1))
+		b := runSim(sim.DefaultConfig(2))
 		is.True(t, a.Digest != b.Digest)
 	})
 
@@ -455,7 +553,7 @@ func TestSimulator(t *testing.T) {
 			cfg.MaxOutage = time.Duration(1+rng.IntN(3000)) * time.Millisecond
 			cfg.OutageTimeout = time.Duration(rng.IntN(200)) * time.Millisecond
 			cfg.GracePeriod = time.Duration(50+rng.IntN(3000)) * time.Millisecond
-			res := sim.Run(cfg)
+			res := runSim(cfg)
 			runs++
 			batch.add(res)
 			if res.Failed() {
@@ -728,37 +826,134 @@ var update = flag.Bool("update", false, "write the kill matrix to "+verify.KillM
 // killMatrixSeeds tried in every cell.
 const killMatrixSeeds = 20
 
-func TestMutants(t *testing.T) {
-	verify.Covers(t, "every mutant is detected by a checker in at least one simulator configuration, every configuration that cannot detect a mutant says why, and the kill matrix matches its golden file", "AC-2")
-
-	km := verify.KillMatrix{Seeds: killMatrixSeeds}
-	for _, c := range cells() {
-		km.Cells = append(km.Cells, c.String())
-	}
-	for _, m := range mutants() {
-		t.Run(m.id, func(t *testing.T) {
-			kmm := verify.KillMatrixMutant{ID: m.id, Name: m.name, Replay: m.replay, Description: m.description}
-			caught := map[string]bool{}
-			for _, c := range cells() {
-				r := verify.KillMatrixResult{Cell: c.String(), Status: verify.Undetected}
-				if !m.applicable(c) {
-					r.Status = verify.NotApplicable
-					r.Reason = sqlOnly
-					kmm.Results = append(kmm.Results, r)
+func TestRun(t *testing.T) {
+	t.Run("leaves no goroutine running after the run, in every workload and maintenance mode, through the engine and SQL, with and without heavy faults", func(t *testing.T) {
+		for _, w := range []sim.Workload{sim.ListAppend, sim.Bank, sim.Unique, sim.ForeignKey} {
+			for _, useSQL := range []bool{false, true} {
+				if (w == sim.Unique || w == sim.ForeignKey) && !useSQL {
 					continue
 				}
-				for seed := uint64(1); seed <= killMatrixSeeds; seed++ {
-					cfg := sim.DefaultConfig(seed)
-					cfg.Workload = c.workload
-					cfg.SQL = c.sql
-					cfg.Maintainers = c.maintainers
-					cfg.Mutations = m.mutations
-					cfg.SQLMutations = m.sqlMutations
-					res := sim.Run(cfg)
-					if res.Failed() {
-						r.Status, r.Seed, r.Checkers = verify.Detected, seed, res.Checkers()
-						break
+				for _, mode := range []sim.MaintenanceMode{sim.MaintenanceOff, sim.MaintenanceLease, sim.MaintenanceNoLease, sim.MaintenanceOverlap} {
+					for _, heavy := range []bool{false, true} {
+						cfg := sim.DefaultConfig(3)
+						cfg.Workload = w
+						cfg.SQL = useSQL
+						cfg.Maintenance = mode
+						if heavy {
+							// Crashes in the middle of transactions, and outages long enough that
+							// processes fail to open.
+							cfg.Seed = 4
+							cfg.Clients = 10
+							cfg.ErrorRate = 0.15
+							cfg.LostAckRate = 0.15
+							cfg.CrashRate = 0.05
+							cfg.OutageRate = 0.03
+							cfg.Maintainers = 2
+						}
+						t.Run(fmt.Sprintf("%v, heavy faults %v", cfg.Name(), heavy), func(t *testing.T) {
+							t.Parallel()
+							slots <- struct{}{}
+							defer func() { <-slots }()
+							// The bubble fails the test when a goroutine started in it is still
+							// blocked at its end.
+							synctest.Test(t, func(t *testing.T) {
+								res := sim.Run(cfg)
+								is.True(t, res.Stats.Commits > 0, cfg.Name())
+								if heavy {
+									is.True(t, res.Stats.Crashes > 0, cfg.Name())
+								}
+							})
+						})
 					}
+				}
+			}
+		}
+	})
+}
+
+func TestMutants(t *testing.T) {
+	verify.Covers(t, "every mutant is detected by a checker in at least one simulator configuration, every configuration that cannot detect a mutant says why, and the kill matrix matches its golden file", "AC-2")
+	t.Parallel()
+
+	ms := mutants()
+	// ran holds the matrix row of every mutant whose subtest ran. The subtests run in parallel, so
+	// the whole matrix is compared once they are all done.
+	ran := make([]*verify.KillMatrixMutant, len(ms))
+	t.Cleanup(func() {
+		km := verify.KillMatrix{Seeds: killMatrixSeeds}
+		for _, c := range cells() {
+			km.Cells = append(km.Cells, c.String())
+		}
+		for _, kmm := range ran {
+			if kmm == nil {
+				// Only some mutants ran, with -run, so there is no whole matrix to compare.
+				return
+			}
+			km.Mutants = append(km.Mutants, *kmm)
+		}
+		got, err := json.MarshalIndent(km, "", "  ")
+		if err != nil {
+			t.Errorf("marshaling the kill matrix: %v", err)
+			return
+		}
+		got = append(got, '\n')
+		path := filepath.Join("..", "..", verify.KillMatrixPath)
+		if *update {
+			if err := os.WriteFile(path, got, 0o644); err != nil {
+				t.Errorf("writing the kill matrix: %v", err)
+				return
+			}
+		}
+		want, err := os.ReadFile(path)
+		if err != nil {
+			t.Errorf("reading the kill matrix: %v", err)
+			return
+		}
+		if string(got) != string(want) {
+			t.Errorf("the kill matrix differs from %s; run `make verification` to regenerate it:\n%s", verify.KillMatrixPath, diff(string(want), string(got)))
+		}
+	})
+
+	for i, m := range ms {
+		t.Run(m.id, func(t *testing.T) {
+			t.Parallel()
+			kmm := verify.KillMatrixMutant{ID: m.id, Name: m.name, Replay: m.replay, Description: m.description}
+			// Every cell tries its seeds in order until one detects the mutant, and the cells run in
+			// parallel.
+			cs := cells()
+			results := make([]verify.KillMatrixResult, len(cs))
+			var wg sync.WaitGroup
+			for j, c := range cs {
+				results[j] = verify.KillMatrixResult{Cell: c.String(), Status: verify.Undetected}
+				if !m.applicable(c) {
+					results[j].Status = verify.NotApplicable
+					results[j].Reason = sqlOnly
+					continue
+				}
+				wg.Go(func() {
+					r := &results[j]
+					for seed := uint64(1); seed <= killMatrixSeeds; seed++ {
+						cfg := sim.DefaultConfig(seed)
+						cfg.Workload = c.workload
+						cfg.SQL = c.sql
+						cfg.Maintainers = c.maintainers
+						cfg.Mutations = m.mutations
+						cfg.SQLMutations = m.sqlMutations
+						res := runSim(cfg)
+						if res.Failed() {
+							r.Status, r.Seed, r.Checkers = verify.Detected, seed, res.Checkers()
+							return
+						}
+					}
+				})
+			}
+			wg.Wait()
+			caught := map[string]bool{}
+			for j, c := range cs {
+				r := results[j]
+				if r.Status == verify.NotApplicable {
+					kmm.Results = append(kmm.Results, r)
+					continue
 				}
 				for _, name := range r.Checkers {
 					caught[name] = true
@@ -785,24 +980,7 @@ func TestMutants(t *testing.T) {
 					t.Errorf("the %s checker never detects the mutant", name)
 				}
 			}
-			km.Mutants = append(km.Mutants, kmm)
+			ran[i] = &kmm
 		})
-	}
-
-	if len(km.Mutants) != len(mutants()) {
-		// Only some mutants ran, with -run, so there is no whole matrix to compare.
-		return
-	}
-	got, err := json.MarshalIndent(km, "", "  ")
-	is.NotError(t, err)
-	got = append(got, '\n')
-	path := filepath.Join("..", "..", verify.KillMatrixPath)
-	if *update {
-		is.NotError(t, os.WriteFile(path, got, 0o644))
-	}
-	want, err := os.ReadFile(path)
-	is.NotError(t, err)
-	if string(got) != string(want) {
-		t.Errorf("the kill matrix differs from %s; run `make verification` to regenerate it:\n%s", verify.KillMatrixPath, diff(string(want), string(got)))
 	}
 }

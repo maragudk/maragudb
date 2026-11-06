@@ -622,6 +622,7 @@ type client struct {
 
 func (c *client) loop(ctx context.Context) {
 	defer func() {
+		c.closeSQL()
 		c.run.activeClients--
 	}()
 	for i := 0; i < c.run.cfg.TxPerClient; i++ {
@@ -709,11 +710,18 @@ func (c *client) afterCrash() {
 		c.run.stats.Crashes++
 		c.db = nil
 		c.maint = nil
-		if c.sql != nil {
-			_ = c.sql.Close()
-			c.sql = nil
-		}
+		c.closeSQL()
 		c.proc = nil
+	}
+}
+
+// closeSQL closes the client's database/sql handle, if it has one. Closing it releases its
+// goroutines, which would otherwise keep the whole run alive after it ends. It reaches neither the
+// store nor the clock.
+func (c *client) closeSQL() {
+	if c.sql != nil {
+		_ = c.sql.Close()
+		c.sql = nil
 	}
 }
 
