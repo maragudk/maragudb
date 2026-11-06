@@ -576,15 +576,18 @@ func (g *gen) where(s scope) ast.Expr {
 	if g.draw(0, 3) == 0 {
 		return nil
 	}
+	mayFail := !s.safe
 	if !g.rarely(6) {
 		s.safe = true
 	}
 	if g.draw(0, 2) == 0 && len(g.table.PrimaryKey) > 0 {
-		// A comparison on a key column, so that key access paths are exercised.
-		name := pick(g, g.table.PrimaryKey)
-		op := pick(g, []ast.BinaryOp{ast.Eq, ast.Eq, ast.Lt, ast.Le, ast.Gt, ast.Ge})
-		var e ast.Expr = &ast.Binary{Op: op, Left: &ast.ColumnRef{Name: name}, Right: g.literal(g.column(name).Type)}
+		e := g.keyCondition()
 		if g.bool() {
+			if mayFail && g.bool() {
+				// A condition that can fail next to the key condition, which both evaluate only on
+				// the rows that the key condition selects.
+				s.safe = false
+			}
 			e = &ast.Binary{Op: ast.And, Left: e, Right: g.expr(value.Bool, s, 1)}
 		}
 		return e
@@ -594,6 +597,29 @@ func (g *gen) where(s scope) ast.Expr {
 		s.safe = false
 	}
 	return g.expr(value.Bool, s, 0)
+}
+
+// keyCondition on the primary key columns, so that key access paths are exercised: a
+// comparison of a key column with a literal, an IN of literals, or a range of two comparisons.
+func (g *gen) keyCondition() ast.Expr {
+	name := pick(g, g.table.PrimaryKey)
+	col := &ast.ColumnRef{Name: name}
+	typ := g.column(name).Type
+	switch g.draw(0, 3) {
+	case 0:
+		in := &ast.In{Expr: col}
+		for range g.draw(2, 3) {
+			in.List = append(in.List, g.literal(typ))
+		}
+		return in
+	case 1:
+		return &ast.Binary{Op: ast.And,
+			Left:  &ast.Binary{Op: pick(g, []ast.BinaryOp{ast.Gt, ast.Ge}), Left: col, Right: g.literal(typ)},
+			Right: &ast.Binary{Op: pick(g, []ast.BinaryOp{ast.Lt, ast.Le}), Left: col, Right: g.literal(typ)},
+		}
+	}
+	op := pick(g, []ast.BinaryOp{ast.Eq, ast.Eq, ast.Lt, ast.Le, ast.Gt, ast.Ge})
+	return &ast.Binary{Op: op, Left: col, Right: g.literal(typ)}
 }
 
 func (g *gen) statement() ast.Statement {
