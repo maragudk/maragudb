@@ -280,11 +280,14 @@ func TestUnsupported(t *testing.T) {
 		)
 	})
 
-	t.Run("UNS-PLAN-DEPENDENT-WHERE a LIKE on a key column whose pattern can fail", func(t *testing.T) {
-		verify.Covers(t, "a LIKE on a primary key column whose pattern can fail is rejected, because Postgres scans the index for its prefix and evaluates it only on those rows, and Postgres accepts it when no row there fails", "UNS-PLAN-DEPENDENT-WHERE")
+	t.Run("UNS-PLAN-DEPENDENT-WHERE a LIKE on an indexed column whose pattern can fail", func(t *testing.T) {
+		verify.Covers(t, "a LIKE on a column of the primary key or of another index whose pattern can fail is rejected, because Postgres scans the index for its prefix and evaluates it only on those rows, and Postgres accepts it when no row there fails", "UNS-PLAN-DEPENDENT-WHERE")
 		rejects(t, "CREATE TABLE dev (s text PRIMARY KEY, j bigint)",
 			example{SQL: "SELECT j FROM dev WHERE s LIKE 'b\\'", Setup: []string{"INSERT INTO dev VALUES ('a', 0), ('b', 5)"}},
 			example{SQL: "UPDATE dev SET j = 1 WHERE s LIKE 'b\\' AND j > 0", Setup: []string{"INSERT INTO dev VALUES ('a', 0), ('b', 5)"}},
+		)
+		rejects(t, "CREATE TABLE dev (i bigint PRIMARY KEY, s text UNIQUE, j bigint)",
+			example{SQL: "SELECT j FROM dev WHERE s LIKE 'b\\'", Setup: []string{"INSERT INTO dev VALUES (1, 'a', 0), (2, 'b', 5)"}},
 		)
 	})
 

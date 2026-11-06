@@ -206,3 +206,16 @@ Alternatives considered:
 Also decided: `integer` stays a type for literals only. It is not a column type for now, so the column types stay a small set to test.
 
 Markus left both choices to the lead.
+
+## 2026-11-06: With several indexes, a row is skipped only when every scan Postgres could pick skips it
+
+Context: the previous decision fixes the plan to a scan of the primary key index, because with `enable_seqscan = off` Postgres always scans it when a condition can use it. With secondary indexes, Postgres chooses by cost between the primary key, the other indexes, and bitmap combinations of them. Each scan has its own index conditions, so the rows on which Postgres evaluates the other conditions depend on the plan again. EXPLAIN on Postgres 18 shows that it can also scan a whole index without index conditions, when `ORDER BY` sorts by the index's first column or when the index has every column a query reads.
+
+Decision: maragudb models the plans instead of choosing one. A condition that cannot fail and compares a column with a constant, an `IN` of constants, or a boolean column is an index condition of every scan of every index on that column, as EXPLAIN shows. An index is a candidate scan when it has such a condition, or when Postgres could scan it without one: another condition could use it, also inside an `OR`, `ORDER BY` sorts by its first column, or it covers every column of a `SELECT`. When a condition can fail, maragudb skips a row only when every candidate rejects it by one of its index conditions, and when some candidate has no index condition, it skips no row. On every other row, the runtime check of `UNS-ORDER-DEPENDENT-WHERE` applies as before. So a statement whose outcome differs between candidate plans is rejected at run time, and one whose outcome is the same in all of them gives Postgres's result. maragudb itself reads the union of the candidates' rows in that case, and otherwise the narrowest index. It visits the rows in key order whenever a row can fail, and in index order only when nothing can fail, such as for an `ORDER BY` with `LIMIT` that an index sorts.
+
+The differential harness reruns a statement whose error class differs with the rows stored in key order, as before, and now also with the table's other indexes marked invalid in `pg_index` for the rerun, so that Postgres scans the table or its primary key. An invalid index is still updated and still enforces uniqueness.
+
+Alternatives considered:
+- Emulating Postgres's cost model to pick the same index. Rejected for the same reasons as in the decision of 2026-11-04: it depends on statistics and cost constants.
+- Treating only the conditions common to every index as index conditions. Rejected because a row that one index's conditions reject can still be read by another index, so it is not sound.
+- Rejecting every condition that can fail on a table with secondary indexes. Rejected because it refuses the point updates that the previous decision exists for.
