@@ -309,13 +309,22 @@ func (s *Session) deleteRelation(name string) {
 // chooseName of an index as Postgres's ChooseRelationName does: the name of [makeObjectName], or
 // with the label numbered from 1 until no table or index has the name.
 func (s *Session) chooseName(ctx context.Context, name1, name2, label string) (string, error) {
+	return chooseNumbered(name1, name2, label, func(name string) (bool, error) {
+		_, exists, err := s.relation(ctx, name)
+		return exists, err
+	})
+}
+
+// chooseNumbered is the name of [makeObjectName], or with the label numbered from 1, until taken
+// reports that the name is free.
+func chooseNumbered(name1, name2, label string, taken func(name string) (bool, error)) (string, error) {
 	for pass := 0; ; pass++ {
 		l := label
 		if pass > 0 {
 			l = fmt.Sprint(label, pass)
 		}
 		name := makeObjectName(name1, name2, l)
-		if _, exists, err := s.relation(ctx, name); err != nil || !exists {
+		if t, err := taken(name); err != nil || !t {
 			return name, err
 		}
 	}

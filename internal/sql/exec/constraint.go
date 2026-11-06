@@ -100,46 +100,27 @@ func (n *names) add(name string) {
 // with the label numbered from 1, until no constraint of any table, and none that the statement
 // chose before, has the name.
 func (s *Session) chooseConstraintName(ctx context.Context, n *names, name1, name2, label string) (string, error) {
-	for pass := 0; ; pass++ {
-		l := label
-		if pass > 0 {
-			l = fmt.Sprint(label, pass)
-		}
-		name := makeObjectName(name1, name2, l)
+	return chooseNumbered(name1, name2, label, func(name string) (bool, error) {
 		if n.has(name) {
-			continue
+			return true, nil
 		}
-		exists, err := s.constraintNameExists(ctx, name)
-		if err != nil || !exists {
-			return name, err
-		}
-	}
+		return s.constraintNameExists(ctx, name)
+	})
 }
 
 // chooseIndexConstraintName for the index of a PRIMARY KEY or UNIQUE constraint, as Postgres's
 // ChooseRelationName does for a constraint: like [Session.chooseName], and also until no
 // constraint has the name.
 func (s *Session) chooseIndexConstraintName(ctx context.Context, n *names, name1, name2, label string) (string, error) {
-	for pass := 0; ; pass++ {
-		l := label
-		if pass > 0 {
-			l = fmt.Sprint(label, pass)
-		}
-		name := makeObjectName(name1, name2, l)
+	return chooseNumbered(name1, name2, label, func(name string) (bool, error) {
 		if n.has(name) {
-			continue
+			return true, nil
 		}
 		if _, exists, err := s.relation(ctx, name); err != nil || exists {
-			if err != nil {
-				return "", err
-			}
-			continue
+			return true, err
 		}
-		exists, err := s.constraintNameExists(ctx, name)
-		if err != nil || !exists {
-			return name, err
-		}
-	}
+		return s.constraintNameExists(ctx, name)
+	})
 }
 
 // addChecks checks the CHECK constraints of a new table, in the order they are written, and

@@ -4,7 +4,6 @@
 package exec
 
 import (
-	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -461,8 +460,9 @@ func verb(st ast.Statement) string {
 type kvstore struct {
 	tx      *engine.Tx
 	pending map[string]pendingEntry
-	// keys in write order, so that writes apply deterministically.
-	keys []string
+	// keys in write order, so that writes apply deterministically, and sorted in key order, for
+	// [kvstore.scanLatest].
+	keys, sorted []string
 }
 
 type pendingEntry struct {
@@ -498,6 +498,8 @@ func (k *kvstore) set(key []byte, e pendingEntry) {
 	}
 	if _, ok := k.pending[string(key)]; !ok {
 		k.keys = append(k.keys, string(key))
+		i, _ := slices.BinarySearch(k.sorted, string(key))
+		k.sorted = slices.Insert(k.sorted, i, string(key))
 	}
 	k.pending[string(key)] = e
 }
@@ -528,41 +530,48 @@ func (k *kvstore) wrote(key []byte) bool {
 	return ok || k.tx.Wrote(key)
 }
 
-// kvPair is a key and its value.
-type kvPair struct {
-	key, value []byte
-}
-
-// scanLatest returns the keys in [start, end) and their values in order, as the statement sees
-// them: with its own pending writes, unlike [kvstore.scan]. With txOnly, it leaves out the
-// pending writes.
-func (k *kvstore) scanLatest(ctx context.Context, start, end []byte, txOnly bool) ([]kvPair, error) {
-	var out []kvPair
+// scanLatest calls fn with the keys in [start, end) and their values in order, as the statement
+// sees them: with its own pending writes, unlike [kvstore.scan], until fn returns false. With
+// txOnly, it leaves out the pending writes. The value is only valid during the call.
+func (k *kvstore) scanLatest(ctx context.Context, start, end []byte, txOnly bool, fn func(key, value []byte) bool) error {
+	var pending []string
+	if !txOnly {
+		lo, _ := slices.BinarySearch(k.sorted, string(start))
+		hi, _ := slices.BinarySearch(k.sorted, string(end))
+		pending = k.sorted[lo:hi]
+	}
 	it := k.tx.Scan(ctx, start, end)
-	for it.Next() {
-		key := string(it.Key())
-		if _, ok := k.pending[key]; ok && !txOnly {
+	more := it.Next()
+	for more || len(pending) > 0 {
+		var key string
+		switch {
+		case !more:
+			key = pending[0]
+		case len(pending) == 0 || string(it.Key()) < pending[0]:
+			key = string(it.Key())
+		default:
+			key = pending[0]
+		}
+		if len(pending) > 0 && key == pending[0] {
+			pending = pending[1:]
+			if more && string(it.Key()) == key {
+				more = it.Next()
+			}
+			if e := k.pending[key]; !e.tombstone && !fn([]byte(key), e.value) {
+				return nil
+			}
 			continue
 		}
-		out = append(out, kvPair{key: []byte(key), value: append([]byte{}, it.Value()...)})
-	}
-	if err := it.Err(); err != nil {
-		return nil, err
-	}
-	if txOnly {
-		return out, nil
-	}
-	for key, e := range k.pending {
-		if e.tombstone || key < string(start) || key >= string(end) {
-			continue
+		if !fn(it.Key(), it.Value()) {
+			return nil
 		}
-		out = append(out, kvPair{key: []byte(key), value: e.value})
+		more = it.Next()
 	}
-	slices.SortFunc(out, func(a, b kvPair) int { return bytes.Compare(a.key, b.key) })
-	return out, nil
+	return it.Err()
 }
 
 func (k *kvstore) discard() {
 	k.pending = nil
 	k.keys = nil
+	k.sorted = nil
 }

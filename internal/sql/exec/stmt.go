@@ -145,14 +145,33 @@ func (s *Session) insert(ctx context.Context, st *ast.Insert, params []value.Val
 	if st.DefaultValues {
 		rows = [][]ast.Expr{{}}
 	}
+	// defaults are the bound defaults of the columns, bound once, because they read no columns.
+	defaults := make([]*cexpr, len(t.Columns))
+	defaultOf := func(i int) (*cexpr, error) {
+		if defaults[i] == nil {
+			var err error
+			if defaults[i], err = s.defaultExpr(b, t, i); err != nil {
+				return nil, err
+			}
+		}
+		return defaults[i], nil
+	}
 	// As in Postgres, each row is analyzed, checked against the first row's length and the
 	// target columns, and converted to the column types before the next row.
 	for _, exprRow := range rows {
 		var es []*cexpr
+		// isDefault marks the items that are DEFAULT, which are converted already.
+		var isDefault []bool
 		for i, e := range exprRow {
-			if _, ok := e.(*ast.Default); ok && i < len(cols) {
-				// The column's default, which is converted to its type already.
-				c, err := s.defaultExpr(b, t, cols[i])
+			_, ok := e.(*ast.Default)
+			isDefault = append(isDefault, ok)
+			if ok && i >= len(cols) {
+				// Too many items, which the check below reports.
+				es = append(es, constant(value.NewNull(value.Unknown)))
+				continue
+			}
+			if ok {
+				c, err := defaultOf(cols[i])
 				if err != nil {
 					return Result{}, err
 				}
@@ -177,6 +196,9 @@ func (s *Session) insert(ctx context.Context, st *ast.Insert, params []value.Val
 		// defaults.
 		width = len(es)
 		for i := range es {
+			if isDefault[i] {
+				continue
+			}
 			var err error
 			if es[i], err = b.assignable(es[i], t, cols[i]); err != nil {
 				return Result{}, err
@@ -190,7 +212,7 @@ func (s *Session) insert(ctx context.Context, st *ast.Insert, params []value.Val
 		for i := range full {
 			if full[i] == nil {
 				var err error
-				if full[i], err = s.defaultExpr(b, t, i); err != nil {
+				if full[i], err = defaultOf(i); err != nil {
 					return Result{}, err
 				}
 			}
@@ -224,13 +246,8 @@ func (s *Session) insert(ctx context.Context, st *ast.Insert, params []value.Val
 // oldKey, when given. As in Postgres, it checks NOT NULL, then the CHECK constraints, then the
 // primary key, and then the unique indexes.
 func (s *Session) writeRow(ctx context.Context, t *table, oldKey []byte, old, row []value.Value) error {
-	if err := t.checkRow(row); err != nil {
+	if err := s.checkNewRow(t, row, oldKey != nil); err != nil {
 		return err
-	}
-	if oldKey == nil || !s.opts.Mutations.CheckSkipUpdate {
-		if err := s.checkConstraints(t, row); err != nil {
-			return err
-		}
 	}
 	key := t.rowKey(row)
 	wrote := oldKey != nil && s.kv.wrote(oldKey)
@@ -250,6 +267,18 @@ func (s *Session) writeRow(ctx context.Context, t *table, oldKey []byte, old, ro
 	s.kv.put(key, value.EncodeRow(nil, row))
 	s.queue(rowEvent{t: t, oldKey: oldKey, key: key, old: old, row: row, wrote: wrote})
 	return nil
+}
+
+// checkNewRow checks the row that an insert, or an update when update is set, writes, against
+// the NOT NULL constraints and then the CHECK constraints of its table, before the keys.
+func (s *Session) checkNewRow(t *table, row []value.Value, update bool) error {
+	if err := t.checkRow(row); err != nil {
+		return err
+	}
+	if update && s.opts.Mutations.CheckSkipUpdate {
+		return nil
+	}
+	return s.checkConstraints(t, row)
 }
 
 // keyDuplicate is the error of a row whose primary key another row has.
@@ -541,10 +570,7 @@ func (s *Session) updateKeys(ctx context.Context, t *table, a access, f filter, 
 	err := s.scanRows(ctx, t, a, f, func(key []byte, old []value.Value) (bool, error) {
 		m := move{oldKey: append([]byte{}, key...), old: old}
 		if m.row, m.err = assign(old); m.err == nil {
-			m.err = t.checkRow(m.row)
-		}
-		if m.err == nil && !s.opts.Mutations.CheckSkipUpdate {
-			m.err = s.checkConstraints(t, m.row)
+			m.err = s.checkNewRow(t, m.row, true)
 		}
 		failed = failed || m.err != nil
 		moves = append(moves, m)
@@ -834,7 +860,6 @@ func (s *Session) delete(ctx context.Context, st *ast.Delete, params []value.Val
 	a := t.plan(f, nil)
 	var n int64
 	err = s.scanRows(ctx, t, a, f, func(key []byte, row []value.Value) (bool, error) {
-		key = append([]byte{}, key...)
 		s.kv.del(key)
 		s.deleteRowEntries(t, row)
 		s.queue(rowEvent{t: t, oldKey: key, old: row})

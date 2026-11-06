@@ -367,7 +367,20 @@ func (s *Session) act(ctx context.Context, ev rowEvent, r reference) error {
 	if err != nil {
 		return err
 	}
-	b := &binder{now: s.now()}
+	// The defaults of SET DEFAULT read no columns, so they are evaluated once.
+	defaults := map[int]value.Value{}
+	if action == ast.SetDefault {
+		b := &binder{now: s.now()}
+		for _, c := range fk.setColumns() {
+			e, err := s.defaultExpr(b, child, c)
+			if err != nil {
+				return err
+			}
+			if defaults[c], err = e.value(nil); err != nil {
+				return err
+			}
+		}
+	}
 	for _, row := range rows {
 		if action == ast.Cascade {
 			s.kv.del(row.key)
@@ -382,13 +395,7 @@ func (s *Session) act(ctx context.Context, ev rowEvent, r reference) error {
 		for _, c := range fk.setColumns() {
 			next[c] = value.NewNull(child.Columns[c].Type)
 			if action == ast.SetDefault {
-				e, err := s.defaultExpr(b, child, c)
-				if err != nil {
-					return err
-				}
-				if next[c], err = e.value(nil); err != nil {
-					return err
-				}
+				next[c] = defaults[c]
 			}
 		}
 		if err := s.writeRow(ctx, child, row.key, row.row, next); err != nil {
@@ -511,15 +518,18 @@ func (s *Session) referencing(ctx context.Context, child *table, fk *foreignKey,
 		return true
 	}
 	var out []childRow
-	decode := func(k, v []byte) error {
-		row, err := value.DecodeRow(v, types)
-		if err != nil {
-			return fmt.Errorf("exec: table %q: %w", child.Name, err)
+	var err error
+	// visit decodes a row and keeps it when it matches, and reports whether to go on.
+	visit := func(k, v []byte) bool {
+		row, derr := value.DecodeRow(v, types)
+		if derr != nil {
+			err = fmt.Errorf("exec: table %q: %w", child.Name, derr)
+			return false
 		}
 		if matches(row) {
-			out = append(out, childRow{key: k, row: row})
+			out = append(out, childRow{key: slices.Clone(k), row: row})
 		}
-		return nil
+		return !one || len(out) == 0
 	}
 	// The primary key is an index too, but only its leading columns make a prefix.
 	if pk := child.keyIndex(); leads(pk) {
@@ -527,19 +537,14 @@ func (s *Session) referencing(ctx context.Context, child *table, fk *foreignKey,
 		for _, c := range pk.Columns[:len(fk.Columns)] {
 			start = value.EncodeKey(start, at(c.Column))
 		}
-		pairs, err := s.kv.scanLatest(ctx, start, prefixEnd(start), txOnly)
-		if err != nil {
-			return nil, err
+		if serr := s.kv.scanLatest(ctx, start, prefixEnd(start), txOnly, visit); serr != nil {
+			return nil, serr
 		}
-		for _, p := range pairs {
-			if err := decode(p.key, p.value); err != nil {
-				return nil, err
-			}
-			if one && len(out) > 0 {
-				break
-			}
-		}
-		return out, nil
+		return out, err
+	}
+	get := s.kv.get
+	if txOnly {
+		get = s.kv.tx.Get
 	}
 	for i := range child.Indexes {
 		x := &child.Indexes[i]
@@ -550,47 +555,33 @@ func (s *Session) referencing(ctx context.Context, child *table, fk *foreignKey,
 		for _, c := range x.Columns[:len(fk.Columns)] {
 			start = value.EncodeIndexKey(start, at(c.Column), c.Desc, c.NullsFirst)
 		}
-		pairs, err := s.kv.scanLatest(ctx, start, prefixEnd(start), txOnly)
+		serr := s.kv.scanLatest(ctx, start, prefixEnd(start), txOnly, func(_, pk []byte) bool {
+			k := child.rowKeyOf(pk)
+			v, ok, gerr := get(ctx, k)
+			switch {
+			case gerr != nil:
+				err = gerr
+				return false
+			case !ok:
+				err = fmt.Errorf("exec: %w: an entry of an index of %q points to the missing row %x", ErrIndexInconsistent, child.Name, k)
+				return false
+			}
+			return visit(k, v)
+		})
+		if serr != nil {
+			return nil, serr
+		}
 		if err != nil {
 			return nil, err
-		}
-		for _, p := range pairs {
-			k := child.rowKeyOf(p.value)
-			get := s.kv.get
-			if txOnly {
-				get = s.kv.tx.Get
-			}
-			v, ok, err := get(ctx, k)
-			if err != nil {
-				return nil, err
-			}
-			if !ok {
-				return nil, fmt.Errorf("exec: %w: an entry of an index of %q points to the missing row %x", ErrIndexInconsistent, child.Name, k)
-			}
-			if err := decode(k, v); err != nil {
-				return nil, err
-			}
-			if one && len(out) > 0 {
-				break
-			}
 		}
 		slices.SortFunc(out, func(a, b childRow) int { return bytes.Compare(a.key, b.key) })
 		return out, nil
 	}
 	start, end := child.rowRange()
-	pairs, err := s.kv.scanLatest(ctx, start, end, txOnly)
-	if err != nil {
-		return nil, err
+	if serr := s.kv.scanLatest(ctx, start, end, txOnly, visit); serr != nil {
+		return nil, serr
 	}
-	for _, p := range pairs {
-		if err := decode(p.key, p.value); err != nil {
-			return nil, err
-		}
-		if one && len(out) > 0 {
-			break
-		}
-	}
-	return out, nil
+	return out, err
 }
 
 // prefixEnd is the first key after every key that starts with prefix.
