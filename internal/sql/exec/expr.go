@@ -51,9 +51,19 @@ func constant(v value.Value) *cexpr {
 	return &cexpr{typ: v.Type, folded: true, val: v}
 }
 
-// binder binds expressions against an optional table scope and the statement's parameters.
+// binder binds expressions against an optional scope of tables and the statement's parameters.
 type binder struct {
+	// scope of the statement's tables, and ns the namespace that names resolve in. Both are made
+	// from table when they are nil.
+	scope *scope
+	ns    namespace
+	// layout is the offset of each entry's columns in the rows that expressions read, or nil for
+	// the offsets of the entries, which a row of a join has. An entry at -1 is not in the rows.
+	layout []int
+	// table is the one table that the rows hold, whose indexes the WHERE clause can use, at the
+	// entry of index entry, or nil when the rows are those of a join.
 	table  *table
+	entry  int
 	params []value.Value
 	// pruned is positive while binding a branch that can never be evaluated, such as the ELSE of a
 	// CASE whose WHEN is known true. Such a branch is still type-checked, but an error in folding
@@ -72,9 +82,11 @@ type binder struct {
 }
 
 // Phases of a statement, in the order in which Postgres folds their constants: the output
-// expressions, including those of ORDER BY, then WHERE, then OFFSET, then LIMIT.
+// expressions, including those of ORDER BY, then the conditions of the joins, then WHERE, then
+// OFFSET, then LIMIT.
 const (
 	phaseOutput = iota
+	phaseOn
 	phaseWhere
 	phaseOffset
 	phaseLimit
@@ -125,6 +137,63 @@ func (b *binder) fold(e *cexpr, children ...*cexpr) (*cexpr, error) {
 		return e, nil
 	}
 	return constant(v), nil
+}
+
+// names returns the scope and the namespace that names resolve in, which are those of table
+// when the binder has none.
+func (b *binder) names() (*scope, namespace) {
+	if b.scope == nil && b.table != nil {
+		b.scope, b.ns = singleScope(b.table, b.table.Name)
+	}
+	return b.scope, b.ns
+}
+
+// resolve a column reference in the binder's namespace.
+func (b *binder) resolve(ref *ast.ColumnRef) (colRef, error) {
+	sc, ns := b.names()
+	if sc == nil {
+		if ref.Table != "" {
+			return colRef{}, fmt.Errorf("%w: missing FROM-clause entry for table %q", ErrNoTable, ref.Table)
+		}
+		return colRef{}, fmt.Errorf("%w: column %q does not exist", ErrInvalid, ref.Name)
+	}
+	return sc.resolve(ns, ref)
+}
+
+// offset of the columns of entry i in the rows the binder binds for.
+func (b *binder) offset(i int) int {
+	if b.layout != nil {
+		return b.layout[i]
+	}
+	return b.scope.entries[i].offset
+}
+
+// column reads the column r from a row.
+func (b *binder) column(r colRef) *cexpr {
+	off := b.offset(r.entry)
+	if off < 0 {
+		panic(fmt.Sprintf("exec: binding a column of entry %d, which the rows do not hold", r.entry))
+	}
+	at := off + r.col
+	ce := &cexpr{typ: b.scope.entries[r.entry].t.Columns[r.col].Type, refs: true, eval: func(row []value.Value) (value.Value, error) {
+		return row[at], nil
+	}}
+	if r.cast != value.Unknown {
+		ce = widen(ce, r.cast)
+	}
+	return ce
+}
+
+// forEntry is a binder for the rows of the entry i alone, whose table's indexes its WHERE clause
+// can use, in the same namespace.
+func (b *binder) forEntry(i int) *binder {
+	nb := &binder{scope: b.scope, ns: b.ns, table: b.scope.entries[i].t, entry: i, params: b.params, now: b.now, phase: b.phase}
+	nb.layout = make([]int, len(b.scope.entries))
+	for j := range nb.layout {
+		nb.layout[j] = -1
+	}
+	nb.layout[i] = 0
+	return nb
 }
 
 // bindPruned binds a branch that is known never to be evaluated.
@@ -414,16 +483,11 @@ func (b *binder) bind(e ast.Expr) (*cexpr, error) {
 		}
 		return &cexpr{typ: value.Unknown, folded: true, val: v, param: e.Index}, nil
 	case *ast.ColumnRef:
-		if b.table == nil {
-			return nil, fmt.Errorf("%w: column %q does not exist", ErrInvalid, e.Name)
+		r, err := b.resolve(e)
+		if err != nil {
+			return nil, err
 		}
-		i, ok := b.table.columnIndex(e.Name)
-		if !ok {
-			return nil, fmt.Errorf("%w: column %q does not exist", ErrInvalid, e.Name)
-		}
-		return &cexpr{typ: b.table.Columns[i].Type, refs: true, eval: func(row []value.Value) (value.Value, error) {
-			return row[i], nil
-		}}, nil
+		return b.column(r), nil
 	case *ast.Unary:
 		return b.unary(e)
 	case *ast.Binary:

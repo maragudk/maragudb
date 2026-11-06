@@ -74,7 +74,7 @@ SELECT a, b FROM t1 WHERE a > 1
 these results are never read
 
 query I rowsort
-SELECT DISTINCT a FROM t1
+SELECT DISTINCT ON (a) a FROM t1
 ----
 1
 
@@ -89,7 +89,7 @@ INSERT INTO t1 VALUES(1, 'x')
 		is.Equal(t, 9, rep.Records)
 		is.Equal(t, 1, rep.OtherEngine, "only for MySQL")
 		is.Equal(t, 8, rep.Statements)
-		is.Equal(t, 1, rep.Rejected, "DISTINCT")
+		is.Equal(t, 1, rep.Rejected, "DISTINCT ON")
 		is.Equal(t, 7, rep.Executed, "CREATE INDEX runs too")
 		is.Equal(t, 1, rep.Errors, "the duplicate key")
 		is.Equal(t, 1, rep.SetupFailed["23505 duplicate key value violates unique constraint _"])

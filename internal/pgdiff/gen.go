@@ -977,7 +977,7 @@ func (g *gen) update() *ast.Update {
 }
 
 func (g *gen) selectStmt() *ast.Select {
-	s := &ast.Select{From: g.table.Name}
+	s := &ast.Select{From: []ast.TableExpr{&ast.TableRef{Name: g.table.Name}}}
 	limited := g.draw(0, 2) == 0
 	sc := scope{columns: true, safe: limited && !g.rarely(8)}
 	n := g.draw(1, 3)
@@ -1086,7 +1086,8 @@ func FullyOrdered(s *ast.Select, pk []string) bool {
 	for _, k := range pk {
 		found := false
 		for _, o := range s.OrderBy {
-			if ref, ok := o.Expr.(*ast.ColumnRef); ok && ref.Name == k && !shadowed(s, k) {
+			// A qualified name is never an output column.
+			if ref, ok := o.Expr.(*ast.ColumnRef); ok && ref.Name == k && (ref.Table != "" || !shadowed(s, k)) {
 				found = true
 			}
 			if i, ok := orderPosition(o.Expr); ok && i < len(s.Items) && !starBefore(s, i) {
@@ -1137,8 +1138,10 @@ func sortedColumns(s *ast.Select, columns []string) []int {
 				i = p
 			}
 		case *ast.ColumnRef:
-			// Postgres resolves a name in ORDER BY to an output column first.
-			i = slices.Index(columns, e.Name)
+			// Postgres resolves a name alone in ORDER BY to an output column first.
+			if e.Table == "" {
+				i = slices.Index(columns, e.Name)
+			}
 		}
 		if i < 0 {
 			break

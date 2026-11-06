@@ -167,7 +167,8 @@ func (l *lexer) next() (token, error) {
 		}
 	}
 	if c == '.' {
-		return token{}, l.unsupportedf(start, "qualified names such as table.column are not supported, name the column alone")
+		l.pos++
+		return token{kind: tokOp, text: ".", pos: start}, nil
 	}
 	if c == '[' || c == ']' {
 		return token{}, l.unsupportedf(start, "arrays are not supported")

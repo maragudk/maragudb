@@ -38,6 +38,8 @@ func TestErrorClasses(t *testing.T) {
 		{sql: "SELEC 1", want: maragudb.ErrSyntax, code: "42601"},
 		{sql: "SELECT 1 ORDER BY 'a'", want: maragudb.ErrSyntax, code: "42601"},
 		{sql: "SELECT * FROM nope", want: maragudb.ErrNoTable, code: "42P01"},
+		{sql: "SELECT nope.i FROM dev", want: maragudb.ErrNoTable, code: "42P01"},
+		{sql: "SELECT * FROM dev, dev", want: maragudb.ErrInvalid, code: "42712"},
 		{sql: "CREATE TABLE dev (i bigint PRIMARY KEY)", want: maragudb.ErrTableExists, code: "42P07"},
 		{sql: "CREATE INDEX dev ON dev (j)", want: maragudb.ErrTableExists, code: "42P07"},
 		{sql: "CREATE TABLE dev_pkey (i bigint PRIMARY KEY)", want: maragudb.ErrTableExists, code: "42P07"},

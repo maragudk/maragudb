@@ -31,7 +31,7 @@ func TestRunner_Run(t *testing.T) {
 
 	t.Run("accepts different errors that agree once Postgres visits the rows in key order", func(t *testing.T) {
 		r := newRunner(t)
-		sel := &ast.Select{From: "t", Items: []ast.SelectItem{
+		sel := &ast.Select{From: []ast.TableExpr{&ast.TableRef{Name: "t"}}, Items: []ast.SelectItem{
 			{Expr: &ast.Binary{Op: ast.Div, Left: c0, Right: c0}},
 			{Expr: &ast.Call{Name: "abs", Args: []ast.Expr{c0}}},
 		}}
@@ -51,7 +51,7 @@ func TestRunner_Run(t *testing.T) {
 				{&ast.Literal{Value: value.NewInt(1)}, &ast.Literal{Value: value.NewInt(2)}, &ast.Literal{Value: value.NewInt(0)}, &ast.Literal{Value: value.NewUnknown("1")}},
 				{&ast.Literal{Value: value.NewInt(2)}, &ast.Literal{Value: value.NewInt(1)}, &ast.Literal{Value: value.NewInt(1)}, &ast.Literal{Value: value.NewUnknown("z")}},
 			}},
-			&ast.Select{From: "t", Items: []ast.SelectItem{{Expr: &ast.Binary{Op: ast.Add,
+			&ast.Select{From: []ast.TableExpr{&ast.TableRef{Name: "t"}}, Items: []ast.SelectItem{{Expr: &ast.Binary{Op: ast.Add,
 				Left:  &ast.Binary{Op: ast.Div, Left: &ast.Literal{Value: value.NewInt4(10)}, Right: &ast.ColumnRef{Name: "n"}},
 				Right: &ast.Cast{Expr: &ast.ColumnRef{Name: "s"}, Type: value.Int},
 			}}}, OrderBy: []ast.OrderItem{{Expr: &ast.ColumnRef{Name: "a"}}}},
@@ -64,7 +64,7 @@ func TestRunner_Run(t *testing.T) {
 
 	t.Run("also inside a transaction, which stays aborted on both sides", func(t *testing.T) {
 		r := newRunner(t)
-		sel := &ast.Select{From: "t", Items: []ast.SelectItem{
+		sel := &ast.Select{From: []ast.TableExpr{&ast.TableRef{Name: "t"}}, Items: []ast.SelectItem{
 			{Expr: &ast.Binary{Op: ast.Div, Left: c0, Right: c0}},
 			{Expr: &ast.Call{Name: "abs", Args: []ast.Expr{c0}}},
 		}}
@@ -78,7 +78,7 @@ func TestRunner_Run(t *testing.T) {
 
 	t.Run("also inside a read-only transaction, whose rows are the committed ones", func(t *testing.T) {
 		r := newRunner(t)
-		sel := &ast.Select{From: "t", Items: []ast.SelectItem{
+		sel := &ast.Select{From: []ast.TableExpr{&ast.TableRef{Name: "t"}}, Items: []ast.SelectItem{
 			{Expr: &ast.Binary{Op: ast.Div, Left: c0, Right: c0}},
 			{Expr: &ast.Call{Name: "abs", Args: []ast.Expr{c0}}},
 		}}
@@ -149,7 +149,7 @@ func TestRunner_Run(t *testing.T) {
 	t.Run("skips a rejected statement on Postgres, and aborts the transaction there instead", func(t *testing.T) {
 		verify.Covers(t, "a statement that maragudb rejects as unsupported is counted as rejected and not run on Postgres, and inside a transaction both transactions end up aborted", "AC-4.5")
 		r := newRunner(t)
-		unsupported := &ast.Select{From: "t", Items: []ast.SelectItem{{Expr: c0}}, Limit: &ast.Literal{Value: value.NewInt4(1)}}
+		unsupported := &ast.Select{From: []ast.TableExpr{&ast.TableRef{Name: "t"}}, Items: []ast.SelectItem{{Expr: c0}}, Limit: &ast.Literal{Value: value.NewInt4(1)}}
 		rep, err := r.Run(t.Context(), pgdiff.Case{Create: create, Statements: []ast.Statement{insert, unsupported, &ast.Begin{}, unsupported, insert, &ast.Rollback{}}})
 		is.NotError(t, err)
 		is.Equal(t, 2, rep.Rejected)

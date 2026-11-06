@@ -10,10 +10,10 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 ## At a glance
 
-- 33 acceptance criteria (`AC-`), 24 key invariants (`INV-`), 23 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
+- 33 acceptance criteria (`AC-`), 24 key invariants (`INV-`), 26 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
 - 15 mutants (`MUT-`), deliberate bugs, of which 14 are detected by the simulator's checkers within 20 seeds.
 - 17 interesting states (`STATE-`) that the simulator's fixed corpus must reach.
-- 174 declarations of coverage in the tests.
+- 183 declarations of coverage in the tests.
 
 ## Acceptance criteria
 
@@ -130,6 +130,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 > Differential testing against Postgres: When ORDER BY determines the order completely, results must match exactly. Otherwise they must match as multisets.
 
 - `internal/pgdiff` `TestDifferential/generated_statements_give_the_same_results_on_Postgres_and_maragudb`: hegel-generated schemas, rows, transactions, and statements, written once as Postgres SQL, give the same results, column names, affected-row counts, and transaction states on both sides, ordered exactly when ORDER BY decides the order and as multisets otherwise, and fail on both sides with the same error class, except for statements that maragudb rejects as unsupported, which Postgres skips
+- `internal/pgdiff` `TestJoins/joins_as_Postgres_does`: several tables in FROM, CROSS JOIN, [INNER] JOIN with ON and USING, LEFT [OUTER] JOIN with ON and USING, NATURAL joins, self-joins, and parenthesized and nested joins give Postgres's rows and column names, with the columns that USING merges once, of the common type, and those of a LEFT JOIN's right side NULL where it has no row
 
 ### `AC-4.3`
 
@@ -144,6 +145,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/pgdiff` `TestIndexConditions/takes_the_index_conditions_out_of_an_OR_as_Postgres_does_when_it_drops_constants_and_common_conditions_from_the_OR`: in a WHERE clause, Postgres drops the arguments of an OR that are FALSE or NULL constants and takes the conditions common to every argument out of the OR, which can make them index conditions; maragudb does the same and gives the same results
 - `internal/pgdiff` `TestIndexPlans/evaluates_the_other_conditions_only_on_the_rows_that_every_index_scan_Postgres_could_pick_skips,_and_otherwise_on_every_row`: with several indexes, a condition that can fail is evaluated on the rows that any index scan Postgres could pick reads: those of each index's certain conditions, and every row when an index without them could serve a condition or ORDER BY; maragudb gives Postgres's result when every such scan agrees, and rejects the statement otherwise
 - `internal/pgdiff` `TestIndexes/names_indexes_as_Postgres_does,_in_the_namespace_of_tables,_with_the_same_errors`: CREATE INDEX, DROP INDEX, and UNIQUE constraints name their indexes as Postgres does, tables and indexes share one namespace, and every clash, missing name, and wrong kind of relation fails with the class of Postgres's error
+- `internal/pgdiff` `TestJoins/resolves_aliases_and_qualified_names_as_Postgres_does,_with_the_same_errors`: table aliases with and without AS, names for the columns of a table, qualified names, t.*, and a name alone resolve as in Postgres, and an ambiguous name (42702), a missing or hidden FROM entry (42P01), a table named twice (42712), a missing column (42703), and too many column names (42P10) fail with the class of Postgres's error
 - `internal/pgdiff` `TestRunner_Run/accepts_different_errors_that_agree_once_Postgres_visits_the_rows_in_key_order_instead_of_the_order_of_an_index`: when Postgres reads the rows through an index in the order of its entries and reports another row's error than maragudb, which reads them in key order, the rerun in key order marks the other indexes invalid, so that Postgres agrees
 - `internal/pgdiff` `TestRunner_Run/reports_errors_of_different_classes_as_a_mismatch`: a statement that fails on both sides for different reasons is a mismatch
 
@@ -423,6 +425,12 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/pgdiff` `TestIndexes/enforces_UNIQUE_as_Postgres_does,_with_NULLs_distinct_or_not,_and_fails_a_unique_index_on_duplicated_rows`: inserts, updates, and CREATE UNIQUE INDEX that would give two rows the same values of a unique index fail with SQLSTATE 23505 on both, NULLs collide only with NULLS NOT DISTINCT, and the rows are the same on both afterwards
 - `internal/pgdiff` `TestIndexes/fails_a_cycle_of_unique_values_in_an_UPDATE_as_Postgres_does_in_every_order,_and_rejects_a_chain`: an UPDATE whose rows swap the values of a unique index or of the primary key fails with SQLSTATE 23505 on both, an UPDATE that moves a chain of rows onto the values the next one leaves is rejected, and one that moves rows onto free values succeeds on both
 - `internal/pgdiff` `TestIndexes/names_indexes_as_Postgres_does,_in_the_namespace_of_tables,_with_the_same_errors`: CREATE INDEX, DROP INDEX, and UNIQUE constraints name their indexes as Postgres does, tables and indexes share one namespace, and every clash, missing name, and wrong kind of relation fails with the class of Postgres's error
+- `internal/pgdiff` `TestJoinPlans/Postgres_pushes_conditions_down,_picks_the_join_method_by_cost,_and_evaluates_conditions_on_rows_and_pairs_that_depend_on_it`: EXPLAIN and the outcomes on Postgres 18 with sequential scans off show that a condition on one table goes into the scan of that table, also on the right side of a LEFT JOIN, that a strict WHERE condition on that side makes the join inner, that equalities derive conditions on other tables, that the join method follows enable_nestloop, enable_hashjoin, and enable_mergejoin, and that the same statement fails with one method and succeeds with another, also when one side is empty
+- `internal/pgdiff` `TestJoinPlans/rejects_a_join_whose_conditions_fail_on_a_row_or_pair_that_some_plan_evaluates_them_on,_and_accepts_it_otherwise`: a condition of a join that can fail, in WHERE or ON, on one table or several, is evaluated on every row and combination of rows that a plan of Postgres could evaluate it on, also on its sides alone and with NULLs for the right side of a LEFT JOIN, and the statement is rejected when it fails on any, while an output expression that fails is reported when every failing row fails with the same class
+- `internal/pgdiff` `TestJoins/joins_as_Postgres_does`: several tables in FROM, CROSS JOIN, [INNER] JOIN with ON and USING, LEFT [OUTER] JOIN with ON and USING, NATURAL joins, self-joins, and parenthesized and nested joins give Postgres's rows and column names, with the columns that USING merges once, of the common type, and those of a LEFT JOIN's right side NULL where it has no row
+- `internal/pgdiff` `TestJoins/names_the_output_columns_as_Postgres_does,_and_resolves_ORDER_BY_against_them`: the output columns of a join are named as in Postgres, with repeated names, and ORDER BY a name alone is the output column of that name, ambiguous only when two of them are different expressions
+- `internal/pgdiff` `TestJoins/removes_duplicate_rows_with_DISTINCT_as_Postgres_does`: SELECT DISTINCT keeps one row of every group of rows that are equal as Postgres compares them, NULLs equal to each other and NaN equal to NaN, sorts by ORDER BY items that must be output columns (42P10 otherwise), and rejects a group of -0 and 0, whose output depends on the plan
+- `internal/pgdiff` `TestJoins/resolves_aliases_and_qualified_names_as_Postgres_does,_with_the_same_errors`: table aliases with and without AS, names for the columns of a table, qualified names, t.*, and a name alone resolve as in Postgres, and an ambiguous name (42702), a missing or hidden FROM entry (42P01), a table named twice (42712), a missing column (42703), and too many column names (42P10) fail with the class of Postgres's error
 - `internal/pgdiff` `TestParameters/a_parameter_of_every_Go_type_in_every_context_gives_the_same_result_as_Postgres_with_pgx,_or_is_rejected_as_unsupported`: hegel-drawn Go values bound as parameters in contexts that infer different types give the same result or error class as Postgres with pgx, or fail on both when pgx refuses to encode them, unless maragudb rejects them as unsupported
 - `internal/sql/exec` `TestSession_Defaults/now()_is_the_start_of_the_transaction,_the_same_for_every_use_in_it,_from_the_engine's_clock_at_microsecond_precision`: now(), CURRENT_TIMESTAMP, and transaction_timestamp() are the start of the transaction on the engine's clock, truncated to microseconds, the same in every statement of a transaction and in a DEFAULT, and later in a later transaction
 - `internal/sql/exec` `TestSession_Insert/applies_Postgres's_assignment_casts`: an INSERT applies the assignment casts Postgres has: a quoted literal as the column's type, numeric and float literals rounded into bigint, integers widened to double precision, and any value written into text
@@ -581,7 +589,13 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 > Other clauses.
 
-- `internal/pgdiff` `TestUnsupported/UNS-CLAUSES_other_clauses_of_queries_and_writes`: DISTINCT, GROUP BY, joins, subqueries, set operations, aliases, qualified names, FOR UPDATE, RETURNING, ON CONFLICT, and INSERT ... SELECT are rejected, and Postgres accepts them
+- `internal/pgdiff` `TestUnsupported/UNS-CLAUSES_other_clauses_of_queries_and_writes`: DISTINCT ON, GROUP BY, subqueries, set operations, FOR UPDATE, RETURNING, ON CONFLICT, INSERT ... SELECT, an alias in INSERT, UPDATE ... FROM, and DELETE ... USING are rejected, and Postgres accepts them
+
+### `UNS-JOINS`
+
+> Other forms of FROM and of names.
+
+- `internal/pgdiff` `TestUnsupported/UNS-JOINS_other_forms_of_FROM_and_of_names`: RIGHT and FULL joins, LATERAL, an alias for a join or for the columns of USING, subqueries and functions in FROM, names with a schema, a reference to a whole row, and a repeated name in the names of a table's columns are rejected, and Postgres accepts them
 
 ### `UNS-FUNCTIONS`
 
@@ -637,6 +651,20 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/pgdiff` `TestIndexPlans/evaluates_the_other_conditions_only_on_the_rows_that_every_index_scan_Postgres_could_pick_skips,_and_otherwise_on_every_row`: with several indexes, a condition that can fail is evaluated on the rows that any index scan Postgres could pick reads: those of each index's certain conditions, and every row when an index without them could serve a condition or ORDER BY; maragudb gives Postgres's result when every such scan agrees, and rejects the statement otherwise
 - `internal/pgdiff` `TestUnsupported/UNS-ORDER-DEPENDENT-WHERE_a_condition_that_fails_on_a_row_that_another_condition_rejects`: a WHERE clause with a condition that fails on a row that another condition rejects is rejected, because whether Postgres fails depends on the order it picks, and Postgres accepts it in the order it picks here
 - `internal/sql/exec` `TestSession_Select/accepts_a_WHERE_clause_only_when_its_outcome_is_the_same_in_every_order_Postgres_could_pick_on_the_rows_its_primary_key_index_selects`: a WHERE clause whose outcome on a row depends on the order Postgres evaluates its conditions in, including the equalities its equivalence classes imply, is ErrUnsupported, and so is a LIKE on a key column that can fail; the other conditions are evaluated only on the rows that the primary key conditions select, and every other WHERE clause fails exactly when Postgres fails in every order
+
+### `UNS-PLAN-DEPENDENT-JOIN`
+
+> A condition of a join that fails on a row that some plan evaluates it on.
+
+- `internal/pgdiff` `TestJoinPlans/rejects_a_join_whose_conditions_fail_on_a_row_or_pair_that_some_plan_evaluates_them_on,_and_accepts_it_otherwise`: a condition of a join that can fail, in WHERE or ON, on one table or several, is evaluated on every row and combination of rows that a plan of Postgres could evaluate it on, also on its sides alone and with NULLs for the right side of a LEFT JOIN, and the statement is rejected when it fails on any, while an output expression that fails is reported when every failing row fails with the same class
+- `internal/pgdiff` `TestUnsupported/UNS-PLAN-DEPENDENT-JOIN_a_condition_of_a_join_that_fails_on_a_row_that_some_plan_evaluates_it_on`: a SELECT on several tables with a condition that fails on a row or a combination of rows that a plan of Postgres could evaluate it on is rejected, because whether Postgres fails depends on its join plan, and Postgres accepts it when its plan does not evaluate the condition there
+
+### `UNS-DISTINCT-ZERO`
+
+> DISTINCT of -0 and 0.
+
+- `internal/pgdiff` `TestJoins/removes_duplicate_rows_with_DISTINCT_as_Postgres_does`: SELECT DISTINCT keeps one row of every group of rows that are equal as Postgres compares them, NULLs equal to each other and NaN equal to NaN, sorts by ORDER BY items that must be output columns (42P10 otherwise), and rejects a group of -0 and 0, whose output depends on the plan
+- `internal/pgdiff` `TestUnsupported/UNS-DISTINCT-ZERO_DISTINCT_of_-0_and_0`: a SELECT DISTINCT whose result has -0 and 0 in one group is rejected, because which of them Postgres outputs depends on its plan, and Postgres accepts it
 
 ### `UNS-STABLE-CONSTANT`
 

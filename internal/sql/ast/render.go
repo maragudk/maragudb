@@ -192,10 +192,15 @@ func (r *renderer) stmt(s Statement) {
 	case *Update:
 		r.b.WriteString("UPDATE ")
 		r.ident(s.Table)
+		r.alias(s.Alias)
 		r.b.WriteString(" SET ")
 		for i, a := range s.Set {
 			if i > 0 {
 				r.b.WriteString(", ")
+			}
+			if a.Qualifier != "" {
+				r.ident(a.Qualifier)
+				r.b.WriteByte('.')
 			}
 			r.ident(a.Column)
 			r.b.WriteString(" = ")
@@ -205,14 +210,22 @@ func (r *renderer) stmt(s Statement) {
 	case *Delete:
 		r.b.WriteString("DELETE FROM ")
 		r.ident(s.Table)
+		r.alias(s.Alias)
 		r.where(s.Where)
 	case *Select:
 		r.b.WriteString("SELECT ")
+		if s.Distinct {
+			r.b.WriteString("DISTINCT ")
+		}
 		for i, item := range s.Items {
 			if i > 0 {
 				r.b.WriteString(", ")
 			}
 			if item.Star {
+				if item.Table != "" {
+					r.ident(item.Table)
+					r.b.WriteByte('.')
+				}
 				r.b.WriteByte('*')
 				continue
 			}
@@ -222,9 +235,13 @@ func (r *renderer) stmt(s Statement) {
 				r.ident(item.Alias)
 			}
 		}
-		if s.From != "" {
-			r.b.WriteString(" FROM ")
-			r.ident(s.From)
+		for i, from := range s.From {
+			if i == 0 {
+				r.b.WriteString(" FROM ")
+			} else {
+				r.b.WriteString(", ")
+			}
+			r.from(from)
 		}
 		r.where(s.Where)
 		if len(s.OrderBy) > 0 {
@@ -264,6 +281,66 @@ func (r *renderer) stmt(s Statement) {
 		r.b.WriteString("ROLLBACK")
 	default:
 		panic(fmt.Sprintf("ast: rendering %T", s))
+	}
+}
+
+// alias writes AS and the alias of a table, when there is one.
+func (r *renderer) alias(name string) {
+	if name != "" {
+		r.b.WriteString(" AS ")
+		r.ident(name)
+	}
+}
+
+// from writes an item of FROM. A join is left-associative, so a join on its right side is in
+// parentheses.
+func (r *renderer) from(e TableExpr) {
+	switch e := e.(type) {
+	case *TableRef:
+		r.ident(e.Name)
+		r.alias(e.Alias)
+		if len(e.Columns) > 0 {
+			if e.Alias == "" {
+				// Column aliases need a table alias; the table's own name serves.
+				r.alias(e.Name)
+			}
+			r.b.WriteString(" (")
+			r.idents(e.Columns)
+			r.b.WriteByte(')')
+		}
+	case *Join:
+		r.from(e.Left)
+		switch {
+		case e.Kind == JoinCross:
+			r.b.WriteString(" CROSS JOIN ")
+		case e.Natural && e.Kind == JoinLeft:
+			r.b.WriteString(" NATURAL LEFT JOIN ")
+		case e.Natural:
+			r.b.WriteString(" NATURAL JOIN ")
+		case e.Kind == JoinLeft:
+			r.b.WriteString(" LEFT JOIN ")
+		default:
+			r.b.WriteString(" JOIN ")
+		}
+		if _, ok := e.Right.(*Join); ok {
+			r.b.WriteByte('(')
+			r.from(e.Right)
+			r.b.WriteByte(')')
+		} else {
+			r.from(e.Right)
+		}
+		switch {
+		case e.Kind == JoinCross, e.Natural:
+		case len(e.Using) > 0:
+			r.b.WriteString(" USING (")
+			r.idents(e.Using)
+			r.b.WriteByte(')')
+		default:
+			r.b.WriteString(" ON ")
+			r.expr(e.On, 0)
+		}
+	default:
+		panic(fmt.Sprintf("ast: rendering %T", e))
 	}
 }
 
@@ -417,6 +494,10 @@ func (r *renderer) expr(e Expr, minimum int) {
 	case *Param:
 		fmt.Fprintf(&r.b, "$%d", e.Index)
 	case *ColumnRef:
+		if e.Table != "" {
+			r.ident(e.Table)
+			r.b.WriteByte('.')
+		}
 		r.ident(e.Name)
 	case *Unary:
 		if e.Op == Not {

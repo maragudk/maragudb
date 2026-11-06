@@ -158,40 +158,105 @@ type Insert struct {
 	DefaultValues bool
 }
 
-// Update statement.
+// Update statement. Alias, when set, is the name that references the table in the statement.
 type Update struct {
 	Table string
+	Alias string
 	Set   []Assignment
 	Where Expr
 }
 
-// Assignment in an [Update]. Its Value can be [Default].
+// Assignment in an [Update]. Its Value can be [Default]. A Qualifier is the first part of a
+// target written as two names, such as x.c, which Postgres reads as the field c of the column x.
 type Assignment struct {
-	Column string
-	Value  Expr
+	Qualifier string
+	Column    string
+	Value     Expr
 }
 
-// Delete statement.
+// Delete statement. Alias, when set, is the name that references the table in the statement.
 type Delete struct {
 	Table string
+	Alias string
 	Where Expr
 }
 
-// Select statement. An empty From selects a single row without a table.
+// Select statement. An empty From selects a single row without a table. Several items in From
+// are joined as with CROSS JOIN, and the WHERE clause filters their rows.
 type Select struct {
-	Items   []SelectItem
-	From    string
-	Where   Expr
-	OrderBy []OrderItem
-	Limit   Expr
-	Offset  Expr
+	Distinct bool
+	Items    []SelectItem
+	From     []TableExpr
+	Where    Expr
+	OrderBy  []OrderItem
+	Limit    Expr
+	Offset   Expr
 }
 
-// SelectItem is a `*` or an expression with an optional alias.
+// SelectItem is a `*`, a `table.*` when Table is set, or an expression with an optional alias.
 type SelectItem struct {
 	Star  bool
+	Table string
 	Expr  Expr
 	Alias string
+}
+
+// TableExpr is an item of FROM: a [TableRef] or a [Join].
+type TableExpr interface {
+	tableExpr()
+}
+
+// TableRef is a table in FROM, with an optional alias, which is then the only name that
+// references it, and optional names for its first columns.
+type TableRef struct {
+	Name    string
+	Alias   string
+	Columns []string
+}
+
+// JoinKind of a [Join].
+type JoinKind int
+
+// Join kinds.
+const (
+	JoinInner JoinKind = iota
+	JoinLeft
+	JoinCross
+)
+
+// Join of two FROM items. An inner or left join has a condition: On, the columns of Using, or
+// Natural, which is Using with the columns that both sides have.
+type Join struct {
+	Kind        JoinKind
+	Natural     bool
+	Left, Right TableExpr
+	On          Expr
+	Using       []string
+}
+
+func (*TableRef) tableExpr() {}
+func (*Join) tableExpr()     {}
+
+// FromTable is the table of a SELECT that reads exactly one table, or "".
+func FromTable(s *Select) string {
+	if len(s.From) != 1 {
+		return ""
+	}
+	if t, ok := s.From[0].(*TableRef); ok {
+		return t.Name
+	}
+	return ""
+}
+
+// Tables of a FROM item, in the order they are written.
+func Tables(e TableExpr) []*TableRef {
+	switch e := e.(type) {
+	case *TableRef:
+		return []*TableRef{e}
+	case *Join:
+		return append(Tables(e.Left), Tables(e.Right)...)
+	}
+	return nil
 }
 
 // OrderItem in ORDER BY.
@@ -251,9 +316,10 @@ type Param struct {
 	Index int
 }
 
-// ColumnRef by name.
+// ColumnRef by name, qualified by the name of a table in FROM when Table is set.
 type ColumnRef struct {
-	Name string
+	Table string
+	Name  string
 }
 
 // UnaryOp of a [Unary].

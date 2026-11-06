@@ -412,17 +412,23 @@ type clause struct {
 	ce   *cexpr
 }
 
-// where binds a WHERE clause into a filter, and rejects a clause whose outcome would depend on
-// the plan Postgres chooses.
-func (b *binder) where(e ast.Expr) (filter, error) {
+// where binds a WHERE clause, or the condition of another clause, into a filter, and rejects a
+// clause whose outcome would depend on the plan Postgres chooses.
+func (b *binder) where(e ast.Expr, what string) (filter, error) {
 	if e == nil {
 		return filter{}, nil
 	}
+	return b.filterOf(b.whereConjuncts(b.normalize(e)), what)
+}
+
+// filterOf the conjuncts of a WHERE clause, or of the condition of another clause, as
+// [binder.whereConjuncts] splits it.
+func (b *binder) filterOf(conjs []ast.Expr, what string) (filter, error) {
 	var f filter
 	var clauses []clause
 	pruned := false
 	null := false
-	for _, c := range b.whereConjuncts(e) {
+	for _, c := range conjs {
 		var ce *cexpr
 		var err error
 		if pruned {
@@ -437,7 +443,7 @@ func (b *binder) where(e ast.Expr) (filter, error) {
 			return filter{}, err
 		}
 		if ce.typ != value.Bool {
-			return filter{}, fmt.Errorf("%w: argument of WHERE must be type boolean, not type %v", ErrType, ce.typ)
+			return filter{}, fmt.Errorf("%w: argument of %s must be type boolean, not type %v", ErrType, what, ce.typ)
 		}
 		if pruned {
 			continue
@@ -716,11 +722,21 @@ func (b *binder) plainColumn(e ast.Expr) (int, bool) {
 		}
 		e = c.Expr
 	}
+	return b.columnOf(e)
+}
+
+// columnOf returns the column of the binder's table that e is: a reference that resolves to a
+// column of the table's entry, without a conversion.
+func (b *binder) columnOf(e ast.Expr) (int, bool) {
 	ref, ok := e.(*ast.ColumnRef)
 	if !ok || b.table == nil {
 		return 0, false
 	}
-	return b.table.columnIndex(ref.Name)
+	r, err := b.resolve(ref)
+	if err != nil || r.entry != b.entry || r.cast != value.Unknown {
+		return 0, false
+	}
+	return r.col, true
 }
 
 // impliedIndexConditions returns an equality between an indexed column and a constant for every
@@ -820,11 +836,7 @@ func (b *binder) keyIn(e *ast.In) (int, bool) {
 // keyColumn returns the index of the column that e names, if it is in the primary key or in an
 // index.
 func (b *binder) keyColumn(e ast.Expr) (int, bool) {
-	ref, ok := e.(*ast.ColumnRef)
-	if !ok || b.table == nil {
-		return 0, false
-	}
-	col, ok := b.table.columnIndex(ref.Name)
+	col, ok := b.columnOf(e)
 	if !ok || !b.table.indexed(col) {
 		return 0, false
 	}

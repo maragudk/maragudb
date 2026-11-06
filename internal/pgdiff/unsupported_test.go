@@ -249,17 +249,37 @@ func TestUnsupported(t *testing.T) {
 	})
 
 	t.Run("UNS-CLAUSES other clauses of queries and writes", func(t *testing.T) {
-		verify.Covers(t, "DISTINCT, GROUP BY, joins, subqueries, set operations, aliases, qualified names, FOR UPDATE, RETURNING, ON CONFLICT, and INSERT ... SELECT are rejected, and Postgres accepts them", "UNS-CLAUSES")
+		verify.Covers(t, "DISTINCT ON, GROUP BY, subqueries, set operations, FOR UPDATE, RETURNING, ON CONFLICT, INSERT ... SELECT, an alias in INSERT, UPDATE ... FROM, and DELETE ... USING are rejected, and Postgres accepts them", "UNS-CLAUSES")
 		rejects(t, create,
-			example{SQL: "SELECT DISTINCT j FROM dev"},
+			example{SQL: "SELECT DISTINCT ON (j) j FROM dev"},
 			example{SQL: "SELECT j FROM dev GROUP BY j"},
-			example{SQL: "SELECT d.i FROM dev d"},
 			example{SQL: "SELECT i FROM dev UNION SELECT 1"},
 			example{SQL: "SELECT i FROM dev WHERE i IN (SELECT 1)"},
 			example{SQL: "SELECT i FROM dev FOR UPDATE"},
 			example{SQL: "INSERT INTO dev VALUES (5, 1, 'x') RETURNING i"},
 			example{SQL: "INSERT INTO dev SELECT 6, 1, 'x'"},
 			example{SQL: "INSERT INTO dev VALUES (7, 1, 'x') ON CONFLICT DO NOTHING"},
+			example{SQL: "INSERT INTO dev AS d VALUES (8, 1, 'x')"},
+			example{SQL: "UPDATE dev SET j = d.j FROM dev AS d WHERE d.i = dev.i"},
+			example{SQL: "DELETE FROM dev USING dev AS d WHERE d.i = dev.i"},
+		)
+	})
+
+	t.Run("UNS-JOINS other forms of FROM and of names", func(t *testing.T) {
+		verify.Covers(t, "RIGHT and FULL joins, LATERAL, an alias for a join or for the columns of USING, subqueries and functions in FROM, names with a schema, a reference to a whole row, and a repeated name in the names of a table's columns are rejected, and Postgres accepts them", "UNS-JOINS")
+		rejects(t, create,
+			example{SQL: "SELECT * FROM dev a RIGHT JOIN dev b ON a.i = b.j"},
+			example{SQL: "SELECT * FROM dev a FULL JOIN dev b ON a.i = b.j"},
+			example{SQL: "SELECT * FROM dev a JOIN LATERAL (SELECT a.i) b ON true"},
+			example{SQL: "SELECT * FROM (dev a JOIN dev b ON a.i = b.j) AS c"},
+			example{SQL: "SELECT * FROM dev a JOIN dev b USING (i) AS c"},
+			example{SQL: "SELECT * FROM (SELECT 1) AS a"},
+			example{SQL: "SELECT * FROM generate_series(1, 2)"},
+			example{SQL: "SELECT i FROM public.dev"},
+			example{SQL: "SELECT public.dev.i FROM dev"},
+			example{SQL: "SELECT dev FROM dev"},
+			example{SQL: "SELECT dev.* IS NULL FROM dev"},
+			example{SQL: "SELECT * FROM dev AS d (a, a)"},
 		)
 	})
 
@@ -325,6 +345,24 @@ func TestUnsupported(t *testing.T) {
 		rejects(t, create,
 			example{SQL: "SELECT i FROM dev LIMIT 1", Setup: []string{rows}},
 			example{SQL: "SELECT i FROM dev ORDER BY j OFFSET 1", Setup: []string{rows}},
+			example{SQL: "SELECT a.i FROM dev a, dev b ORDER BY a.i LIMIT 1", Setup: []string{rows}},
+			example{SQL: "SELECT DISTINCT j, s FROM dev ORDER BY j LIMIT 1", Setup: []string{rows}},
+		)
+	})
+
+	t.Run("UNS-PLAN-DEPENDENT-JOIN a condition of a join that fails on a row that some plan evaluates it on", func(t *testing.T) {
+		verify.Covers(t, "a SELECT on several tables with a condition that fails on a row or a combination of rows that a plan of Postgres could evaluate it on is rejected, because whether Postgres fails depends on its join plan, and Postgres accepts it when its plan does not evaluate the condition there", "UNS-PLAN-DEPENDENT-JOIN")
+		rejects(t, create,
+			example{SQL: "SELECT * FROM dev JOIN dev2 ON dev.j = dev2.j WHERE 10 / dev.j > 0", Setup: []string{rows, "CREATE TABLE dev2 (i bigint PRIMARY KEY, j bigint)"}},
+			example{SQL: "SELECT * FROM dev2 LEFT JOIN dev ON dev.j = dev2.j AND 10 / dev.j > 0", Setup: []string{rows, "CREATE TABLE dev2 (i bigint PRIMARY KEY, j bigint)"}},
+		)
+	})
+
+	t.Run("UNS-DISTINCT-ZERO DISTINCT of -0 and 0", func(t *testing.T) {
+		verify.Covers(t, "a SELECT DISTINCT whose result has -0 and 0 in one group is rejected, because which of them Postgres outputs depends on its plan, and Postgres accepts it", "UNS-DISTINCT-ZERO")
+		rejects(t, "CREATE TABLE dev (i bigint PRIMARY KEY, f double precision)",
+			example{SQL: "SELECT DISTINCT f FROM dev", Setup: []string{"INSERT INTO dev VALUES (1, '-0'), (2, 0)"}},
+			example{SQL: "SELECT DISTINCT a.f FROM dev a, dev b", Setup: []string{"INSERT INTO dev VALUES (1, '-0'), (2, 0)"}},
 		)
 	})
 

@@ -258,7 +258,7 @@ func (r *Runner) Run(ctx context.Context, c Case) (Report, error) {
 // stateCheck selects every row of the table in key order, with the column whose default is now()
 // compared with now() instead of as it is.
 func stateCheck(t *ast.CreateTable, nowColumn string) *ast.Select {
-	sel := &ast.Select{From: t.Name}
+	sel := &ast.Select{From: []ast.TableExpr{&ast.TableRef{Name: t.Name}}}
 	for _, c := range t.Columns {
 		var e ast.Expr = &ast.ColumnRef{Name: c.Name}
 		if c.Name == nowColumn {
@@ -380,8 +380,8 @@ func (s *sides) compare(ctx context.Context, text string, st ast.Statement, rep 
 	pgRows, mgRows := canonical(pg.rows), canonical(mg.rows)
 	// A table whose primary key is unknown is never fully ordered, but a SELECT without one has
 	// one row.
-	pk, known := s.keys[sel.From]
-	if (known || sel.From == "") && FullyOrdered(sel, pk) {
+	pk, known := s.keys[ast.FromTable(sel)]
+	if (known || len(sel.From) == 0) && FullyOrdered(sel, pk) {
 		rep.Ordered++
 	} else {
 		if keys := sortedColumns(sel, mg.cols); len(keys) > 0 {
@@ -424,7 +424,7 @@ func isQuery(text string, st ast.Statement) bool {
 func tableOf(st ast.Statement) string {
 	switch st := st.(type) {
 	case *ast.Select:
-		return st.From
+		return ast.FromTable(st)
 	case *ast.Insert:
 		return st.Table
 	case *ast.Update:

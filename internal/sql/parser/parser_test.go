@@ -63,6 +63,14 @@ func TestParse(t *testing.T) {
 			{"select a from t limit all", "SELECT a FROM t LIMIT NULL"},
 			{"select a as select, b as from, c key, d as end from t", `SELECT a AS "select", b AS "from", c AS key, d AS "end" FROM t`},
 			{"select 1 + 1", "SELECT 1 + 1"},
+			{"select distinct t.a, x.\"B\", x.order, u.* from t, u as x where t.a = x.b", `SELECT DISTINCT t.a, x."B", x."order", u.* FROM t, u AS x WHERE t.a = x.b`},
+			{"select * from t x (a, b) join u using (a) left outer join v y on y.a = x.a cross join w natural join z natural left join q", "SELECT * FROM t AS x (a, b) JOIN u USING (a) LEFT JOIN v AS y ON y.a = x.a CROSS JOIN w NATURAL JOIN z NATURAL LEFT JOIN q"},
+			{"select * from a join b join c on x on y", "SELECT * FROM a JOIN (b JOIN c ON x) ON y"},
+			{"select * from a cross join b join c on x", "SELECT * FROM a CROSS JOIN b JOIN c ON x"},
+			{"select * from a inner join (b cross join c) on x, ((d join e on true))", "SELECT * FROM a JOIN (b CROSS JOIN c) ON x, d JOIN e ON TRUE"},
+			{"update t as x set a = x.b, x.c = 1 where x.a = 1", "UPDATE t AS x SET a = x.b, x.c = 1 WHERE x.a = 1"},
+			{"update t x set a = 1", "UPDATE t AS x SET a = 1"},
+			{"delete from t x where x.a = 1", "DELETE FROM t AS x WHERE x.a = 1"},
 			{"select 1;", "SELECT 1"},
 			{"begin", "BEGIN"},
 			{"begin work", "BEGIN"},
@@ -240,6 +248,11 @@ func TestParse(t *testing.T) {
 			{"select 'abc", "syntax error at position 8: unterminated string"},
 			{"select 1e", "syntax error at position 8: trailing junk after numeric literal"},
 			{"select 1abc", "syntax error at position 8: trailing junk after numeric literal"},
+			{"select * from a join b", "syntax error at position 23: expected ON or USING, got end of statement"},
+			{"select * from a cross join b on true", "syntax error at position 30: unexpected ON"},
+			{"select * from a natural join b using (c)", "syntax error at position 32: unexpected USING"},
+			{"select * from (a)", "syntax error at position 17: unexpected \")\""},
+			{"select a.*.b from a", "syntax error at position 11: improper use of \"*\""},
 			{"select 0x", "syntax error at position 8: invalid number"},
 			{"select $", "syntax error at position 8: parameter needs a number"},
 			{"select $0", "syntax error at position 8: there is no parameter $0"},
@@ -292,14 +305,21 @@ func TestParse(t *testing.T) {
 			sql  string
 			want string
 		}{
-			{"select a from t join u on a = b", "JOIN is not supported"},
-			{"select a from t, u", "several tables in FROM are not supported"},
-			{"select a from t as x", "a table alias is not supported"},
-			{"select a from t x", "a table alias is not supported"},
-			{"select t.a from t", "qualified names such as table.column are not supported, name the column alone"},
+			{"select a from t right join u on a = b", "RIGHT JOIN is not supported, write a LEFT JOIN with the tables the other way round"},
+			{"select a from t full outer join u on a = b", "FULL JOIN is not supported, write a LEFT JOIN with the tables the other way round"},
+			{"select a from t join lateral u on true", "LATERAL is not supported"},
+			{"select a from (t join u on true) as j", "an alias for a join is not supported, name the columns through the aliases of its tables"},
+			{"select a from t join u using (a) as j", "an alias for the columns of USING is not supported"},
+			{"select a from (select 1) x", "subqueries in FROM are not supported"},
+			{"select a from generate_series(1, 2)", "functions in FROM are not supported"},
+			{"select a from t tablesample bernoulli (1)", "TABLESAMPLE is not supported"},
+			{"select a.b.c from t", "names of more than two parts, such as schema.table.column, are not supported"},
+			{"select t.* is null from t", "t.* is not supported in an expression, name the columns"},
+			{"select t.*::text from t", "t.* is not supported in an expression, name the columns"},
+			{"select x.f(1) from t", "functions with a schema are not supported"},
+			{"select distinct on (a) a from t", "DISTINCT ON is not supported, write DISTINCT"},
 			{"select a from t group by a", "GROUP BY is not supported"},
 			{"select a from t union select b from u", "UNION is not supported"},
-			{"select distinct a from t", "DISTINCT is not supported"},
 			{"select from t", "a SELECT without output columns is not supported"},
 			{"select", "a SELECT without output columns is not supported"},
 			{"select count(*) from t", "function count is not supported"},
@@ -404,11 +424,13 @@ func TestParse(t *testing.T) {
 			{"insert into t select * from u", "INSERT ... SELECT is not supported, write VALUES"},
 			{"insert into t values (1) on conflict do nothing", "ON CONFLICT is not supported"},
 			{"insert into t values (1) returning a", "RETURNING is not supported, read the rows with a SELECT"},
-			{"update t set a = 1 from u", "FROM in UPDATE is not supported"},
+			{"update t set a = 1 from u", "UPDATE ... FROM is not supported, read the other tables in a SELECT first"},
 			{"update t set a = 1 returning a", "RETURNING is not supported, read the rows with a SELECT"},
 			{"update t set (a, b) = (1, 2)", "SET (columns) = (values) is not supported, assign the columns one at a time"},
-			{"update t x set a = 1", "a table alias in UPDATE is not supported"},
-			{"delete from t using u", "USING is not supported"},
+			{"update t.u set a = 1", "a table name with a schema is not supported, name the table alone"},
+			{"update t set a.b.c = 1", "assigning to a field of a field is not supported"},
+			{"delete from t using u", "DELETE ... USING is not supported, read the other tables in a SELECT first"},
+			{"delete from t x using u", "DELETE ... USING is not supported, read the other tables in a SELECT first"},
 			{"delete from t where current of c", "WHERE CURRENT OF is not supported"},
 			{"select a from t for update", "FOR UPDATE and FOR SHARE are not supported, every transaction is serializable"},
 			{"select a from t order by a limit 1 offset 2 rows", "OFFSET n ROWS is not supported, write OFFSET n"},
@@ -426,7 +448,7 @@ func TestParse(t *testing.T) {
 			{"savepoint s", "SAVEPOINT is not supported"},
 			{"select 1; select 2", "several statements in one string are not supported, run them one at a time"},
 			{"select Ä from t", "identifiers with non-ASCII letters such as 'Ä' are not supported unquoted, quote the identifier"},
-			{"select a from public.t", "qualified names such as table.column are not supported, name the column alone"},
+			{"select a from public.t", "a table name with a schema is not supported, name the table alone"},
 			{"(select 1)", "a parenthesized statement is not supported"},
 			{"select row(1, 2)", "row constructors are not supported"},
 			{"select left('abc', 1)", "function left is not supported"},
@@ -569,6 +591,9 @@ func drawExpr(ht hegel.TestCase, depth int) ast.Expr {
 	case 0:
 		return drawLiteral(ht)
 	case 1:
+		if hegel.Draw(ht, hegel.Integers(0, 3)) == 0 {
+			return &ast.ColumnRef{Table: drawName(ht), Name: drawName(ht)}
+		}
 		return &ast.ColumnRef{Name: drawName(ht)}
 	case 2:
 		return &ast.Param{Index: hegel.Draw(ht, hegel.Integers(1, 5))}
@@ -633,6 +658,37 @@ func drawNames(ht hegel.TestCase, minN, maxN int) []string {
 	return out
 }
 
+// drawAlias is an alias of a table, or none.
+func drawAlias(ht hegel.TestCase) string {
+	if hegel.Draw(ht, hegel.Booleans()) {
+		return ""
+	}
+	return drawName(ht)
+}
+
+// drawTableExpr is a table with an alias or without, or a join of any kind.
+func drawTableExpr(ht hegel.TestCase, depth int) ast.TableExpr {
+	if depth >= 2 || hegel.Draw(ht, hegel.Booleans()) {
+		t := &ast.TableRef{Name: drawName(ht), Alias: drawAlias(ht)}
+		if t.Alias != "" && hegel.Draw(ht, hegel.Integers(0, 3)) == 0 {
+			t.Columns = drawNames(ht, 1, 2)
+		}
+		return t
+	}
+	j := &ast.Join{Kind: ast.JoinKind(hegel.Draw(ht, hegel.Integers(0, 2))), Left: drawTableExpr(ht, depth+1), Right: drawTableExpr(ht, depth+1)}
+	if j.Kind != ast.JoinCross {
+		switch hegel.Draw(ht, hegel.Integers(0, 2)) {
+		case 0:
+			j.Natural = true
+		case 1:
+			j.Using = drawNames(ht, 1, 2)
+		default:
+			j.On = drawExpr(ht, 1)
+		}
+	}
+	return j
+}
+
 func drawStatement(ht hegel.TestCase) ast.Statement {
 	switch hegel.Draw(ht, hegel.Integers(0, 8)) {
 	case 0:
@@ -667,21 +723,31 @@ func drawStatement(ht hegel.TestCase) ast.Statement {
 		}
 		return s
 	case 3:
-		s := &ast.Update{Table: drawName(ht), Where: drawOptionalExpr(ht)}
+		s := &ast.Update{Table: drawName(ht), Alias: drawAlias(ht), Where: drawOptionalExpr(ht)}
 		for range hegel.Draw(ht, hegel.Integers(1, 3)) {
-			s.Set = append(s.Set, ast.Assignment{Column: drawName(ht), Value: drawExpr(ht, 1)})
+			a := ast.Assignment{Column: drawName(ht), Value: drawExpr(ht, 1)}
+			if hegel.Draw(ht, hegel.Integers(0, 5)) == 0 {
+				a.Qualifier = drawName(ht)
+			}
+			s.Set = append(s.Set, a)
 		}
 		return s
 	case 4:
-		return &ast.Delete{Table: drawName(ht), Where: drawOptionalExpr(ht)}
+		return &ast.Delete{Table: drawName(ht), Alias: drawAlias(ht), Where: drawOptionalExpr(ht)}
 	case 5, 6:
-		s := &ast.Select{Where: drawOptionalExpr(ht)}
+		s := &ast.Select{Distinct: hegel.Draw(ht, hegel.Booleans()), Where: drawOptionalExpr(ht)}
 		if hegel.Draw(ht, hegel.Booleans()) {
-			s.From = drawName(ht)
+			for range hegel.Draw(ht, hegel.Integers(1, 3)) {
+				s.From = append(s.From, drawTableExpr(ht, 0))
+			}
 		}
 		for range hegel.Draw(ht, hegel.Integers(1, 3)) {
-			if hegel.Draw(ht, hegel.Integers(0, 3)) == 0 {
+			switch hegel.Draw(ht, hegel.Integers(0, 5)) {
+			case 0:
 				s.Items = append(s.Items, ast.SelectItem{Star: true})
+				continue
+			case 1:
+				s.Items = append(s.Items, ast.SelectItem{Star: true, Table: drawName(ht)})
 				continue
 			}
 			item := ast.SelectItem{Expr: drawExpr(ht, 1)}

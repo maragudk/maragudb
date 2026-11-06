@@ -2,11 +2,11 @@ package exec
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"maps"
-	"math"
 	"slices"
 	"sort"
 	"strings"
@@ -449,6 +449,7 @@ func (s *Session) update(ctx context.Context, st *ast.Update, params []value.Val
 		return Result{}, err
 	}
 	b := &binder{table: t, params: params, now: s.now()}
+	b.scope, b.ns = singleScope(t, cmp.Or(st.Alias, t.Name))
 	type assignment struct {
 		col int
 		e   *cexpr
@@ -456,7 +457,7 @@ func (s *Session) update(ctx context.Context, st *ast.Update, params []value.Val
 	// Postgres analyzes WHERE first, then every SET expression, and then converts each to its
 	// column's type. It folds the SET expressions before WHERE.
 	b.phase = phaseWhere
-	f, err := b.where(st.Where)
+	f, err := b.where(st.Where, "WHERE")
 	if err != nil {
 		return Result{}, err
 	}
@@ -474,6 +475,13 @@ func (s *Session) update(ctx context.Context, st *ast.Update, params []value.Val
 	var sets []assignment
 	movesKeys := false
 	for j, a := range st.Set {
+		if a.Qualifier != "" {
+			// Postgres reads x.c as the field c of the column x, and no column has fields.
+			if i, ok := t.columnIndex(a.Qualifier); ok {
+				return Result{}, fmt.Errorf("%w: cannot assign to field %q of column %q because its type %v is not a composite type", ErrType, a.Column, a.Qualifier, t.Columns[i].Type)
+			}
+			return Result{}, fmt.Errorf("%w: column %q of relation %q does not exist", ErrInvalid, a.Qualifier, t.Name)
+		}
 		i, ok := t.columnIndex(a.Column)
 		if !ok {
 			return Result{}, fmt.Errorf("%w: column %q of relation %q does not exist", ErrInvalid, a.Column, t.Name)
@@ -839,7 +847,8 @@ func (s *Session) delete(ctx context.Context, st *ast.Delete, params []value.Val
 		return Result{}, err
 	}
 	b := &binder{table: t, params: params, phase: phaseWhere, now: s.now()}
-	f, err := b.where(st.Where)
+	b.scope, b.ns = singleScope(t, cmp.Or(st.Alias, t.Name))
+	f, err := b.where(st.Where, "WHERE")
 	if err != nil {
 		return Result{}, err
 	}
@@ -880,300 +889,12 @@ type orderKey struct {
 	desc   bool
 	// nullsFirst after applying the Postgres default: last when ascending, first when descending.
 	nullsFirst bool
-	// column is the index of the column the item sorts by, when it is a plain column, or -1.
+	// column is the index of the column the item sorts by, when it is a plain column of the one
+	// table of the statement, or -1.
 	column int
-}
-
-func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value.Value) (*Rows, error) {
-	var t *table
-	if st.From != "" {
-		var err error
-		if t, err = s.getTable(ctx, st.From); err != nil {
-			return nil, err
-		}
-	}
-	b := &binder{table: t, params: params, now: s.now()}
-
-	var columns []Column
-	var items []*cexpr
-	// itemExprs are the output expressions with stars expanded.
-	var itemExprs []ast.Expr
-	for _, item := range st.Items {
-		if item.Star {
-			if t == nil {
-				return nil, fmt.Errorf("%w: SELECT * with no tables specified is not valid", ErrSyntax)
-			}
-			for i, c := range t.Columns {
-				ref := &ast.ColumnRef{Name: c.Name}
-				e, _ := b.bind(ref)
-				items = append(items, e)
-				itemExprs = append(itemExprs, ref)
-				columns = append(columns, Column{Name: c.Name, Type: c.Type, Nullable: !t.Columns[i].NotNull})
-			}
-			continue
-		}
-		e, err := b.bind(item.Expr)
-		if err != nil {
-			return nil, err
-		}
-		// An output column of unknown type is text, as in Postgres.
-		if e, err = resolve(e, value.String); err != nil {
-			return nil, err
-		}
-		if e.typ == value.Numeric {
-			return nil, fmt.Errorf("%w: the numeric type is not supported, cast the literal %s to double precision or bigint", ErrUnsupported, e.val.S)
-		}
-		items = append(items, e)
-		itemExprs = append(itemExprs, item.Expr)
-		col := Column{Name: item.Alias, Type: e.typ, Nullable: true}
-		if col.Name == "" {
-			col.Name = OutputName(item.Expr)
-		}
-		if ref, ok := item.Expr.(*ast.ColumnRef); ok {
-			i, _ := t.columnIndex(ref.Name)
-			col.Nullable = !t.Columns[i].NotNull
-		}
-		columns = append(columns, col)
-	}
-
-	b.phase = phaseWhere
-	f, err := b.where(st.Where)
-	if err != nil {
-		return nil, err
-	}
-
-	// ORDER BY is checked after WHERE, but its expressions are output expressions, which
-	// Postgres folds before WHERE.
-	b.phase = phaseOutput
-	var order []orderKey
-	for _, o := range st.OrderBy {
-		k := orderKey{output: -1, desc: o.Desc, column: -1}
-		switch o.Nulls {
-		case ast.NullsFirst:
-			k.nullsFirst = true
-		case ast.NullsLast:
-			k.nullsFirst = false
-		default:
-			k.nullsFirst = o.Desc
-		}
-		switch e := o.Expr.(type) {
-		case *ast.Literal:
-			// An integer constant is an output position. Other constants are an error, as in
-			// Postgres, which only takes a literal whose digits fit in 32 bits as a position, so
-			// that -2147483648 is not one.
-			switch {
-			case e.Value.Null, e.Value.Type != value.Int4, e.Value.I == math.MinInt32:
-				return nil, fmt.Errorf("%w: non-integer constant in ORDER BY", ErrSyntax)
-			default:
-				if e.Value.I < 1 || e.Value.I > int64(len(columns)) {
-					return nil, fmt.Errorf("%w: ORDER BY position %d is not in select list", ErrInvalid, e.Value.I)
-				}
-				k.output = int(e.Value.I) - 1
-			}
-		case *ast.ColumnRef:
-			// A name matches an output column first. Several output columns of that name are
-			// only ambiguous when they are different expressions, as in Postgres.
-			matches := -1
-			for i, c := range columns {
-				if c.Name == e.Name {
-					if matches >= 0 && b.canonical(itemExprs[matches]) != b.canonical(itemExprs[i]) {
-						return nil, fmt.Errorf("%w: ORDER BY %q is ambiguous", ErrInvalid, e.Name)
-					}
-					if matches < 0 {
-						matches = i
-					}
-				}
-			}
-			k.output = matches
-		}
-		if k.output < 0 {
-			if k.expr, err = b.bind(o.Expr); err != nil {
-				return nil, err
-			}
-			if k.expr, err = resolve(k.expr, value.String); err != nil {
-				return nil, err
-			}
-			if k.expr.typ == value.Numeric {
-				return nil, fmt.Errorf("%w: the numeric type is not supported, cast the literal to double precision or bigint", ErrUnsupported)
-			}
-		}
-		// The item sorts by a column when it is that column, either directly or through an
-		// output column that is a plain reference to it.
-		sorted := o.Expr
-		if k.output >= 0 {
-			sorted = itemExprs[k.output]
-		}
-		if ref, ok := sorted.(*ast.ColumnRef); ok && t != nil {
-			if i, ok := t.columnIndex(ref.Name); ok {
-				k.column = i
-			}
-		}
-		order = append(order, k)
-	}
-
-	// OFFSET is checked and folded before LIMIT, as in Postgres.
-	b.phase = phaseOffset
-	offsetExpr, err := b.limit(st.Offset, "OFFSET")
-	if err != nil {
-		return nil, err
-	}
-	b.phase = phaseLimit
-	limitExpr, err := b.limit(st.Limit, "LIMIT")
-	if err != nil {
-		return nil, err
-	}
-	if err := b.folding(); err != nil {
-		return nil, err
-	}
-	if f.unsupported != nil {
-		return nil, f.unsupported
-	}
-	if (st.Limit != nil || st.Offset != nil) && t != nil {
-		if err := limitable(t, order, items, f); err != nil {
-			return nil, err
-		}
-	}
-	// The planner needs the folded constants.
-	var a access
-	if t != nil {
-		var sortCols []int
-		for _, k := range order {
-			if k.column >= 0 {
-				sortCols = append(sortCols, k.column)
-			}
-		}
-		f.candidates = t.candidates(f, sortCols, t.reads(st))
-		var stream *scan
-		if !fallible(f, items, order) {
-			stream = t.orderedScan(order)
-		}
-		a = t.plan(f, stream)
-	}
-	offset, err := limitValue(offsetExpr, "OFFSET")
-	if err != nil {
-		return nil, err
-	}
-	limit, err := limitValue(limitExpr, "LIMIT")
-	if err != nil {
-		return nil, err
-	}
-	if limit == 0 {
-		// Postgres does not read any row under LIMIT 0.
-		return &Rows{Columns: columns, Rows: [][]value.Value{}}, nil
-	}
-
-	// The rows are sorted after they are read, unless the access reads them in order.
-	sorting := len(order) > 0 && !a.ordered
-	type sortable struct {
-		out  []value.Value
-		keys []value.Value
-	}
-	var collected []sortable
-	var out [][]value.Value
-	var skipped int64
-	project := func(row []value.Value) ([]value.Value, error) {
-		o := make([]value.Value, len(items))
-		for i, e := range items {
-			var err error
-			if o[i], err = e.value(row); err != nil {
-				return nil, err
-			}
-		}
-		return o, nil
-	}
-	visit := func(_ []byte, row []value.Value) (bool, error) {
-		if !sorting && limit >= 0 && int64(len(out)) >= limit {
-			return false, nil
-		}
-		o, err := project(row)
-		if err != nil {
-			return false, err
-		}
-		if sorting {
-			keys := make([]value.Value, len(order))
-			for i, k := range order {
-				if k.output >= 0 {
-					keys[i] = o[k.output]
-					continue
-				}
-				if keys[i], err = k.expr.value(row); err != nil {
-					return false, err
-				}
-			}
-			collected = append(collected, sortable{o, keys})
-			return true, nil
-		}
-		if offset >= 0 && skipped < offset {
-			skipped++
-			return true, nil
-		}
-		out = append(out, o)
-		return limit < 0 || int64(len(out)) < limit, nil
-	}
-	if t == nil {
-		open, err := f.open()
-		if err != nil {
-			return nil, err
-		}
-		if ok, err := f.matches(nil); err != nil {
-			return nil, err
-		} else if ok && open {
-			if _, err := visit(nil, nil); err != nil {
-				return nil, err
-			}
-		}
-	} else if err := s.scanRows(ctx, t, a, f, visit); err != nil {
-		return nil, err
-	}
-	if sorting {
-		sort.SliceStable(collected, func(i, j int) bool {
-			return compareKeys(order, collected[i].keys, collected[j].keys) < 0
-		})
-		for _, c := range collected {
-			out = append(out, c.out)
-		}
-		if offset > 0 {
-			out = out[min(offset, int64(len(out))):]
-		}
-		if limit >= 0 && int64(len(out)) > limit {
-			out = out[:limit]
-		}
-	}
-	if out == nil {
-		out = [][]value.Value{}
-	}
-	return &Rows{Columns: columns, Rows: out}, nil
-}
-
-// reads are the columns of t that a SELECT reads, by name, in its output, WHERE, and ORDER BY.
-func (t *table) reads(st *ast.Select) []int {
-	var out []int
-	add := func(e ast.Expr) {
-		ast.Walk(e, func(x ast.Expr) bool {
-			if ref, ok := x.(*ast.ColumnRef); ok {
-				if i, ok := t.columnIndex(ref.Name); ok && !slices.Contains(out, i) {
-					out = append(out, i)
-				}
-			}
-			return true
-		})
-	}
-	for _, item := range st.Items {
-		if item.Star {
-			for i := range t.Columns {
-				if !slices.Contains(out, i) {
-					out = append(out, i)
-				}
-			}
-			continue
-		}
-		add(item.Expr)
-	}
-	add(st.Where)
-	for _, o := range st.OrderBy {
-		add(o.Expr)
-	}
-	return out
+	// ref is the column the item sorts by, of any entry, when plain is set.
+	ref   colRef
+	plain bool
 }
 
 // fallible reports whether evaluating a SELECT on a row can fail, in its WHERE clause, its
@@ -1200,14 +921,16 @@ func fallible(f filter, items []*cexpr, order []orderKey) bool {
 // that the row order is fully determined, and no output expression or WHERE condition may be
 // one that can fail, because an index scan under a LIMIT evaluates them on fewer rows than a
 // sequential scan and a sort.
-func limitable(t *table, order []orderKey, items []*cexpr, f filter) error {
-	for _, col := range t.PrimaryKey {
-		found := false
-		for _, k := range order {
-			found = found || k.column == col
-		}
-		if !found {
-			return fmt.Errorf("%w: LIMIT and OFFSET without an ORDER BY on every primary key column are not supported, because which rows Postgres returns is then not determined; add %s to ORDER BY", ErrUnsupported, t.Columns[col].Name)
+func limitable(t *table, order []orderKey, items []*cexpr, f filter, distinct bool, outputs int) error {
+	if !distinct || !sortsByEveryOutput(order, outputs) {
+		for _, col := range t.PrimaryKey {
+			found := false
+			for _, k := range order {
+				found = found || k.column == col
+			}
+			if !found {
+				return fmt.Errorf("%w: LIMIT and OFFSET without an ORDER BY on every primary key column are not supported, because which rows Postgres returns is then not determined; add %s to ORDER BY", ErrUnsupported, t.Columns[col].Name)
+			}
 		}
 	}
 	for _, e := range items {
@@ -1221,6 +944,17 @@ func limitable(t *table, order []orderKey, items []*cexpr, f filter) error {
 		}
 	}
 	return nil
+}
+
+// sortsByEveryOutput reports whether the ORDER BY sorts by every output column, which determines
+// the order of the rows of a SELECT DISTINCT completely, because no two of them are equal.
+func sortsByEveryOutput(order []orderKey, outputs int) bool {
+	for i := range outputs {
+		if !slices.ContainsFunc(order, func(k orderKey) bool { return k.output == i }) {
+			return false
+		}
+	}
+	return true
 }
 
 // limit binds a LIMIT or OFFSET expression, which must be a bigint that reads no columns, or
@@ -1336,7 +1070,7 @@ func outputNameStrength(e ast.Expr) (string, int) {
 // Postgres's analysis sees them: casts are written in one style, and a cast to the type the
 // expression already has is dropped, because Postgres drops it too.
 func (b *binder) canonical(e ast.Expr) string {
-	return ast.RenderExpr(ast.Map(e, func(x ast.Expr) ast.Expr {
+	return ast.RenderExpr(ast.Map(b.normalize(e), func(x ast.Expr) ast.Expr {
 		c, ok := x.(*ast.Cast)
 		if !ok {
 			return x

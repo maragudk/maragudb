@@ -106,6 +106,20 @@ func (p *parser) peek() token {
 	return t
 }
 
+// peek2 at the second token after the current one, without consuming anything.
+func (p *parser) peek2() token {
+	saved := p.lex
+	defer func() { p.lex = saved }()
+	if _, err := p.lex.next(); err != nil {
+		return token{kind: tokEOF}
+	}
+	t, err := p.lex.next()
+	if err != nil {
+		return token{kind: tokEOF}
+	}
+	return t
+}
+
 // peekIsWord reports whether the next token is one of the given keywords or unquoted words.
 func (p *parser) peekIsWord(words ...string) bool {
 	next := p.peek()
@@ -182,7 +196,6 @@ var unsupportedClauses = map[string]string{
 	"for":        "FOR UPDATE and FOR SHARE are not supported, every transaction is serializable",
 	"returning":  "RETURNING is not supported, read the rows with a SELECT",
 	"on":         "ON CONFLICT is not supported",
-	"using":      "USING is not supported",
 	"from":       "FROM in UPDATE is not supported",
 	"join":       "JOIN is not supported",
 	"inner":      "JOIN is not supported",
@@ -1212,8 +1225,12 @@ func (p *parser) update() (ast.Statement, error) {
 	if s.Table, err = p.ident(); err != nil {
 		return nil, err
 	}
-	if p.isKeyword("as") || p.tok.kind == tokIdent && p.tok.text != "set" {
-		return nil, p.unsupportedf("a table alias in UPDATE is not supported")
+	if p.isOp(".") {
+		return nil, p.unsupportedf("a table name with a schema is not supported, name the table alone")
+	}
+	// SET is a keyword only in context, and never an alias without AS, as in Postgres.
+	if s.Alias, err = p.alias(!p.isWord("set")); err != nil {
+		return nil, err
 	}
 	if err := p.expectWord("set"); err != nil {
 		return nil, err
@@ -1222,18 +1239,29 @@ func (p *parser) update() (ast.Statement, error) {
 		if p.isOp("(") {
 			return nil, p.unsupportedf("SET (columns) = (values) is not supported, assign the columns one at a time")
 		}
-		col, err := p.ident()
-		if err != nil {
+		var a ast.Assignment
+		if a.Column, err = p.ident(); err != nil {
 			return nil, err
+		}
+		if p.isOp(".") {
+			if err := p.advance(); err != nil {
+				return nil, err
+			}
+			a.Qualifier = a.Column
+			if a.Column, err = p.label(); err != nil {
+				return nil, err
+			}
+			if p.isOp(".") {
+				return nil, p.unsupportedf("assigning to a field of a field is not supported")
+			}
 		}
 		if err := p.expectOp("="); err != nil {
 			return nil, err
 		}
-		e, err := p.expr(0)
-		if err != nil {
+		if a.Value, err = p.expr(0); err != nil {
 			return nil, err
 		}
-		s.Set = append(s.Set, ast.Assignment{Column: col, Value: e})
+		s.Set = append(s.Set, a)
 		if p.isOp(",") {
 			if err := p.advance(); err != nil {
 				return nil, err
@@ -1241,6 +1269,9 @@ func (p *parser) update() (ast.Statement, error) {
 			continue
 		}
 		break
+	}
+	if p.isKeyword("from") {
+		return nil, p.unsupportedf("UPDATE ... FROM is not supported, read the other tables in a SELECT first")
 	}
 	if s.Where, err = p.where(); err != nil {
 		return nil, err
@@ -1263,13 +1294,42 @@ func (p *parser) delete() (ast.Statement, error) {
 	if s.Table, err = p.ident(); err != nil {
 		return nil, err
 	}
-	if p.isKeyword("as") || p.tok.kind == tokIdent {
-		return nil, p.unsupportedf("a table alias in DELETE is not supported")
+	if p.isOp(".") {
+		return nil, p.unsupportedf("a table name with a schema is not supported, name the table alone")
+	}
+	if s.Alias, err = p.alias(true); err != nil {
+		return nil, err
+	}
+	if p.isKeyword("using") {
+		return nil, p.unsupportedf("DELETE ... USING is not supported, read the other tables in a SELECT first")
 	}
 	if s.Where, err = p.where(); err != nil {
 		return nil, err
 	}
 	return s, nil
+}
+
+// alias of a table: AS and a name, or, when bare, a name alone, as Postgres reads an alias
+// without AS.
+func (p *parser) alias(bare bool) (string, error) {
+	if ok, err := p.accept("as"); err != nil {
+		return "", err
+	} else if ok {
+		return p.ident()
+	}
+	if bare && p.tok.kind == tokIdent {
+		return p.ident()
+	}
+	return "", nil
+}
+
+// label is a name after a dot, which can be any keyword, as in Postgres.
+func (p *parser) label() (string, error) {
+	if p.tok.kind != tokIdent && p.tok.kind != tokKeyword {
+		return "", p.errorf("expected identifier, got %v", p.tok)
+	}
+	name := p.tok.text
+	return name, p.advance()
 }
 
 func (p *parser) where() (ast.Expr, error) {
@@ -1286,23 +1346,42 @@ func (p *parser) selectStmt() (ast.Statement, error) {
 	if err := p.advance(); err != nil {
 		return nil, err
 	}
+	s := &ast.Select{}
 	if p.isKeyword("distinct") {
-		return nil, p.unsupportedf("DISTINCT is not supported")
-	}
-	if _, err := p.accept("all"); err != nil {
+		if err := p.advance(); err != nil {
+			return nil, err
+		}
+		if p.isKeyword("on") {
+			return nil, p.unsupportedf("DISTINCT ON is not supported, write DISTINCT")
+		}
+		s.Distinct = true
+	} else if _, err := p.accept("all"); err != nil {
 		return nil, err
 	}
-	s := &ast.Select{}
 	if p.tok.kind == tokEOF || p.isKeyword("from") || p.isKeyword("where") || p.isOp(";") {
 		return nil, p.unsupportedf("a SELECT without output columns is not supported")
 	}
 	for {
 		var item ast.SelectItem
+		if p.tok.kind == tokIdent && p.peek().kind == tokOp && p.peek().text == "." && p.peek2().kind == tokOp && p.peek2().text == "*" {
+			item.Table = p.tok.text
+			for range 2 {
+				if err := p.advance(); err != nil {
+					return nil, err
+				}
+			}
+		}
 		if p.isOp("*") {
 			if err := p.advance(); err != nil {
 				return nil, err
 			}
 			item.Star = true
+			switch {
+			case p.isOp("."):
+				return nil, p.errorf("improper use of \"*\"")
+			case item.Table != "" && !p.isOp(",") && !p.isOp(";") && p.tok.kind != tokEOF && !p.isKeyword("from") && !p.isKeyword("where") && !p.isKeyword("order") && !p.isKeyword("limit") && !p.isKeyword("offset"):
+				return nil, p.unsupportedf("%s.* is not supported in an expression, name the columns", item.Table)
+			}
 		} else {
 			e, err := p.expr(0)
 			if err != nil {
@@ -1341,22 +1420,21 @@ func (p *parser) selectStmt() (ast.Statement, error) {
 	if ok, err := p.accept("from"); err != nil {
 		return nil, err
 	} else if ok {
-		switch {
-		case p.isKeyword("only"):
-			return nil, p.unsupportedf("FROM ONLY is not supported, there is no inheritance")
-		case p.isKeyword("lateral"), p.isOp("("):
-			return nil, p.unsupportedf("subqueries in FROM are not supported")
-		}
-		if s.From, err = p.ident(); err != nil {
-			return nil, err
-		}
-		switch {
-		case p.isKeyword("as"), p.tok.kind == tokIdent:
-			return nil, p.unsupportedf("a table alias is not supported")
-		case p.isOp(","):
-			return nil, p.unsupportedf("several tables in FROM are not supported")
-		case p.isKeyword("tablesample"):
-			return nil, p.unsupportedf("TABLESAMPLE is not supported")
+		for {
+			from, err := p.tableRef()
+			if err != nil {
+				return nil, err
+			}
+			s.From = append(s.From, from)
+			if p.isKeyword("on") || p.isKeyword("using") {
+				return nil, p.errorf("unexpected %v", p.tok)
+			}
+			if !p.isOp(",") {
+				break
+			}
+			if err := p.advance(); err != nil {
+				return nil, err
+			}
 		}
 	}
 	var err error
@@ -1447,6 +1525,157 @@ func (p *parser) selectStmt() (ast.Statement, error) {
 		}
 	}
 	return s, nil
+}
+
+// tableRef is an item of FROM: a table or a parenthesized join, followed by any joins with it
+// on the left, which associate to the left.
+func (p *parser) tableRef() (ast.TableExpr, error) {
+	left, err := p.tablePrimary()
+	if err != nil {
+		return nil, err
+	}
+	for p.atJoin() {
+		if left, err = p.join(left); err != nil {
+			return nil, err
+		}
+	}
+	return left, nil
+}
+
+// atJoin reports whether a join starts at the current token.
+func (p *parser) atJoin() bool {
+	for _, w := range []string{"join", "inner", "left", "right", "full", "cross", "natural"} {
+		if p.isKeyword(w) {
+			return true
+		}
+	}
+	return false
+}
+
+// join parses a join with left on its left side. A join that needs a condition takes the joins
+// before its condition into its right side, as Postgres's grammar does, so that a JOIN b JOIN c
+// ON x ON y is a JOIN (b JOIN c ON x) ON y.
+func (p *parser) join(left ast.TableExpr) (ast.TableExpr, error) {
+	j := &ast.Join{Left: left}
+	if ok, err := p.accept("natural"); err != nil {
+		return nil, err
+	} else if ok {
+		j.Natural = true
+	}
+	switch {
+	case p.isKeyword("cross") && !j.Natural:
+		j.Kind = ast.JoinCross
+		if err := p.advance(); err != nil {
+			return nil, err
+		}
+	case p.isKeyword("inner"):
+		if err := p.advance(); err != nil {
+			return nil, err
+		}
+	case p.isKeyword("left"):
+		j.Kind = ast.JoinLeft
+		if err := p.advance(); err != nil {
+			return nil, err
+		}
+		if _, err := p.accept("outer"); err != nil {
+			return nil, err
+		}
+	case p.isKeyword("right"), p.isKeyword("full"):
+		return nil, p.unsupportedf("%s JOIN is not supported, write a LEFT JOIN with the tables the other way round", strings.ToUpper(p.tok.text))
+	}
+	if err := p.expectWord("join"); err != nil {
+		return nil, err
+	}
+	right, err := p.tablePrimary()
+	if err != nil {
+		return nil, err
+	}
+	if j.Kind == ast.JoinCross || j.Natural {
+		j.Right = right
+		return j, nil
+	}
+	for p.atJoin() {
+		if right, err = p.join(right); err != nil {
+			return nil, err
+		}
+	}
+	j.Right = right
+	switch {
+	case p.isKeyword("on"):
+		if err := p.advance(); err != nil {
+			return nil, err
+		}
+		if j.On, err = p.expr(0); err != nil {
+			return nil, err
+		}
+	case p.isKeyword("using"):
+		if err := p.advance(); err != nil {
+			return nil, err
+		}
+		if j.Using, err = p.columnList(); err != nil {
+			return nil, err
+		}
+		if p.isKeyword("as") {
+			return nil, p.unsupportedf("an alias for the columns of USING is not supported")
+		}
+	default:
+		return nil, p.errorf("expected ON or USING, got %v", p.tok)
+	}
+	return j, nil
+}
+
+// tablePrimary is a table with an optional alias, or a join in parentheses.
+func (p *parser) tablePrimary() (ast.TableExpr, error) {
+	switch {
+	case p.isKeyword("only"):
+		return nil, p.unsupportedf("FROM ONLY is not supported, there is no inheritance")
+	case p.isKeyword("lateral"):
+		return nil, p.unsupportedf("LATERAL is not supported")
+	case p.isOp("("):
+		if err := p.advance(); err != nil {
+			return nil, err
+		}
+		if p.isKeyword("select") || p.isKeyword("with") || p.isKeyword("values") || p.isOp("(") && p.peekIsWord("select", "with", "values") {
+			return nil, p.unsupportedf("subqueries in FROM are not supported")
+		}
+		inner, err := p.tableRef()
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := inner.(*ast.Join); !ok {
+			return nil, p.errorf("unexpected %v", p.tok)
+		}
+		if err := p.expectOp(")"); err != nil {
+			return nil, err
+		}
+		if p.isKeyword("as") || p.tok.kind == tokIdent {
+			return nil, p.unsupportedf("an alias for a join is not supported, name the columns through the aliases of its tables")
+		}
+		return inner, nil
+	}
+	t := &ast.TableRef{}
+	var err error
+	if t.Name, err = p.ident(); err != nil {
+		return nil, err
+	}
+	switch {
+	case p.isOp("."):
+		return nil, p.unsupportedf("a table name with a schema is not supported, name the table alone")
+	case p.isOp("("):
+		return nil, p.unsupportedf("functions in FROM are not supported")
+	}
+	if t.Alias, err = p.alias(true); err != nil {
+		return nil, err
+	}
+	if t.Alias != "" && p.isOp("(") {
+		if t.Columns, err = p.columnList(); err != nil {
+			return nil, err
+		}
+	}
+	if p.isKeyword("tablesample") {
+		return nil, p.unsupportedf("TABLESAMPLE is not supported")
+	}
+	return t, nil
 }
 
 // Binding powers, tighter is higher, following the Postgres operator precedence table.
@@ -1854,6 +2083,9 @@ func (p *parser) primary() (ast.Expr, error) {
 			return nil, p.unsupportedf("function %s is not supported", tok.text)
 		}
 	case tokIdent:
+		if p.peek().kind == tokOp && p.peek().text == "." {
+			return p.qualified()
+		}
 		if tok.quoted {
 			if err := p.advance(); err != nil {
 				return nil, err
@@ -1909,6 +2141,30 @@ func (p *parser) primary() (ast.Expr, error) {
 		}
 	}
 	return nil, p.errorf("expected an expression, got %v", tok)
+}
+
+// qualified parses a column qualified by the name of a table, table.column.
+func (p *parser) qualified() (ast.Expr, error) {
+	ref := &ast.ColumnRef{Table: p.tok.text}
+	for range 2 {
+		if err := p.advance(); err != nil {
+			return nil, err
+		}
+	}
+	if p.isOp("*") {
+		return nil, p.unsupportedf("%s.* is not supported in an expression, name the columns", ref.Table)
+	}
+	var err error
+	if ref.Name, err = p.label(); err != nil {
+		return nil, err
+	}
+	switch {
+	case p.isOp("."):
+		return nil, p.unsupportedf("names of more than two parts, such as schema.table.column, are not supported")
+	case p.isOp("("):
+		return nil, p.unsupportedf("functions with a schema are not supported")
+	}
+	return ref, nil
 }
 
 // prefixLiteral parses `type 'string'`, which is a cast of the string.
