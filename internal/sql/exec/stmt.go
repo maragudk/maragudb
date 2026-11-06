@@ -16,15 +16,6 @@ import (
 	"maragu.dev/maragudb/internal/sql/value"
 )
 
-// lookupTable returns the table, or false when it does not exist.
-func (s *Session) lookupTable(ctx context.Context, name string) (*table, bool, error) {
-	t, err := s.getTable(ctx, name)
-	if errors.Is(err, ErrNoTable) {
-		return nil, false, nil
-	}
-	return t, err == nil, err
-}
-
 // createTable runs CREATE TABLE. As in Postgres, IF NOT EXISTS skips a statement whose name is
 // taken before anything else, and otherwise the definition is checked before the name, which
 // tables and indexes share.

@@ -586,7 +586,7 @@ func mutants() []mutant {
 			mutations:   engine.Mutations{SkipFreshnessCheck: true},
 			cannot: merge(bankCells("a stale snapshot makes a transfer conflict or read an older consistent state, which conserves money"),
 				map[cell]string{{workload: sim.Unique, sql: true}: "a stale snapshot is an older consistent state in which no value repeats, and a write from it conflicts at commit; without maintainers no reader loses an object either"}),
-			checkers:    []string{sim.CheckerListAppend},
+			checkers: []string{sim.CheckerListAppend},
 		},
 		{
 			id: "MUT-ACK-BEFORE-CONFIRM", replay: "ack", name: "acking before the write is confirmed",
