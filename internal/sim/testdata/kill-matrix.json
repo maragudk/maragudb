@@ -250,8 +250,11 @@
         },
         {
           "cell": "bank through SQL, 2 maintainers",
-          "status": "undetected",
-          "reason": "a stale snapshot makes a transfer conflict or read an older consistent state, which conserves money"
+          "status": "detected",
+          "seed": 5,
+          "checkers": [
+            "grace period"
+          ]
         },
         {
           "cell": "unique through SQL, no maintainers",
@@ -502,6 +505,7 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "workload invariants",
             "bank"
           ]
         },
@@ -510,6 +514,7 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "workload invariants",
             "bank"
           ]
         },

@@ -10,10 +10,10 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 ## At a glance
 
-- 34 acceptance criteria (`AC-`), 24 key invariants (`INV-`), 26 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
+- 34 acceptance criteria (`AC-`), 24 key invariants (`INV-`), 29 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
 - 15 mutants (`MUT-`), deliberate bugs, of which 14 are detected by the simulator's checkers within 20 seeds.
 - 17 interesting states (`STATE-`) that the simulator's fixed corpus must reach.
-- 184 declarations of coverage in the tests.
+- 194 declarations of coverage in the tests.
 
 ## Acceptance criteria
 
@@ -141,6 +141,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/pgdiff` `TestDifferential/generated_statements_give_the_same_results_on_Postgres_and_maragudb`: hegel-generated schemas, rows, transactions, and statements, written once as Postgres SQL, give the same results, column names, affected-row counts, and transaction states on both sides, ordered exactly when ORDER BY decides the order and as multisets otherwise, and fail on both sides with the same error class, except for statements that maragudb rejects as unsupported, which Postgres skips
 - `internal/pgdiff` `TestErrorClasses`: every maragudb error class fails with its mapped SQLSTATE code on Postgres for the same statement
 - `internal/pgdiff` `TestForeignKeys/creates_and_drops_foreign_keys_as_Postgres_does,_with_the_same_names_and_errors`: FOREIGN KEY and REFERENCES get Postgres's names, reference a primary key or the first unique index on the referenced columns, fail with the class of Postgres's error for a missing table or column, columns without a unique index, a different number of columns, and incompatible types, and DROP TABLE and DROP INDEX of what a foreign key depends on fail with 2BP01
+- `internal/pgdiff` `TestGroupBy/groups_by_expressions,_output_positions,_and_output_names,_with_Postgres's_resolution_and_errors`: GROUP BY of expressions, output positions, and names, where a name is a column of FROM before it is an output column's, HAVING with and without GROUP BY, aggregates in ORDER BY, and the grouping errors of Postgres: an ungrouped column (42803) unless the GROUP BY has the primary key of its table, nested aggregates and aggregates in WHERE, JOIN conditions, GROUP BY, LIMIT, VALUES, and UPDATE (42803), positions out of range (42P10), constants (42601), and ambiguous names (42702)
 - `internal/pgdiff` `TestIndexConditions/evaluates_the_other_conditions_only_on_the_rows_that_the_primary_key_conditions_select,_as_Postgres_does_with_an_index_scan`: with sequential scans off, Postgres evaluates the other WHERE conditions only on the rows that the conditions on the primary key index select: comparisons and IN of constants on any key column, a boolean key column, and key equalities implied by equalities with a constant; maragudb accepts such statements and gives the same results
 - `internal/pgdiff` `TestIndexConditions/takes_the_index_conditions_out_of_an_OR_as_Postgres_does_when_it_drops_constants_and_common_conditions_from_the_OR`: in a WHERE clause, Postgres drops the arguments of an OR that are FALSE or NULL constants and takes the conditions common to every argument out of the OR, which can make them index conditions; maragudb does the same and gives the same results
 - `internal/pgdiff` `TestIndexPlans/evaluates_the_other_conditions_only_on_the_rows_that_every_index_scan_Postgres_could_pick_skips,_and_otherwise_on_every_row`: with several indexes, a condition that can fail is evaluated on the rows that any index scan Postgres could pick reads: those of each index's certain conditions, and every row when an index without them could serve a condition or ORDER BY; maragudb gives Postgres's result when every such scan agrees, and rejects the statement otherwise
@@ -413,6 +414,10 @@ Each entry names the test's package, the test's name, and what the test asserts,
 > SQL flavor: a strict subset of Postgres 18. The same SQL text runs on both, and for every statement that maragudb accepts, the result is identical to Postgres: rows, values, column names, affected-row counts, and transaction state. When Postgres fails a statement, maragudb fails it too, with the same error class wherever the error does not depend on evaluation order or physical row order. The only exceptions are the differences that docs/unsupported.md lists with a DEV- ID, an example, and a test each. There is one: DEV-20, where Postgres scans the whole table and fails on a row that the primary key condition does not select, and maragudb does not fail.
 
 - `.` `TestTx/a_statement_that_does_not_parse_aborts_the_transaction,_as_in_Postgres`: a syntax error or an unsupported statement in an explicit transaction aborts it, so a later commit rolls everything back
+- `internal/pgdiff` `TestAggregatePlans/Postgres_moves_HAVING_into_WHERE,_stops_sorted_grouping_under_LIMIT,_computes_MIN_and_MAX_from_an_index,_and_adds_floats_in_the_order_of_its_plan`: EXPLAIN and the outcomes on Postgres 18 with sequential scans off show that a HAVING condition without aggregates is a condition of the scan, that sorted grouping under a LIMIT stops reading rows and succeeds where the whole query fails, that MIN and MAX read the first row of an index that passes WHERE and succeed where COUNT fails, that grouping is hashed or sorted by enable_hashagg and enable_sort, and that the SUM of the same floats depends on the order of the rows
+- `internal/pgdiff` `TestAggregatePlans/rejects_an_aggregate_whose_result_or_error_depends_on_the_plan,_and_accepts_it_otherwise`: a SUM or AVG of double precision is accepted only when every order of adding gives the same result, with NaN and infinities, and its overflow is an error only when every order overflows; errors in the arguments of aggregates, in the GROUP BY expressions, and in HAVING are reported when every failing row or group fails with the same class; a HAVING condition without aggregates is a WHERE condition; and MIN and MAX that Postgres can compute from the first row of an index reject a WHERE condition that fails
+- `internal/pgdiff` `TestAggregates/compares,_sorts,_casts,_and_outputs_numeric_results_as_Postgres_does`: the numeric results of SUM and AVG of integers compare with each other, with integers, and with floats through Postgres's implicit casts, sort, take part in DISTINCT, IS NULL, CASE, COALESCE, NULLIF, and ||, and cast to bigint with rounding half away from zero and overflow errors, to double precision, and to text, while arithmetic on them is rejected
+- `internal/pgdiff` `TestAggregates/computes_COUNT,_SUM,_AVG,_MIN,_and_MAX_as_Postgres_does,_with_numeric_results_for_SUM_and_AVG_of_integers`: COUNT(*), COUNT(x), SUM, AVG, MIN, and MAX, also with DISTINCT, over bigint, integer, double precision, text, bytea, timestamptz, and NULLs give Postgres's values and types: SUM of integer is bigint, SUM of bigint and AVG of integers are numeric with Postgres's scale, and MIN and MAX of text compare by byte order
 - `internal/pgdiff` `TestCasts/every_value_casts_to_every_type_the_same_as_Postgres,_or_is_rejected_as_unsupported`: hegel-drawn values of every supported type, and integer and numeric literals, cast to every supported type and back to text with the same result or error class as Postgres, unless maragudb rejects the cast as unsupported
 - `internal/pgdiff` `TestCasts/text_casts_to_every_type,_and_back_to_text,_the_same_as_Postgres,_or_are_rejected_as_unsupported`: hegel-drawn text near valid input for bigint, double precision, boolean, bytea, and timestamptz casts to the type and back to text with the same result or the same error class as Postgres, unless maragudb rejects it as unsupported
 - `internal/pgdiff` `TestChecks/checks_CHECK_constraints_in_the_order_of_their_names,_after_NOT_NULL_and_before_the_keys,_as_Postgres_does`: an INSERT or UPDATE evaluates the NOT NULL constraints, then the CHECK constraints in the order of their names, failing at the first that is false or fails itself, and then the primary key and the unique indexes, row by row, so it fails with the same class as Postgres, and NULL passes a CHECK
@@ -424,6 +429,8 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/pgdiff` `TestForeignKeys/checks_foreign_keys_and_fires_their_actions_as_Postgres_does`: an insert or update of a row whose foreign key has no NULL and no parent row fails with 23503 at the end of the statement, a delete or key update of a referenced row fails with 23503 for NO ACTION and 23001 for RESTRICT, or deletes, sets to NULL, or sets to the defaults the referencing rows, with the rows the same on both afterwards
 - `internal/pgdiff` `TestForeignKeys/creates_and_drops_foreign_keys_as_Postgres_does,_with_the_same_names_and_errors`: FOREIGN KEY and REFERENCES get Postgres's names, reference a primary key or the first unique index on the referenced columns, fail with the class of Postgres's error for a missing table or column, columns without a unique index, a different number of columns, and incompatible types, and DROP TABLE and DROP INDEX of what a foreign key depends on fail with 2BP01
 - `internal/pgdiff` `TestForeignKeys/fires_the_events_of_an_action_after_the_other_events_of_the_statement,_as_Postgres_does`: the rows that an action deletes or updates fire their own actions and checks only after every other action and check of the statement that is queued before them, because Postgres queues them behind the statement's, so a cascade's RESTRICT comes after the NOT NULL of a SET NULL on another table
+- `internal/pgdiff` `TestGroupBy/groups_by_expressions,_output_positions,_and_output_names,_with_Postgres's_resolution_and_errors`: GROUP BY of expressions, output positions, and names, where a name is a column of FROM before it is an output column's, HAVING with and without GROUP BY, aggregates in ORDER BY, and the grouping errors of Postgres: an ungrouped column (42803) unless the GROUP BY has the primary key of its table, nested aggregates and aggregates in WHERE, JOIN conditions, GROUP BY, LIMIT, VALUES, and UPDATE (42803), positions out of range (42P10), constants (42601), and ambiguous names (42702)
+- `internal/pgdiff` `TestGroupBy/groups_the_rows_of_joins_as_Postgres_does`: GROUP BY and aggregates over inner and left joins and USING give Postgres's groups, and the GROUP BY of a table's primary key allows its other columns but not those of the other tables
 - `internal/pgdiff` `TestIndexConditions/evaluates_the_other_conditions_only_on_the_rows_that_the_primary_key_conditions_select,_as_Postgres_does_with_an_index_scan`: with sequential scans off, Postgres evaluates the other WHERE conditions only on the rows that the conditions on the primary key index select: comparisons and IN of constants on any key column, a boolean key column, and key equalities implied by equalities with a constant; maragudb accepts such statements and gives the same results
 - `internal/pgdiff` `TestIndexConditions/takes_the_index_conditions_out_of_an_OR_as_Postgres_does_when_it_drops_constants_and_common_conditions_from_the_OR`: in a WHERE clause, Postgres drops the arguments of an OR that are FALSE or NULL constants and takes the conditions common to every argument out of the OR, which can make them index conditions; maragudb does the same and gives the same results
 - `internal/pgdiff` `TestIndexPlans/Postgres_takes_the_certain_conditions_on_an_indexed_column_as_conditions_of_the_scan_of_the_index,_and_picks_between_indexes`: EXPLAIN on Postgres 18 with sequential scans off shows that comparisons, IN, and boolean conditions on any column of a secondary index are conditions of its scan, that it picks between the primary key and another index with conditions, and that it scans a whole index in order for ORDER BY
@@ -464,15 +471,18 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 ### `INV-TYPES`
 
-> Types: As in Postgres, an integer literal that fits in 32 bits has type integer, and arithmetic on it overflows at 32 bits; integer itself is not a column type. NULL is supported.
+> Types: As in Postgres, an integer literal that fits in 32 bits has type integer, and arithmetic on it overflows at 32 bits; integer itself is not a column type. Postgres's numeric is the type of SUM of bigint and of AVG of integers, and of nothing else: it holds their exact results, which reach Go as text. NULL is supported.
 
 - `.` `TestDB/round_trips_every_type_through_parameters_and_Scan`: every type and NULL round-trips through $1-style parameters and Scan
+- `internal/pgdiff` `TestAggregates/compares,_sorts,_casts,_and_outputs_numeric_results_as_Postgres_does`: the numeric results of SUM and AVG of integers compare with each other, with integers, and with floats through Postgres's implicit casts, sort, take part in DISTINCT, IS NULL, CASE, COALESCE, NULLIF, and ||, and cast to bigint with rounding half away from zero and overflow errors, to double precision, and to text, while arithmetic on them is rejected
+- `internal/pgdiff` `TestAggregates/computes_COUNT,_SUM,_AVG,_MIN,_and_MAX_as_Postgres_does,_with_numeric_results_for_SUM_and_AVG_of_integers`: COUNT(*), COUNT(x), SUM, AVG, MIN, and MAX, also with DISTINCT, over bigint, integer, double precision, text, bytea, timestamptz, and NULLs give Postgres's values and types: SUM of integer is bigint, SUM of bigint and AVG of integers are numeric with Postgres's scale, and MIN and MAX of text compare by byte order
 - `internal/pgdiff` `TestCasts/every_value_casts_to_every_type_the_same_as_Postgres,_or_is_rejected_as_unsupported`: hegel-drawn values of every supported type, and integer and numeric literals, cast to every supported type and back to text with the same result or error class as Postgres, unless maragudb rejects the cast as unsupported
 - `internal/pgdiff` `TestCasts/text_casts_to_every_type,_and_back_to_text,_the_same_as_Postgres,_or_are_rejected_as_unsupported`: hegel-drawn text near valid input for bigint, double precision, boolean, bytea, and timestamptz casts to the type and back to text with the same result or the same error class as Postgres, unless maragudb rejects it as unsupported
 - `internal/sql/exec` `TestSession_Insert/applies_Postgres's_assignment_casts`: an INSERT applies the assignment casts Postgres has: a quoted literal as the column's type, numeric and float literals rounded into bigint, integers widened to double precision, and any value written into text
 - `internal/sql/exec` `TestSession_Insert/binds_parameters_of_every_type`: every type binds through a parameter, and a timestamptz keeps microseconds
 - `internal/sql/exec` `TestSession_Select/evaluates_expressions_like_Postgres`: expressions evaluate as in Postgres: integer literals are 32-bit, numeric literals adapt to double precision, quoted literals take the type their context demands, || writes any type next to text, and casts use Postgres's text formats
 - `internal/sql/value` `TestEncodeRow/round_trips_every_type_and_NULL`: every value of the six types and NULL round-trips through the row encoding
+- `internal/sqldriver` `TestConn/gives_a_numeric_as_its_text,_of_the_database_type_NUMERIC`: the numeric results of SUM and AVG reach database/sql as strings in Postgres's text, and ColumnTypeDatabaseTypeName is NUMERIC, as with Postgres drivers
 
 ### `INV-LOGGER`
 
@@ -529,7 +539,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 > The numeric type.
 
-- `internal/pgdiff` `TestUnsupported/UNS-NUMERIC_numeric_literals_outside_double_precision_and_bigint_contexts`: numeric literals that Postgres keeps as numeric, such as SELECT 1.5 or a literal beyond the bigint range, are rejected, and Postgres accepts them
+- `internal/pgdiff` `TestUnsupported/UNS-NUMERIC_numeric_literals_outside_double_precision_and_bigint_contexts,_and_arithmetic_on_numeric`: numeric literals that Postgres keeps as numeric, such as SELECT 1.5 or a literal beyond the bigint range, arithmetic on the numeric results of SUM and AVG, and quoted literals read as numeric are rejected, and Postgres accepts them
 
 ### `UNS-TYPES`
 
@@ -595,7 +605,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 > Other clauses.
 
-- `internal/pgdiff` `TestUnsupported/UNS-CLAUSES_other_clauses_of_queries_and_writes`: DISTINCT ON, GROUP BY, subqueries, set operations, FOR UPDATE, RETURNING, ON CONFLICT, INSERT ... SELECT, an alias in INSERT, UPDATE ... FROM, and DELETE ... USING are rejected, and Postgres accepts them
+- `internal/pgdiff` `TestUnsupported/UNS-CLAUSES_other_clauses_of_queries_and_writes`: DISTINCT ON, subqueries, set operations, FOR UPDATE, RETURNING, ON CONFLICT, INSERT ... SELECT, an alias in INSERT, UPDATE ... FROM, and DELETE ... USING are rejected, and Postgres accepts them
 
 ### `UNS-JOINS`
 
@@ -603,11 +613,17 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 - `internal/pgdiff` `TestUnsupported/UNS-JOINS_other_forms_of_FROM_and_of_names`: RIGHT and FULL joins, LATERAL, an alias for a join or for the columns of USING, subqueries and functions in FROM, names with a schema, a reference to a whole row, and a repeated name in the names of a table's columns are rejected, and Postgres accepts them
 
+### `UNS-AGGREGATES`
+
+> Other aggregates and forms of grouping.
+
+- `internal/pgdiff` `TestUnsupported/UNS-AGGREGATES_other_aggregates_and_forms_of_grouping`: FILTER, ORDER BY in an aggregate, WITHIN GROUP, GROUPING SETS, ROLLUP, CUBE, the empty grouping set, GROUP BY ALL and DISTINCT, and the aggregates other than COUNT, SUM, AVG, MIN, and MAX are rejected, and Postgres accepts them
+
 ### `UNS-FUNCTIONS`
 
 > Other functions.
 
-- `internal/pgdiff` `TestUnsupported/UNS-FUNCTIONS_functions_other_than_the_supported_ones`: functions other than abs, coalesce, length, lower, upper, now, transaction_timestamp, and CURRENT_TIMESTAMP, including aggregates, window functions, the other clocks, and CURRENT_TIMESTAMP with a precision, are rejected, and Postgres accepts them
+- `internal/pgdiff` `TestUnsupported/UNS-FUNCTIONS_functions_other_than_the_supported_ones`: functions other than abs, coalesce, length, lower, nullif, upper, now, transaction_timestamp, CURRENT_TIMESTAMP, and the aggregates, including window functions, the other clocks, and CURRENT_TIMESTAMP with a precision, are rejected, and Postgres accepts them
 
 ### `UNS-OPERATORS`
 
@@ -633,15 +649,31 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 > LIMIT and OFFSET without a total order.
 
-- `internal/pgdiff` `TestUnsupported/UNS-LIMIT-ORDER_LIMIT_and_OFFSET_without_a_total_order`: LIMIT and OFFSET without ORDER BY on every primary key column are rejected, because which rows Postgres returns depends on its plan, and Postgres accepts them
+- `internal/pgdiff` `TestUnsupported/UNS-LIMIT-ORDER_LIMIT_and_OFFSET_without_a_total_order`: LIMIT and OFFSET without ORDER BY on every primary key column, or on groups without ORDER BY on every GROUP BY expression, are rejected, because which rows Postgres returns depends on its plan, and Postgres accepts them
 - `internal/sql/exec` `TestSession_Select/rejects_LIMIT_and_OFFSET_whose_rows_or_errors_would_depend_on_Postgres's_plan`: LIMIT and OFFSET need an ORDER BY on every primary key column and no expression that can fail, else ErrUnsupported
 
 ### `UNS-PLAN-DEPENDENT-LIMIT`
 
 > LIMIT and OFFSET with an expression that can fail.
 
+- `internal/pgdiff` `TestAggregatePlans/Postgres_moves_HAVING_into_WHERE,_stops_sorted_grouping_under_LIMIT,_computes_MIN_and_MAX_from_an_index,_and_adds_floats_in_the_order_of_its_plan`: EXPLAIN and the outcomes on Postgres 18 with sequential scans off show that a HAVING condition without aggregates is a condition of the scan, that sorted grouping under a LIMIT stops reading rows and succeeds where the whole query fails, that MIN and MAX read the first row of an index that passes WHERE and succeed where COUNT fails, that grouping is hashed or sorted by enable_hashagg and enable_sort, and that the SUM of the same floats depends on the order of the rows
 - `internal/pgdiff` `TestUnsupported/UNS-PLAN-DEPENDENT-LIMIT_LIMIT_and_OFFSET_with_an_expression_that_can_fail`: LIMIT and OFFSET with an output, ORDER BY, or WHERE expression that can fail are rejected, because how many rows Postgres evaluates it on depends on its plan, and Postgres accepts them when no row fails
 - `internal/sql/exec` `TestSession_Select/rejects_LIMIT_and_OFFSET_whose_rows_or_errors_would_depend_on_Postgres's_plan`: LIMIT and OFFSET need an ORDER BY on every primary key column and no expression that can fail, else ErrUnsupported
+
+### `UNS-FLOAT-SUM`
+
+> A SUM or AVG of double precision whose result depends on the order of the rows.
+
+- `internal/pgdiff` `TestAggregatePlans/Postgres_moves_HAVING_into_WHERE,_stops_sorted_grouping_under_LIMIT,_computes_MIN_and_MAX_from_an_index,_and_adds_floats_in_the_order_of_its_plan`: EXPLAIN and the outcomes on Postgres 18 with sequential scans off show that a HAVING condition without aggregates is a condition of the scan, that sorted grouping under a LIMIT stops reading rows and succeeds where the whole query fails, that MIN and MAX read the first row of an index that passes WHERE and succeed where COUNT fails, that grouping is hashed or sorted by enable_hashagg and enable_sort, and that the SUM of the same floats depends on the order of the rows
+- `internal/pgdiff` `TestUnsupported/UNS-FLOAT-SUM_a_SUM_or_AVG_of_double_precision_whose_result_depends_on_the_order_of_the_rows`: a SUM or AVG of double precision values whose sum, or whether it overflows, depends on the order in which Postgres adds them is rejected, and Postgres accepts it
+
+### `UNS-PLAN-DEPENDENT-AGGREGATE`
+
+> MIN and MAX that Postgres computes from the first row of an index, with a WHERE condition that fails.
+
+- `internal/pgdiff` `TestAggregatePlans/Postgres_moves_HAVING_into_WHERE,_stops_sorted_grouping_under_LIMIT,_computes_MIN_and_MAX_from_an_index,_and_adds_floats_in_the_order_of_its_plan`: EXPLAIN and the outcomes on Postgres 18 with sequential scans off show that a HAVING condition without aggregates is a condition of the scan, that sorted grouping under a LIMIT stops reading rows and succeeds where the whole query fails, that MIN and MAX read the first row of an index that passes WHERE and succeed where COUNT fails, that grouping is hashed or sorted by enable_hashagg and enable_sort, and that the SUM of the same floats depends on the order of the rows
+- `internal/pgdiff` `TestAggregatePlans/rejects_an_aggregate_whose_result_or_error_depends_on_the_plan,_and_accepts_it_otherwise`: a SUM or AVG of double precision is accepted only when every order of adding gives the same result, with NaN and infinities, and its overflow is an error only when every order overflows; errors in the arguments of aggregates, in the GROUP BY expressions, and in HAVING are reported when every failing row or group fails with the same class; a HAVING condition without aggregates is a WHERE condition; and MIN and MAX that Postgres can compute from the first row of an index reject a WHERE condition that fails
+- `internal/pgdiff` `TestUnsupported/UNS-PLAN-DEPENDENT-AGGREGATE_MIN_and_MAX_that_Postgres_can_compute_from_the_first_row_of_an_index,_with_a_WHERE_condition_that_fails`: a SELECT on one table without GROUP BY whose aggregates are all MIN and MAX, with a WHERE condition that fails on a row, is rejected, because Postgres can read only the first row of an index that passes the condition, and Postgres accepts it when that row comes first
 
 ### `UNS-PLAN-DEPENDENT-WHERE`
 
@@ -667,10 +699,10 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 ### `UNS-DISTINCT-ZERO`
 
-> DISTINCT of -0 and 0.
+> DISTINCT, GROUP BY, MIN, and MAX of values that are equal but print differently.
 
 - `internal/pgdiff` `TestJoins/removes_duplicate_rows_with_DISTINCT_as_Postgres_does`: SELECT DISTINCT keeps one row of every group of rows that are equal as Postgres compares them, NULLs equal to each other and NaN equal to NaN, sorts by ORDER BY items that must be output columns (42P10 otherwise), and rejects a group of -0 and 0, whose output depends on the plan
-- `internal/pgdiff` `TestUnsupported/UNS-DISTINCT-ZERO_DISTINCT_of_-0_and_0`: a SELECT DISTINCT whose result has -0 and 0 in one group is rejected, because which of them Postgres outputs depends on its plan, and Postgres accepts it
+- `internal/pgdiff` `TestUnsupported/UNS-DISTINCT-ZERO_DISTINCT,_GROUP_BY,_MIN,_and_MAX_of_-0_and_0`: a SELECT DISTINCT whose result has -0 and 0 in one group, or numerics of different scales, a GROUP BY whose group has -0 and 0 when the query reads its value, and a MIN, MAX, or SUM(DISTINCT) of -0 and 0 are rejected, because which of them Postgres outputs depends on its plan, and Postgres accepts them
 
 ### `UNS-STABLE-CONSTANT`
 
@@ -711,10 +743,10 @@ Every mutant runs in every simulator configuration below, with seeds 1 to 20, un
 |---|---|---|---|
 | `MUT-COMMIT-WITHOUT-CAS` commit without CAS | 6 of 12 configurations | 1 | durability, final read, list-append, real-time order |
 | `MUT-GC-IGNORE-GRACE` GC ignoring the grace period | 6 of 12 configurations | 1 | final read, grace period, list-append |
-| `MUT-SKIP-FRESHNESS` serving the cache without a freshness check | 7 of 12 configurations | 1 | grace period, list-append, real-time order |
+| `MUT-SKIP-FRESHNESS` serving the cache without a freshness check | 8 of 12 configurations | 1 | grace period, list-append, real-time order |
 | `MUT-ACK-BEFORE-CONFIRM` acking before the write is confirmed | 6 of 12 configurations | 1 | durability, real-time order |
 | `MUT-COMPACTED-AHEAD` the compacted segment ahead of newer ones after a rebase | 5 of 12 configurations | 1 | durability, index consistency, list-append, real-time order |
-| `MUT-FRESH-SNAPSHOT` a fresh snapshot per statement | 8 of 8 configurations | 1 | bank, foreign key, index consistency, list-append |
+| `MUT-FRESH-SNAPSHOT` a fresh snapshot per statement | 8 of 8 configurations | 1 | bank, foreign key, index consistency, list-append, workload invariants |
 | `MUT-RETRY-UNKNOWN` retrying an autocommit statement after an unknown commit outcome | 2 of 8 configurations | 1 | durability, list-append |
 | `MUT-INDEX-STALE-DELETE` stale index entries after an UPDATE or DELETE | 6 of 8 configurations | 1 | index consistency |
 | `MUT-UNIQUE-NO-CHECK` no unique check | 2 of 8 configurations | 1 | index consistency, unique |
@@ -785,7 +817,7 @@ Targeted tests:
 | list-append through SQL, no maintainers | detected with seed 1 by list-append |
 | list-append through SQL, 2 maintainers | detected with seed 1 by list-append |
 | bank through SQL, no maintainers | cannot detect: a stale snapshot makes a transfer conflict or read an older consistent state, which conserves money |
-| bank through SQL, 2 maintainers | cannot detect: a stale snapshot makes a transfer conflict or read an older consistent state, which conserves money |
+| bank through SQL, 2 maintainers | detected with seed 5 by grace period |
 | unique through SQL, no maintainers | cannot detect: a stale snapshot is an older consistent state in which no value repeats, and a write from it conflicts at commit; without maintainers no reader loses an object either |
 | unique through SQL, 2 maintainers | detected with seed 5 by grace period |
 | foreign-key through SQL, no maintainers | detected with seed 2 by real-time order |
@@ -850,8 +882,8 @@ Targeted tests:
 | bank through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
 | list-append through SQL, no maintainers | detected with seed 1 by list-append |
 | list-append through SQL, 2 maintainers | detected with seed 1 by list-append |
-| bank through SQL, no maintainers | detected with seed 1 by bank |
-| bank through SQL, 2 maintainers | detected with seed 1 by bank |
+| bank through SQL, no maintainers | detected with seed 1 by workload invariants, bank |
+| bank through SQL, 2 maintainers | detected with seed 1 by workload invariants, bank |
 | unique through SQL, no maintainers | detected with seed 1 by index consistency |
 | unique through SQL, 2 maintainers | detected with seed 1 by index consistency |
 | foreign-key through SQL, no maintainers | detected with seed 8 by foreign key |

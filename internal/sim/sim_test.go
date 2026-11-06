@@ -717,8 +717,14 @@ func mutants() []mutant {
 			id: "MUT-SKIP-FRESHNESS", replay: "freshness", name: "serving the cache without a freshness check",
 			description: "`engine.Mutations.SkipFreshnessCheck` starts transactions from the cached manifest without asking the store, so a transaction can miss commits acknowledged before it began.",
 			mutations:   engine.Mutations{SkipFreshnessCheck: true},
-			cannot: merge(bankCells("a stale snapshot makes a transfer conflict or read an older consistent state, which conserves money"),
-				map[cell]string{{workload: sim.Unique, sql: true}: "a stale snapshot is an older consistent state in which no value repeats, and a write from it conflicts at commit; without maintainers no reader loses an object either"}),
+			cannot: func() map[cell]string {
+				m := merge(bankCells("a stale snapshot makes a transfer conflict or read an older consistent state, which conserves money"),
+					map[cell]string{{workload: sim.Unique, sql: true}: "a stale snapshot is an older consistent state in which no value repeats, and a write from it conflicts at commit; without maintainers no reader loses an object either"})
+				// The audits through SQL read the accounts twice, by rows and with SUM, and a stale
+				// snapshot can lose an object that maintenance collected meanwhile.
+				delete(m, cell{workload: sim.Bank, sql: true, maintainers: 2})
+				return m
+			}(),
 			checkers: []string{sim.CheckerListAppend},
 		},
 		{

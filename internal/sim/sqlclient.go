@@ -463,6 +463,21 @@ func (c *client) bankSQL(ctx context.Context) {
 			c.run.anomaly(CheckerWorkload, "client %d: read %d accounts, want %d", c.id, len(balances), c.run.cfg.Keys)
 			return
 		}
+		// The same snapshot as aggregates, whose numeric sum reaches Go as its text.
+		var sum string
+		var count int64
+		if err := tx.QueryRowContext(ctx, "SELECT sum(balance), count(*) FROM accounts").Scan(&sum, &count); err != nil {
+			c.readErrorSQL(ctx, startedAt, err)
+			return
+		}
+		var total int64
+		for _, b := range balances {
+			total += b
+		}
+		if sum != fmt.Sprint(total) || count != int64(c.run.cfg.Keys) {
+			c.run.anomaly(CheckerWorkload, "client %d: SUM and COUNT of the accounts are %s and %d, but their rows add up to %d in %d accounts", c.id, sum, count, total, len(balances))
+			return
+		}
 		h.Complete = c.run.stamp()
 		h.Outcome = history.OK
 		c.record(h)
