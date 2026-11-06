@@ -239,6 +239,21 @@ SELECT a, b FROM t1 ORDER BY a
 	})
 }
 
+func TestFileRunner_postgres(t *testing.T) {
+	t.Run("gives each worker a connection in its own schema with sequential scans off", func(t *testing.T) {
+		r := newFileRunner(t)
+		for worker := range 3 {
+			conn, err := r.postgres(t.Context(), worker)
+			is.NotError(t, err)
+			t.Cleanup(func() { _ = conn.Close() })
+			var schema, seqscan string
+			is.NotError(t, conn.QueryRowContext(t.Context(), "SELECT current_schema(), current_setting('enable_seqscan')").Scan(&schema, &seqscan))
+			is.Equal(t, fmt.Sprintf("sqllogictest_%d", worker), schema)
+			is.Equal(t, "off", seqscan)
+		}
+	})
+}
+
 // TestRegressions has the statements of the corpus that found differences from Postgres, which
 // are fixed. They run on both databases, through the rewrites and the comparison of the
 // corpus.

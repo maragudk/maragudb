@@ -112,17 +112,11 @@ func (r *fileRunner) run(ctx context.Context, worker int, name string, content [
 		return rep, fmt.Errorf("maragudb: %w", err)
 	}
 	defer func() { _ = mConn.Close() }()
-	pgConn, err := r.pg.Conn(ctx)
+	pgConn, err := r.postgres(ctx, worker)
 	if err != nil {
-		return rep, fmt.Errorf("postgres: %w", err)
+		return rep, err
 	}
 	defer func() { _ = pgConn.Close() }()
-	schema := fmt.Sprintf("sqllogictest_%d", worker)
-	for _, q := range []string{"DROP SCHEMA IF EXISTS " + schema + " CASCADE", "CREATE SCHEMA " + schema, "SET search_path TO " + schema} {
-		if _, err := pgConn.ExecContext(ctx, q); err != nil {
-			return rep, fmt.Errorf("postgres: %s: %w", q, err)
-		}
-	}
 	session := pgdiff.NewSession(pgConn, mConn)
 	// The connection goes back to the pool without a transaction, also after a mismatch in the
 	// middle of one, which the session may not know is open.
@@ -163,6 +157,24 @@ func (r *fileRunner) run(ctx context.Context, worker int, name string, content [
 		}
 	}
 	return rep, nil
+}
+
+// postgres returns a connection to Postgres in a fresh, empty schema of the worker, which is
+// the connection's search path. The connection has the settings of every connection that
+// [pgdiff.Postgres] gives, among them enable_seqscan=off.
+func (r *fileRunner) postgres(ctx context.Context, worker int) (*sql.Conn, error) {
+	conn, err := r.pg.Conn(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: %w", err)
+	}
+	schema := fmt.Sprintf("sqllogictest_%d", worker)
+	for _, q := range []string{"DROP SCHEMA IF EXISTS " + schema + " CASCADE", "CREATE SCHEMA " + schema, "SET search_path TO " + schema} {
+		if _, err := conn.ExecContext(ctx, q); err != nil {
+			_ = conn.Close()
+			return nil, fmt.Errorf("postgres: %s: %w", q, err)
+		}
+	}
+	return conn, nil
 }
 
 // forOtherEngine reports whether an onlyif condition of the record names another engine.

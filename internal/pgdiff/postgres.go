@@ -26,7 +26,8 @@ const container = "maragudb-pgdiff"
 // Postgres returns a connection to a database collated with "C" for the harness. It uses
 // MARAGUDB_PGDIFF_URL when set, the CI service when CI is set, and otherwise starts a
 // postgres:18 Docker container, which stays running for later runs. It fails the test, never
-// skips, when Postgres is unavailable.
+// skips, when Postgres is unavailable. Every connection runs with enable_seqscan=off, so that
+// Postgres scans through the primary key index wherever it can, as [replaceDatabase] explains.
 //
 // Every test process gets a database of its own, created on first use from template0 under a
 // unique name, so that test processes sharing one server never meet. [DropDatabase] drops it at
@@ -146,13 +147,21 @@ func DropDatabase() {
 }
 
 // replaceDatabase in a Postgres URL, keeping its query and adding the pgx mode that describes
-// every statement instead of caching plans.
+// every statement instead of caching plans, and the setting enable_seqscan=off, which pgx sends
+// when it opens a connection, so that it is the default of every connection of the pool.
+//
+// With sequential scans off, Postgres scans a table through its primary key index whenever a
+// condition of the WHERE clause can use the index, and evaluates the other conditions only on
+// the rows the index finds, as maragudb does. Bitmap scans stay on: a bitmap heap scan also
+// checks the index conditions before the other ones, and without it Postgres would choose by
+// cost between two disabled plans for an OR of key ranges.
 func replaceDatabase(url, name string) string {
+	const params = "default_query_exec_mode=describe_exec&enable_seqscan=off"
 	i := strings.LastIndex(url, "/")
 	if j := strings.Index(url[i:], "?"); j >= 0 {
-		return url[:i+1] + name + url[i+j:] + "&default_query_exec_mode=describe_exec"
+		return url[:i+1] + name + url[i+j:] + "&" + params
 	}
-	return url[:i+1] + name + "?default_query_exec_mode=describe_exec"
+	return url[:i+1] + name + "?" + params
 }
 
 func waitReady(ctx context.Context, db *sql.DB) error {

@@ -26,6 +26,27 @@ func TestPostgres(t *testing.T) {
 		is.Equal(t, name, same, "every test of the process shares it")
 	})
 
+	t.Run("turns sequential scans off on every connection, also after RESET", func(t *testing.T) {
+		db := Postgres(t)
+		// Connections held at the same time are different connections of the pool.
+		var conns []*sql.Conn
+		for range 3 {
+			conn, err := db.Conn(t.Context())
+			is.NotError(t, err)
+			t.Cleanup(func() { _ = conn.Close() })
+			conns = append(conns, conn)
+		}
+		for _, conn := range conns {
+			var setting string
+			is.NotError(t, conn.QueryRowContext(t.Context(), "SHOW enable_seqscan").Scan(&setting))
+			is.Equal(t, "off", setting)
+			_, err := conn.ExecContext(t.Context(), "RESET enable_seqscan")
+			is.NotError(t, err)
+			is.NotError(t, conn.QueryRowContext(t.Context(), "SHOW enable_seqscan").Scan(&setting))
+			is.Equal(t, "off", setting, "the setting is the connection's default")
+		}
+	})
+
 	t.Run("drops databases left behind before the cutoff and keeps newer ones", func(t *testing.T) {
 		Postgres(t)
 		admin, err := sql.Open("pgx", processDB.admin)
