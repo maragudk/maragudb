@@ -349,9 +349,9 @@ func (p *parser) begin() (ast.Statement, error) {
 var unsupportedTypes = map[string]string{
 	"integer": "integer is not supported, use bigint", "int": "int is not supported, use bigint", "int4": "int4 is not supported, use bigint",
 	"smallint": "smallint is not supported, use bigint", "int2": "int2 is not supported, use bigint", "serial": "serial is not supported, because there are no sequences; use bigint and generate the keys in the application",
-	"bigserial": "bigserial is not supported, because there are no sequences; use bigint and generate the keys in the application",
+	"bigserial":   "bigserial is not supported, because there are no sequences; use bigint and generate the keys in the application",
 	"smallserial": "smallserial is not supported, because there are no sequences; use bigint and generate the keys in the application",
-	"real": "real is not supported, use double precision", "float4": "float4 is not supported, use double precision",
+	"real":        "real is not supported, use double precision", "float4": "float4 is not supported, use double precision",
 	"numeric": "numeric is not supported, use double precision or bigint", "decimal": "decimal is not supported, use double precision or bigint",
 	"dec": "dec is not supported, use double precision or bigint", "money": "money is not supported, use bigint",
 	"varchar": "varchar is not supported, use text", "character": "character and character varying are not supported, use text",

@@ -46,6 +46,8 @@ type Mutations struct {
 	// UniqueOwnWrites makes the check of a unique entry read the transaction without the
 	// statement's own writes, so that it misses a duplicate within one statement.
 	UniqueOwnWrites bool
+	// CheckSkipUpdate checks the CHECK constraints of a row only when it is inserted.
+	CheckSkipUpdate bool
 }
 
 // Session runs statements for one client, serially. It is not safe for concurrent use.
@@ -64,6 +66,8 @@ type Session struct {
 	aborted bool
 	// tables caches definitions read in the transaction. A nil entry is a known-missing table.
 	tables map[string]*table
+	// checks caches the bound CHECK constraints of the tables in tables.
+	checks map[*table][]boundCheck
 	kv     kvstore
 }
 
@@ -202,6 +206,7 @@ func (s *Session) begin(ctx context.Context, readOnly bool) error {
 	s.wrote = false
 	s.aborted = false
 	s.tables = map[string]*table{}
+	s.checks = nil
 	s.kv = kvstore{tx: tx}
 	return nil
 }
@@ -249,6 +254,7 @@ func (s *Session) end() {
 	s.readOnly = false
 	s.aborted = false
 	s.tables = nil
+	s.checks = nil
 	s.kv = kvstore{}
 }
 
@@ -345,7 +351,7 @@ func (s *Session) run(ctx context.Context, st *Statement, params []value.Value) 
 	if err != nil {
 		s.kv.discard()
 		if ddl {
-			s.tables = map[string]*table{}
+			s.tables, s.checks = map[string]*table{}, nil
 		}
 		s.aborted = s.explicit
 		return nil, Result{}, err
@@ -359,7 +365,7 @@ func (s *Session) run(ctx context.Context, st *Statement, params []value.Value) 
 	}
 	s.wrote = s.wrote || wrote
 	if ddl {
-		s.tables = map[string]*table{}
+		s.tables, s.checks = map[string]*table{}, nil
 	}
 	return rows, res, nil
 }

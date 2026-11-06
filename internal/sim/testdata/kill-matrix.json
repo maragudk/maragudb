@@ -229,7 +229,7 @@
         {
           "cell": "unique through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 6,
+          "seed": 5,
           "checkers": [
             "grace period"
           ]
@@ -371,7 +371,7 @@
         {
           "cell": "unique through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 1,
+          "seed": 2,
           "checkers": [
             "index consistency"
           ]
@@ -705,16 +705,16 @@
         {
           "cell": "unique through SQL, no maintainers",
           "status": "detected",
-          "seed": 4,
+          "seed": 5,
           "checkers": [
-            "index consistency",
-            "unique"
+            "unique",
+            "index consistency"
           ]
         },
         {
           "cell": "unique through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 4,
+          "seed": 9,
           "checkers": [
             "unique",
             "index consistency"

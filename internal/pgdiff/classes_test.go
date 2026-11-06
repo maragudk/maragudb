@@ -30,6 +30,8 @@ func TestErrorClasses(t *testing.T) {
 		{sql: "SELECT CAST(1e300::float8 AS bigint)", want: maragudb.ErrOutOfRange, code: "22003"},
 		{sql: "INSERT INTO dev VALUES (2, NULL)", want: maragudb.ErrNotNull, code: "23502"},
 		{sql: "INSERT INTO dev VALUES (1, 1)", want: maragudb.ErrDuplicateKey, code: "23505"},
+		{setup: "CREATE TABLE dev2 (a bigint PRIMARY KEY CHECK (a > 0))", sql: "INSERT INTO dev2 VALUES (0)", want: maragudb.ErrCheck, code: "23514"},
+		{sql: "CREATE TABLE dev2 (a bigint PRIMARY KEY, CONSTRAINT c CHECK (a > 0), CONSTRAINT c CHECK (a < 9))", want: maragudb.ErrDuplicateObject, code: "42710"},
 		{sql: "SELEC 1", want: maragudb.ErrSyntax, code: "42601"},
 		{sql: "SELECT 1 ORDER BY 'a'", want: maragudb.ErrSyntax, code: "42601"},
 		{sql: "SELECT * FROM nope", want: maragudb.ErrNoTable, code: "42P01"},

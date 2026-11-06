@@ -18,7 +18,7 @@ import (
 // encoding of the primary key columns, and the entries of a secondary index at
 // `i/<index name>\x00<entry>`, where <entry> is the index key encoding of the indexed columns,
 // followed by the row's <key> unless the entry must be unique, and the entry's value is the
-// row's <key>. The layout requires that a table or index name never contains a NUL byte, so that
+// row's <key>. The name of every constraint is at `k/<name>\x00<table>`. The layout requires that a table or index name never contains a NUL byte, so that
 // the prefix of one never covers another; [newTable] and [Session.createIndex] enforce it.
 
 // table definition as stored in the catalog.
@@ -35,6 +35,18 @@ type table struct {
 	// IndexOf is set when the catalog entry is the name of an index rather than a table, to the
 	// table it belongs to. Such an entry has only its Name besides.
 	IndexOf string `json:"indexOf,omitempty"`
+	// Checks are the CHECK constraints of the table, in the order they were created.
+	Checks []check `json:"checks,omitempty"`
+	// Constraints are the names of every constraint of the table, NOT NULL constraints among
+	// them, as Postgres names those. Each is also at `k/<name>\x00<table>`, because the
+	// constraints of all tables share the namespace in which Postgres chooses their names.
+	Constraints []string `json:"constraints,omitempty"`
+}
+
+// check is a CHECK constraint, with its expression as SQL text.
+type check struct {
+	Name string `json:"name"`
+	Expr string `json:"expr"`
 }
 
 type column struct {

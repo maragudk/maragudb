@@ -10,10 +10,10 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 ## At a glance
 
-- 32 acceptance criteria (`AC-`), 22 key invariants (`INV-`), 20 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
+- 32 acceptance criteria (`AC-`), 23 key invariants (`INV-`), 21 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
 - 11 mutants (`MUT-`), deliberate bugs, of which 10 are detected by the simulator's checkers within 20 seeds.
 - 15 interesting states (`STATE-`) that the simulator's fixed corpus must reach.
-- 159 declarations of coverage in the tests.
+- 162 declarations of coverage in the tests.
 
 ## Acceptance criteria
 
@@ -135,6 +135,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 > Differential testing against Postgres: Both systems must agree on whether a statement succeeds or fails, and on the error class when both fail. Postgres runs with enable_seqscan = off, so that the differences with a DEV- ID do not show.
 
+- `internal/pgdiff` `TestChecks/names_CHECK_constraints_as_Postgres_does,_and_fails_a_CHECK_as_Postgres_does_when_the_table_is_created`: CHECK constraints get Postgres's names, after the one column they read or after the table, numbered past the names of every constraint of every table, they share the names of a table's constraints with its PRIMARY KEY and UNIQUE constraints and its NOT NULL constraints, and a CHECK that is not boolean, reads a missing column, or repeats a name fails with the class of Postgres's error
 - `internal/pgdiff` `TestDefaults/fills_in_defaults_as_Postgres_does,_with_the_same_errors`: a column's DEFAULT is used for a column that an INSERT leaves out, for DEFAULT in VALUES and in SET, and for DEFAULT VALUES, converted to the column's type by assignment, and a DEFAULT that reads a column, has a parameter, has the wrong type, or fails to fold fails as in Postgres
 - `internal/pgdiff` `TestDifferential/generated_statements_give_the_same_results_on_Postgres_and_maragudb`: hegel-generated schemas, rows, transactions, and statements, written once as Postgres SQL, give the same results, column names, affected-row counts, and transaction states on both sides, ordered exactly when ORDER BY decides the order and as multisets otherwise, and fail on both sides with the same error class, except for statements that maragudb rejects as unsupported, which Postgres skips
 - `internal/pgdiff` `TestErrorClasses`: every maragudb error class fails with its mapped SQLSTATE code on Postgres for the same statement
@@ -398,6 +399,8 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `.` `TestTx/a_statement_that_does_not_parse_aborts_the_transaction,_as_in_Postgres`: a syntax error or an unsupported statement in an explicit transaction aborts it, so a later commit rolls everything back
 - `internal/pgdiff` `TestCasts/every_value_casts_to_every_type_the_same_as_Postgres,_or_is_rejected_as_unsupported`: hegel-drawn values of every supported type, and integer and numeric literals, cast to every supported type and back to text with the same result or error class as Postgres, unless maragudb rejects the cast as unsupported
 - `internal/pgdiff` `TestCasts/text_casts_to_every_type,_and_back_to_text,_the_same_as_Postgres,_or_are_rejected_as_unsupported`: hegel-drawn text near valid input for bigint, double precision, boolean, bytea, and timestamptz casts to the type and back to text with the same result or the same error class as Postgres, unless maragudb rejects it as unsupported
+- `internal/pgdiff` `TestChecks/checks_CHECK_constraints_in_the_order_of_their_names,_after_NOT_NULL_and_before_the_keys,_as_Postgres_does`: an INSERT or UPDATE evaluates the NOT NULL constraints, then the CHECK constraints in the order of their names, failing at the first that is false or fails itself, and then the primary key and the unique indexes, row by row, so it fails with the same class as Postgres, and NULL passes a CHECK
+- `internal/pgdiff` `TestChecks/names_CHECK_constraints_as_Postgres_does,_and_fails_a_CHECK_as_Postgres_does_when_the_table_is_created`: CHECK constraints get Postgres's names, after the one column they read or after the table, numbered past the names of every constraint of every table, they share the names of a table's constraints with its PRIMARY KEY and UNIQUE constraints and its NOT NULL constraints, and a CHECK that is not boolean, reads a missing column, or repeats a name fails with the class of Postgres's error
 - `internal/pgdiff` `TestDefaults/fills_in_defaults_as_Postgres_does,_with_the_same_errors`: a column's DEFAULT is used for a column that an INSERT leaves out, for DEFAULT in VALUES and in SET, and for DEFAULT VALUES, converted to the column's type by assignment, and a DEFAULT that reads a column, has a parameter, has the wrong type, or fails to fold fails as in Postgres
 - `internal/pgdiff` `TestIndexConditions/evaluates_the_other_conditions_only_on_the_rows_that_the_primary_key_conditions_select,_as_Postgres_does_with_an_index_scan`: with sequential scans off, Postgres evaluates the other WHERE conditions only on the rows that the conditions on the primary key index select: comparisons and IN of constants on any key column, a boolean key column, and key equalities implied by equalities with a constant; maragudb accepts such statements and gives the same results
 - `internal/pgdiff` `TestIndexConditions/takes_the_index_conditions_out_of_an_OR_as_Postgres_does_when_it_drops_constants_and_common_conditions_from_the_OR`: in a WHERE clause, Postgres drops the arguments of an OR that are FALSE or NULL constants and takes the conditions common to every argument out of the OR, which can make them index conditions; maragudb does the same and gives the same results
@@ -470,6 +473,12 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/sql/exec` `TestSession_Unique/rejects_a_row_whose_values_another_row_has,_in_one_statement_or_across_statements,_and_allows_NULLs`: inserts and updates that would give two rows the same non-NULL values of a unique index fail with ErrDuplicateKey, within one statement, across statements of a transaction, and against committed rows, and NULLs never collide unless NULLS NOT DISTINCT
 - `internal/sql/exec` `TestSession_Unique/rejects_an_UPDATE_whose_outcome_depends_on_the_order_Postgres_visits_the_rows,_and_fails_a_cycle_of_moves`: an UPDATE whose rows move onto unique values that other rows of it leave is rejected when they form a chain, whose outcome depends on the order, and fails with ErrDuplicateKey when they form a cycle, which fails in every order
 
+### `INV-CHECK`
+
+> No committed row ever violates a CHECK constraint of its table.
+
+- `internal/pgdiff` `TestChecks/checks_CHECK_constraints_in_the_order_of_their_names,_after_NOT_NULL_and_before_the_keys,_as_Postgres_does`: an INSERT or UPDATE evaluates the NOT NULL constraints, then the CHECK constraints in the order of their names, failing at the first that is false or fails itself, and then the primary key and the unique indexes, row by row, so it fails with the same class as Postgres, and NULL passes a CHECK
+
 ## Unsupported statements
 
 ### `UNS-NUMERIC`
@@ -513,6 +522,12 @@ Each entry names the test's package, the test's name, and what the test asserts,
 > A DEFAULT that can fail.
 
 - `internal/pgdiff` `TestUnsupported/UNS-DEFAULT_a_DEFAULT_that_can_fail`: a DEFAULT whose constant part fails, or that can fail when it is evaluated, is rejected when the table is created, and Postgres accepts the table
+
+### `UNS-CHECK`
+
+> Other forms of CHECK.
+
+- `internal/pgdiff` `TestUnsupported/UNS-CHECK_other_forms_of_CHECK`: a CHECK with NO INHERIT, NOT VALID, or NOT ENFORCED, or whose constant part fails, is rejected, and Postgres accepts the table
 
 ### `UNS-INDEX`
 
@@ -626,7 +641,7 @@ Every mutant runs in every simulator configuration below, with seeds 1 to 20, un
 | `MUT-RETRY-UNKNOWN` retrying an autocommit statement after an unknown commit outcome | 2 of 6 configurations | 1 | durability, list-append |
 | `MUT-INDEX-STALE-DELETE` stale index entries after an UPDATE or DELETE | 4 of 6 configurations | 1 | index consistency |
 | `MUT-UNIQUE-NO-CHECK` no unique check | 2 of 6 configurations | 1 | index consistency, unique |
-| `MUT-UNIQUE-OWN-WRITES` a unique check that misses the statement's own writes | 2 of 6 configurations | 4 | index consistency, unique |
+| `MUT-UNIQUE-OWN-WRITES` a unique check that misses the statement's own writes | 2 of 6 configurations | 5 | index consistency, unique |
 | `MUT-UPDATE-SEES-OWN-WRITES` an UPDATE that revisits the rows it wrote | 0 of 6 configurations | none |  |
 
 ### `MUT-COMMIT-WITHOUT-CAS`
@@ -687,7 +702,7 @@ Targeted tests:
 | bank through SQL, no maintainers | cannot detect: a stale snapshot makes a transfer conflict or read an older consistent state, which conserves money |
 | bank through SQL, 2 maintainers | cannot detect: a stale snapshot makes a transfer conflict or read an older consistent state, which conserves money |
 | unique through SQL, no maintainers | cannot detect: a stale snapshot is an older consistent state in which no value repeats, and a write from it conflicts at commit; without maintainers no reader loses an object either |
-| unique through SQL, 2 maintainers | detected with seed 6 by grace period |
+| unique through SQL, 2 maintainers | detected with seed 5 by grace period |
 
 ### `MUT-ACK-BEFORE-CONFIRM`
 
@@ -725,7 +740,7 @@ Targeted tests:
 | bank through SQL, no maintainers | cannot detect: without maintainers nothing compacts, so there is never a rebase |
 | bank through SQL, 2 maintainers | detected with seed 2 by index consistency |
 | unique through SQL, no maintainers | cannot detect: without maintainers nothing compacts, so there is never a rebase |
-| unique through SQL, 2 maintainers | detected with seed 1 by index consistency |
+| unique through SQL, 2 maintainers | detected with seed 2 by index consistency |
 
 Targeted tests:
 
@@ -830,8 +845,8 @@ Targeted tests:
 | list-append through SQL, 2 maintainers | cannot detect: the workload has no unique index besides the primary key |
 | bank through SQL, no maintainers | cannot detect: the workload has no unique index besides the primary key |
 | bank through SQL, 2 maintainers | cannot detect: the workload has no unique index besides the primary key |
-| unique through SQL, no maintainers | detected with seed 4 by index consistency, unique |
-| unique through SQL, 2 maintainers | detected with seed 4 by unique, index consistency |
+| unique through SQL, no maintainers | detected with seed 5 by unique, index consistency |
+| unique through SQL, 2 maintainers | detected with seed 9 by unique, index consistency |
 
 Targeted tests:
 

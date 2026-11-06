@@ -186,7 +186,7 @@ func (t *table) indexConstraints(st *ast.CreateTable) ([]indexConstraint, error)
 
 // addIndexes adds the indexes of a new table's constraints from [table.indexConstraints], one at a
 // time, so that the name Postgres chooses for one depends on the names of those before it.
-func (s *Session) addIndexes(ctx context.Context, t *table, cs []indexConstraint) error {
+func (s *Session) addIndexes(ctx context.Context, t *table, cs []indexConstraint, n *names) error {
 	for i, c := range cs {
 		if err := checkIndexColumns(len(c.columns)); err != nil {
 			return err
@@ -202,18 +202,22 @@ func (s *Session) addIndexes(ctx context.Context, t *table, cs []indexConstraint
 			} else if exists {
 				return fmt.Errorf("%w: relation %q already exists", ErrTableExists, name)
 			}
-		case i == 0:
-			name, err = s.chooseName(ctx, t.Name, "", "pkey")
-		default:
-			var names []string
-			for _, col := range c.columns {
-				names = append(names, t.Columns[col].Name)
+			if n.has(name) {
+				return fmt.Errorf("%w: constraint %q for relation %q already exists", ErrDuplicateObject, name, t.Name)
 			}
-			name, err = s.chooseName(ctx, t.Name, indexNameAddition(names), "key")
+		case i == 0:
+			name, err = s.chooseIndexConstraintName(ctx, n, t.Name, "", "pkey")
+		default:
+			var columns []string
+			for _, col := range c.columns {
+				columns = append(columns, t.Columns[col].Name)
+			}
+			name, err = s.chooseIndexConstraintName(ctx, n, t.Name, indexNameAddition(columns), "key")
 		}
 		if err != nil {
 			return err
 		}
+		n.add(name)
 		if i == 0 {
 			t.PrimaryKeyIndex = name
 		} else {

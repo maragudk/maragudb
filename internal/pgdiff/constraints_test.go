@@ -90,3 +90,66 @@ func TestDefaults(t *testing.T) {
 		)
 	})
 }
+
+func TestChecks(t *testing.T) {
+	t.Run("names CHECK constraints as Postgres does, and fails a CHECK as Postgres does when the table is created", func(t *testing.T) {
+		verify.Covers(t, "CHECK constraints get Postgres's names, after the one column they read or after the table, numbered past the names of every constraint of every table, they share the names of a table's constraints with its PRIMARY KEY and UNIQUE constraints and its NOT NULL constraints, and a CHECK that is not boolean, reads a missing column, or repeats a name fails with the class of Postgres's error", "INV-PG-SUBSET", "AC-4.3")
+		s := newConstraintSession(t)
+		expect(t, s,
+			outcome{sql: "CREATE TABLE cc (a bigint PRIMARY KEY CHECK (a))", code: "42804"},
+			outcome{sql: "CREATE TABLE cc (a bigint PRIMARY KEY CHECK (nope > 0))", code: "42703"},
+			outcome{sql: "CREATE TABLE cc (a bigint PRIMARY KEY CHECK (a > $1))", code: "42P02"},
+			outcome{sql: "CREATE TABLE cc (a bigint PRIMARY KEY CHECK (DEFAULT))", code: "42601"},
+			outcome{sql: "CREATE TABLE cc (a bigint PRIMARY KEY, CONSTRAINT x CHECK (a > 0), CONSTRAINT x CHECK (a < 9))", code: "42710"},
+			outcome{sql: "CREATE TABLE cc (a bigint PRIMARY KEY CHECK (a > 0) CHECK (a > 1) CONSTRAINT cc_a_check1 CHECK (a > 2))", code: "42710"},
+			outcome{sql: "CREATE TABLE cc (a bigint PRIMARY KEY, CONSTRAINT x CHECK (a > 0), CONSTRAINT x UNIQUE (a))", code: "42710"},
+			outcome{sql: "CREATE TABLE cc (a bigint PRIMARY KEY, b bigint, CONSTRAINT cc_a_not_null UNIQUE (b))", code: "42710"},
+			outcome{sql: "CREATE TABLE cc (a bigint CONSTRAINT x PRIMARY KEY, CONSTRAINT x CHECK (a > 0))", code: "42710"},
+			outcome{sql: "CREATE TABLE cc (a bigint PRIMARY KEY CHECK (1 / 0 > 0))", rejected: true},
+			outcome{sql: "CREATE TABLE cc (a bigint PRIMARY KEY CHECK (a > 0) NO INHERIT)", rejected: true},
+			outcome{sql: "CREATE TABLE cc (a bigint PRIMARY KEY, CHECK (a > 0) NOT VALID)", rejected: true},
+			outcome{sql: "CREATE TABLE cc (a bigint PRIMARY KEY CHECK (a > 0) NOT ENFORCED)", rejected: true},
+			outcome{sql: "CREATE TABLE cc2 (a bigint PRIMARY KEY, CONSTRAINT cc_pkey CHECK (a > 0), CONSTRAINT cc_b_check CHECK (a > 0))"},
+			outcome{sql: "CREATE TABLE cc (a bigint PRIMARY KEY CHECK (a > 0) ENFORCED, b bigint CHECK (a < b) CHECK (b > 0), CHECK (true), CHECK (b > 0), CONSTRAINT foo CHECK (b < 100), CHECK (a + b > 0 AND b <> 7), CONSTRAINT cc_b_check3 CHECK (b <> 8))"},
+			outcome{sql: "DROP INDEX cc_pkey", code: "42704"},
+			outcome{sql: "DROP INDEX cc_pkey1", code: "2BP01"},
+			outcome{sql: "INSERT INTO cc VALUES (1, 8)", code: "23514"},
+			outcome{sql: "INSERT INTO cc VALUES (1, 7)", code: "23514"},
+			outcome{sql: "INSERT INTO cc VALUES (1, 2), (2, NULL)"},
+			outcome{sql: "UPDATE cc SET b = 0", code: "23514"},
+			outcome{sql: "UPDATE cc SET b = 50 WHERE a = 1"},
+			outcome{sql: "UPDATE cc SET a = -a", code: "23514"},
+			outcome{sql: "SELECT * FROM cc ORDER BY a"},
+			outcome{sql: "DROP TABLE cc2"},
+			outcome{sql: "CREATE TABLE cc2 (a bigint PRIMARY KEY CHECK (a > 0))"},
+			outcome{sql: "DROP TABLE cc2"},
+			outcome{sql: "DROP TABLE cc"},
+			outcome{sql: "CREATE TABLE cc2 (a bigint PRIMARY KEY CHECK (a > 0))"},
+		)
+	})
+
+	t.Run("checks CHECK constraints in the order of their names, after NOT NULL and before the keys, as Postgres does", func(t *testing.T) {
+		verify.Covers(t, "an INSERT or UPDATE evaluates the NOT NULL constraints, then the CHECK constraints in the order of their names, failing at the first that is false or fails itself, and then the primary key and the unique indexes, row by row, so it fails with the same class as Postgres, and NULL passes a CHECK", "INV-CHECK", "INV-PG-SUBSET")
+		s := newConstraintSession(t)
+		expect(t, s,
+			outcome{sql: "CREATE TABLE cc (a bigint PRIMARY KEY, b bigint NOT NULL, s text UNIQUE, CONSTRAINT z CHECK (10 / a > 0), CONSTRAINT y CHECK (b > 0), CONSTRAINT x CHECK (a > 5), CHECK (CAST(s AS bigint) > 0))"},
+			outcome{sql: "INSERT INTO cc VALUES (0, 1, '1')", code: "23514"},
+			outcome{sql: "INSERT INTO cc VALUES (0, NULL, '1')", code: "23502"},
+			outcome{sql: "INSERT INTO cc VALUES (6, -1, '1')", code: "23514"},
+			outcome{sql: "INSERT INTO cc VALUES (6, 1, 'x')", code: "22P02"},
+			outcome{sql: "INSERT INTO cc VALUES (20, 1, '1')", code: "23514"},
+			outcome{sql: "INSERT INTO cc VALUES (6, 1, '1'), (6, 2, '1')", code: "23505"},
+			outcome{sql: "INSERT INTO cc VALUES (6, 1, '1'), (7, -2, '1')", code: "23514"},
+			outcome{sql: "INSERT INTO cc VALUES (6, 1, '1'), (7, 2, NULL), (8, 3, '3')"},
+			outcome{sql: "UPDATE cc SET s = '1' WHERE a = 7", code: "23505"},
+			outcome{sql: "UPDATE cc SET s = '0' WHERE a = 7", code: "23514"},
+			outcome{sql: "UPDATE cc SET a = a + 10 WHERE a = 8", code: "23514"},
+			outcome{sql: "UPDATE cc SET b = b - 1", code: "23514"},
+			outcome{sql: "UPDATE cc SET b = b + 1"},
+			outcome{sql: "SELECT * FROM cc ORDER BY a"},
+			outcome{sql: "CREATE TABLE cc2 (a bigint PRIMARY KEY, t timestamptz DEFAULT now() CHECK (t <= now()))"},
+			outcome{sql: "INSERT INTO cc2 VALUES (1, '2100-01-01 00:00:00+00')", code: "23514"},
+			outcome{sql: "INSERT INTO cc2 (a) VALUES (2)"},
+		)
+	})
+}

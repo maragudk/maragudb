@@ -61,6 +61,7 @@ The project is built in three sections. A section is done only when all of its a
   - After any committed history, every index holds exactly the entries derived from its table's rows. `INV-INDEX-CONSISTENT`
   - No committed state ever has two rows with equal non-NULL values in a UNIQUE index. `INV-UNIQUE`
 - The `UNIQUE`, `DEFAULT` (including expressions such as `now()`), and `CHECK` constraints.
+  - No committed row ever violates a CHECK constraint of its table. `INV-CHECK`
 - `FOREIGN KEY`, always enforced.
 
 ### Section 3: Queries

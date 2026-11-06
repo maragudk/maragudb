@@ -155,6 +155,17 @@ func TestUnsupported(t *testing.T) {
 		)
 	})
 
+	t.Run("UNS-CHECK other forms of CHECK", func(t *testing.T) {
+		verify.Covers(t, "a CHECK with NO INHERIT, NOT VALID, or NOT ENFORCED, or whose constant part fails, is rejected, and Postgres accepts the table", "UNS-CHECK")
+		rejects(t, create,
+			example{SQL: "CREATE TABLE dev2 (a bigint PRIMARY KEY CHECK (a > 0) NO INHERIT)"},
+			example{SQL: "CREATE TABLE dev2 (a bigint PRIMARY KEY, CHECK (a > 0) NOT VALID)"},
+			example{SQL: "CREATE TABLE dev2 (a bigint PRIMARY KEY CHECK (a > 0) NOT ENFORCED)"},
+			example{SQL: "CREATE TABLE dev2 (a bigint PRIMARY KEY CHECK (1 / 0 > a))"},
+			example{SQL: "CREATE TABLE dev2 (a bigint PRIMARY KEY, CHECK (a > 0 OR 2147483647 + 1 > 0))"},
+		)
+	})
+
 	t.Run("UNS-NO-PRIMARY-KEY tables without a primary key", func(t *testing.T) {
 		verify.Covers(t, "a table without a primary key is rejected, and Postgres accepts it", "UNS-NO-PRIMARY-KEY")
 		rejects(t, create, example{SQL: "CREATE TABLE dev2 (a bigint)"})

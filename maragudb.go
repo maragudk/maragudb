@@ -102,6 +102,10 @@ var (
 	// ErrDuplicateKey is an insert or update that would repeat a primary key or the values of a
 	// unique index, or a CREATE UNIQUE INDEX on rows that do.
 	ErrDuplicateKey = exec.ErrDuplicateKey
+	// ErrCheck is an insert or update of a row for which a CHECK constraint is false.
+	ErrCheck = exec.ErrCheck
+	// ErrDuplicateObject is a constraint whose name another constraint of its table has.
+	ErrDuplicateObject = exec.ErrDuplicateObject
 	// ErrNotNull is a NULL in a NOT NULL column.
 	ErrNotNull = exec.ErrNotNull
 	// ErrDivisionByZero is a division or modulo by zero.

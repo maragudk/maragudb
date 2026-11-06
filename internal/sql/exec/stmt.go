@@ -27,8 +27,8 @@ func (s *Session) createTable(ctx context.Context, st *ast.CreateTable) error {
 	if exists && st.IfNotExists {
 		return nil
 	}
-	if len(st.Checks) > 0 || len(st.ForeignKeys) > 0 {
-		return fmt.Errorf("%w: CHECK and FOREIGN KEY are not supported yet", ErrUnsupported)
+	if len(st.ForeignKeys) > 0 {
+		return fmt.Errorf("%w: FOREIGN KEY is not supported yet", ErrUnsupported)
 	}
 	t, err := newTable(st)
 	if err != nil {
@@ -49,10 +49,26 @@ func (s *Session) createTable(ctx context.Context, st *ast.CreateTable) error {
 			return err
 		}
 	}
+	// Postgres creates the constraints in this order, and each takes a name that the ones before
+	// it do not have.
+	var n names
+	if err := s.addChecks(ctx, t, st, &n); err != nil {
+		return err
+	}
+	if err := s.addNotNullNames(ctx, t, &n); err != nil {
+		return err
+	}
 	if err := s.putTable(t); err != nil {
 		return err
 	}
-	return s.addIndexes(ctx, t, cs)
+	if err := s.addIndexes(ctx, t, cs, &n); err != nil {
+		return err
+	}
+	t.Constraints = n.list
+	for _, name := range n.list {
+		s.kv.put(constraintKey(name, t.Name), []byte(t.Name))
+	}
+	return s.putTable(t)
 }
 
 // dropTable runs DROP TABLE, which drops the table's indexes too.
@@ -84,6 +100,9 @@ func (s *Session) dropTable(ctx context.Context, st *ast.DropTable) error {
 	}
 	if t.PrimaryKeyIndex != "" {
 		s.deleteRelation(t.PrimaryKeyIndex)
+	}
+	for _, name := range t.Constraints {
+		s.kv.del(constraintKey(name, t.Name))
 	}
 	s.deleteRelation(st.Name)
 	return nil
@@ -199,11 +218,16 @@ func (s *Session) insert(ctx context.Context, st *ast.Insert, params []value.Val
 }
 
 // writeRow checks constraints and writes row and its index entries, replacing old, the row at
-// oldKey, when given. As in Postgres, it checks NOT NULL, then the primary key, and then the
-// unique indexes.
+// oldKey, when given. As in Postgres, it checks NOT NULL, then the CHECK constraints, then the
+// primary key, and then the unique indexes.
 func (s *Session) writeRow(ctx context.Context, t *table, oldKey []byte, old, row []value.Value) error {
 	if err := t.checkRow(row); err != nil {
 		return err
+	}
+	if oldKey == nil || !s.opts.Mutations.CheckSkipUpdate {
+		if err := s.checkConstraints(t, row); err != nil {
+			return err
+		}
 	}
 	key := t.rowKey(row)
 	if oldKey == nil || string(key) != string(oldKey) {
@@ -506,6 +530,9 @@ func (s *Session) updateKeys(ctx context.Context, t *table, a access, f filter, 
 		m := move{oldKey: append([]byte{}, key...), old: old}
 		if m.row, m.err = assign(old); m.err == nil {
 			m.err = t.checkRow(m.row)
+		}
+		if m.err == nil && !s.opts.Mutations.CheckSkipUpdate {
+			m.err = s.checkConstraints(t, m.row)
 		}
 		failed = failed || m.err != nil
 		moves = append(moves, m)

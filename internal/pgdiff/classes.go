@@ -28,6 +28,10 @@ var ErrorClasses = []ErrorClass{
 	{Name: "out of range", Err: maragudb.ErrOutOfRange, Codes: []string{"22003"}},
 	{Name: "not null", Err: maragudb.ErrNotNull, Codes: []string{"23502"}},
 	{Name: "duplicate key", Err: maragudb.ErrDuplicateKey, Codes: []string{"23505"}},
+	// 23514 is check_violation.
+	{Name: "check", Err: maragudb.ErrCheck, Codes: []string{"23514"}},
+	// 42710 is duplicate_object.
+	{Name: "duplicate object", Err: maragudb.ErrDuplicateObject, Codes: []string{"42710"}},
 	{Name: "syntax", Err: maragudb.ErrSyntax, Codes: []string{"42601"}},
 	{Name: "no table", Err: maragudb.ErrNoTable, Codes: []string{"42P01"}},
 	{Name: "table exists", Err: maragudb.ErrTableExists, Codes: []string{"42P07"}},
