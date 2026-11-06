@@ -93,7 +93,7 @@ func DecimalNeg(a Value) Value {
 	switch {
 	case strings.HasPrefix(a.S, "-"):
 		return NewDecimal(a.S[1:])
-	case strings.Trim(a.S, "0.") == "":
+	case decimalZero(a.S):
 		return a
 	}
 	return NewDecimal("-" + a.S)
@@ -101,18 +101,20 @@ func DecimalNeg(a Value) Value {
 
 // DecimalAdd is a + b, exact, with the larger of their scales, as Postgres's add_var.
 func DecimalAdd(a, b Value) (Value, error) {
-	x, y := parseDecimal(a.S), parseDecimal(b.S)
-	scale := max(x.scale, y.scale)
-	n := x.rescale(scale)
-	return decimal{n: n.Add(n, y.rescale(scale)), scale: scale}.value()
+	return aligned(a, b, (*big.Int).Add)
 }
 
 // DecimalSub is a - b, exact, with the larger of their scales, as Postgres's sub_var.
 func DecimalSub(a, b Value) (Value, error) {
+	return aligned(a, b, (*big.Int).Sub)
+}
+
+// aligned applies f to a and b at the larger of their scales, which is the scale of the result.
+func aligned(a, b Value, f func(z, x, y *big.Int) *big.Int) (Value, error) {
 	x, y := parseDecimal(a.S), parseDecimal(b.S)
 	scale := max(x.scale, y.scale)
 	n := x.rescale(scale)
-	return decimal{n: n.Sub(n, y.rescale(scale)), scale: scale}.value()
+	return decimal{n: f(n, n, y.rescale(scale)), scale: scale}.value()
 }
 
 // DecimalMul is a * b, exact with the sum of their scales, rounded half away from zero to a
@@ -135,24 +137,10 @@ func DecimalQuo(a, b Value) (Value, error) {
 // DecimalRem is a % b, which is a - trunc(a / b) * b, exact, with the sign of a and the larger
 // of their scales, as Postgres's mod_var, or [ErrDivisionByZero].
 func DecimalRem(a, b Value) (Value, error) {
-	x, y := parseDecimal(a.S), parseDecimal(b.S)
-	if y.n.Sign() == 0 {
+	if decimalZero(b.S) {
 		return Value{}, ErrDivisionByZero
 	}
-	scale := max(x.scale, y.scale)
-	n := x.rescale(scale)
-	return decimal{n: n.Rem(n, y.rescale(scale)), scale: scale}.value()
-}
-
-// DecimalDiv is the quotient of two integers as numeric, as Postgres's numeric division
-// computes it: rounded half away from zero to the scale that select_div_scale picks, which
-// gives at least 16 significant digits. The divisor must not be zero.
-func DecimalDiv(dividend, divisor *big.Int) Value {
-	v, err := quotient(decimal{n: dividend}, decimal{n: divisor})
-	if err != nil {
-		panic(fmt.Sprintf("value: %v / %v: %v", dividend, divisor, err))
-	}
-	return v
+	return aligned(a, b, (*big.Int).Rem)
 }
 
 // quotient x / y as Postgres's numeric_div: rounded half away from zero to the scale of
@@ -213,7 +201,7 @@ func decimalText(digits string, scale int, negative bool) string {
 		digits = strings.Repeat("0", scale-len(digits)+1) + digits
 	}
 	var b strings.Builder
-	if negative && strings.Trim(digits, "0") != "" {
+	if negative && !decimalZero(digits) {
 		b.WriteByte(decimalSignMinus)
 	}
 	b.WriteString(digits[:len(digits)-scale])
@@ -222,6 +210,12 @@ func decimalText(digits string, scale int, negative bool) string {
 		b.WriteString(digits[len(digits)-scale:])
 	}
 	return b.String()
+}
+
+// decimalZero reports whether the text of a numeric, or its digits, is zero.
+func decimalZero(s string) bool {
+	_, whole, frac := decimalParts(s)
+	return whole == "" && frac == ""
 }
 
 // decimalParts of the text of a numeric: its sign, its integer digits without leading zeros,
@@ -281,7 +275,7 @@ func DecimalKey(s string) string {
 // numeric that is not.
 func DecimalToFloat(s string) (float64, error) {
 	f, err := strconv.ParseFloat(s, 64)
-	if err != nil || math.IsInf(f, 0) || f == 0 && strings.Trim(s, "-0.") != "" {
+	if err != nil || math.IsInf(f, 0) || f == 0 && !decimalZero(s) {
 		return 0, fmt.Errorf("%w: %q is out of range for type double precision", ErrOutOfRange, s)
 	}
 	return f, nil

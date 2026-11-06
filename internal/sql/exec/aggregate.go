@@ -435,7 +435,7 @@ func (s *aggState) result(a *aggregate) (value.Value, error) {
 		case a.typ == value.Float:
 			return s.floatResult(a)
 		case a.name == "avg":
-			return value.DecimalDiv(s.sum, big.NewInt(s.n)), nil
+			return value.DecimalQuo(value.DecimalFromBig(s.sum), value.DecimalFromInt(s.n))
 		case a.typ == value.Int:
 			return value.NewInt(s.sum.Int64()), nil
 		}

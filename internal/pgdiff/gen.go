@@ -1739,6 +1739,10 @@ func (g *gen) numericArithmetic(e ast.Expr, s scope) (ast.Expr, value.Type) {
 		other = &ast.Call{Name: "count", Star: true}
 	case 8:
 		other, t = g.literal(value.Float), value.Float
+		if lit, ok := other.(*ast.Literal); ok && lit.Value.Type == value.Numeric {
+			// A double precision, which g.literal writes as a numeric literal now and then.
+			other = &ast.Cast{Expr: lit, Type: value.Float, Style: ast.CastColons}
+		}
 	default:
 		other = &ast.Literal{Value: value.NewNumeric(pick(g, []string{"1.5", "0.25", "1e3"}))}
 	}

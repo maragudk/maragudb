@@ -14,7 +14,7 @@ import (
 	"maragu.dev/maragudb/internal/sql/value"
 )
 
-func TestDecimalDiv(t *testing.T) {
+func TestDecimalQuo_integers(t *testing.T) {
 	// The quotients are Postgres 18's, of n::numeric / d::numeric.
 	tests := []struct{ n, d, want string }{
 		{"5", "3", "1.6666666666666667"},
@@ -42,7 +42,7 @@ func TestDecimalDiv(t *testing.T) {
 		t.Run(test.n+"/"+test.d, func(t *testing.T) {
 			n, _ := new(big.Int).SetString(test.n, 10)
 			d, _ := new(big.Int).SetString(test.d, 10)
-			is.Equal(t, test.want, value.Format(value.DecimalDiv(n, d)))
+			is.Equal(t, test.want, value.Format(must(value.DecimalQuo(value.DecimalFromBig(n), value.DecimalFromBig(d)))))
 		})
 	}
 
@@ -357,7 +357,7 @@ func TestCompare_decimal(t *testing.T) {
 			}
 			a, b := draw()
 			c, d := draw()
-			x, y := value.DecimalDiv(a, b), value.DecimalDiv(c, d)
+			x, y := must(value.DecimalQuo(value.DecimalFromBig(a), value.DecimalFromBig(b))), must(value.DecimalQuo(value.DecimalFromBig(c), value.DecimalFromBig(d)))
 			ht.Note(fmt.Sprintf("%v/%v = %s, %v/%v = %s", a, b, x.S, c, d, y.S))
 			for _, q := range []struct {
 				n, d *big.Int
