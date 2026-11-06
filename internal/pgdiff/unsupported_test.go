@@ -1,13 +1,16 @@
 package pgdiff_test
 
 import (
+	"context"
 	"database/sql"
 	"fmt"
+	"strings"
 	"testing"
 
 	"maragu.dev/is"
 
 	"maragu.dev/maragudb"
+	"maragu.dev/maragudb/internal/pgdiff"
 	"maragu.dev/maragudb/internal/verify"
 )
 
@@ -280,4 +283,61 @@ func TestUnsupported(t *testing.T) {
 			example{SQL: "UPDATE dev SET i = i + 1", Setup: []string{rows}},
 		)
 	})
+}
+
+// TestDifferences has one test per remaining difference from Postgres in /docs/unsupported.md.
+// Each runs the example of the difference on both databases.
+func TestDifferences(t *testing.T) {
+	t.Run("DEV-20 Postgres with sequential scans can fail on a row that the primary key does not select", func(t *testing.T) {
+		verify.Covers(t, "on a small table with statistics, Postgres in its default configuration scans the whole table and fails on a row that the primary key condition does not select, maragudb evaluates the condition only on the selected rows and succeeds, and Postgres with enable_seqscan=off gives the same result as maragudb", "DEV-20")
+		b := newBoth(t, "CREATE TABLE dev (id bigint PRIMARY KEY, b bigint)")
+		b.exec(t, "INSERT INTO dev VALUES (1, 100), (2, 50), (9, -9223372036854775808)")
+		const update = "UPDATE dev SET b = b - 10 WHERE id IN (1, 2, 3, 4, 5) AND b - 10 >= 0"
+
+		res, err := b.m.ExecContext(t.Context(), update)
+		is.NotError(t, err, "maragudb evaluates b - 10 only on the rows 1 and 2")
+		n, err := res.RowsAffected()
+		is.NotError(t, err)
+		is.Equal(t, int64(2), n)
+
+		conn, err := b.pg.Conn(t.Context())
+		is.NotError(t, err)
+		t.Cleanup(func() { _ = conn.Close() })
+		for _, q := range []string{"SET enable_seqscan = on", "ANALYZE dev"} {
+			_, err := conn.ExecContext(t.Context(), q)
+			is.NotError(t, err, q)
+		}
+		_, err = conn.ExecContext(t.Context(), update)
+		is.Equal(t, "22003", pgdiff.SQLState(err), "Postgres scans the whole table and evaluates b - 10 first, also on row 9")
+
+		_, err = conn.ExecContext(t.Context(), "SET enable_seqscan = off")
+		is.NotError(t, err)
+		res, err = conn.ExecContext(t.Context(), update)
+		is.NotError(t, err, "with sequential scans off, Postgres scans the primary key index")
+		n, err = res.RowsAffected()
+		is.NotError(t, err)
+		is.Equal(t, int64(2), n)
+
+		var states []string
+		for _, q := range []querier{b.m, conn} {
+			rows, err := q.QueryContext(t.Context(), "SELECT id, b FROM dev ORDER BY id")
+			is.NotError(t, err)
+			var state []string
+			for rows.Next() {
+				var id, balance int64
+				is.NotError(t, rows.Scan(&id, &balance))
+				state = append(state, fmt.Sprint(id, "=", balance))
+			}
+			is.NotError(t, rows.Err())
+			_ = rows.Close()
+			states = append(states, strings.Join(state, " "))
+		}
+		is.Equal(t, "1=90 2=40 9=-9223372036854775808", states[0])
+		is.Equal(t, states[0], states[1], "both databases end in the same state")
+	})
+}
+
+// querier is a database or a connection.
+type querier interface {
+	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }

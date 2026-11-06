@@ -1,8 +1,8 @@
 # Unsupported Postgres SQL
 
-maragudb accepts a strict subset of Postgres 18 SQL. Every statement that it accepts gives the same result as in Postgres. When it cannot promise that, it rejects the statement with `maragudb.ErrUnsupported` (SQLSTATE 0A000, feature_not_supported) before it changes anything. The error message says what is unsupported and, where possible, what to write instead.
+maragudb accepts a strict subset of Postgres 18 SQL. Every statement that it accepts gives the same result as in Postgres, except for the differences that "Remaining differences" lists. When it cannot promise that, it rejects the statement with `maragudb.ErrUnsupported` (SQLSTATE 0A000, feature_not_supported) before it changes anything. The error message says what is unsupported and, where possible, what to write instead.
 
-This document lists every class of statement that maragudb rejects. Each class has a stable `UNS-` ID and its own test in `/internal/pgdiff/unsupported_test.go`. The test runs examples of the class on both databases. It asserts that Postgres accepts them and that maragudb rejects them, so the list cannot drift from the behavior.
+This document lists every class of statement that maragudb rejects, and the remaining differences from Postgres. Each class has a stable `UNS-` ID and its own test in `/internal/pgdiff/unsupported_test.go`. The test runs examples of the class on both databases. It asserts that Postgres accepts them and that maragudb rejects them, so the list cannot drift from the behavior.
 
 The differential harness in `/internal/pgdiff` runs every generated statement on maragudb first. If maragudb rejects the statement, the harness skips it on Postgres and counts it as rejected. If not, the harness runs the same text on Postgres and compares the results.
 
@@ -34,7 +34,7 @@ One plan choice maragudb does follow: when a condition of the `WHERE` clause can
 - a boolean key column, or `NOT` of one
 - an equality of a key column with a constant that follows from the equalities of the clause, such as `id = 5` from `id = n AND n = 5`
 
-Other conditions on key columns, such as an `OR` of comparisons, a `LIKE`, `<>`, or a key column in an expression or cast to another type, are evaluated on every row that the index conditions select, as in Postgres's plan they may be.
+Other conditions on key columns, such as an `OR` of comparisons, a `LIKE`, `<>`, or a key column in an expression or cast to another type, are evaluated on every row that the index conditions select, as in Postgres's plan they may be. Postgres in its default configuration can also scan the whole table, which DEV-20 describes.
 
 - **LIMIT and OFFSET without a total order.** `UNS-LIMIT-ORDER` Which rows Postgres returns under `LIMIT` or `OFFSET` depends on its plan unless `ORDER BY` sorts by every primary key column. Add the primary key columns to `ORDER BY`.
 - **LIMIT and OFFSET with an expression that can fail.** `UNS-PLAN-DEPENDENT-LIMIT` Under a `LIMIT`, an index scan stops early and a sequential scan with a sort does not, so how many rows Postgres evaluates an expression on depends on its plan. maragudb rejects `LIMIT` and `OFFSET` when an output, `ORDER BY`, or `WHERE` expression can fail at run time, such as an addition, which can overflow, or a cast of text. Select the rows first, and compute the expression on the result.
@@ -50,9 +50,11 @@ When different rows of a statement fail for different reasons, Postgres reports 
 
 ## Remaining differences
 
-None. maragudb has no known difference from Postgres for the statements it accepts.
+For the statements it accepts, maragudb has one known difference from Postgres. It has a `DEV-` ID and its own test in `/internal/pgdiff/unsupported_test.go`, which runs the example on both databases.
 
-The deviations of the former own SQL flavor, DEV-1 to DEV-19 in its deviations document, are gone:
+- **A condition that can fail on a row that the primary key does not select.** `DEV-20` maragudb evaluates the conditions of a `WHERE` clause only on the rows that its primary key conditions select, as Postgres does when it scans the primary key index. Postgres in its default configuration can scan the whole table instead, for example when the table is small, and then it evaluates the conditions on every row. When a condition fails on a row that the key does not select, Postgres fails and maragudb does not. On a table `acct` with the rows `(1, 100)`, `(2, 50)`, and `(9, -9223372036854775808)`, after `ANALYZE`, Postgres fails `UPDATE acct SET b = b - 10 WHERE id IN (1, 2, 3, 4, 5) AND b - 10 >= 0` with bigint out of range on the row 9, and maragudb updates the rows 1 and 2. With `enable_seqscan = off`, Postgres updates the rows 1 and 2 too. The differential harnesses run Postgres with that setting. So here maragudb is more lenient than Postgres.
+
+The deviations of the former own SQL flavor, DEV-1 to DEV-19 in its deviations document, are gone, and their IDs are not reused:
 
 | Former deviation | Now |
 |---|---|

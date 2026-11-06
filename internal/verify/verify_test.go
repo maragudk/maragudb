@@ -324,7 +324,7 @@ func TestCatalog_IDs(t *testing.T) {
 	t.Run("has every requirement, mutant, and state", func(t *testing.T) {
 		_, c, _ := load(t)
 		ids := c.IDs()
-		for _, id := range []string{"AC-1.5", "INV-STRICT-SERIALIZABLE", "INV-PG-SUBSET", "UNS-NUMERIC", "MUT-COMMIT-WITHOUT-CAS", string(reach.LeaseOverlap)} {
+		for _, id := range []string{"AC-1.5", "INV-STRICT-SERIALIZABLE", "INV-PG-SUBSET", "UNS-NUMERIC", "DEV-20", "MUT-COMMIT-WITHOUT-CAS", string(reach.LeaseOverlap)} {
 			is.True(t, ids[id], id)
 		}
 		var kinds []string
@@ -333,7 +333,7 @@ func TestCatalog_IDs(t *testing.T) {
 				kinds = append(kinds, r.Kind())
 			}
 		}
-		is.EqualSlice(t, []string{"INV", "AC", "UNS"}, kinds)
+		is.EqualSlice(t, []string{"INV", "AC", "UNS", "DEV"}, kinds)
 	})
 }
 
