@@ -682,8 +682,8 @@ func TestRequestBudgets(t *testing.T) {
 			mustExec(t, cold, "INSERT INTO t VALUES ($1, $2, $3)", n/2, "back", 0.5)
 			d = stats(t, cold).Sub(before)
 			t.Logf("n=%d cold insert: %+v", n, d)
-			verify.CheckBudget(t, "SQL autocommit INSERT, cold: PUTs", n, d.Put + d.PutConditional, 2)
-			verify.CheckBudget(t, "SQL autocommit INSERT, cold: GETs", n, d.Get, int64(2 * maxDepth(n)))
+			verify.CheckBudget(t, "SQL autocommit INSERT, cold: PUTs", n, d.Put+d.PutConditional, 2)
+			verify.CheckBudget(t, "SQL autocommit INSERT, cold: GETs", n, d.Get, int64(2*maxDepth(n)))
 			is.Equal(t, maragudb.Requests{Get: d.Get, GetConditional: 1, Put: 1, PutConditional: 1}, d)
 			is.True(t, d.Get <= int64(2*maxDepth(n)), fmt.Sprintf("n=%d: %d GETs, max depth %d", n, d.Get, maxDepth(n)))
 		}
@@ -716,7 +716,7 @@ func TestRequestBudgets(t *testing.T) {
 			is.Equal(t, fmt.Sprintf("%q", fmt.Sprint("name-", n/2)), queryRows(t, cold, "SELECT name FROM t WHERE id = $1", n/2))
 			d := stats(t, cold).Sub(before)
 			t.Logf("n=%d cold select: %+v", n, d)
-			verify.CheckBudget(t, "SQL SELECT by key, cold: GETs", n, d.Get, int64(2 * maxDepth(n)))
+			verify.CheckBudget(t, "SQL SELECT by key, cold: GETs", n, d.Get, int64(2*maxDepth(n)))
 			// The table definition and the row are each found by one descent of the tree,
 			// one block per level.
 			is.True(t, d.Get <= int64(2*maxDepth(n)), fmt.Sprintf("n=%d: %d GETs, max depth %d", n, d.Get, maxDepth(n)))

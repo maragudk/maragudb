@@ -169,9 +169,9 @@ func Generate(src Source) Case {
 	for range g.draw(0, 2) {
 		c.Statements = append(c.Statements, g.createIndex())
 	}
-	// Two of the kinds of statements are joins, so that the others are as frequent as they were
-	// before there were joins.
-	n := g.draw(1, 8)
+	// Two of the kinds of statements are joins and two are grouped, so that the others are as
+	// frequent as they were before there were either.
+	n := g.draw(1, 10)
 	// A third of the cases run some statements in an explicit transaction, which ends with a
 	// COMMIT, a ROLLBACK, or not at all.
 	begin, end := -1, -1
@@ -964,7 +964,7 @@ func (g *gen) statement() ast.Statement {
 		}
 		return g.createIndex()
 	}
-	switch g.draw(0, 7) {
+	switch g.draw(0, 9) {
 	case 0:
 		return g.insert(g.draw(1, 3))
 	case 1:
@@ -975,6 +975,8 @@ func (g *gen) statement() ast.Statement {
 		return d
 	case 3, 4:
 		return g.joinSelect()
+	case 5, 6:
+		return g.groupSelect()
 	default:
 		return g.selectStmt()
 	}
@@ -1133,8 +1135,14 @@ func shadowed(s *ast.Select, k string) bool {
 
 // FullyOrdered reports whether the ORDER BY of s determines the row order completely, which
 // is when every primary key column is a sort key, referenced by a name that no output column
-// shadows, or by the position of an output column that is the key column itself.
+// shadows, or by the position of an output column that is the key column itself. A grouped
+// SELECT is fully ordered when it has one group at most, without GROUP BY, or when every GROUP
+// BY item is a sort key, as the same expression or by the position of an output column that is
+// it.
 func FullyOrdered(s *ast.Select, pk []string) bool {
+	if isGrouped(s) {
+		return groupsOrdered(s)
+	}
 	if len(s.OrderBy) == 0 {
 		return false
 	}
@@ -1269,69 +1277,7 @@ func (g *gen) aliased(exprs ...*ast.Expr) string {
 // join plan.
 func (g *gen) joinSelect() *ast.Select {
 	s := &ast.Select{Distinct: g.rarely(4)}
-	refs := []ref{{name: "x", g: g}}
-	other := ref{name: "y", g: g}
-	if g.parent != nil && g.bool() {
-		other = ref{name: parentName, g: g.parent}
-		if g.bool() {
-			other.name = "z"
-		}
-	}
-	refs = append(refs, other)
-	table := func(r ref) ast.TableExpr {
-		t := &ast.TableRef{Name: r.g.table.Name}
-		if r.name != t.Name {
-			t.Alias = r.name
-		}
-		return t
-	}
-	kind := pick(g, []ast.JoinKind{ast.JoinInner, ast.JoinInner, ast.JoinLeft, ast.JoinLeft, ast.JoinCross})
-	var conds []ast.Expr
-	var from ast.TableExpr
-	switch g.draw(0, 5) {
-	case 0:
-		// A list of tables, joined by WHERE.
-		s.From = []ast.TableExpr{table(refs[0]), table(refs[1])}
-		conds = append(conds, g.joinCondition(refs[0], refs[1]))
-	case 1:
-		j := &ast.Join{Kind: pick(g, []ast.JoinKind{ast.JoinInner, ast.JoinLeft}), Left: table(refs[0]), Right: table(refs[1])}
-		// NATURAL would compare the column whose default is now(), which differs between the
-		// databases.
-		if g.bool() && g.nowColumn == "" {
-			j.Natural = true
-		} else {
-			j.Using = g.usingColumns(refs[0], refs[1])
-		}
-		from = j
-	default:
-		j := &ast.Join{Kind: kind, Left: table(refs[0]), Right: table(refs[1])}
-		if kind != ast.JoinCross {
-			j.On = g.joinCondition(refs[0], refs[1])
-		}
-		from = j
-	}
-	if from != nil && g.rarely(3) {
-		// A third table, which a join of two references from the right, in parentheses, or which
-		// joins the two from the left.
-		third := ref{name: "w", g: g}
-		if g.parent != nil && other.g != g.parent && g.bool() {
-			third = ref{name: parentName, g: g.parent}
-		}
-		refs = append(refs, third)
-		j := &ast.Join{Kind: pick(g, []ast.JoinKind{ast.JoinInner, ast.JoinLeft})}
-		if g.bool() {
-			inner := from.(*ast.Join)
-			j.Left, j.Right = table(third), inner
-			j.On = g.joinCondition(third, pick(g, refs[:2]))
-		} else {
-			j.Left, j.Right = from, table(third)
-			j.On = g.joinCondition(pick(g, refs[:2]), third)
-		}
-		from = j
-	}
-	if from != nil {
-		s.From = []ast.TableExpr{from}
-	}
+	refs, other, conds := g.joinFrom(s)
 	// Under a LIMIT, an expression that can fail is rejected, so a limited join has none.
 	limited := g.rarely(6)
 	sc := scope{columns: true, refs: refs, safe: limited}
@@ -1404,6 +1350,75 @@ func (g *gen) joinSelect() *ast.Select {
 		s.Limit = &ast.Literal{Value: value.NewInt4(int32(g.draw(0, 4)))}
 	}
 	return s
+}
+
+// joinFrom sets the FROM of s to a join of the table with itself or with the referenced table,
+// and returns the tables, the other table of the first join, and conditions on them for WHERE.
+func (g *gen) joinFrom(s *ast.Select) ([]ref, ref, []ast.Expr) {
+	refs := []ref{{name: "x", g: g}}
+	other := ref{name: "y", g: g}
+	if g.parent != nil && g.bool() {
+		other = ref{name: parentName, g: g.parent}
+		if g.bool() {
+			other.name = "z"
+		}
+	}
+	refs = append(refs, other)
+	table := func(r ref) ast.TableExpr {
+		t := &ast.TableRef{Name: r.g.table.Name}
+		if r.name != t.Name {
+			t.Alias = r.name
+		}
+		return t
+	}
+	kind := pick(g, []ast.JoinKind{ast.JoinInner, ast.JoinInner, ast.JoinLeft, ast.JoinLeft, ast.JoinCross})
+	var conds []ast.Expr
+	var from ast.TableExpr
+	switch g.draw(0, 5) {
+	case 0:
+		// A list of tables, joined by WHERE.
+		s.From = []ast.TableExpr{table(refs[0]), table(refs[1])}
+		conds = append(conds, g.joinCondition(refs[0], refs[1]))
+	case 1:
+		j := &ast.Join{Kind: pick(g, []ast.JoinKind{ast.JoinInner, ast.JoinLeft}), Left: table(refs[0]), Right: table(refs[1])}
+		// NATURAL would compare the column whose default is now(), which differs between the
+		// databases.
+		if g.bool() && g.nowColumn == "" {
+			j.Natural = true
+		} else {
+			j.Using = g.usingColumns(refs[0], refs[1])
+		}
+		from = j
+	default:
+		j := &ast.Join{Kind: kind, Left: table(refs[0]), Right: table(refs[1])}
+		if kind != ast.JoinCross {
+			j.On = g.joinCondition(refs[0], refs[1])
+		}
+		from = j
+	}
+	if from != nil && g.rarely(3) {
+		// A third table, which a join of two references from the right, in parentheses, or which
+		// joins the two from the left.
+		third := ref{name: "w", g: g}
+		if g.parent != nil && other.g != g.parent && g.bool() {
+			third = ref{name: parentName, g: g.parent}
+		}
+		refs = append(refs, third)
+		j := &ast.Join{Kind: pick(g, []ast.JoinKind{ast.JoinInner, ast.JoinLeft})}
+		if g.bool() {
+			inner := from.(*ast.Join)
+			j.Left, j.Right = table(third), inner
+			j.On = g.joinCondition(third, pick(g, refs[:2]))
+		} else {
+			j.Left, j.Right = from, table(third)
+			j.On = g.joinCondition(pick(g, refs[:2]), third)
+		}
+		from = j
+	}
+	if from != nil {
+		s.From = []ast.TableExpr{from}
+	}
+	return refs, other, conds
 }
 
 // join the conditions with AND.
@@ -1504,4 +1519,300 @@ func (g *gen) usingColumns(l, r ref) []string {
 		}
 	}
 	return cols
+}
+
+// groupSelect is a grouped SELECT on the table or on a join: GROUP BY columns, expressions, or
+// the primary key, aggregates in the output, HAVING, and ORDER BY, with DISTINCT inside them,
+// and now and then arguments, GROUP BY expressions, and HAVING conditions that can fail, a
+// column outside the GROUP BY, and a LIMIT with an ORDER BY on every GROUP BY expression.
+func (g *gen) groupSelect() *ast.Select {
+	s := &ast.Select{}
+	var refs []ref
+	var conds []ast.Expr
+	if g.rarely(3) {
+		refs, _, conds = g.joinFrom(s)
+	} else {
+		s.From = []ast.TableExpr{&ast.TableRef{Name: g.table.Name}}
+		if w := g.where(scope{columns: true}); w != nil {
+			conds = append(conds, w)
+		}
+	}
+	limited := g.rarely(6)
+	sc := scope{columns: true, refs: refs, safe: limited}
+	var keys []ast.Expr
+	switch g.draw(0, 4) {
+	case 0:
+	case 1:
+		// The primary key of a table, which allows its other columns.
+		r := ref{g: g}
+		if len(refs) > 0 {
+			r = pick(g, refs)
+		}
+		for _, k := range r.g.table.PrimaryKey {
+			keys = append(keys, &ast.ColumnRef{Table: r.name, Name: k})
+		}
+	default:
+		for range g.draw(1, 2) {
+			t := g.anyTypeIn(sc)
+			if g.hasColumn(t, sc) && !g.rarely(3) {
+				keys = append(keys, g.columnOfType(t, sc))
+			} else {
+				keys = append(keys, g.expr(t, sc, 2))
+			}
+		}
+	}
+	for i := range g.draw(1, 3) {
+		var item ast.SelectItem
+		switch {
+		case len(keys) > 0 && g.draw(0, 2) == 0:
+			item.Expr = pick(g, keys)
+		case g.rarely(20):
+			// A column that is not grouped, which is an error unless the GROUP BY has the primary
+			// key of its table.
+			item.Expr = g.columnOfTypeOr(g.anyTypeIn(sc), sc)
+		default:
+			item.Expr, _ = g.aggregate(sc)
+		}
+		if g.bool() {
+			item.Alias = fmt.Sprint("a", i)
+		}
+		s.Items = append(s.Items, item)
+	}
+	if len(keys) > 0 && g.rarely(3) {
+		// A GROUP BY item by the position of an output column that is a key.
+		for i, item := range s.Items {
+			if j := slices.IndexFunc(keys, func(k ast.Expr) bool { return k == item.Expr }); j >= 0 && item.Alias == "" {
+				keys[j] = &ast.Literal{Value: value.NewInt4(int32(i + 1))}
+				break
+			}
+		}
+	}
+	s.GroupBy = keys
+	if g.rarely(3) {
+		s.Having = g.havingCondition(sc, keys)
+	}
+	if !limited && g.rarely(6) {
+		conds = append(conds, g.failing(sc))
+	}
+	if len(conds) > 0 {
+		s.Where = join(conds)
+	}
+	if limited {
+		// The order of the groups is fully determined by an ORDER BY on every GROUP BY item.
+		for _, k := range keys {
+			s.OrderBy = append(s.OrderBy, ast.OrderItem{Expr: k, Desc: g.bool(), Nulls: ast.NullsOrder(g.draw(0, 2))})
+		}
+		if g.bool() {
+			s.Limit = &ast.Literal{Value: value.NewInt4(int32(g.draw(0, 3)))}
+		} else {
+			s.Offset = &ast.Literal{Value: value.NewInt4(int32(g.draw(0, 2)))}
+		}
+	} else {
+		for range g.draw(0, 2) {
+			o := ast.OrderItem{Desc: g.bool(), Nulls: ast.NullsOrder(g.draw(0, 2))}
+			switch {
+			case g.bool():
+				o.Expr = &ast.Literal{Value: value.NewInt4(int32(g.draw(1, len(s.Items))))}
+			case len(keys) > 0 && g.bool():
+				o.Expr = pick(g, keys)
+			default:
+				o.Expr, _ = g.aggregate(sc)
+			}
+			s.OrderBy = append(s.OrderBy, o)
+		}
+		s.Distinct = g.rarely(6)
+	}
+	if len(refs) == 0 {
+		exprs := []*ast.Expr{&s.Where, &s.Having}
+		for i := range s.Items {
+			exprs = append(exprs, &s.Items[i].Expr)
+		}
+		for i := range s.GroupBy {
+			exprs = append(exprs, &s.GroupBy[i])
+		}
+		for i := range s.OrderBy {
+			exprs = append(exprs, &s.OrderBy[i].Expr)
+		}
+		s.From[0].(*ast.TableRef).Alias = g.aliased(exprs...)
+	}
+	return s
+}
+
+// aggregate is an expression with an aggregate of the columns of the scope: COUNT(*), or COUNT,
+// SUM, AVG, MIN, or MAX of a column or an expression, with DISTINCT now and then, often in an
+// expression of its own. It returns the expression and its type, where the numeric result of
+// SUM and AVG of bigint is [value.Numeric].
+func (g *gen) aggregate(s scope) (ast.Expr, value.Type) {
+	name := pick(g, []string{"count", "count", "sum", "sum", "avg", "min", "max"})
+	call := &ast.Call{Name: name, Distinct: g.rarely(4)}
+	var t value.Type
+	switch name {
+	case "count":
+		if g.bool() {
+			return &ast.Call{Name: "count", Star: true}, value.Int
+		}
+		call.Args = []ast.Expr{g.expr(g.anyTypeIn(s), s, 2)}
+		t = value.Int
+	case "sum", "avg":
+		at := pick(g, []value.Type{value.Int, value.Float})
+		if !g.hasColumn(at, s) {
+			at = value.Int
+		}
+		var arg ast.Expr
+		switch {
+		case !s.safe && at == value.Int && g.rarely(6):
+			// An argument that fails on some rows.
+			arg = &ast.Binary{Op: ast.Div, Left: &ast.Literal{Value: value.NewInt4(10)}, Right: g.columnOfTypeOr(value.Int, s)}
+		case g.hasColumn(at, s) && !g.rarely(4):
+			arg = g.columnOfType(at, s)
+		default:
+			arg = g.expr(at, s, 2)
+		}
+		call.Args = []ast.Expr{arg}
+		t = at
+		if at == value.Int {
+			t = value.Numeric
+		}
+	default:
+		var types []value.Type
+		for _, ty := range allTypes {
+			if ty != value.Bool && g.hasColumn(ty, s) {
+				types = append(types, ty)
+			}
+		}
+		t = value.Int
+		if len(types) > 0 {
+			t = pick(g, types)
+		}
+		if g.hasColumn(t, s) && !g.rarely(4) {
+			call.Args = []ast.Expr{g.columnOfType(t, s)}
+		} else {
+			call.Args = []ast.Expr{g.expr(t, s, 2)}
+		}
+	}
+	var e ast.Expr = call
+	switch g.draw(0, 7) {
+	case 0:
+		if t == value.Numeric || t == value.Int {
+			return &ast.Call{Name: "coalesce", Args: []ast.Expr{e, &ast.Literal{Value: value.NewInt4(int32(g.draw(-2, 2)))}}}, t
+		}
+	case 1:
+		if t == value.Numeric || t == value.Float || t == value.Int {
+			return &ast.Cast{Expr: e, Type: pick(g, []value.Type{value.Float, value.Int, value.String}), Style: ast.CastColons}, value.Float
+		}
+	case 2:
+		lt := t
+		if t == value.Numeric {
+			lt = value.Int
+		}
+		return &ast.Binary{Op: pick(g, []ast.BinaryOp{ast.Lt, ast.Ge, ast.Eq, ast.Ne}), Left: e, Right: g.literal(lt)}, value.Bool
+	case 3:
+		if t == value.Int && !s.safe {
+			return &ast.Binary{Op: pick(g, []ast.BinaryOp{ast.Add, ast.Mul, ast.Div}), Left: e, Right: g.literal(value.Int)}, value.Int
+		}
+	case 4:
+		if t == value.Numeric && g.rarely(4) {
+			// Arithmetic on numeric, which maragudb rejects.
+			return &ast.Binary{Op: ast.Add, Left: e, Right: &ast.Literal{Value: value.NewInt4(1)}}, t
+		}
+	}
+	return e, t
+}
+
+// columnOfTypeOr is a column of type t, or a literal of it when the scope has none.
+func (g *gen) columnOfTypeOr(t value.Type, s scope) ast.Expr {
+	if g.hasColumn(t, s) {
+		return g.columnOfType(t, s)
+	}
+	return g.literal(t)
+}
+
+// havingCondition is a condition of HAVING: a comparison of an aggregate, a condition on a
+// GROUP BY expression, which Postgres moves into WHERE, or now and then one that fails on some
+// groups.
+func (g *gen) havingCondition(s scope, keys []ast.Expr) ast.Expr {
+	switch {
+	case !s.safe && g.rarely(5):
+		divisor := ast.Expr(&ast.Binary{Op: ast.Sub, Left: &ast.Call{Name: "count", Star: true}, Right: &ast.Literal{Value: value.NewInt4(int32(g.draw(1, 2)))}})
+		if ref, ok := pickColumnKey(g, keys); ok && g.bool() {
+			divisor = ref
+		}
+		return &ast.Binary{Op: ast.Gt, Left: &ast.Binary{Op: ast.Div, Left: &ast.Literal{Value: value.NewInt4(10)}, Right: divisor}, Right: &ast.Literal{Value: value.NewInt4(0)}}
+	case len(keys) > 0 && g.rarely(3):
+		if k, ok := keys[0].(*ast.ColumnRef); ok {
+			return &ast.IsNull{Expr: k, Not: g.bool()}
+		}
+	}
+	e, t := g.aggregate(s)
+	if t == value.Bool {
+		return e
+	}
+	if t == value.Numeric {
+		t = value.Int
+	}
+	return &ast.Binary{Op: pick(g, []ast.BinaryOp{ast.Gt, ast.Le, ast.Ne}), Left: e, Right: g.literal(t)}
+}
+
+// pickColumnKey is a GROUP BY item that is a column, if there is one.
+func pickColumnKey(g *gen, keys []ast.Expr) (ast.Expr, bool) {
+	for _, k := range keys {
+		if _, ok := k.(*ast.ColumnRef); ok {
+			return k, true
+		}
+	}
+	return nil, false
+}
+
+// isGrouped reports whether a SELECT is grouped: by GROUP BY, HAVING, or an aggregate in its
+// output or ORDER BY.
+func isGrouped(s *ast.Select) bool {
+	if len(s.GroupBy) > 0 || s.Having != nil {
+		return true
+	}
+	for _, item := range s.Items {
+		if !item.Star && ast.HasAggregate(item.Expr) {
+			return true
+		}
+	}
+	return slices.ContainsFunc(s.OrderBy, func(o ast.OrderItem) bool { return ast.HasAggregate(o.Expr) })
+}
+
+// groupsOrdered reports whether the groups of a grouped SELECT are in one order in every plan.
+func groupsOrdered(s *ast.Select) bool {
+	if len(s.GroupBy) == 0 {
+		return true
+	}
+	// output is the text of the expression of output column i, or "".
+	output := func(i int) string {
+		if i < 0 || i >= len(s.Items) || starBefore(s, i) {
+			return ""
+		}
+		return ast.RenderExpr(s.Items[i].Expr)
+	}
+	alias := func(name string) int {
+		return slices.IndexFunc(s.Items, func(item ast.SelectItem) bool { return !item.Star && item.Alias == name })
+	}
+	var sorted []string
+	for _, o := range s.OrderBy {
+		text := ast.RenderExpr(o.Expr)
+		if p, ok := orderPosition(o.Expr); ok {
+			text = output(p)
+		} else if ref, ok := o.Expr.(*ast.ColumnRef); ok && ref.Table == "" && alias(ref.Name) >= 0 {
+			text = output(alias(ref.Name))
+		}
+		sorted = append(sorted, text)
+	}
+	for _, k := range s.GroupBy {
+		text := ast.RenderExpr(k)
+		if p, ok := orderPosition(k); ok {
+			text = output(p)
+		} else if ref, ok := k.(*ast.ColumnRef); ok && ref.Table == "" && alias(ref.Name) >= 0 {
+			// A name in GROUP BY is a column of FROM before it is an output column's.
+			return false
+		}
+		if text == "" || !slices.Contains(sorted, text) {
+			return false
+		}
+	}
+	return true
 }

@@ -142,7 +142,9 @@ func (r *aggRun) limitable(st *ast.Select, f filter) error {
 	}
 	fails := f.fallible ||
 		slices.ContainsFunc(r.g.keys, func(k *groupKey) bool { return k.ce.fallible }) ||
-		slices.ContainsFunc(r.liveAggs(), func(a *aggregate) bool { return a.arg != nil && a.arg.fallible || a.typ == value.Float && (a.name == "sum" || a.name == "avg") }) ||
+		slices.ContainsFunc(r.liveAggs(), func(a *aggregate) bool {
+			return a.arg != nil && a.arg.fallible || a.typ == value.Float && (a.name == "sum" || a.name == "avg")
+		}) ||
 		slices.ContainsFunc(r.h.kept, func(c *cexpr) bool { return c.fallible }) ||
 		slices.ContainsFunc(r.o.items, func(c *cexpr) bool { return c.fallible }) ||
 		slices.ContainsFunc(r.order, func(k orderKey) bool { return k.expr != nil && k.expr.fallible })

@@ -381,7 +381,7 @@ func (s *sides) compare(ctx context.Context, text string, st ast.Statement, rep 
 	// A table whose primary key is unknown is never fully ordered, but a SELECT without one has
 	// one row.
 	pk, known := s.keys[ast.FromTable(sel)]
-	if (known || len(sel.From) == 0) && FullyOrdered(sel, pk) {
+	if (known || len(sel.From) == 0 || isGrouped(sel)) && FullyOrdered(sel, pk) {
 		rep.Ordered++
 	} else {
 		if keys := sortedColumns(sel, mg.cols); len(keys) > 0 {
