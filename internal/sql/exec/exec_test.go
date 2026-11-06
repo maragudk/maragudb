@@ -880,6 +880,10 @@ func TestSession_Update(t *testing.T) {
 		is.Error(t, exec.ErrUnsupported, queryErr(t, s, "UPDATE k SET b = 3 - b"), "the rows swap keys")
 		is.Equal(t, int64(2), mustExec(t, s, "UPDATE k SET a = 2").RowsAffected)
 		is.Equal(t, "2 1\n2 2", query(t, s, "SELECT * FROM k"))
+		mustExec(t, s, "CREATE TABLE d (id bigint PRIMARY KEY, n bigint)")
+		mustExec(t, s, "INSERT INTO d VALUES (1, 1), (3, 0), (5, -1)")
+		is.Error(t, exec.ErrDuplicateKey, queryErr(t, s, "UPDATE d SET id = id + 4 WHERE 10 / n > 0"), "in key order, the move of 1 onto 5 fails before the condition fails on 3")
+		is.Error(t, exec.ErrDivisionByZero, queryErr(t, s, "UPDATE d SET id = id + 8 WHERE 10 / n > 0"), "the move of 1 onto 9 succeeds, and then the condition fails on 3")
 	})
 
 	t.Run("checks constraints and types", func(t *testing.T) {

@@ -338,8 +338,9 @@ func (s *Session) update(ctx context.Context, st *ast.Update, params []value.Val
 // of a row that the same statement moves away, whether the statement fails depends on that
 // order. Such a statement is rejected; every other outcome is the same in every order: a move
 // onto a key that stays is a duplicate, two rows moving onto one key are a duplicate, and
-// anything else succeeds. When a row's new values fail, the statement fails in every order, and
-// the error is the one Postgres reports when it visits the rows in key order.
+// anything else succeeds. When a row's new values fail, or the WHERE clause fails on a row, the
+// statement fails in every order, and the error is the one Postgres reports when it visits the
+// rows in key order, which can be a duplicate key of a row before.
 func (s *Session) updateKeys(ctx context.Context, t *table, a access, f filter, assign func([]value.Value) ([]value.Value, error)) (Result, error) {
 	type move struct {
 		oldKey, newKey []byte
@@ -359,7 +360,12 @@ func (s *Session) updateKeys(ctx context.Context, t *table, a access, f filter, 
 		moves = append(moves, m)
 		return true, nil
 	})
-	if err != nil && (!failed || !errors.Is(err, errOrderDependent)) {
+	switch {
+	case err != nil && !errors.Is(err, errOrderDependent) && len(moves) > 0:
+		// The scan stopped at a row that fails; the rows before it are visited first.
+		moves = append(moves, move{err: err})
+		failed = true
+	case err != nil && (!failed || !errors.Is(err, errOrderDependent)):
 		return Result{}, err
 	}
 	if failed {
