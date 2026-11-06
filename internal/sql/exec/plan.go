@@ -272,6 +272,10 @@ func (b *binder) canonicalQual(e ast.Expr) (ast.Expr, bool) {
 	}
 	switch {
 	case bin.Op == ast.And && sawNull, bin.Op == ast.Or && len(args) == 0 && sawNull:
+		// The arguments that the NULL drops are still type-checked and folded.
+		if !b.bindsCleanly(args) {
+			return e, false
+		}
 		return &ast.Literal{Value: value.NewNull(value.Bool)}, true
 	case len(args) == 0:
 		return &ast.Literal{Value: value.NewBool(bin.Op == ast.And)}, true
@@ -279,6 +283,24 @@ func (b *binder) canonicalQual(e ast.Expr) (ast.Expr, bool) {
 		return join(args, ast.And), true
 	}
 	return b.factorOr(args), true
+}
+
+// bindsCleanly reports whether every expression binds as a boolean, folding its constants
+// raises no error, and it has no stable constant that can fail.
+func (b *binder) bindsCleanly(es []ast.Expr) bool {
+	foldErr, foldPhase, stableErr := b.foldErr, b.foldPhase, b.stableErr
+	defer func() { b.foldErr, b.foldPhase, b.stableErr = foldErr, foldPhase, stableErr }()
+	for _, e := range es {
+		b.foldErr, b.stableErr = nil, nil
+		ce, err := b.bind(e)
+		if err == nil {
+			ce, err = resolve(ce, value.Bool)
+		}
+		if err != nil || b.foldErr != nil || b.stableErr != nil || ce.typ != value.Bool {
+			return false
+		}
+	}
+	return true
 }
 
 // typeChecks reports whether every expression binds as a boolean, without folding.

@@ -127,6 +127,12 @@ func TestIndexConditions(t *testing.T) {
 			"SELECT i FROM plan_i WHERE i OR TRUE",
 			"SELECT i FROM plan_i WHERE CAST(NULL AS bigint) OR TRUE",
 			"SELECT i FROM plan_i WHERE FALSE AND (TRUE OR j)",
+			"SELECT i FROM plan_i WHERE NULL AND (CASE 'x' WHEN s THEN NULL WHEN CAST('\\x' AS bytea) THEN TRUE END) OR NULL",
+			"SELECT i FROM plan_i WHERE (NULL AND j) OR NULL",
+			"SELECT i FROM plan_i WHERE NULL AND j",
+			"UPDATE plan_i SET j = 1 WHERE (j AND NULL) OR NULL",
+			"SELECT i FROM plan_i WHERE (NULL AND j > 1 / 0) OR NULL",
+			"SELECT i FROM plan_i WHERE NULL AND j > 1 / 0",
 			// An IN whose constants have no common type compares its elements in the order they
 			// are written, so the mistyped column comes before the bytea that does not parse.
 			"SELECT i FROM plan_i WHERE CAST('\\x' AS bytea) IN (s, '\\', CAST('' AS text))",
