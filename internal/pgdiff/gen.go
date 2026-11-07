@@ -33,6 +33,9 @@ type Case struct {
 	Args [][]any
 }
 
+// paramRef is a reference to a parameter in rendered SQL.
+var paramRef = regexp.MustCompile(`\$(\d+)\b`)
+
 // Tables used by the cases.
 const (
 	tableName  = "t"
@@ -169,10 +172,16 @@ func Generate(src Source) Case {
 	c := Case{Parent: parent, Create: g.table, NowColumn: g.nowColumn}
 	add := func(st ast.Statement) {
 		// Postgres fails a statement that does not use each of its parameters.
-		text := ast.Render(st)
-		for i := range *g.args {
-			if !regexp.MustCompile(fmt.Sprintf(`\$%d\b`, i+1)).MatchString(text) {
-				panic(fmt.Sprintf("pgdiff: the statement does not use its parameter $%d: %s", i+1, text))
+		if len(*g.args) > 0 {
+			text := ast.Render(st)
+			used := map[string]bool{}
+			for _, m := range paramRef.FindAllStringSubmatch(text, -1) {
+				used[m[1]] = true
+			}
+			for i := range *g.args {
+				if !used[fmt.Sprint(i+1)] {
+					panic(fmt.Sprintf("pgdiff: the statement does not use its parameter $%d: %s", i+1, text))
+				}
 			}
 		}
 		c.Statements = append(c.Statements, st)

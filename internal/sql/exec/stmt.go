@@ -1136,10 +1136,11 @@ func outputNameStrength(e ast.Expr, names map[*ast.Select]string) (string, int) 
 
 // canonical text of an expression, for telling whether two expressions are the same one as
 // Postgres's analysis sees them: casts are written in one style, and a cast to the type the
-// expression already has is dropped, because Postgres drops it too. A constant of type boolean or
-// bigint, whether a keyword, digits, or a quoted literal cast to the type, is written as its
-// value, because Postgres reads each of them into the same constant: FALSE and 'no'::boolean are
-// one expression there.
+// expression already has is dropped, because Postgres drops it too. A quoted literal cast to a
+// type is written as the value it reads into, and so is a constant of type boolean or bigint,
+// because Postgres reads each of them into a constant of that type and value: FALSE and
+// 'no'::boolean are one expression there, and so are 9223372036854775807 and its quoted text cast
+// to bigint. An integer constant has no other spelling, because integer is no type name here.
 func (b *binder) canonical(e ast.Expr) string {
 	constant := func(v value.Value) ast.Expr {
 		return &ast.Cast{Expr: &ast.Literal{Value: value.NewUnknown(value.Format(v))}, Type: v.Type}

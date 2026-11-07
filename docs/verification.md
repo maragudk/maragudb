@@ -13,7 +13,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - 36 acceptance criteria (`AC-`), 27 key invariants (`INV-`), 31 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
 - 28 mutants (`MUT-`), deliberate bugs, of which 26 are detected by the simulator's checkers within 20 seeds.
 - 27 interesting states (`STATE-`) that the simulator's fixed corpus must reach.
-- 275 declarations of coverage in the tests.
+- 276 declarations of coverage in the tests.
 
 ## Acceptance criteria
 
@@ -441,6 +441,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 - `.` `TestDriverOptions/recover_a_panic_in_a_driver_call_as_ErrInternal,_log_it_with_its_stack,_and_run_a_write_that_panicked_after_its_commit_once`: through the public driver's options, an UPDATE outside a transaction that panics after its commit fails with ErrInternal and not driver.ErrBadConn, Options.Logger gets the panic with its stack at the error level, and the update lands once
 - `internal/sim` `TestRun_panic/a_panic_in_the_SQL_layer_fails_the_run_at_once_with_the_panic's_value_and_stack,_instead_of_hanging_it_in_database/sql`: the simulator's SQL clients go through the driver's recovery of panics, which ends every call that panicked with an error, so that the task fails the run with the panic instead of hanging in database/sql
+- `internal/sqldriver` `TestDriver_panics/a_connection_from_Driver.Open_whose_transaction_panicked_closes_its_connector_and_the_maintenance_with_it`: a connection that Driver.Open opened, broken by a panic in a statement of its transaction, closes its connector when it closes, so that background maintenance stops
 - `internal/sqldriver` `TestDriver_panics/a_panic_in_a_statement_of_a_transaction_fails_it_with_ErrInternal,_logs_the_stack,_rolls_the_transaction_back_at_once,_and_the_next_statement_runs_on_a_new_connection`: a panic in a statement of a transaction fails it with an error that wraps ErrInternal and names the panic, the log gets the stack, OnPanic sees it, a deferred rollback returns at once, and the next statement runs on a new connection
 - `internal/sqldriver` `TestDriver_panics/a_panic_while_a_connection_opens_fails_it_with_ErrInternal_and_leaves_the_connector_usable`: a panic in opening the engine for a connection fails the ping with an error that wraps ErrInternal, and a second ping fails the same way instead of hanging
 - `internal/sqldriver` `TestDriver_panics/a_statement_outside_a_transaction_that_panics_after_its_commit_runs_once,_and_database/sql_does_not_run_it_again`: an UPDATE outside a transaction, plain and prepared, that panics after its commit fails with an error that wraps ErrInternal and not driver.ErrBadConn, and its increment lands exactly once

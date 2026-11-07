@@ -319,12 +319,13 @@ func (s *sides) compare(ctx context.Context, text string, st ast.Statement, args
 		}
 		return &Mismatch{Statement: text, Postgres: describe(pg), Maragudb: describe(mg), Detail: detail}
 	}
-	if len(args) > 0 && pg.err != nil && SQLState(pg.err) == "" {
-		// pgx refused to encode a parameter, such as an int64 for an integer that it does not
-		// fit, so the statement never reached Postgres. Postgres would refuse such a value too,
-		// and so must maragudb, whose transaction the failure aborts.
-		if mg.err == nil {
-			return executed, mismatch("pgx refused to encode a parameter, and maragudb ran the statement")
+	if len(args) > 0 && pg.err != nil && SQLState(pg.err) == "" && strings.Contains(pg.err.Error(), "failed to encode") {
+		// pgx refused to encode a parameter, an int64 for an integer that it does not fit, so the
+		// statement never reached Postgres. Postgres would refuse such a value as out of range
+		// too, and so must maragudb, whose transaction the failure aborts. pgx refuses the other
+		// conversions too, which maragudb rejects as unsupported before this.
+		if !errors.Is(mg.err, maragudb.ErrOutOfRange) {
+			return executed, mismatch("pgx refused to encode a parameter, and maragudb did not fail with ErrOutOfRange")
 		}
 		rep.Errors++
 		executed.Err = pg.err

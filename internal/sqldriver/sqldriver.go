@@ -34,11 +34,11 @@ import (
 // ErrDSN is an invalid data source name.
 var ErrDSN = errors.New("sqldriver: invalid DSN, want s3://bucket/prefix")
 
-// ErrInternal is a bug in maragudb: a call into the driver panicked, and the driver recovered the
-// panic. The message holds the panic's value. The connection is discarded, and a transaction in
+// ErrInternal is a call into the driver that panicked, which is a bug in maragudb or in an object
+// store that it calls, and whose panic the driver recovered. The message holds the panic's value. The connection is discarded, and a transaction in
 // which a call panicked rolls back. A statement outside a transaction, or a commit, that fails
 // with it may or may not have taken effect, as with [engine.ErrCommitUnknown].
-var ErrInternal = errors.New("sqldriver: internal error, a bug in maragudb")
+var ErrInternal = errors.New("sqldriver: internal error, a call into the driver panicked")
 
 // errBroken is the error of a call on a connection that an earlier call broke with a panic.
 var errBroken = fmt.Errorf("%w: an earlier call on the connection panicked, and the connection is discarded", ErrInternal)
@@ -62,10 +62,11 @@ type Options struct {
 	Logger      *slog.Logger
 	// OnPanic, when set, is called with the value and the stack of every panic that the driver
 	// recovers, after the panic is logged. The driver recovers a panic in every call into a
-	// connector, a connection, a statement, a transaction, or rows, so that it never unwinds
-	// through database/sql, whose locks it would leave held. The call returns an error that wraps
-	// [ErrInternal], and the connection is broken: its transaction cannot commit, and database/sql
-	// discards it.
+	// connector, a connection, a statement, a transaction, or rows that does work and returns an
+	// error, so that it never unwinds through database/sql, whose locks it would leave held. The
+	// calls without an error, such as the column types of rows, only read fields. The call
+	// returns an error that wraps [ErrInternal], and the connection is broken: its transaction
+	// cannot commit, and database/sql discards it.
 	OnPanic func(value any, stack []byte)
 }
 
@@ -248,7 +249,7 @@ func (d *Driver) recoverPanic(err *error) {
 // [ErrInternal]. It runs in the deferred function, before the stack unwinds.
 func (d *Driver) recovered(p any, err *error) {
 	stack := debug.Stack()
-	d.opts.Logger.Error("sqldriver: recovered a panic in a call into the driver, which is a bug in maragudb; the connection is discarded",
+	d.opts.Logger.Error("sqldriver: recovered a panic in a call into the driver, which is a bug in maragudb or in its object store; the connection is discarded",
 		"panic", fmt.Sprint(p), "stack", string(stack))
 	assert.Unreachable("a call into the driver panics", map[string]any{"panic": fmt.Sprint(p), "stack": string(stack)})
 	if d.opts.OnPanic != nil {
@@ -266,13 +267,13 @@ func (c *Connector) Driver() driver.Driver {
 
 // Close the connector. It stops background maintenance, waiting for a running step to notice,
 // and releases the maintenance lease if it is held.
-func (c *Connector) Close() error {
+func (c *Connector) Close() (err error) {
+	defer c.d.recoverPanic(&err)
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.db == nil {
 		return nil
 	}
-	var err error
 	if c.maintainer != nil {
 		c.stop()
 		<-c.stopped
@@ -348,13 +349,16 @@ func (c *Conn) PrepareContext(_ context.Context, query string) (_ driver.Stmt, e
 // Close the connection.
 func (c *Conn) Close() (err error) {
 	defer c.recoverPanic(&err)
+	// The owner closes even when the rollback of a broken session panics.
+	defer func() {
+		if c.owner != nil {
+			if cerr := c.owner.Close(); cerr != nil && err == nil {
+				err = cerr
+			}
+		}
+	}()
 	if c.session.InTx() {
 		err = c.session.Rollback()
-	}
-	if c.owner != nil {
-		if cerr := c.owner.Close(); cerr != nil && err == nil {
-			err = cerr
-		}
 	}
 	return err
 }
@@ -656,7 +660,8 @@ func (r *Rows) Columns() []string {
 }
 
 // Close the rows.
-func (r *Rows) Close() error {
+func (r *Rows) Close() (err error) {
+	defer r.conn.recoverPanic(&err)
 	return nil
 }
 

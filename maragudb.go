@@ -42,7 +42,7 @@
 // [ErrConflict], and the caller retries the whole transaction. A read-only transaction, begun
 // with sql.TxOptions{ReadOnly: true}, never conflicts.
 //
-// A panic inside the driver is a bug in maragudb. The driver recovers it, so that it never
+// A panic inside the driver is a bug in maragudb, or in [Options.Store]. The driver recovers it, so that it never
 // unwinds through database/sql, and the call fails with [ErrInternal]; the connection is
 // discarded, and a transaction in which a call panicked never commits.
 package maragudb
@@ -152,8 +152,9 @@ var (
 	// Postgres, every statement fails with it until the transaction ends, and a COMMIT of such a
 	// transaction rolls it back.
 	ErrTxAborted = exec.ErrTxAborted
-	// ErrInternal is a bug in maragudb: a call into the driver panicked, and the driver
-	// recovered the panic instead of letting it unwind through database/sql. The message holds
+	// ErrInternal is a call into the driver that panicked, which is a bug in maragudb or in
+	// [Options.Store], and whose panic the driver recovered instead of letting it unwind through
+	// database/sql. The message holds
 	// the panic's value, and [Options.Logger] gets it with the stack at the error level. The
 	// connection is discarded, and database/sql opens a new one for the next statement. A
 	// transaction in which a call panicked rolls back: its later statements fail with

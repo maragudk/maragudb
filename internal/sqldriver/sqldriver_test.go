@@ -370,6 +370,26 @@ func TestDriver_panics(t *testing.T) {
 		is.Equal(t, int64(3), valueOf(t, clean), "the transaction, whose commit succeeded before the panic, committed once")
 	})
 
+	t.Run("a connection from Driver.Open whose transaction panicked closes its connector and the maintenance with it", func(t *testing.T) {
+		verify.Covers(t, "a connection that Driver.Open opened, broken by a panic in a statement of its transaction, closes its connector when it closes, so that background maintenance stops", "INV-PANIC-RECOVERED")
+		synctest.Test(t, func(t *testing.T) {
+			fake := s3fake.New()
+			cleanDB(t, fake)
+			d := sqldriver.New(sqldriver.Options{Engine: engine.Options{Client: fake}, Exec: exec.Options{Mutations: exec.Mutations{PanicInScan: true}}, Maintenance: sqldriver.MaintenanceOptions{Interval: time.Second}})
+			conn, err := d.Open("s3://bucket/db")
+			is.NotError(t, err)
+			_, err = conn.(driver.ConnBeginTx).BeginTx(t.Context(), driver.TxOptions{})
+			is.NotError(t, err)
+			_, err = conn.(driver.QueryerContext).QueryContext(t.Context(), "SELECT v FROM t WHERE v = 0", nil)
+			is.Error(t, sqldriver.ErrInternal, err)
+			is.True(t, !conn.(driver.Validator).IsValid())
+			is.NotError(t, conn.Close())
+			before := fake.Counts()
+			time.Sleep(10 * time.Second)
+			is.Equal(t, int64(0), fake.Counts().Sub(before).Total(), "the loop stopped with the connection")
+		})
+	})
+
 	t.Run("a panic while a connection opens fails it with ErrInternal and leaves the connector usable", func(t *testing.T) {
 		verify.Covers(t, "a panic in opening the engine for a connection fails the ping with an error that wraps ErrInternal, and a second ping fails the same way instead of hanging", "INV-PANIC-RECOVERED")
 		d := sqldriver.New(sqldriver.Options{
