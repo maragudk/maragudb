@@ -442,12 +442,22 @@ func (b *binder) inSubquery(e *ast.Subquery, cols []Column, innerFallible bool, 
 		return nil, false, err
 	}
 	not := e.Not
+	// In a condition, Postgres can turn an IN into a semi-join, whose hash join computes the left
+	// side as its key on every row of the query around, also when the subquery has no rows, where
+	// a subplan never computes it. A NOT IN stays a subplan. An IN under OR or NOT does too, which
+	// the binder does not tell apart here, so such an IN is rejected as well.
+	condition := left.fallible && !e.Not && (b.phase == phaseWhere || b.phase == phaseOn)
 	return &cexpr{typ: value.Bool, refs: left.refs || info.refsParent, fallible: innerFallible || left.fallible || in.fallible, stable: left.stable, sublink: true, aggs: left.aggs, eval: func(row []value.Value) (value.Value, error) {
 		rows, err := evaluate(row)
 		if err != nil {
 			return value.Value{}, err
 		}
 		if len(rows) == 0 {
+			if condition {
+				if _, err := left.value(row); err != nil {
+					return value.Value{}, fmt.Errorf("%w: %w: the left side of an IN with a subquery fails with %v on a row for which the subquery has no rows, and whether Postgres evaluates it there depends on its plan; write the left side so that it cannot fail", ErrUnsupported, errPlanDependentSubquery, err)
+				}
+			}
 			return value.NewBool(not), nil
 		}
 		v, err := left.value(row)

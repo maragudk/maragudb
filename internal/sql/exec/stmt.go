@@ -1033,7 +1033,7 @@ func (b *binder) limit(e ast.Expr, what string) (*cexpr, error) {
 	case value.Int:
 		return c, nil
 	}
-	return nil, fmt.Errorf("%w: argument of %s must be type bigint, not type %v", ErrType, what, c.typ)
+	return nil, b.locate(e, fmt.Errorf("%w: argument of %s must be type bigint, not type %v", ErrType, what, c.typ))
 }
 
 // limitValue of a bound LIMIT or OFFSET expression whose folding succeeded. It returns -1 when

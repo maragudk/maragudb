@@ -342,7 +342,26 @@ func TestUnsupported(t *testing.T) {
 		rejects(t, create,
 			example{SQL: "SELECT i FROM dev WHERE i = $1", Args: []any{1.0}},
 			example{SQL: "SELECT $1::bigint + j FROM dev", Args: []any{2.0}},
+			example{SQL: "SELECT i FROM dev WHERE i = $1 AND j + 0.5::float8 > $1", Args: []any{1.5}},
 		)
+	})
+
+	t.Run("UNS-PARAMETERS a parameter that ORDER BY or GROUP BY may take for an output column, in contexts of different types", func(t *testing.T) {
+		verify.Covers(t, "a parameter that is an output column and that ORDER BY names by the same parameter, or GROUP BY by the output column's alias, where Postgres may take it for the output column, is rejected when its contexts give it different types, and Postgres with pgx accepts it", "UNS-PARAMETERS")
+		rejects(t, create,
+			example{SQL: "SELECT $1::bigint + 0, $1 FROM dev ORDER BY $1", Args: []any{int64(1)}},
+			example{SQL: "SELECT $1::bigint AS b, $1 AS a FROM dev GROUP BY a", Args: []any{int64(1)}},
+		)
+	})
+
+	t.Run("UNS-PARAMETERS a statement that fails before its analysis reaches references of a parameter that Postgres analyzes first", func(t *testing.T) {
+		verify.Covers(t, "a statement whose analysis fails where maragudb has not analyzed every reference of a repeated parameter that Postgres analyzes before that point, or where the failure has no position in Postgres's order, is rejected, because the types of those references could make Postgres fail first, and Postgres fails it too", "UNS-PARAMETERS")
+		b := newBoth(t, create)
+		query := "INSERT INTO dev (i, j) VALUES (TRUE, 1), ($1, $1 + 1)"
+		_, err := b.m.ExecContext(t.Context(), query, int64(5))
+		is.Error(t, maragudb.ErrUnsupported, err)
+		_, err = b.pg.ExecContext(t.Context(), query, int64(5))
+		is.Equal(t, "42804", pgdiff.SQLState(err), fmt.Sprint(err))
 	})
 
 	t.Run("UNS-AGGREGATES other aggregates and forms of grouping", func(t *testing.T) {
@@ -420,7 +439,7 @@ func TestUnsupported(t *testing.T) {
 	})
 
 	t.Run("UNS-PLAN-DEPENDENT-SUBQUERY a subquery that fails where some plan evaluates it and another does not", func(t *testing.T) {
-		verify.Covers(t, "a statement whose subquery fails on rows or in places that one plan of Postgres evaluates it on and another does not is rejected: an uncorrelated subquery in a condition, a correlated EXISTS whose conditions fail on rows that no row of the query around reaches, a correlated IN that can fail, a subquery in FROM or a CTE that fails, and a condition that can fail on their columns, and Postgres accepts the statement when its plan does not evaluate the subquery there", "UNS-PLAN-DEPENDENT-SUBQUERY")
+		verify.Covers(t, "a statement whose subquery fails on rows or in places that one plan of Postgres evaluates it on and another does not is rejected: an uncorrelated subquery in a condition, a correlated EXISTS whose conditions fail on rows that no row of the query around reaches, a correlated IN that can fail, an IN whose left side fails on a row for which its subquery has no rows, a subquery in FROM or a CTE that fails, and a condition that can fail on their columns, and Postgres accepts the statement when its plan does not evaluate the subquery there", "UNS-PLAN-DEPENDENT-SUBQUERY")
 		setup := []string{rows, "CREATE TABLE dev2 (i bigint PRIMARY KEY, j bigint)"}
 		rejects(t, create,
 			example{SQL: "SELECT * FROM dev2 WHERE j = (SELECT j FROM dev)", Setup: setup},
@@ -430,7 +449,21 @@ func TestUnsupported(t *testing.T) {
 			example{SQL: "SELECT count(*) FROM (SELECT 10 / j AS q FROM dev) x", Setup: setup},
 			example{SQL: "WITH x AS (SELECT 10 / j AS q FROM dev) SELECT count(*) FROM x", Setup: setup},
 			example{SQL: "SELECT * FROM (SELECT * FROM dev WHERE j <> 0) x WHERE 10 / x.j > 0", Setup: setup},
+			example{SQL: "SELECT * FROM dev WHERE 10 / j IN (SELECT i FROM dev2)", Setup: setup},
+			example{SQL: "SELECT * FROM dev WHERE 10 / j IN (SELECT dev2.i FROM dev2 WHERE dev2.j = dev.i)", Setup: setup},
 		)
+	})
+
+	t.Run("UNS-PLAN-DEPENDENT-SUBQUERY a subquery whose correlation a NULL conjunct folds away", func(t *testing.T) {
+		verify.Covers(t, "a scalar subquery whose references to the query around sit in a WHERE that a NULL conjunct decides, which Postgres folds to false and evaluates as an uncorrelated InitPlan before any row, is rejected when it returns more than one row and no row reaches it, where Postgres fails with 21000", "UNS-PLAN-DEPENDENT-SUBQUERY")
+		b := newBoth(t, create)
+		b.exec(t, "CREATE TABLE dev2 (i bigint PRIMARY KEY, j bigint)")
+		b.exec(t, "INSERT INTO dev2 VALUES (1, 1), (2, 2)")
+		query := "SELECT 1 FROM dev AS o WHERE (SELECT true FROM dev2 WHERE NULL NOT IN (SELECT x.j FROM dev AS x WHERE x.j = o.j AND NOT NULL))"
+		_, err := b.m.ExecContext(t.Context(), query)
+		is.Error(t, maragudb.ErrUnsupported, err)
+		_, err = b.pg.ExecContext(t.Context(), query)
+		is.Equal(t, "21000", pgdiff.SQLState(err), fmt.Sprint(err))
 	})
 
 	t.Run("UNS-PLAN-DEPENDENT-JOIN a condition of a join that fails on a row that some plan evaluates it on", func(t *testing.T) {

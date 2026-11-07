@@ -391,10 +391,13 @@ type IsNull struct {
 	Not  bool
 }
 
-// Between is `expr [NOT] BETWEEN low AND high`.
+// Between is `expr [NOT] BETWEEN low AND high`. Postgres analyzes it as `expr >= low AND expr <=
+// high`, with expr twice, so Copy, when set, is a copy of Expr for the second comparison, which
+// is not rendered.
 type Between struct {
 	Expr, Low, High Expr
 	Not             bool
+	Copy            Expr
 }
 
 // In is `expr [NOT] IN (list)`.
@@ -580,7 +583,7 @@ func Map(e Expr, fn func(Expr) Expr) Expr {
 	case *IsNull:
 		return fn(&IsNull{Expr: m(e.Expr), Not: e.Not})
 	case *Between:
-		return fn(&Between{Expr: m(e.Expr), Low: m(e.Low), High: m(e.High), Not: e.Not})
+		return fn(&Between{Expr: m(e.Expr), Low: m(e.Low), High: m(e.High), Not: e.Not, Copy: m(e.Copy)})
 	case *In:
 		return fn(&In{Expr: m(e.Expr), List: list(e.List), Not: e.Not})
 	case *Like:

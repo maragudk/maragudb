@@ -126,6 +126,8 @@ type Statement struct {
 	nparams int
 	// used are the parameter numbers that the statement references.
 	used map[int]bool
+	// order of the references to the parameters, as Postgres analyzes them.
+	order *paramOrder
 }
 
 // NumParams is the highest parameter number used.
@@ -175,11 +177,14 @@ func Prepare(sql string) (*Statement, error) {
 	}
 	if sel, ok := s.(*ast.Select); ok {
 		query(sel)
-		return st, nil
+	} else {
+		for _, e := range exprs(s) {
+			params(e)
+			ast.SubqueriesOf(e, query)
+		}
 	}
-	for _, e := range exprs(s) {
-		params(e)
-		ast.SubqueriesOf(e, query)
+	if st.nparams > 0 {
+		st.order = newParamOrder(s)
 	}
 	return st, nil
 }
@@ -459,17 +464,44 @@ func (s *Session) run(ctx context.Context, st *Statement, params []value.Value) 
 		s.subqueries = nil
 		defer func() { s.subqueries = nil }()
 	}
-	s.events = nil
-	s.params = newParamLedger(st.nparams, st.used)
-	s.uncertain, s.running = nil, false
-	rows, res, err := s.execute(ctx, st.ast, params)
-	s.events = nil
-	if err == nil {
-		// Every statement checks its parameters where it folds constants, and this is the last
-		// resort.
-		if err = s.params.check(); err == nil {
-			err = s.params.refusal()
+	var rows *Rows
+	var res Result
+	var err error
+	// The statement is analyzed again, with the types of [paramLedger.check], when a reference
+	// to a parameter that Postgres makes once the parameter has a type has another type in its
+	// context. An analysis ends that way once the statement is analyzed, before it reads or
+	// writes rows, or, for a statement that never checks its parameters there, after, and its
+	// writes are discarded.
+	var retype map[*ast.Param]value.Type
+	for pass := 1; ; pass++ {
+		s.events = nil
+		s.params = newParamLedger(st, retype)
+		s.uncertain, s.running = nil, false
+		rows, res, err = s.execute(ctx, st.ast, params)
+		s.events = nil
+		if err == nil {
+			// Every statement checks its parameters where it folds constants, and this is the
+			// last resort.
+			if err = s.params.check(); err == nil {
+				err = s.params.refusal()
+			}
+		} else {
+			err = s.params.failed(err)
 		}
+		if !errors.Is(err, errRetype) {
+			break
+		}
+		s.kv.discard()
+		if !s.opts.Mutations.SubqueryStaleAcrossRetries {
+			s.subqueries = nil
+		}
+		// Each analysis settles at least the first reference whose type differs, in the order
+		// of the analysis, so there are at most as many as references.
+		if st.order == nil || pass > len(st.order.sites) {
+			err = fmt.Errorf("%w: the types of the parameters of this statement do not settle in the order in which Postgres analyzes it; cast the parameters, such as $1::bigint", ErrUnsupported)
+			break
+		}
+		retype = s.params.next
 	}
 	// A read-only transaction refuses a write when the statement starts, before any subquery.
 	if s.uncertain != nil && s.running && !errors.Is(err, ErrCardinality) && !errors.Is(err, ErrReadOnlyTx) {

@@ -193,7 +193,7 @@ func negate(e ast.Expr) ast.Expr {
 	case *ast.IsNull:
 		return &ast.IsNull{Expr: x.Expr, Not: !x.Not}
 	case *ast.Between:
-		return simplify(&ast.Between{Expr: x.Expr, Low: x.Low, High: x.High, Not: !x.Not})
+		return simplify(&ast.Between{Expr: x.Expr, Low: x.Low, High: x.High, Not: !x.Not, Copy: x.Copy})
 	case *ast.In:
 		// An IN of constants stays an array comparison, whose negation is NOT IN.
 		return simplify(&ast.In{Expr: x.Expr, List: x.List, Not: !x.Not})
@@ -472,7 +472,7 @@ func (b *binder) filterOf(conjs []ast.Expr, what string) (filter, error) {
 			return filter{}, err
 		}
 		if ce.typ != value.Bool {
-			return filter{}, fmt.Errorf("%w: argument of %s must be type boolean, not type %v", ErrType, what, ce.typ)
+			return filter{}, b.locate(c, fmt.Errorf("%w: argument of %s must be type boolean, not type %v", ErrType, what, ce.typ))
 		}
 		bound = append(bound, ce)
 		if pruned {
@@ -500,8 +500,9 @@ func (b *binder) filterOf(conjs []ast.Expr, what string) (filter, error) {
 		}
 		clauses = append(clauses, clause{expr: c, ce: ce})
 	}
-	if f.never {
-		// Postgres folds the whole clause to FALSE.
+	if f.never || null {
+		// Postgres folds the whole clause to FALSE, also for a NULL conjunct, which EXPLAIN
+		// shows as a One-Time Filter: false, so it drops the references to the queries around.
 		dropped(bound...)
 	}
 	if f.never || null {

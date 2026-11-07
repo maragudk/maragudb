@@ -146,10 +146,10 @@ func (b *binder) orderBy(st *ast.Select, o output) ([]orderKey, error) {
 			// that -2147483648 is not one.
 			switch {
 			case e.Value.Null, e.Value.Type != value.Int4, e.Value.I == math.MinInt32:
-				return nil, fmt.Errorf("%w: non-integer constant in ORDER BY", ErrSyntax)
+				return nil, b.locate(e, fmt.Errorf("%w: non-integer constant in ORDER BY", ErrSyntax))
 			default:
 				if e.Value.I < 1 || e.Value.I > int64(len(o.columns)) {
-					return nil, fmt.Errorf("%w: ORDER BY position %d is not in select list", ErrInvalid, e.Value.I)
+					return nil, b.locate(e, fmt.Errorf("%w: ORDER BY position %d is not in select list", ErrInvalid, e.Value.I))
 				}
 				k.output = int(e.Value.I) - 1
 			}
@@ -163,7 +163,7 @@ func (b *binder) orderBy(st *ast.Select, o output) ([]orderKey, error) {
 			for i, c := range o.columns {
 				if c.Name == e.Name {
 					if matches >= 0 && b.canonical(o.exprs[matches]) != b.canonical(o.exprs[i]) {
-						return nil, fmt.Errorf("%w: ORDER BY %q is ambiguous", ErrInvalid, e.Name)
+						return nil, b.locate(e, fmt.Errorf("%w: ORDER BY %q is ambiguous", ErrInvalid, e.Name))
 					}
 					if matches < 0 {
 						matches = i

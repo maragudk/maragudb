@@ -3,6 +3,7 @@ package pgdiff
 import (
 	"cmp"
 	"fmt"
+	"hash/fnv"
 	"math"
 	"math/rand/v2"
 	"regexp"
@@ -66,8 +67,19 @@ type gen struct {
 	// rows are the rows that INSERTs of the table wrote, or tried to.
 	rows [][]ast.Expr
 	// args are the values of the parameters of the statement being generated, shared with the
-	// generator of the other table.
+	// generator of the other table. A [skipped] value is one that the statement does not
+	// reference.
 	args *[]any
+	// aux is the source of the choices of parameters in expressions and of skipped parameter
+	// numbers, once the schema is generated, or nil before. For a [RandSource] it is a stream of
+	// its own, seeded by the schema, so that the other choices of a seed stay as they are.
+	aux Source
+}
+
+// skipped is the value of a parameter number that a statement skips, which Postgres fails with
+// 42P18.
+type skipped struct {
+	v any
 }
 
 // Source of the generator's choices.
@@ -169,23 +181,37 @@ func Generate(src Source) Case {
 	}
 	g.schema()
 	g.constraints()
+	g.aux = src
+	if _, ok := src.(randSource); ok {
+		h := fnv.New64a()
+		_, _ = h.Write([]byte(ast.Render(g.table)))
+		if parent != nil {
+			_, _ = h.Write([]byte(ast.Render(parent)))
+		}
+		g.aux = RandSource(rand.New(rand.NewPCG(h.Sum64(), 1)))
+	}
 	c := Case{Parent: parent, Create: g.table, NowColumn: g.nowColumn}
 	add := func(st ast.Statement) {
-		// Postgres fails a statement that does not use each of its parameters.
+		// Postgres fails a statement that does not use each of its parameters, which the
+		// generator only skips on purpose.
+		var args []any
 		if len(*g.args) > 0 {
 			text := ast.Render(st)
 			used := map[string]bool{}
 			for _, m := range paramRef.FindAllStringSubmatch(text, -1) {
 				used[m[1]] = true
 			}
-			for i := range *g.args {
-				if !used[fmt.Sprint(i+1)] {
+			for i, v := range *g.args {
+				if s, ok := v.(skipped); ok {
+					v = s.v
+				} else if !used[fmt.Sprint(i+1)] {
 					panic(fmt.Sprintf("pgdiff: the statement does not use its parameter $%d: %s", i+1, text))
 				}
+				args = append(args, v)
 			}
 		}
 		c.Statements = append(c.Statements, st)
-		c.Args = append(c.Args, *g.args)
+		c.Args = append(c.Args, args)
 		*g.args = nil
 	}
 	if g.parent != nil {
@@ -619,7 +645,11 @@ func (g *gen) expr(t value.Type, s scope, depth int) ast.Expr {
 		return g.columnOfType(t, s)
 	}
 	if depth >= 3 || g.draw(0, 3) == 0 {
-		return g.literal(t)
+		lit := g.literal(t)
+		if a := g.withAux(); a != nil && a.rarely(12) {
+			return a.exprParam(t)
+		}
+		return lit
 	}
 	depth++
 	// Forms shared by every type.
@@ -877,10 +907,69 @@ func (g *gen) parameterize(row []ast.Expr) []ast.Expr {
 	return out
 }
 
-// param of the statement being generated, with the value v.
+// param of the statement being generated, with the value v. Now and then the statement skips
+// the number before it.
 func (g *gen) param(v any) ast.Expr {
+	if a := g.withAux(); a != nil && a.rarely(40) {
+		*g.args = append(*g.args, skipped{v: v})
+	}
 	*g.args = append(*g.args, v)
 	return &ast.Param{Index: len(*g.args)}
+}
+
+// withAux is the generator with the choices of [gen.aux], or nil before the schema is generated.
+func (g *gen) withAux() *gen {
+	if g.aux == nil {
+		return nil
+	}
+	a := *g
+	a.src = g.aux
+	return &a
+}
+
+// exprParam is a parameter in an expression of type t: a new one with a value for t, or now and
+// then one of the statement's parameters again, which Postgres gives the type of its first
+// context in the order in which it analyzes the statement, whatever type t is. A new one has the
+// text of a value, which reads as any type, as a quoted literal does, because the context may
+// give the parameter another type than t, such as text for an output column, and a Go value of
+// another type is not converted to text (UNS-PARAMETERS).
+func (g *gen) exprParam(t value.Type) ast.Expr {
+	if n := len(*g.args); n > 0 && g.rarely(3) {
+		i := g.draw(0, n-1)
+		if _, ok := (*g.args)[i].(skipped); !ok {
+			return &ast.Param{Index: i + 1}
+		}
+	}
+	if g.rarely(10) {
+		return g.param(nil)
+	}
+	return g.param(value.Format(g.value(t)))
+}
+
+// optionalFilter is the condition that applications write for a filter that a NULL parameter
+// turns off, `c = $n OR $n IS NULL`, on a column c, which Postgres accepts only in this order,
+// since in the other one IS NULL reads the parameter before it has a type.
+func (g *gen) optionalFilter(s scope) ast.Expr {
+	t := g.anyTypeIn(s)
+	var v any
+	if g.bool() {
+		v = g.paramValue(t)
+	}
+	if !g.hasColumn(t, s) {
+		// A quoted literal next to the parameter makes it text, which reads only a string.
+		if v != nil {
+			v = value.Format(g.value(t))
+		}
+		p := g.param(v).(*ast.Param)
+		return &ast.Binary{Op: ast.Or, Left: &ast.Binary{Op: ast.Eq, Left: g.literal(t), Right: p}, Right: &ast.IsNull{Expr: &ast.Param{Index: p.Index}}}
+	}
+	p := g.param(v).(*ast.Param)
+	var e ast.Expr = &ast.Binary{Op: ast.Eq, Left: g.columnOfType(t, s), Right: p}
+	isNull := &ast.IsNull{Expr: &ast.Param{Index: p.Index}}
+	if g.rarely(4) {
+		return &ast.Binary{Op: ast.Or, Left: isNull, Right: e}
+	}
+	return &ast.Binary{Op: ast.Or, Left: e, Right: isNull}
 }
 
 // paramValue for a parameter in the place of a value of type t: mostly a value of the Go type of
@@ -988,6 +1077,13 @@ func (g *gen) rowKey2(row []ast.Expr) []ast.Expr {
 // that can depend on the order in which Postgres evaluates them, which maragudb rejects, so
 // they are mostly combined only with conditions that cannot fail.
 func (g *gen) where(s scope) ast.Expr {
+	if a := g.withAux(); s.columns && a != nil && a.rarely(8) {
+		e := a.optionalFilter(s)
+		if w := g.where(s); w != nil {
+			e = &ast.Binary{Op: ast.And, Left: e, Right: w}
+		}
+		return e
+	}
 	if g.draw(0, 3) == 0 {
 		return nil
 	}

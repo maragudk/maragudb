@@ -115,7 +115,7 @@ func slot(typ value.Type, at int) *cexpr {
 // expressions and the aggregates.
 func (b *binder) errGrouping(r colRef) error {
 	e := b.scope.entries[r.entry]
-	return fmt.Errorf("%w: column %q must appear in the GROUP BY clause or be used in an aggregate function", ErrGrouping, e.name+"."+e.columns[r.col])
+	return fmt.Errorf("%w: %w: column %q must appear in the GROUP BY clause or be used in an aggregate function", ErrGrouping, errUngrouped, e.name+"."+e.columns[r.col])
 }
 
 // groupedExpr binds e as an expression of the group rows when it is a GROUP BY expression, or a
@@ -253,12 +253,23 @@ func (b *binder) aggregateType(agg *aggregate, e *ast.Call, args []*cexpr) error
 		return notExist()
 	}
 	x := args[0]
-	if x.use != nil && e.Name == "count" && x.typ == value.Unknown {
-		// count() gives a parameter no type, as in Postgres.
-		x.use.untyped()
-		c := *x
-		c.use = nil
-		x = &c
+	if x.use != nil && e.Name == "count" {
+		if e.Distinct {
+			// Postgres gives the argument of count(DISTINCT), which it sorts, the type text when
+			// it has none.
+			var err error
+			if x, err = resolve(x, value.String); err != nil {
+				return err
+			}
+		} else {
+			// count() gives a parameter no type, as in Postgres, and reads only whether its
+			// value is NULL.
+			x.use.untyped()
+			x = constant(value.NewBool(true))
+			if args[0].val.Null {
+				x = constant(value.NewNull(value.Bool))
+			}
+		}
 	}
 	if x.param > 0 {
 		return fmt.Errorf("%w: parameter $%d as the argument of %s is not supported, because its type is not known; cast it, such as $%d::bigint", ErrUnsupported, x.param, e.Name, x.param)
@@ -335,7 +346,7 @@ func (s *Session) selectGrouped(ctx context.Context, st *ast.Select, b *binder, 
 			return nil, err
 		}
 		if ce.typ != value.Bool {
-			return nil, fmt.Errorf("%w: argument of HAVING must be type boolean, not type %v", ErrType, ce.typ)
+			return nil, b.locate(st.Having, fmt.Errorf("%w: argument of HAVING must be type boolean, not type %v", ErrType, ce.typ))
 		}
 	}
 	// Postgres checks that the ORDER BY of DISTINCT is in the output after GROUP BY.
@@ -488,10 +499,10 @@ func (b *binder) grouping(st *ast.Select, o output) (*grouping, error) {
 		switch e := item.(type) {
 		case *ast.Literal:
 			if e.Value.Null || e.Value.Type != value.Int4 || e.Value.I == math.MinInt32 {
-				return nil, fmt.Errorf("%w: non-integer constant in GROUP BY", ErrSyntax)
+				return nil, b.locate(e, fmt.Errorf("%w: non-integer constant in GROUP BY", ErrSyntax))
 			}
 			if e.Value.I < 1 || e.Value.I > int64(len(o.columns)) {
-				return nil, fmt.Errorf("%w: GROUP BY position %d is not in select list", ErrInvalid, e.Value.I)
+				return nil, b.locate(e, fmt.Errorf("%w: GROUP BY position %d is not in select list", ErrInvalid, e.Value.I))
 			}
 			output = int(e.Value.I) - 1
 		case *ast.ColumnRef:
@@ -512,7 +523,7 @@ func (b *binder) grouping(st *ast.Select, o output) (*grouping, error) {
 					continue
 				}
 				if output >= 0 && b.canonical(o.exprs[output]) != b.canonical(o.exprs[i]) {
-					return nil, fmt.Errorf("%w: GROUP BY %q is ambiguous", ErrInvalid, e.Name)
+					return nil, b.locate(e, fmt.Errorf("%w: GROUP BY %q is ambiguous", ErrInvalid, e.Name))
 				}
 				if output < 0 {
 					output = i
@@ -597,7 +608,7 @@ func (b *binder) having(st *ast.Select, groupBy bool) (havingConds, error) {
 			return havingConds{}, err
 		}
 		if ce.typ != value.Bool {
-			return havingConds{}, fmt.Errorf("%w: argument of HAVING must be type boolean, not type %v", ErrType, ce.typ)
+			return havingConds{}, b.locate(c, fmt.Errorf("%w: argument of HAVING must be type boolean, not type %v", ErrType, ce.typ))
 		}
 		bound = append(bound, ce)
 		switch {

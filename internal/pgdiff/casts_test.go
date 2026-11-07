@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"hegel.dev/go/hegel"
+	"maragu.dev/is"
 
 	"maragu.dev/maragudb"
 	"maragu.dev/maragudb/internal/pgdiff"
@@ -204,6 +205,222 @@ func TestParameters(t *testing.T) {
 				ht.Fatalf("maragudb %#v, postgres %#v", m, pg)
 			}
 		}, hegel.WithTestCases(castCases()/4))
+	})
+
+	t.Run("a SELECT whose parameters repeat across its clauses gives the same result as Postgres with pgx, or is rejected as unsupported", func(t *testing.T) {
+		verify.Covers(t, "hegel-drawn SELECTs on a table that reference parameters in several contexts each, in the output, WHERE, ORDER BY, and LIMIT, with typed contexts, IS NULL, coalesce, CASE, IN, BETWEEN, and comparisons of two parameters, give the same result or error class as Postgres with pgx, which types each parameter at its first context in the order in which it analyzes the clauses, unless maragudb rejects them as unsupported", "INV-PLACEHOLDERS", "INV-PG-SUBSET")
+		b := newBoth(t, "CREATE TABLE dev (k bigint PRIMARY KEY, i bigint, s text, f double precision, b boolean)")
+		b.exec(t, "INSERT INTO dev VALUES (1, 10, 'a', 1.5, TRUE), (2, 20, 'b', 2.5, FALSE), (3, NULL, NULL, NULL, NULL)")
+		// Each context has $%[1]d for a parameter and $%[2]d for another one.
+		outputs := []string{"$%[1]d", "$%[1]d IS NULL", "k + $%[1]d", "coalesce($%[1]d, s)", "$%[1]d::bigint", "CASE WHEN $%[1]d IS NULL THEN 0 ELSE k END", "$%[1]d || s", "+$%[1]d"}
+		conditions := []string{"k = $%[1]d", "s = $%[1]d", "f > $%[1]d", "b = $%[1]d", "$%[1]d IS NULL", "$%[1]d IS NOT NULL", "k = $%[1]d OR $%[1]d IS NULL", "$%[1]d IS NULL OR k = $%[1]d",
+			"$%[1]d::bigint IS NULL OR k = $%[1]d", "k = coalesce($%[1]d, k)", "$%[1]d + 1 > k", "$%[1]d IN (k, i)", "k IN ($%[1]d, 2)", "k BETWEEN $%[1]d AND 5", "$%[1]d BETWEEN k AND 5",
+			"CASE WHEN $%[1]d IS NULL THEN TRUE ELSE s = $%[1]d END", "length($%[1]d) > 0", "$%[1]d = $%[2]d", "coalesce($%[1]d, $%[2]d) = k", "$%[1]d"}
+		orders := []string{"k + $%[1]d", "$%[1]d IS NULL", "coalesce($%[1]d, k)"}
+		hegel.Test(t, func(ht *hegel.T) {
+			n := 0
+			param := func() int {
+				p := hegel.Draw(ht, hegel.Integers(1, 2))
+				n = max(n, p)
+				return p
+			}
+			context := func(forms []string) string {
+				p := param()
+				return fmt.Sprintf(hegel.Draw(ht, hegel.SampledFrom(forms)), p, 3-p)
+			}
+			var items, conds []string
+			for range hegel.Draw(ht, hegel.Integers(1, 2)) {
+				items = append(items, context(outputs))
+			}
+			for range hegel.Draw(ht, hegel.Integers(0, 2)) {
+				conds = append(conds, "("+context(conditions)+")")
+			}
+			query := "SELECT " + strings.Join(items, ", ") + " FROM dev"
+			if len(conds) > 0 {
+				query += " WHERE " + strings.Join(conds, " AND ")
+			}
+			query += " ORDER BY "
+			if hegel.Draw(ht, hegel.Booleans()) {
+				query += context(orders) + ", "
+			}
+			query += "k"
+			if hegel.Draw(ht, hegel.Booleans()) {
+				query += fmt.Sprintf(" LIMIT $%d", param())
+			}
+			if strings.Contains(query, "$2") {
+				n = 2
+			}
+			args := make([]any, n)
+			for i := range args {
+				args[i] = hegel.Draw(ht, hegel.SampledFrom([]any{nil, int64(1), int64(2), "1", "a", "t", "2.5", 1.5, true}))
+			}
+			ht.Note(fmt.Sprintf("%s with %#v", query, args))
+			m, mErr := queryRow(t, b.m, query, args)
+			if errors.Is(mErr, maragudb.ErrUnsupported) {
+				return
+			}
+			pg, pgErr := queryRow(t, b.pg, query, args)
+			switch {
+			case pgErr != nil && pgdiff.SQLState(pgErr) == "":
+				// pgx refused to encode a value for the type that Postgres gave its parameter.
+				if mErr == nil {
+					ht.Fatalf("maragudb %v; postgres client %v", m, pgErr)
+				}
+			case (mErr == nil) != (pgErr == nil):
+				ht.Fatalf("maragudb %#v, %v; postgres %#v, %v", m, mErr, pg, pgErr)
+			case mErr != nil && !pgdiff.SameClass(mErr, pgErr):
+				ht.Fatalf("maragudb %v; postgres SQLSTATE %s, %v", mErr, pgdiff.SQLState(pgErr), pgErr)
+			case mErr == nil && fmt.Sprint(m) != fmt.Sprint(pg):
+				ht.Fatalf("maragudb %#v, postgres %#v", m, pg)
+			}
+		}, hegel.WithTestCases(castCases()/4))
+	})
+
+	t.Run("a parameter gets the type of its first context in the order in which Postgres analyzes the statement, and later references have that type", func(t *testing.T) {
+		verify.Covers(t, "statements that reference a parameter in several contexts, among them the optional filters k = $1 OR $1 IS NULL, ($1::bigint IS NULL OR k = $1), coalesce($1, k), and k = coalesce($1, k), and references across the WITH clause, FROM and join conditions, the output, WHERE, HAVING, ORDER BY, GROUP BY, OFFSET, LIMIT, subqueries, INSERT rows, and UPDATE SET and WHERE, give Postgres's result, or its error class: 42P08 for a reference made before the parameter has a type that a later context coerces to another type or reads in IS NULL, and the error of a later reference whose context does not take the type", "INV-PLACEHOLDERS", "INV-PG-SUBSET")
+		b := newBoth(t, "CREATE TABLE dev (k bigint PRIMARY KEY, i bigint, s text, f double precision, b boolean)")
+		b.exec(t, "INSERT INTO dev VALUES (1, 10, 'a', 1.5, TRUE), (2, 20, 'b', 2.5, FALSE), (3, NULL, NULL, NULL, NULL)")
+		b.exec(t, "CREATE TABLE dev2 (k bigint PRIMARY KEY, j bigint)")
+		b.exec(t, "INSERT INTO dev2 VALUES (1, 100), (2, 200)")
+		tests := []struct {
+			sql  string
+			args []any
+			// code is the SQLSTATE that Postgres fails with, or "" when it succeeds.
+			code string
+		}{
+			// Optional filters.
+			{sql: "SELECT k FROM dev WHERE k = $1 OR $1 IS NULL ORDER BY k", args: []any{int64(2)}},
+			{sql: "SELECT k FROM dev WHERE k = $1 OR $1 IS NULL ORDER BY k", args: []any{nil}},
+			{sql: "SELECT k FROM dev WHERE s = $1 OR $1 IS NULL ORDER BY k", args: []any{"a"}},
+			{sql: "SELECT k FROM dev WHERE (k = $1 OR $1 IS NULL) AND (s = $2 OR $2 IS NULL) AND (f > $3 OR $3 IS NULL) ORDER BY k LIMIT $4", args: []any{nil, nil, 1.0, int64(10)}},
+			{sql: "SELECT k FROM dev WHERE $1 IS NULL OR k = $1 ORDER BY k", args: []any{int64(2)}, code: "42P08"},
+			{sql: "SELECT k FROM dev WHERE ($1::bigint IS NULL OR k = $1) ORDER BY k", args: []any{nil}},
+			{sql: "SELECT k FROM dev WHERE ($1::bigint IS NULL OR k = $1) ORDER BY k", args: []any{int64(1)}},
+			{sql: "SELECT coalesce($1, k) FROM dev ORDER BY k", args: []any{nil}},
+			{sql: "SELECT k FROM dev WHERE k = coalesce($1, k) ORDER BY k", args: []any{nil}},
+			{sql: "SELECT k FROM dev WHERE k = coalesce($1, k) ORDER BY k", args: []any{"2"}},
+			{sql: "SELECT count(*) FROM dev GROUP BY k HAVING k > $1 OR $1 IS NULL ORDER BY k", args: []any{int64(1)}},
+			// The order of the clauses.
+			{sql: "SELECT $1 IS NULL FROM dev WHERE k = $1", args: []any{int64(1)}, code: "42P08"},
+			{sql: "SELECT k = $1 FROM dev WHERE $1 IS NULL", args: []any{int64(1)}},
+			{sql: "SELECT dev.k FROM dev JOIN dev2 ON $1 IS NULL WHERE dev.k = $1", args: []any{int64(1)}, code: "42P08"},
+			{sql: "SELECT $1 IS NULL FROM dev JOIN dev2 ON dev.k = $1", args: []any{int64(1)}},
+			{sql: "SELECT dev.k FROM dev JOIN dev2 ON dev.k = dev2.k AND dev.k = $1 JOIN dev2 AS v ON $1 IS NULL", args: []any{int64(1)}},
+			{sql: "SELECT dev.k FROM dev JOIN dev2 ON dev.k = dev2.k AND $1 IS NULL JOIN dev2 AS v ON v.k = $1", args: []any{int64(1)}, code: "42P08"},
+			{sql: "SELECT d.k FROM (SELECT k FROM dev2 WHERE k = $1) AS d, (SELECT k FROM dev2 WHERE $1 IS NULL) AS e", args: []any{int64(1)}},
+			{sql: "SELECT d.k FROM (SELECT k FROM dev2 WHERE $1 IS NULL) AS d, (SELECT k FROM dev2 WHERE k = $1) AS e", args: []any{int64(1)}, code: "42P08"},
+			{sql: "WITH c AS (SELECT k FROM dev2 WHERE k = $1) SELECT k FROM dev WHERE $1 IS NULL", args: []any{int64(1)}},
+			{sql: "WITH c AS (SELECT k FROM dev2 WHERE $1 IS NULL) SELECT k FROM c WHERE k = $1", args: []any{int64(1)}, code: "42P08"},
+			{sql: "SELECT count(*) FROM dev WHERE k > $1 HAVING $1 IS NULL", args: []any{int64(1)}},
+			{sql: "SELECT count(*) FROM dev WHERE $1 IS NULL HAVING count(*) > $1", args: []any{int64(1)}, code: "42P08"},
+			{sql: "SELECT k FROM dev GROUP BY k HAVING $1 IS NULL ORDER BY k + $1", args: []any{int64(1)}, code: "42P08"},
+			{sql: "SELECT k, count(*) FROM dev GROUP BY k, $1 IS NULL ORDER BY k + $1", args: []any{int64(1)}},
+			{sql: "SELECT k FROM dev GROUP BY k, k + $1 ORDER BY $1 IS NULL, k", args: []any{int64(1)}, code: "42P08"},
+			{sql: "SELECT k FROM dev ORDER BY k LIMIT CASE WHEN $1 IS NULL THEN 1 END OFFSET $1", args: []any{int64(1)}},
+			{sql: "SELECT k FROM dev ORDER BY k LIMIT $1 OFFSET CASE WHEN $1 IS NULL THEN 1 END", args: []any{int64(1)}, code: "42P08"},
+			{sql: "SELECT k FROM dev WHERE EXISTS (SELECT 1 FROM dev2 WHERE dev2.k = dev.k AND $1 IS NULL) AND k = $1", args: []any{int64(1)}, code: "42P08"},
+			{sql: "SELECT k FROM dev WHERE k = $1 AND EXISTS (SELECT 1 FROM dev2 WHERE dev2.k = dev.k AND $1 IS NULL)", args: []any{int64(1)}},
+			{sql: "SELECT (SELECT j FROM dev2 WHERE dev2.k = $1), $1 IS NULL FROM dev WHERE k = 1", args: []any{int64(1)}},
+			{sql: "SELECT k FROM dev WHERE (CASE WHEN $1 IS NULL THEN 1 END) IN (SELECT k FROM dev2 WHERE k = $1)", args: []any{int64(1)}},
+			{sql: "SELECT k FROM dev WHERE k IN (SELECT $1 FROM dev2)", args: []any{"1"}, code: "42883"},
+			// Output columns get text at the end of their query, or where ORDER BY, GROUP BY, or
+			// DISTINCT reads them.
+			{sql: "SELECT $1, $1::bigint", args: []any{"1"}, code: "42P08"},
+			{sql: "SELECT $1::bigint, $1", args: []any{int64(1)}},
+			{sql: "SELECT $1 FROM dev WHERE k = $1", args: []any{int64(1)}, code: "42P08"},
+			{sql: "SELECT $1 FROM dev WHERE s = $1", args: []any{"a"}},
+			{sql: "SELECT $1 FROM dev ORDER BY 1 LIMIT $1", args: []any{"1"}, code: "42804"},
+			{sql: "SELECT $1 FROM dev GROUP BY 1 HAVING $1 > 0", args: []any{"1"}, code: "42P08"},
+			{sql: "SELECT DISTINCT $1 FROM dev WHERE k = $1", args: []any{int64(1)}, code: "42P08"},
+			{sql: "SELECT (SELECT $1), $1::bigint", args: []any{"1"}},
+			// Contexts that coerce right after their operand.
+			{sql: "SELECT k FROM dev WHERE $1 OR k = $1", args: []any{true}, code: "42883"},
+			{sql: "SELECT CASE WHEN $1 THEN $1 END FROM dev", args: []any{true}},
+			{sql: "SELECT CASE $1 WHEN 'a' THEN $1 ELSE 1 END", args: []any{"a"}, code: "42804"},
+			{sql: "SELECT CASE k WHEN $1 THEN $1 IS NULL END FROM dev ORDER BY k", args: []any{int64(1)}},
+			{sql: "SELECT CASE WHEN $1 IS NULL THEN 1 WHEN k = $1 THEN 2 END FROM dev", args: []any{int64(1)}, code: "42P08"},
+			{sql: "SELECT coalesce($1, $1::bigint)", args: []any{int64(1)}},
+			{sql: "SELECT coalesce($1 IS NULL, $1::bigint > 0)", args: []any{int64(1)}, code: "42P08"},
+			{sql: "SELECT coalesce($1::bigint > 0, $1 IS NULL)", args: []any{int64(1)}},
+			// BETWEEN reads its operand twice, and IN compares the one reference with each item.
+			{sql: "SELECT k FROM dev WHERE k BETWEEN $1 AND $1 + 1 ORDER BY k", args: []any{int64(1)}},
+			{sql: "SELECT k FROM dev WHERE $1 BETWEEN k AND 5 ORDER BY k", args: []any{int64(1)}},
+			{sql: "SELECT 1 WHERE $1 BETWEEN 1 AND NULL", args: []any{"2"}},
+			{sql: "SELECT k FROM dev WHERE NOT ($1 BETWEEN k AND f) ORDER BY k", args: []any{int64(1)}},
+			{sql: "SELECT $1 BETWEEN $1 AND TRUE", args: []any{"t"}, code: "42883"},
+			{sql: "SELECT k FROM dev WHERE k IN ($1, $1 + 1)", args: []any{int64(1)}, code: "42P08"},
+			{sql: "SELECT k FROM dev WHERE $1 IN (k, 5)", args: []any{int64(1)}, code: "42P08"},
+			{sql: "SELECT k FROM dev WHERE k = $1 AND $1 IN (i, 5)", args: []any{int64(1)}},
+			{sql: "SELECT k FROM dev WHERE $1 IN (k, 5::bigint)", args: []any{int64(1)}},
+			{sql: "SELECT k FROM dev WHERE $1 IN (k, NULL)", args: []any{"1"}, code: "42P08"},
+			// A later reference has the type, which its context converts implicitly or not.
+			{sql: "SELECT $1::bigint, $1 + 1", args: []any{int64(1)}},
+			{sql: "SELECT $1 + 1, $1 + 5000000000", args: []any{int64(1)}},
+			{sql: "SELECT $1 + 1, $1 + 5000000000", args: []any{"3000000000"}, code: "22003"},
+			{sql: "SELECT $1::float8, $1 = 1", args: []any{1.5}},
+			{sql: "SELECT $1::bigint, $1 || 'x'", args: []any{int64(1)}},
+			{sql: "SELECT $1::bigint, $1 = 'abc'", args: []any{int64(1)}, code: "22P02"},
+			{sql: "SELECT $1::bigint, length($1)", args: []any{int64(1)}, code: "42883"},
+			{sql: "SELECT $1::text, abs($1)", args: []any{"-1"}, code: "42883"},
+			{sql: "SELECT $1::bytea, $1 = 'abc'", args: []any{"abc"}},
+			{sql: "SELECT $1::bigint, $1 = $2", args: []any{int64(1), int64(1)}},
+			{sql: "SELECT $1 = $2, $2 + 1", args: []any{"1", "1"}, code: "42883"},
+			{sql: "SELECT $1::bigint, coalesce($2, $1), coalesce($3, $2), coalesce($4, $3), coalesce($5, $4), length($5)", args: []any{int64(1), int64(2), int64(3), int64(4), int64(5)}, code: "42883"},
+			{sql: "SELECT $1::bigint, coalesce($2, $1), coalesce($3, $2), coalesce($4, $3), coalesce($5, $4), $5 + 0.5::float8", args: []any{int64(1), int64(2), int64(3), int64(4), int64(5)}},
+			{sql: "SELECT k FROM dev WHERE k = $1 AND s = $1", args: []any{int64(1)}, code: "42883"},
+			{sql: "SELECT k FROM dev WHERE f = $1 AND k = $1", args: []any{1.5}},
+			{sql: "SELECT k FROM dev WHERE k = $1 AND $1 + 1 > 0", args: []any{int64(math.MaxInt64)}, code: "22003"},
+			{sql: "SELECT k FROM dev WHERE k = $1 AND s = $1::text", args: []any{int64(1)}},
+			{sql: "SELECT count($1::bigint), count($1)", args: []any{int64(1)}},
+			{sql: "SELECT count($1), $1::bigint", args: []any{int64(1)}, code: "42P08"},
+			{sql: "SELECT count(DISTINCT $1), $1::bigint", args: []any{"1"}},
+			{sql: "SELECT +$1, $1 + 1", args: []any{"2"}},
+			// Errors of the analysis come in Postgres's order.
+			{sql: "SELECT $1, $1::bigint, nope", args: []any{int64(1)}, code: "42703"},
+			{sql: "SELECT $1 IS NULL, $1::bigint, 1 / 0", args: []any{int64(1)}, code: "42P08"},
+			{sql: "SELECT $1::bigint, $1 = 'abc', nope", args: []any{int64(1)}, code: "22P02"},
+			{sql: "SELECT k FROM dev WHERE k = $1 AND s = $1 AND nope = 1", args: []any{int64(1)}, code: "42883"},
+			{sql: "SELECT 1 WHERE $1 BETWEEN 1 AND -$2", args: []any{"1", "2"}, code: "42725"},
+			{sql: "SELECT 1 WHERE $1 AND '\\x'::bytea IN ('\\x' || $2, CAST($1 AS bytea))", args: []any{nil, ""}, code: "42846"},
+			{sql: "SELECT $1 IS NULL, $2 IS NULL, $2::bigint", args: []any{int64(1), int64(2)}, code: "42P08"},
+			// Writes: VALUES rows one at a time, and UPDATE's WHERE before its SET, whose
+			// expressions are all analyzed before they are coerced to their columns.
+			{sql: "INSERT INTO dev2 VALUES ($1, $1)", args: []any{int64(5)}},
+			{sql: "INSERT INTO dev VALUES ($1, NULL, $1, NULL, NULL)", args: []any{int64(6)}, code: "42P08"},
+			{sql: "INSERT INTO dev VALUES ($1 + 0, NULL, $1, NULL, NULL)", args: []any{int64(6)}},
+			{sql: "INSERT INTO dev VALUES ($1, NULL, 'x', NULL, NULL), (8, NULL, $1 || 'y', NULL, NULL)", args: []any{int64(7)}},
+			{sql: "INSERT INTO dev VALUES (9, NULL, $1 || 'y', NULL, NULL), ($1, NULL, 'x', NULL, NULL)", args: []any{int64(10)}, code: "42804"},
+			{sql: "INSERT INTO dev VALUES (11, NULL, $1, NULL, $1 IS NULL)", args: []any{"z"}, code: "42P08"},
+			{sql: "INSERT INTO dev VALUES (12, NULL, 'q', NULL, $1), (13, NULL, CASE WHEN $1 IS NULL THEN 'n' END, NULL, NULL)", args: []any{true}},
+			{sql: "UPDATE dev SET s = CASE WHEN $1 IS NULL THEN 'n' END WHERE k = $1", args: []any{int64(6)}},
+			{sql: "UPDATE dev SET i = $1 + 100 WHERE $1 IS NULL", args: []any{int64(5)}, code: "42P08"},
+			{sql: "UPDATE dev SET s = $1 WHERE k = $1", args: []any{int64(7)}},
+			{sql: "UPDATE dev SET s = $1 || '', i = $1 WHERE k = 8", args: []any{int64(80)}, code: "42804"},
+			{sql: "UPDATE dev SET i = $1, s = $1 WHERE k = 8", args: []any{int64(90)}, code: "42P08"},
+			{sql: "UPDATE dev SET s = 'w' WHERE k = $1 OR $1 IS NULL", args: []any{int64(12)}},
+			{sql: "DELETE FROM dev WHERE k = $1 OR $1 IS NULL", args: []any{int64(13)}},
+			{sql: "DELETE FROM dev WHERE $1 IS NULL OR k = $1", args: []any{int64(13)}, code: "42P08"},
+		}
+		for _, test := range tests {
+			t.Run(test.sql, func(t *testing.T) {
+				m, mErr := queryRow(t, b.m, test.sql, test.args)
+				pg, pgErr := queryRow(t, b.pg, test.sql, test.args)
+				is.Equal(t, test.code, pgdiff.SQLState(pgErr), fmt.Sprint(pgErr))
+				if test.code == "" {
+					is.NotError(t, mErr)
+					is.Equal(t, fmt.Sprint(pg), fmt.Sprint(m))
+				} else {
+					is.True(t, pgdiff.SameClass(mErr, pgErr), fmt.Sprintf("maragudb %v; postgres %v", mErr, pgErr))
+				}
+			})
+		}
+		for _, query := range []string{"SELECT * FROM dev ORDER BY k", "SELECT * FROM dev2 ORDER BY k"} {
+			m, mErr := queryRow(t, b.m, query, nil)
+			is.NotError(t, mErr)
+			pg, pgErr := queryRow(t, b.pg, query, nil)
+			is.NotError(t, pgErr)
+			is.Equal(t, fmt.Sprint(pg), fmt.Sprint(m), "the writes leave the same rows")
+		}
 	})
 }
 

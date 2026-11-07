@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"math"
-	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -299,6 +298,10 @@ func castError(err error) error {
 // resolve gives a constant of unknown type, a NULL or a quoted string literal, the type its
 // context demands, by reading the string with the type's input function as Postgres does. Other
 // expressions are returned as they are.
+//
+// A parameter's value is converted the same way, but an error of the conversion waits until the
+// statement is analyzed, because Postgres reads the values once it has, with the one type that it
+// gives each parameter, which may not be this context's, and the parameter stands in as NULL.
 func resolve(e *cexpr, t value.Type) (*cexpr, error) {
 	if e.typ != value.Unknown || !e.folded {
 		return e, nil
@@ -309,154 +312,41 @@ func resolve(e *cexpr, t value.Type) (*cexpr, error) {
 	if e.val.Null {
 		return constant(value.NewNull(t)), nil
 	}
-	if e.param > 0 {
-		v, err := resolveParam(e.param, e.val, t)
-		if err != nil {
-			if e.use != nil && errors.Is(err, ErrOutOfRange) {
-				// The client library refuses to encode the value.
-				e.use.ledger.refuse(e.use.n, err, true)
-				return constant(value.NewNull(t)), nil
-			}
-			return nil, err
+	var v value.Value
+	var err error
+	switch {
+	case e.param > 0:
+		v, err = resolveParam(e.param, e.val, t)
+	case t == value.Unknown:
+		return constant(value.NewString(e.val.S)), nil
+	case t == value.Decimal:
+		err = fmt.Errorf("%w: a quoted literal of type numeric, the type of SUM and AVG of integers, is not supported; cast the literal, such as '5'::bigint", ErrUnsupported)
+	default:
+		if v, err = value.Parse(e.val.S, t); err != nil {
+			err = castError(err)
 		}
+	}
+	if err == nil {
 		return constant(v), nil
 	}
-	if t == value.Unknown {
-		return constant(value.NewString(e.val.S)), nil
-	}
-	if t == value.Decimal {
-		return nil, fmt.Errorf("%w: a quoted literal of type numeric, the type of SUM and AVG of integers, is not supported; cast the literal, such as '5'::bigint", ErrUnsupported)
-	}
-	v, err := value.Parse(e.val.S, t)
-	if err != nil {
-		err = castError(err)
-		if e.use != nil && !errors.Is(err, ErrUnsupported) {
-			// Postgres reads a parameter's text as its type when it binds the parameters, after it
-			// analyzed the statement, so the error waits, and the parameter stands in as NULL.
-			e.use.ledger.refuse(e.use.n, err, false)
-			return constant(value.NewNull(t)), nil
-		}
+	if e.use == nil {
 		return nil, err
 	}
-	return constant(v), nil
-}
-
-// paramLedger is what the analysis of a statement learns of its parameters, as Postgres learns it
-// when it parses the statement: the type that the contexts of each parameter give it, from which
-// Postgres infers one type per parameter; and the errors with which it refuses their values when
-// it binds them, after the analysis and before it folds constants, in the order of their numbers.
-type paramLedger struct {
-	// n is the highest parameter number of the statement, and used the numbers it references.
-	n    int
-	used map[int]bool
-	// types are the types that the contexts of each parameter give it, and untyped the
-	// parameters in a context that gives none.
-	types   map[int][]value.Type
-	untyped map[int]bool
-	// refused and encode are the errors of the values that Postgres refuses and that the client
-	// library refuses to encode, which it tries for every parameter before it sends any, by
-	// parameter number.
-	refused, encode map[int]error
-	// checked is set once the analysis of the statement is complete.
-	checked bool
-}
-
-// paramUse is a reference to the parameter n.
-type paramUse struct {
-	n      int
-	ledger *paramLedger
-}
-
-// newParamLedger for a statement that references the parameter numbers used, up to n.
-func newParamLedger(n int, used map[int]bool) *paramLedger {
-	return &paramLedger{n: n, used: used}
-}
-
-// use records a reference to the parameter n.
-func (l *paramLedger) use(n int) *paramUse {
-	return &paramUse{n: n, ledger: l}
-}
-
-// typed records that a context gives the parameter the type t, which is text for an unknown.
-func (u *paramUse) typed(t value.Type) {
+	l := e.use.ledger
+	switch {
+	case e.param > 0 && errors.Is(err, ErrOutOfRange):
+		// The client library refuses to encode the value.
+		l.refuse(&l.encode, e.use.n, err)
+	case errors.Is(err, ErrUnsupported):
+		l.refuse(&l.convert, e.use.n, err)
+	default:
+		// Postgres refuses the parameter's text when it binds the parameters.
+		l.refuse(&l.refused, e.use.n, err)
+	}
 	if t == value.Unknown {
 		t = value.String
 	}
-	l := u.ledger
-	if l.types == nil {
-		l.types = map[int][]value.Type{}
-	}
-	if !slices.Contains(l.types[u.n], t) {
-		l.types[u.n] = append(l.types[u.n], t)
-	}
-}
-
-// untyped records that a context gives the parameter no type, as IS NULL and count() do.
-func (u *paramUse) untyped() {
-	if u.ledger.untyped == nil {
-		u.ledger.untyped = map[int]bool{}
-	}
-	u.ledger.untyped[u.n] = true
-}
-
-// refuse records the error err for the value of parameter n, which the client library refuses to
-// encode when client is set.
-func (l *paramLedger) refuse(n int, err error, client bool) {
-	m := &l.refused
-	if client {
-		m = &l.encode
-	}
-	if *m == nil {
-		*m = map[int]error{}
-	}
-	if _, ok := (*m)[n]; !ok {
-		(*m)[n] = err
-	}
-}
-
-// check reports, once the statement is analyzed, a parameter whose type Postgres does not
-// determine: one that the statement skips, or whose contexts give it no type, which fails with
-// 42P18, as Postgres fails it when it parses the statement. A parameter whose contexts give it
-// different types, or a type and none, is not supported: Postgres gives a parameter the type of
-// its first context in the order of its analysis, which can then fail in a later context, or
-// fails with 42P08, where a quoted literal takes the type of each context.
-func (l *paramLedger) check() error {
-	if l == nil || l.checked {
-		return nil
-	}
-	l.checked = true
-	for n := 1; n <= l.n; n++ {
-		switch types := l.types[n]; {
-		case len(types) > 1:
-			return fmt.Errorf("%w: parameter $%d in contexts of the types %v and %v is not supported, because Postgres gives a parameter one type; cast the parameter, such as $%d::%v, or pass the value twice", ErrUnsupported, n, types[0], types[1], n, types[0])
-		case len(types) == 1 && l.untyped[n]:
-			return fmt.Errorf("%w: parameter $%d in IS NULL or count() and in a context of type %v is not supported, because whether Postgres determines its type depends on their order; cast the parameter, such as $%d::%v", ErrUnsupported, n, types[0], n, types[0])
-		case len(types) == 0 && l.used[n] && !l.untyped[n]:
-			return fmt.Errorf("%w: parameter $%d in a context whose type maragudb does not determine as Postgres does is not supported; cast the parameter, such as $%d::text", ErrUnsupported, n, n)
-		}
-	}
-	for n := 1; n <= l.n; n++ {
-		if len(l.types[n]) == 0 {
-			return fmt.Errorf("%w: could not determine data type of parameter $%d; cast it, such as $%d::bigint", ErrType, n, n)
-		}
-	}
-	return nil
-}
-
-// refusal is the error of the first parameter, by number, whose value the client library refuses
-// to encode, or else that Postgres refuses.
-func (l *paramLedger) refusal() error {
-	if l == nil || l.encode == nil && l.refused == nil {
-		return nil
-	}
-	for _, m := range []map[int]error{l.encode, l.refused} {
-		for n := 1; n <= l.n; n++ {
-			if err, ok := m[n]; ok {
-				return err
-			}
-		}
-	}
-	return nil
+	return constant(value.NewNull(t)), nil
 }
 
 // paramError is the error with which Postgres refuses the value v of parameter n when it reads
@@ -779,7 +669,26 @@ func (b *binder) unifyAll(es []*cexpr, what string) ([]*cexpr, value.Type, error
 	return out, t, nil
 }
 
+// bind e. An error of the analysis carries the position of the innermost expression that
+// failed, in the order of [paramOrder], when the statement needs it.
 func (b *binder) bind(e ast.Expr) (*cexpr, error) {
+	ce, err := b.bindNode(e)
+	if err != nil {
+		err = b.locate(e, err)
+	}
+	return ce, err
+}
+
+// locate err as an error of the analysis right after the expression e, when the statement needs
+// the position. See [paramOrder].
+func (b *binder) locate(e ast.Expr, err error) error {
+	if b.run != nil && b.run.s.params != nil && b.run.s.params.order != nil {
+		return b.run.s.params.order.locate(e, err)
+	}
+	return err
+}
+
+func (b *binder) bindNode(e ast.Expr) (*cexpr, error) {
 	if b.agg != nil && b.agg.g != nil && !b.agg.nested {
 		if ce, ok, err := b.groupedExpr(e); ok || err != nil {
 			return ce, err
@@ -798,7 +707,7 @@ func (b *binder) bind(e ast.Expr) (*cexpr, error) {
 		v := b.params[e.Index-1]
 		var use *paramUse
 		if b.run != nil && b.run.s.params != nil {
-			use = b.run.s.params.use(e.Index)
+			use = b.run.s.params.use(e)
 		}
 		if err := paramError(e.Index, v); err != nil {
 			if use == nil {
@@ -807,13 +716,19 @@ func (b *binder) bind(e ast.Expr) (*cexpr, error) {
 			// Postgres reads the parameters' values once it analyzed the statement, before it
 			// folds constants, so the error waits for [binder.folding], and the parameter stands
 			// for a value that analyzes the same.
-			use.ledger.refuse(e.Index, err, false)
+			use.ledger.refuse(&use.ledger.refused, e.Index, err)
 			v = paramStandIn(v)
 		}
-		if v.Type == value.Unknown {
-			return &cexpr{typ: value.Unknown, folded: true, val: v, use: use}, nil
+		ce := &cexpr{typ: value.Unknown, folded: true, val: v, use: use}
+		if v.Type != value.Unknown {
+			ce.param = e.Index
 		}
-		return &cexpr{typ: value.Unknown, folded: true, val: v, param: e.Index, use: use}, nil
+		if use != nil && use.pre {
+			// Postgres makes this reference once the parameter has a type, which the
+			// reference then has.
+			return resolve(ce, use.ledger.retype[e])
+		}
+		return ce, nil
 	case *ast.ColumnRef:
 		return b.columnRef(e)
 	case *ast.Subquery:
@@ -828,11 +743,10 @@ func (b *binder) bind(e ast.Expr) (*cexpr, error) {
 			return nil, err
 		}
 		if x.use != nil {
-			// IS NULL gives a parameter no type, as in Postgres.
+			// IS NULL gives a parameter no type, as in Postgres, and reads only whether its
+			// value is NULL.
 			x.use.untyped()
-			c := *x
-			c.use = nil
-			x = &c
+			return constant(value.NewBool(x.val.Null != e.Not)), nil
 		}
 		if x, err = resolve(x, value.String); err != nil {
 			return nil, err
@@ -896,7 +810,7 @@ func (b *binder) unary(e *ast.Unary) (*cexpr, error) {
 			return nil, err
 		}
 		if x.typ != value.Bool {
-			return nil, fmt.Errorf("%w: argument of NOT must be type boolean, not type %v", ErrType, x.typ)
+			return nil, b.locate(e.Expr, fmt.Errorf("%w: argument of NOT must be type boolean, not type %v", ErrType, x.typ))
 		}
 		return b.fold(&cexpr{typ: value.Bool, eval: func(row []value.Value) (value.Value, error) {
 			v, err := x.value(row)
@@ -910,10 +824,17 @@ func (b *binder) unary(e *ast.Unary) (*cexpr, error) {
 		if e.Op == ast.Pos {
 			sym = "+"
 		}
+		if x.typ == value.Unknown && e.Op == ast.Pos {
+			// Postgres has unary plus only for numeric types, of which it picks double
+			// precision, the preferred one, for an unknown operand.
+			if x, err = resolve(x, value.Float); err != nil {
+				return nil, err
+			}
+		}
 		switch x.typ {
 		case value.Unknown:
-			// Postgres has unary minus and plus for several types, so an unknown operand is
-			// ambiguous.
+			// Postgres has unary minus for several types of different categories, so an unknown
+			// operand is ambiguous.
 			return nil, fmt.Errorf("%w: operator is not unique: %s unknown", ErrType, sym)
 		case value.Numeric:
 			return nil, fmt.Errorf("%w: the numeric type is not supported, write the sign as part of the literal or cast the literal to double precision or bigint", ErrUnsupported)
@@ -1088,7 +1009,8 @@ func (b *binder) logical(e *ast.Binary) (*cexpr, error) {
 		return nil, err
 	}
 	if l.typ != value.Bool {
-		return nil, fmt.Errorf("%w: argument of %s must be type boolean, not type %v", ErrType, logicalName(e.Op), l.typ)
+		// Postgres coerces each argument right after it analyzes it.
+		return nil, b.locate(e.Left, fmt.Errorf("%w: argument of %s must be type boolean, not type %v", ErrType, logicalName(e.Op), l.typ))
 	}
 	// Postgres folds AND and OR left to right and stops at a constant that decides the result, so
 	// the right side is only type-checked, and an error in folding it is not reported.
@@ -1107,7 +1029,7 @@ func (b *binder) logical(e *ast.Binary) (*cexpr, error) {
 		return nil, err
 	}
 	if r.typ != value.Bool {
-		return nil, fmt.Errorf("%w: argument of %s must be type boolean, not type %v", ErrType, logicalName(e.Op), r.typ)
+		return nil, b.locate(e.Right, fmt.Errorf("%w: argument of %s must be type boolean, not type %v", ErrType, logicalName(e.Op), r.typ))
 	}
 	// A constant that decides the result also decides it on the right, after a left side that is
 	// not constant, because Postgres drops the other arguments of an AND with a FALSE constant
@@ -1291,10 +1213,14 @@ func floatArithmetic(op ast.BinaryOp, x, y float64) (value.Value, error) {
 func desugar(e ast.Expr) (ast.Expr, bool) {
 	switch e := e.(type) {
 	case *ast.Between:
-		if e.Not {
-			return &ast.Binary{Op: ast.Or, Left: &ast.Binary{Op: ast.Lt, Left: e.Expr, Right: e.Low}, Right: &ast.Binary{Op: ast.Gt, Left: e.Expr, Right: e.High}}, true
+		second := e.Expr
+		if e.Copy != nil {
+			second = e.Copy
 		}
-		return &ast.Binary{Op: ast.And, Left: &ast.Binary{Op: ast.Ge, Left: e.Expr, Right: e.Low}, Right: &ast.Binary{Op: ast.Le, Left: e.Expr, Right: e.High}}, true
+		if e.Not {
+			return &ast.Binary{Op: ast.Or, Left: &ast.Binary{Op: ast.Lt, Left: e.Expr, Right: e.Low}, Right: &ast.Binary{Op: ast.Gt, Left: second, Right: e.High}}, true
+		}
+		return &ast.Binary{Op: ast.And, Left: &ast.Binary{Op: ast.Ge, Left: e.Expr, Right: e.Low}, Right: &ast.Binary{Op: ast.Le, Left: second, Right: e.High}}, true
 	case *ast.In:
 		var constants, columns []ast.Expr
 		for _, item := range e.List {
@@ -1550,14 +1476,15 @@ func (b *binder) caseExpr(e *ast.Case) (*cexpr, error) {
 			if err != nil {
 				return nil, err
 			}
+			// Postgres compares each WHEN, or coerces it to boolean, right after it analyzes it.
 			if operand != nil {
 				if _, _, err = b.unify(operand, cond, "="); err != nil {
-					return nil, err
+					return nil, b.locate(w.Cond, err)
 				}
 			} else if cond, err = resolve(cond, value.Bool); err != nil {
 				return nil, err
 			} else if cond.typ != value.Bool {
-				return nil, fmt.Errorf("%w: argument of CASE/WHEN must be type boolean, not type %v", ErrType, cond.typ)
+				return nil, b.locate(w.Cond, fmt.Errorf("%w: argument of CASE/WHEN must be type boolean, not type %v", ErrType, cond.typ))
 			}
 			result, err := b.bindPruned(w.Result)
 			if err != nil {
@@ -1574,7 +1501,7 @@ func (b *binder) caseExpr(e *ast.Case) (*cexpr, error) {
 		o := operand
 		if operand != nil {
 			if o, cond, err = b.unify(operand, cond, "="); err != nil {
-				return nil, err
+				return nil, b.locate(w.Cond, err)
 			}
 			// A NULL operand or value never matches, and the comparison is strict, so the WHEN
 			// is known not to match when either is a known NULL.
@@ -1587,7 +1514,7 @@ func (b *binder) caseExpr(e *ast.Case) (*cexpr, error) {
 				return nil, err
 			}
 			if cond.typ != value.Bool {
-				return nil, fmt.Errorf("%w: argument of CASE/WHEN must be type boolean, not type %v", ErrType, cond.typ)
+				return nil, b.locate(w.Cond, fmt.Errorf("%w: argument of CASE/WHEN must be type boolean, not type %v", ErrType, cond.typ))
 			}
 			if cond.folded {
 				known = true
@@ -1662,16 +1589,20 @@ func (b *binder) caseExpr(e *ast.Case) (*cexpr, error) {
 	}
 	return b.fold(&cexpr{typ: t, eval: func(row []value.Value) (value.Value, error) {
 		for _, w := range whens {
+			// Postgres evaluates the operand before the WHEN values, once per row.
+			var o value.Value
+			if w.operand != nil {
+				var err error
+				if o, err = w.operand.value(row); err != nil {
+					return value.Value{}, err
+				}
+			}
 			c, err := w.cond.value(row)
 			if err != nil {
 				return value.Value{}, err
 			}
 			var matched bool
 			if w.operand != nil {
-				o, err := w.operand.value(row)
-				if err != nil {
-					return value.Value{}, err
-				}
 				matched = !o.Null && !c.Null && value.Compare(o, c) == 0
 			} else {
 				matched = !c.Null && c.B

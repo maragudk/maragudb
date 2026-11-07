@@ -54,10 +54,12 @@ var ErrorClasses = []ErrorClass{
 	{Name: "program limit", Err: maragudb.ErrProgramLimit, Codes: []string{"54011"}},
 	// 42804 is datatype_mismatch and 42883 is undefined_function, which Postgres reports for an
 	// operator without a variant for its operand types, 42725 ambiguous_function, for a
-	// function or operator whose argument of unknown type fits several variants, and 42P18
+	// function or operator whose argument of unknown type fits several variants, 42P18
 	// indeterminate_datatype, for a parameter that the statement skips or whose contexts give it
-	// no type.
-	{Name: "type", Err: maragudb.ErrType, Codes: []string{"42804", "42883", "42725", "42P18"}},
+	// no type, and 42P08 ambiguous_parameter, for a reference to a parameter that Postgres makes
+	// before the parameter has a type and then coerces to another type, or reads in a context
+	// that gives it none.
+	{Name: "type", Err: maragudb.ErrType, Codes: []string{"42804", "42883", "42725", "42P18", "42P08"}},
 	// 42803 is grouping_error.
 	{Name: "grouping", Err: maragudb.ErrGrouping, Codes: []string{"42803"}},
 	// 22P02 is invalid_text_representation, 22007 invalid_datetime_format, 22008

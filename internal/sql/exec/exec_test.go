@@ -361,7 +361,7 @@ func TestSession_Select(t *testing.T) {
 			{"SELECT 1.5::float8 % 1.0::float8", exec.ErrType},
 			{"SELECT -'a'", exec.ErrType},
 			{"SELECT -NULL", exec.ErrType},
-			{"SELECT +NULL", exec.ErrType},
+			{"SELECT +'a'", exec.ErrCast},
 			{"SELECT '1' + '2'", exec.ErrType},
 			{"SELECT NULL + NULL", exec.ErrType},
 			{"SELECT 1 || 2", exec.ErrType},
@@ -658,6 +658,40 @@ func TestSession_Select(t *testing.T) {
 		is.Error(t, exec.ErrUnsupported, queryErr(t, s, "SELECT $1 AND TRUE", 1))
 		is.Equal(t, "true", query(t, s, "SELECT $1 AND TRUE", true))
 		is.Equal(t, "NULL", query(t, s, "SELECT $1 + 1", nil))
+	})
+
+	t.Run("evaluates the operand of a CASE before its WHEN values", func(t *testing.T) {
+		verify.Covers(t, "a simple CASE evaluates its operand on a row before its WHEN values, so an operand that fails on a row fails first, as in Postgres", "INV-PG-SUBSET")
+		s := newSession(t)
+		mustExec(t, s, "CREATE TABLE e (id bigint PRIMARY KEY)")
+		mustExec(t, s, "INSERT INTO e VALUES (-9223372036854775808)")
+		is.Error(t, exec.ErrOutOfRange, queryErr(t, s, "SELECT CASE abs(id) WHEN id / 0 THEN 1 END FROM e"))
+	})
+
+	t.Run("types a parameter at its first context in the order in which Postgres analyzes the statement", func(t *testing.T) {
+		verify.Covers(t, "a parameter gets the type of the first context that coerces it in Postgres's order of analysis, later references have that type, which their contexts convert or refuse, and a reference made before then that a later context coerces to another type or reads in IS NULL fails with ErrType", "INV-PLACEHOLDERS")
+		s := newSession(t)
+		mustExec(t, s, "CREATE TABLE e (id bigint PRIMARY KEY, s text, f double precision)")
+		mustExec(t, s, "INSERT INTO e VALUES (1, 'a', 1.5), (2, 'b', 2.5)")
+		is.Equal(t, "2", query(t, s, "SELECT id FROM e WHERE id = $1 OR $1 IS NULL ORDER BY id", 2))
+		is.Equal(t, "1\n2", query(t, s, "SELECT id FROM e WHERE id = $1 OR $1 IS NULL ORDER BY id", nil))
+		is.Equal(t, "1\n2", query(t, s, "SELECT id FROM e WHERE ($1::bigint IS NULL OR id = $1) ORDER BY id", nil))
+		is.Equal(t, "2", query(t, s, "SELECT id FROM e WHERE id = coalesce($1, id) ORDER BY id", "2"))
+		is.Error(t, exec.ErrType, queryErr(t, s, "SELECT id FROM e WHERE $1 IS NULL OR id = $1", 2), "IS NULL reads the parameter before it has a type")
+		is.Error(t, exec.ErrType, queryErr(t, s, "SELECT $1 IS NULL FROM e WHERE id = $1", 2), "the output comes before WHERE")
+		is.Equal(t, "false", query(t, s, "SELECT $1 IS NULL FROM e JOIN e AS x ON e.id = x.id AND e.id = $1", 2), "the join conditions come before the output")
+		is.Error(t, exec.ErrType, queryErr(t, s, "SELECT $1, $1::bigint", "1"), "an output column is text at the end of its query")
+		is.Equal(t, "1 1", query(t, s, "SELECT $1::bigint, $1", 1))
+		is.Equal(t, "2 5000000001", query(t, s, "SELECT $1 + 1, $1 + 5000000000", 1), "the second reference is an integer, which widens")
+		is.Error(t, exec.ErrOutOfRange, queryErr(t, s, "SELECT $1 + 1, $1 + 5000000000", int64(3000000000)), "the client library refuses an integer out of range")
+		is.Error(t, exec.ErrType, queryErr(t, s, "SELECT id FROM e WHERE id = $1 AND s = $1", 1), "text = bigint does not exist")
+		is.Equal(t, "", query(t, s, "SELECT id FROM e WHERE f = $1 AND id = $1", 1.5), "bigint = double precision exists")
+		is.Equal(t, `1 "1x"`, query(t, s, "SELECT $1::bigint, $1 || 'x'", 1))
+		is.Equal(t, "1", query(t, s, "SELECT id FROM e WHERE id BETWEEN $1 AND $1 + 1 AND id < 2", 1), "BETWEEN reads its operands twice")
+		is.Error(t, exec.ErrType, queryErr(t, s, "SELECT id FROM e WHERE $1 IN (id, 5)", 1), "the left side of IN is one reference with two types")
+		is.Equal(t, "1 1 1", query(t, s, "SELECT $1::bigint, coalesce($2, $1), coalesce($3, $2)", 1, 1, 1), "each analysis settles the next reference")
+		is.Error(t, exec.ErrType, queryErr(t, s, "UPDATE e SET s = $1, f = $1 IS NULL WHERE id = 1", "x"), "SET is analyzed before it is coerced")
+		is.Equal(t, "1", query(t, s, "SELECT count(DISTINCT $1)", "x"), "DISTINCT makes the argument text")
 	})
 
 	t.Run("refuses the values of parameters that Postgres refuses when it reads them, after a mistake anywhere in the statement and before a folding error", func(t *testing.T) {
