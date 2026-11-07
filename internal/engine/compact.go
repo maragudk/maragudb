@@ -725,9 +725,7 @@ func (db *DB) readChains(ctx context.Context, m *manifest, progress func() error
 			if _, ok := keep[key]; ok {
 				return nil, fmt.Errorf("%w: garbage batch %q is in two chains or twice in one", ErrCorrupt, key)
 			}
-			db.batchMu.Lock()
-			b, ok := db.batches[key]
-			db.batchMu.Unlock()
+			b, ok := db.cachedBatch(key)
 			if !ok {
 				// A cold cache reads every batch, which is long work.
 				if err := progress(); err != nil {
@@ -745,10 +743,23 @@ func (db *DB) readChains(ctx context.Context, m *manifest, progress func() error
 		}
 		chains[ref.Key] = c
 	}
-	db.batchMu.Lock()
-	db.batches = keep
-	db.batchMu.Unlock()
+	db.keepBatches(keep)
 	return chains, nil
+}
+
+// cachedBatch of key, if this process has it.
+func (db *DB) cachedBatch(key string) (*garbageBatch, bool) {
+	db.batchMu.Lock()
+	defer db.batchMu.Unlock()
+	b, ok := db.batches[key]
+	return b, ok
+}
+
+// keepBatches as the cached garbage batches, in place of the ones cached so far.
+func (db *DB) keepBatches(keep map[string]*garbageBatch) {
+	db.batchMu.Lock()
+	defer db.batchMu.Unlock()
+	db.batches = keep
 }
 
 // getGarbageBatch from the store, which m references.

@@ -269,9 +269,7 @@ func (db *DB) Close() error {
 
 // Stats so far.
 func (db *DB) Stats() Stats {
-	db.manifestMu.Lock()
-	m := db.manifest
-	db.manifestMu.Unlock()
+	m, _ := db.cachedManifest()
 	s := Stats{
 		S3:                 db.client.Counter.Counts(),
 		MemoryCacheHits:    db.memHits.Load(),
@@ -319,6 +317,13 @@ func (db *DB) newID() string {
 	return hex.EncodeToString(b[:])
 }
 
+// jitter drawn uniformly from [0, d), for d > 0.
+func (db *DB) jitter(d time.Duration) time.Duration {
+	db.randMu.Lock()
+	defer db.randMu.Unlock()
+	return time.Duration(db.rand.Int64N(int64(d)))
+}
+
 // cachedManifest and its ETag, if any.
 func (db *DB) cachedManifest() (*manifest, string) {
 	db.manifestMu.Lock()
@@ -330,20 +335,28 @@ func (db *DB) cachedManifest() (*manifest, string) {
 // store is the truth and a cached one may belong to a database that no longer exists. One that
 // a local write produced only wins when it is newer than the cached one.
 func (db *DB) setManifest(m *manifest, etag string, fromStore bool) {
-	db.manifestMu.Lock()
-	if !fromStore && db.manifest != nil && db.manifest.Seq > m.Seq {
-		db.manifestMu.Unlock()
+	if !db.replaceManifest(m, etag, fromStore) {
 		return
 	}
-	db.manifest = m
-	db.etag = etag
-	db.manifestMu.Unlock()
 	if db.disk != nil {
 		if b, err := encodeManifest(db.manifestKey(), m); err == nil {
 			cached, _ := json.Marshal(diskManifest{ETag: etag, Body: b})
 			db.disk.Put(db.diskManifestKey(), cached)
 		}
 	}
+}
+
+// replaceManifest sets the cached manifest under its lock, unless a local write produced m and
+// the cached one is newer, and reports whether it did.
+func (db *DB) replaceManifest(m *manifest, etag string, fromStore bool) bool {
+	db.manifestMu.Lock()
+	defer db.manifestMu.Unlock()
+	if !fromStore && db.manifest != nil && db.manifest.Seq > m.Seq {
+		return false
+	}
+	db.manifest = m
+	db.etag = etag
+	return true
 }
 
 // diskManifestKey of the disk cache's record of the last seen manifest. It names the version of
@@ -376,10 +389,7 @@ func (db *DB) loadManifestFromDisk() {
 		db.cacheRefused(&db.diskRefused, "disk", db.diskManifestKey(), err)
 		return
 	}
-	db.manifestMu.Lock()
-	db.manifest = m
-	db.etag = dm.ETag
-	db.manifestMu.Unlock()
+	db.replaceManifest(m, dm.ETag, true)
 }
 
 // refreshManifest asks the store whether the cached manifest is still current, with a conditional

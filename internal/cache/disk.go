@@ -223,12 +223,7 @@ func (d *Disk) decodeEntry(key string, b []byte) ([]byte, bool) {
 // cache.
 func (d *Disk) Get(key string) ([]byte, bool) {
 	name := entryName(key)
-	d.mu.Lock()
-	e, ok := d.entries[name]
-	if ok {
-		d.order.MoveToFront(e)
-	}
-	d.mu.Unlock()
+	e, ok := d.touch(name)
 	if !ok {
 		return nil, false
 	}
@@ -259,6 +254,32 @@ func (d *Disk) Put(key string, value []byte) {
 	d.putMu.Lock()
 	defer d.putMu.Unlock()
 	tmp, size, ok := d.writeTemp(key, value)
+	victims := d.install(name, tmp, size, ok)
+	// The files of the evicted entries are removed without the lock, so that reads need not wait
+	// for the removals. Only a Put could write one of these names again, and the Puts take turns.
+	var stuck []*diskEntry
+	for _, e := range victims {
+		if err := d.fs.Remove(e.name); err != nil && !errors.Is(err, fs.ErrNotExist) {
+			stuck = append(stuck, e)
+		}
+	}
+	d.keepStuck(stuck)
+}
+
+// touch the entry of name as the most recently used, and return it, if there is one.
+func (d *Disk) touch(name string) (*list.Element, bool) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	e, ok := d.entries[name]
+	if ok {
+		d.order.MoveToFront(e)
+	}
+	return e, ok
+}
+
+// install the file tmp of size bytes as the entry of name, when ok, by renaming it, or drop the
+// entry otherwise, and return the entries to evict to stay within the bound.
+func (d *Disk) install(name, tmp string, size int64, ok bool) []*diskEntry {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	if ok && d.fs.Rename(tmp, name) != nil {
@@ -267,7 +288,7 @@ func (d *Disk) Put(key string, value []byte) {
 	}
 	if !ok {
 		d.drop(name)
-		return
+		return nil
 	}
 	// The rename replaced the old file of the key, whether it was an entry or stuck.
 	if old, ok := d.entries[name]; ok {
@@ -280,17 +301,14 @@ func (d *Disk) Put(key string, value []byte) {
 	}
 	d.entries[name] = d.order.PushFront(&diskEntry{name: name, bytes: size})
 	d.bytes += size
-	victims := d.evictEntries()
-	d.mu.Unlock()
-	// The files of the evicted entries are removed without the lock, so that reads need not wait
-	// for the removals. Only a Put could write one of these names again, and the Puts take turns.
-	var stuck []*diskEntry
-	for _, e := range victims {
-		if err := d.fs.Remove(e.name); err != nil && !errors.Is(err, fs.ErrNotExist) {
-			stuck = append(stuck, e)
-		}
-	}
+	return d.evictEntries()
+}
+
+// keepStuck counts the entries whose files could not be removed, until a later eviction removes
+// them.
+func (d *Disk) keepStuck(stuck []*diskEntry) {
 	d.mu.Lock()
+	defer d.mu.Unlock()
 	for _, e := range stuck {
 		d.stuck[e.name] = e.bytes
 		d.bytes += e.bytes

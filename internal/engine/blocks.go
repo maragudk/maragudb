@@ -145,9 +145,7 @@ func (db *DB) getBlock(ctx context.Context, objectKey string, ref blockRef) (s3.
 		}
 		assert.Sometimes(true, "a failed block read is retried", nil)
 		wait := 10 * time.Millisecond << attempt
-		db.randMu.Lock()
-		wait += time.Duration(db.rand.Int64N(int64(wait)))
-		db.randMu.Unlock()
+		wait += db.jitter(wait)
 		db.log.Debug("retrying block read", "key", objectKey, "attempt", attempt+1, "wait", wait, "error", err)
 		db.sleep(ctx, wait)
 		if ctx.Err() != nil {

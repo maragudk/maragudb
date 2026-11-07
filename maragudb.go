@@ -41,6 +41,10 @@
 // itself. An explicit transaction whose commit loses to a concurrent commit fails with
 // [ErrConflict], and the caller retries the whole transaction. A read-only transaction, begun
 // with sql.TxOptions{ReadOnly: true}, never conflicts.
+//
+// A panic inside the driver is a bug in maragudb. The driver recovers it, so that it never
+// unwinds through database/sql, and the call fails with [ErrInternal]; the connection is
+// discarded, and a transaction in which a call panicked never commits.
 package maragudb
 
 import (
@@ -143,6 +147,15 @@ var (
 	// Postgres, every statement fails with it until the transaction ends, and a COMMIT of such a
 	// transaction rolls it back.
 	ErrTxAborted = exec.ErrTxAborted
+	// ErrInternal is a bug in maragudb: a call into the driver panicked, and the driver
+	// recovered the panic instead of letting it unwind through database/sql. The message holds
+	// the panic's value, and [Options.Logger] gets it with the stack at the error level. The
+	// connection is discarded, and database/sql opens a new one for the next statement. A
+	// transaction in which a call panicked rolls back: its later statements fail with
+	// ErrInternal, and so does its commit. A statement outside a transaction, or a commit, that
+	// fails with it may or may not have taken effect, as with [ErrCommitUnknown], but it is
+	// never run again.
+	ErrInternal = sqldriver.ErrInternal
 	// ErrDSN is an invalid data source name.
 	ErrDSN = sqldriver.ErrDSN
 	// ErrDiskCacheInUse is a disk cache directory that another process uses. See
@@ -246,12 +259,17 @@ func (o Options) withDefaults() Options {
 }
 
 func newDriver(opts Options) *sqldriver.Driver {
+	return sqldriver.New(driverOptions(opts))
+}
+
+// driverOptions of the SQL driver for opts.
+func driverOptions(opts Options) sqldriver.Options {
 	opts = opts.withDefaults()
 	var client s3.Client
 	if opts.Store != nil {
 		client = storeClient{store: opts.Store}
 	}
-	return sqldriver.New(sqldriver.Options{
+	return sqldriver.Options{
 		Engine: engine.Options{
 			Client:           client,
 			Logger:           opts.Logger,
@@ -270,7 +288,7 @@ func newDriver(opts Options) *sqldriver.Driver {
 		NewClient: func(ctx context.Context, bucket string) (s3.Client, error) {
 			return s3.NewAWSClient(ctx, s3.AWSOptions{Bucket: bucket})
 		},
-	})
+	}
 }
 
 // RegisterDriver with [database/sql] under opts.Name. It panics when the name is registered

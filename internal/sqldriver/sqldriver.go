@@ -22,6 +22,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/antithesishq/antithesis-sdk-go/assert"
+
 	"maragu.dev/maragudb/internal/cache"
 	"maragu.dev/maragudb/internal/engine"
 	"maragu.dev/maragudb/internal/s3"
@@ -31,6 +33,15 @@ import (
 
 // ErrDSN is an invalid data source name.
 var ErrDSN = errors.New("sqldriver: invalid DSN, want s3://bucket/prefix")
+
+// ErrInternal is a bug in maragudb: a call into the driver panicked, and the driver recovered the
+// panic. The message holds the panic's value. The connection is discarded, and a transaction in
+// which a call panicked rolls back. A statement outside a transaction, or a commit, that fails
+// with it may or may not have taken effect, as with [engine.ErrCommitUnknown].
+var ErrInternal = errors.New("sqldriver: internal error, a bug in maragudb")
+
+// errBroken is the error of a call on a connection that an earlier call broke with a panic.
+var errBroken = fmt.Errorf("%w: an earlier call on the connection panicked, and the connection is discarded", ErrInternal)
 
 // Options for a [Driver].
 type Options struct {
@@ -49,14 +60,13 @@ type Options struct {
 	// Maintenance in the background for every database.
 	Maintenance MaintenanceOptions
 	Logger      *slog.Logger
-	// OnPanic, when set, recovers a panic in a call into a connection, a statement, or a
-	// transaction, and the call returns the error that OnPanic returns for the panic's value and
-	// stack. The connection is broken afterwards: its transaction cannot commit, and database/sql
-	// discards it. The panic may have left the engine with locks held or state half changed, so
-	// OnPanic is for a caller that ends soon after, such as a test that fails on the panic.
-	// Without OnPanic, a panic goes on to the caller, through database/sql, which can leave its
-	// locks held.
-	OnPanic func(value any, stack []byte) error
+	// OnPanic, when set, is called with the value and the stack of every panic that the driver
+	// recovers, after the panic is logged. The driver recovers a panic in every call into a
+	// connector, a connection, a statement, a transaction, or rows, so that it never unwinds
+	// through database/sql, whose locks it would leave held. The call returns an error that wraps
+	// [ErrInternal], and the connection is broken: its transaction cannot commit, and database/sql
+	// discards it.
+	OnPanic func(value any, stack []byte)
 }
 
 // MaintenanceOptions for the background loop that compacts and garbage collects a database.
@@ -216,12 +226,37 @@ func (c *Connector) maintain(ctx context.Context) {
 }
 
 // Connect opens a connection.
-func (c *Connector) Connect(ctx context.Context) (driver.Conn, error) {
+func (c *Connector) Connect(ctx context.Context) (_ driver.Conn, err error) {
+	defer c.d.recoverPanic(&err)
 	db, err := c.DB(ctx)
 	if err != nil {
 		return nil, err
 	}
-	return &Conn{db: db, session: exec.NewSession(db, c.d.opts.Exec), onPanic: c.d.opts.OnPanic}, nil
+	return &Conn{d: c.d, db: db, session: exec.NewSession(db, c.d.opts.Exec)}, nil
+}
+
+// recoverPanic, deferred in a call into the driver, recovers a panic as [Driver.recovered]
+// describes.
+func (d *Driver) recoverPanic(err *error) {
+	if p := recover(); p != nil {
+		d.recovered(p, err)
+	}
+}
+
+// recovered handles the panic p that a deferred function recovered: it logs the panic with the
+// stack where it happened, tells [Options.OnPanic], and sets err to an error that wraps
+// [ErrInternal]. It runs in the deferred function, before the stack unwinds.
+func (d *Driver) recovered(p any, err *error) {
+	stack := debug.Stack()
+	d.opts.Logger.Error("sqldriver: recovered a panic in a call into the driver, which is a bug in maragudb; the connection is discarded",
+		"panic", fmt.Sprint(p), "stack", string(stack))
+	assert.Unreachable("a call into the driver panics", map[string]any{"panic": fmt.Sprint(p), "stack": string(stack)})
+	if d.opts.OnPanic != nil {
+		d.opts.OnPanic(p, stack)
+	}
+	// The panic's value is in the message only, never wrapped: a value that wraps
+	// driver.ErrBadConn would make database/sql run the statement again.
+	*err = fmt.Errorf("%w: panic: %v", ErrInternal, p)
 }
 
 // Driver of the connector.
@@ -266,25 +301,24 @@ var _ io.Closer = (*Connector)(nil)
 
 // Conn is one connection with its own session and transaction state.
 type Conn struct {
+	d       *Driver
 	db      *engine.DB
 	session *exec.Session
 	// owner is the connector to close with the connection, when the connection was opened
 	// without one.
 	owner *Connector
-	// onPanic is [Options.OnPanic], and broken is set once it recovered a panic.
-	onPanic func(value any, stack []byte) error
-	broken  bool
+	// broken is set once a call on the connection panicked. The session may be in any state
+	// then, so the connection runs nothing more: database/sql discards it, and its transaction
+	// rolls back.
+	broken bool
 }
 
-// recoverPanic, deferred in every call into the session, recovers a panic when [Options.OnPanic]
-// is set, sets err to what OnPanic returns, and breaks the connection.
+// recoverPanic, deferred in every call on the connection, recovers a panic as
+// [Driver.recoverPanic] does and breaks the connection.
 func (c *Conn) recoverPanic(err *error) {
-	if c.onPanic == nil {
-		return
-	}
 	if p := recover(); p != nil {
 		c.broken = true
-		*err = c.onPanic(p, debug.Stack())
+		c.d.recovered(p, err)
 	}
 }
 
@@ -301,6 +335,9 @@ func (c *Conn) Prepare(query string) (driver.Stmt, error) {
 // PrepareContext parses the statement.
 func (c *Conn) PrepareContext(_ context.Context, query string) (_ driver.Stmt, err error) {
 	defer c.recoverPanic(&err)
+	if c.broken {
+		return nil, errBroken
+	}
 	st, err := c.session.Prepare(query)
 	if err != nil {
 		return nil, err
@@ -328,7 +365,9 @@ func (c *Conn) Begin() (driver.Tx, error) {
 }
 
 // BeginTx begins a transaction. Read-only transactions never conflict. The isolation level must
-// be the default or serializable, which is the only level there is.
+// be the default or serializable, which is the only level there is. On a broken connection it
+// returns [driver.ErrBadConn], with which database/sql begins on another connection, because
+// nothing has happened yet.
 func (c *Conn) BeginTx(ctx context.Context, opts driver.TxOptions) (_ driver.Tx, err error) {
 	defer c.recoverPanic(&err)
 	if c.broken {
@@ -348,6 +387,9 @@ func (c *Conn) BeginTx(ctx context.Context, opts driver.TxOptions) (_ driver.Tx,
 // ExecContext runs a statement without preparing it separately.
 func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (_ driver.Result, err error) {
 	defer c.recoverPanic(&err)
+	if c.broken {
+		return nil, errBroken
+	}
 	st, err := c.session.Prepare(query)
 	if err != nil {
 		return nil, err
@@ -358,6 +400,9 @@ func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.Name
 // QueryContext runs a query without preparing it separately.
 func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (_ driver.Rows, err error) {
 	defer c.recoverPanic(&err)
+	if c.broken {
+		return nil, errBroken
+	}
 	st, err := c.session.Prepare(query)
 	if err != nil {
 		return nil, err
@@ -365,10 +410,13 @@ func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 	return c.query(ctx, st, args)
 }
 
+// exec runs a statement. A broken connection fails it with [errBroken], never with
+// [driver.ErrBadConn]: database/sql discards a broken connection as soon as it is released, so
+// only a transaction or a [sql.Conn] that holds it gets here, and its caller has seen the panic.
 func (c *Conn) exec(ctx context.Context, st *exec.Statement, args []driver.NamedValue) (_ driver.Result, err error) {
 	defer c.recoverPanic(&err)
 	if c.broken {
-		return nil, driver.ErrBadConn
+		return nil, errBroken
 	}
 	params, err := toValues(st, args)
 	if err != nil {
@@ -384,7 +432,7 @@ func (c *Conn) exec(ctx context.Context, st *exec.Statement, args []driver.Named
 func (c *Conn) query(ctx context.Context, st *exec.Statement, args []driver.NamedValue) (_ driver.Rows, err error) {
 	defer c.recoverPanic(&err)
 	if c.broken {
-		return nil, driver.ErrBadConn
+		return nil, errBroken
 	}
 	params, err := toValues(st, args)
 	if err != nil {
@@ -397,7 +445,7 @@ func (c *Conn) query(ctx context.Context, st *exec.Statement, args []driver.Name
 	if rows == nil {
 		rows = &exec.Rows{}
 	}
-	return &Rows{rows: rows}, nil
+	return &Rows{conn: c, rows: rows}, nil
 }
 
 // CheckNamedValue accepts the supported Go parameter types without converting them.
@@ -427,9 +475,12 @@ func (c *Conn) CheckNamedValue(nv *driver.NamedValue) error {
 	return fmt.Errorf("sqldriver: unsupported parameter type %T, want int64, int, float64, bool, string, []byte, time.Time, or nil", nv.Value)
 }
 
-// Ping checks that the database is reachable.
+// Ping checks that the database is reachable. A broken connection gives [driver.ErrBadConn].
 func (c *Conn) Ping(ctx context.Context) (err error) {
 	defer c.recoverPanic(&err)
+	if c.broken {
+		return driver.ErrBadConn
+	}
 	tx, err := c.db.BeginReadOnly(ctx)
 	if err != nil {
 		return err
@@ -437,7 +488,9 @@ func (c *Conn) Ping(ctx context.Context) (err error) {
 	return tx.Rollback()
 }
 
-// ResetSession rolls back a transaction left open with a SQL BEGIN and discards the connection.
+// ResetSession rolls back a transaction left open with a SQL BEGIN and discards the connection,
+// as it discards a broken one. database/sql resets a connection before it reuses it, so the
+// [driver.ErrBadConn] makes it take another before anything runs.
 func (c *Conn) ResetSession(context.Context) (err error) {
 	defer c.recoverPanic(&err)
 	if c.broken {
@@ -548,13 +601,13 @@ type Tx struct {
 }
 
 // Commit the transaction. It returns [engine.ErrConflict] when the transaction lost to a
-// concurrent commit.
+// concurrent commit. When a call in the transaction panicked, it rolls the transaction back and
+// returns an error that wraps [ErrInternal].
 func (t *Tx) Commit() (err error) {
 	defer t.conn.recoverPanic(&err)
 	if t.conn.broken {
-		// A statement of the transaction panicked, so it rolls back instead.
 		_ = t.conn.session.Rollback()
-		return driver.ErrBadConn
+		return fmt.Errorf("%w: the transaction was rolled back, because a call in it panicked", ErrInternal)
 	}
 	return t.conn.session.Commit(t.ctx)
 }
@@ -562,6 +615,11 @@ func (t *Tx) Commit() (err error) {
 // Rollback the transaction.
 func (t *Tx) Rollback() (err error) {
 	defer t.conn.recoverPanic(&err)
+	if t.conn.broken {
+		// The transaction may have ended in the call that panicked.
+		_ = t.conn.session.Rollback()
+		return nil
+	}
 	return t.conn.session.Rollback()
 }
 
@@ -582,6 +640,7 @@ func (r Result) RowsAffected() (int64, error) {
 
 // Rows of a query.
 type Rows struct {
+	conn *Conn
 	rows *exec.Rows
 	next int
 }
@@ -601,7 +660,8 @@ func (r *Rows) Close() error {
 }
 
 // Next row into dest.
-func (r *Rows) Next(dest []driver.Value) error {
+func (r *Rows) Next(dest []driver.Value) (err error) {
+	defer r.conn.recoverPanic(&err)
 	if r.next >= len(r.rows.Rows) {
 		return io.EOF
 	}

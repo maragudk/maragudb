@@ -64,6 +64,10 @@ type Mutations struct {
 	// PanicInScan panics in every scan of the rows of a table, as a bug in the SQL layer would,
 	// so that a test can show that a panic fails a simulation instead of hanging it.
 	PanicInScan bool
+	// PanicAfterCommit panics once a commit succeeded, in an autocommit statement and in the
+	// commit of an explicit transaction, as a bug after the write would, so that a test can
+	// show that a recovered panic never makes a write run twice.
+	PanicAfterCommit bool
 }
 
 // Session runs statements for one client, serially. It is not safe for concurrent use.
@@ -293,7 +297,11 @@ func (s *Session) Commit(ctx context.Context) error {
 func (s *Session) commit(ctx context.Context) error {
 	tx := s.tx
 	s.end()
-	return tx.Commit(ctx)
+	err := tx.Commit(ctx)
+	if err == nil && s.opts.Mutations.PanicAfterCommit {
+		panic("exec: a commit panics after it succeeded")
+	}
+	return err
 }
 
 // Rollback the explicit transaction.

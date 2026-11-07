@@ -377,13 +377,12 @@ type run struct {
 	panicked *sched.TaskPanic
 }
 
-// recovered records a panic that the SQL driver recovered, and returns the error that the call
-// returns instead, so that database/sql unwinds without leaving its locks held.
-func (r *run) recovered(value any, stack []byte) error {
+// recovered records a panic that the SQL driver recovered. The driver call returns an error
+// instead, so that database/sql unwinds without leaving its locks held.
+func (r *run) recovered(value any, stack []byte) {
 	if r.panicked == nil {
 		r.panicked = &sched.TaskPanic{Value: value, Stack: stack}
 	}
-	return fmt.Errorf("sim: the call panicked: %v", value)
 }
 
 // repanic with the panic that the SQL driver recovered, if any, so that the run fails with it.

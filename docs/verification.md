@@ -10,10 +10,10 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 ## At a glance
 
-- 36 acceptance criteria (`AC-`), 26 key invariants (`INV-`), 31 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
+- 36 acceptance criteria (`AC-`), 27 key invariants (`INV-`), 31 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
 - 28 mutants (`MUT-`), deliberate bugs, of which 26 are detected by the simulator's checkers within 20 seeds.
 - 27 interesting states (`STATE-`) that the simulator's fixed corpus must reach.
-- 267 declarations of coverage in the tests.
+- 273 declarations of coverage in the tests.
 
 ## Acceptance criteria
 
@@ -393,7 +393,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus, with reads whose bodies the store damages in every workload, through the engine and SQL, finds no anomalies: no wrong data, no cache that returns bytes that fail their check, every failure for damage an ErrCorrupt of an operation whose read the store damaged, and every failure through the engine of a known kind
 - `internal/sql/exec` `TestCatalog/a_table_definition_that_does_not_hold_up_fails_every_statement_that_reads_it_with_ErrCorrupt,_and_never_panics`: a table definition that does not decode, names another table, has an index without columns, or a column reference, foreign key, or type out of range fails the statements that read it with ErrCorrupt, and never panics
 - `internal/sql/value` `TestEncodeRow/rejects_values_that_no_write_stores:_text_that_is_not_UTF-8,_and_times_finer_than_a_microsecond`: a row of text that is not UTF-8, or of a time finer than a microsecond, fails to decode with ErrCorruptRow
-- `internal/sqldriver` `TestOptions_OnPanic/turns_a_panic_in_a_statement_into_the_error_OnPanic_returns,_discards_the_connection,_and_lets_the_transaction_roll_back`: with OnPanic, a panic in a statement of a transaction becomes an error, the transaction rolls back at once, and the next statement runs on a new connection
+- `internal/sqldriver` `TestDriver_panics/a_panic_in_a_statement_of_a_transaction_fails_it_with_ErrInternal,_logs_the_stack,_rolls_the_transaction_back_at_once,_and_the_next_statement_runs_on_a_new_connection`: a panic in the SQL layer in a statement of a transaction becomes an error instead of a hang, the transaction rolls back at once, and the next statement runs on a new connection
 
 ### `INV-REGISTER`
 
@@ -432,6 +432,17 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 - `.` `TestStats/counts_requests_and_cache_hits_across_connections`: Stats reports request counts by kind and cache hits across connections
 - `internal/engine` `TestDB_Stats/counts_cache_hits_and_misses_per_tier`: Stats counts memory and disk cache hits and misses
+
+### `INV-PANIC-RECOVERED`
+
+> API: A panic inside a call into the driver is a bug in maragudb, and it never reaches database/sql: the call fails with an error that wraps ErrInternal and holds the panic's value, the stack goes to the logger, and the connection is discarded. A recovered panic never makes database/sql run a statement again, and a transaction in which a call panicked never commits.
+
+- `.` `TestDriverOptions/recover_a_panic_in_a_driver_call_as_ErrInternal,_log_it_with_its_stack,_and_run_a_write_that_panicked_after_its_commit_once`: through the public driver's options, an UPDATE outside a transaction that panics after its commit fails with ErrInternal and not driver.ErrBadConn, Options.Logger gets the panic with its stack at the error level, and the update lands once
+- `internal/sim` `TestRun_panic/a_panic_in_the_SQL_layer_fails_the_run_at_once_with_the_panic's_value_and_stack,_instead_of_hanging_it_in_database/sql`: the simulator's SQL clients go through the driver's recovery of panics, which ends every call that panicked with an error, so that the task fails the run with the panic instead of hanging in database/sql
+- `internal/sqldriver` `TestDriver_panics/a_panic_in_a_statement_of_a_transaction_fails_it_with_ErrInternal,_logs_the_stack,_rolls_the_transaction_back_at_once,_and_the_next_statement_runs_on_a_new_connection`: a panic in a statement of a transaction fails it with an error that wraps ErrInternal and names the panic, the log gets the stack, OnPanic sees it, a deferred rollback returns at once, and the next statement runs on a new connection
+- `internal/sqldriver` `TestDriver_panics/a_panic_while_a_connection_opens_fails_it_with_ErrInternal_and_leaves_the_connector_usable`: a panic in opening the engine for a connection fails the ping with an error that wraps ErrInternal, and a second ping fails the same way instead of hanging
+- `internal/sqldriver` `TestDriver_panics/a_statement_outside_a_transaction_that_panics_after_its_commit_runs_once,_and_database/sql_does_not_run_it_again`: an UPDATE outside a transaction, plain and prepared, that panics after its commit fails with an error that wraps ErrInternal and not driver.ErrBadConn, and its increment lands exactly once
+- `internal/sqldriver` `TestDriver_panics/a_transaction_in_which_a_statement_panicked_rolls_back_on_commit,_and_the_commit_fails_with_ErrInternal`: a transaction whose statement panicked after it wrote a row fails its commit with an error that wraps ErrInternal, and the row is not there
 
 ### `INV-CAS-COMMIT`
 

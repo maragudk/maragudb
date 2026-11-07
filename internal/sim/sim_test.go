@@ -1077,6 +1077,7 @@ func TestRun(t *testing.T) {
 func TestRun_panic(t *testing.T) {
 	t.Run("a panic in the SQL layer fails the run at once with the panic's value and stack, instead of hanging it in database/sql", func(t *testing.T) {
 		verify.Covers(t, "a panic in the SQL layer under database/sql fails a simulation run within seconds, with the panic's value and the stack where it happened, instead of hanging it", "INV-DAMAGE-DETECTED")
+		verify.Covers(t, "the simulator's SQL clients go through the driver's recovery of panics, which ends every call that panicked with an error, so that the task fails the run with the panic instead of hanging in database/sql", "INV-PANIC-RECOVERED")
 		t.Parallel()
 		// With seed 4, the bank workload panics in an audit, whose deferred rollback waits forever
 		// for database/sql to release the connection unless the driver recovers the panic, and the
