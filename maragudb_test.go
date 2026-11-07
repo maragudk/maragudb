@@ -178,8 +178,8 @@ func TestRegisterDriver(t *testing.T) {
 }
 
 func TestDB(t *testing.T) {
-	t.Run("fails with an error that names the versions on a database whose manifest an earlier version wrote", func(t *testing.T) {
-		verify.Covers(t, "a statement on a database whose manifest has the encoding of version 1 fails with an error that names the versions, and returns no rows", "AC-6.4")
+	t.Run("fails with ErrUnsupportedManifest, whose message names the versions, on a database whose manifest an earlier version wrote, and leaves it as it is", func(t *testing.T) {
+		verify.Covers(t, "a statement on a database whose manifest has the encoding of version 1 fails with an error that wraps maragudb.ErrUnsupportedManifest and names the versions, returns no rows, and leaves the manifest as it is", "AC-6.4")
 		w := newWorld(t)
 		v1 := `{"version":1,"seq":1,"commitID":"c1","segments":[],"garbage":[{"key":"app/seg/0000000000000000-a","unreferencedAt":"2026-01-01T00:00:00Z"}],"commits":[{"seq":1,"id":"c1"}],"updatedAt":"2026-01-01T00:00:00Z"}`
 		_, err := w.fake.Put(t.Context(), "app/manifest", []byte(v1), s3.PutOptions{})
@@ -189,7 +189,11 @@ func TestDB(t *testing.T) {
 		if err == nil {
 			_ = rows.Close()
 		}
-		is.True(t, err != nil && strings.Contains(err.Error(), "the manifest has version 1, and this version of maragudb reads only version 3"), fmt.Sprint(err))
+		is.Error(t, maragudb.ErrUnsupportedManifest, err)
+		is.True(t, strings.Contains(err.Error(), "the manifest has version 1, and this version of maragudb reads only version 3"), err.Error())
+		body, ok := w.fake.Body("app/manifest")
+		is.True(t, ok)
+		is.Equal(t, v1, string(body))
 	})
 
 	t.Run("round trips every type through parameters and Scan", func(t *testing.T) {

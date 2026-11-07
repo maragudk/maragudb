@@ -156,6 +156,10 @@ var (
 	// fails with it may or may not have taken effect, as with [ErrCommitUnknown], but it is
 	// never run again.
 	ErrInternal = sqldriver.ErrInternal
+	// ErrUnsupportedManifest is a database whose manifest has an encoding that this version of
+	// maragudb does not read, such as one that an earlier version wrote. Opening the database
+	// fails with it, with a message that names both versions, and the database is left as it is.
+	ErrUnsupportedManifest = engine.ErrUnsupportedManifest
 	// ErrDSN is an invalid data source name.
 	ErrDSN = sqldriver.ErrDSN
 	// ErrDiskCacheInUse is a disk cache directory that another process uses. See
