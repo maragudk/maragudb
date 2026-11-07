@@ -66,6 +66,9 @@ var (
 	// ErrCast is an invalid cast: between types that cannot be cast, or from text that does not
 	// parse as the type.
 	ErrCast = errors.New("invalid cast")
+	// ErrInvalidUTF8 is a string parameter that is not valid UTF-8 or that holds a NUL byte, which
+	// no text in Postgres can hold, whatever type the parameter has.
+	ErrInvalidUTF8 = errors.New(`invalid byte sequence for encoding "UTF8"`)
 	// ErrReadOnlyTx is a write in a read-only transaction.
 	ErrReadOnlyTx = errors.New("cannot write in a read-only transaction")
 	// ErrTxAborted is a statement in a transaction in which an earlier statement failed, which

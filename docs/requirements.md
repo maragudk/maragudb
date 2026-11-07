@@ -29,7 +29,7 @@ The project is not reviewed manually. Automated tests are the only quality gate,
   | `boolean` | `bool` | boolean |
   | `text` | | UTF-8 text |
   | `bytea` | | binary data |
-  | `timestamptz` | `timestamp with time zone` | instant with microsecond precision, from 0001-01-01 to the end of 294276, read and written in UTC |
+  | `timestamptz` | `timestamp with time zone` | instant with microsecond precision, from 4714-11-24 BC to the end of 294276 as in Postgres, read and written in UTC; text reads it from the year 1 on |
 
   As in Postgres, an integer literal that fits in 32 bits has type `integer`, and arithmetic on it overflows at 32 bits; `integer` itself is not a column type. Postgres's `numeric` is the type of `SUM` of bigint and of `AVG` of integers, and of arithmetic on those results with each other and with integers and bigints, and of nothing else: it holds their results with the digits and scale that Postgres gives them, which reach Go as text. NULL is supported. `INV-TYPES`
 - **Telemetry:** an optional `*slog.Logger` in Options, plus `Stats()`. `INV-LOGGER` OpenTelemetry is out of scope for now.

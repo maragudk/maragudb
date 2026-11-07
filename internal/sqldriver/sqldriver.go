@@ -448,7 +448,8 @@ func (c *Conn) query(ctx context.Context, st *exec.Statement, args []driver.Name
 	return &Rows{conn: c, rows: rows}, nil
 }
 
-// CheckNamedValue accepts the supported Go parameter types without converting them.
+// CheckNamedValue accepts the supported Go parameter types without converting them. It calls the
+// Value method of a [driver.Valuer], whose panic is the caller's own and is not recovered.
 func (c *Conn) CheckNamedValue(nv *driver.NamedValue) error {
 	if nv.Name != "" {
 		return errors.New("sqldriver: named parameters are not supported, use $1")

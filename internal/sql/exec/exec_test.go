@@ -660,6 +660,59 @@ func TestSession_Select(t *testing.T) {
 		is.Equal(t, "NULL", query(t, s, "SELECT $1 + 1", nil))
 	})
 
+	t.Run("refuses the values of parameters that Postgres refuses when it reads them, after a mistake anywhere in the statement and before a folding error", func(t *testing.T) {
+		verify.Covers(t, "a time parameter outside 4714-11-24 BC to the end of 294276, after flooring to microseconds, fails with ErrOutOfRange, and a string parameter that is not UTF-8 or holds a NUL fails with ErrInvalidUTF8 in every context, after the errors of analysis and before those of folding, as Postgres reads parameters, and in a transaction it aborts the transaction; the bounds themselves are stored and read back", "INV-PG-SUBSET", "INV-TYPES", "INV-PLACEHOLDERS")
+		s := newSession(t)
+		mustExec(t, s, "CREATE TABLE e (id bigint PRIMARY KEY, at timestamptz, s text)")
+		minTime := time.Date(-4713, 11, 24, 0, 0, 0, 0, time.UTC)
+		maxTime := time.Date(294277, 1, 1, 0, 0, 0, 0, time.UTC)
+		tests := []struct {
+			sql  string
+			arg  any
+			want error
+		}{
+			{"SELECT $1::timestamptz", maxTime, exec.ErrOutOfRange},
+			{"SELECT $1::timestamptz", maxTime.AddDate(1000, 0, 0), exec.ErrOutOfRange},
+			{"SELECT $1::timestamptz", minTime.Add(-time.Nanosecond), exec.ErrOutOfRange},
+			{"SELECT $1::timestamptz", time.Date(-100000, 1, 1, 0, 0, 0, 0, time.UTC), exec.ErrOutOfRange},
+			{"INSERT INTO e VALUES (1, $1)", maxTime, exec.ErrOutOfRange},
+			{"UPDATE e SET at = $1", maxTime, exec.ErrOutOfRange},
+			{"DELETE FROM e WHERE at = $1", maxTime, exec.ErrOutOfRange},
+			{"SELECT 1 WHERE false AND $1::timestamptz IS NULL", maxTime, exec.ErrOutOfRange},
+			{"SELECT (SELECT $1::timestamptz)", maxTime, exec.ErrOutOfRange},
+			{"SELECT $1::text", "a\xffb", exec.ErrInvalidUTF8},
+			{"SELECT $1::text", "a\x00b", exec.ErrInvalidUTF8},
+			{"SELECT $1::bigint", "\xff", exec.ErrInvalidUTF8},
+			{"SELECT $1::timestamptz", "\x00", exec.ErrInvalidUTF8},
+			{"SELECT $1::bytea", "\xff", exec.ErrInvalidUTF8},
+			{"SELECT length($1)", "\xed\xa0\x80", exec.ErrInvalidUTF8},
+			{"INSERT INTO e VALUES (2, NULL, $1)", "\xff", exec.ErrInvalidUTF8},
+			// A time is a timestamptz in every statement that maragudb accepts.
+			{"SELECT $1::text", maxTime, exec.ErrUnsupported},
+			// Analysis comes first, then the parameters, and then folding.
+			{"SELECT $1::timestamptz, nope", maxTime, exec.ErrInvalid},
+			{"SELECT $1::timestamptz FROM nope", maxTime, exec.ErrNoTable},
+			{"SELECT nope, $1::text", "\xff", exec.ErrInvalid},
+			{"SELECT $1::timestamptz, 1 / 0", maxTime, exec.ErrOutOfRange},
+			{"SELECT 1 / 0, $1::text", "\xff", exec.ErrInvalidUTF8},
+			{"INSERT INTO e VALUES (1 / 0, $1)", maxTime, exec.ErrOutOfRange},
+		}
+		for _, test := range tests {
+			t.Run(fmt.Sprintf("%s with %v", test.sql, test.arg), func(t *testing.T) {
+				is.Error(t, test.want, queryErr(t, s, test.sql, test.arg))
+			})
+		}
+		is.Equal(t, "", query(t, s, "SELECT * FROM e"), "nothing was written")
+
+		mustExec(t, s, "INSERT INTO e VALUES (1, $1), (2, $2), (3, $3), (4, $4)", maxTime.Add(-time.Nanosecond), minTime, minTime.Add(time.Nanosecond), time.Date(0, 6, 1, 0, 0, 0, 0, time.UTC))
+		is.Equal(t, "1 294276-12-31 23:59:59.999999+00 NULL\n2 4714-11-24 00:00:00+00 BC NULL\n3 4714-11-24 00:00:00+00 BC NULL\n4 0001-06-01 00:00:00+00 BC NULL", query(t, s, "SELECT * FROM e"), "the bounds are in range, and times floor to microseconds")
+
+		mustExec(t, s, "BEGIN")
+		is.Error(t, exec.ErrOutOfRange, queryErr(t, s, "SELECT $1::timestamptz", maxTime))
+		is.Error(t, exec.ErrTxAborted, queryErr(t, s, "SELECT 1"), "the refused parameter aborted the transaction")
+		mustExec(t, s, "ROLLBACK")
+	})
+
 	t.Run("reports a mistake anywhere in the statement before a folding error, and folding errors in Postgres's order", func(t *testing.T) {
 		s := newSession(t)
 		mustExec(t, s, "CREATE TABLE e (id bigint PRIMARY KEY, j bigint)")

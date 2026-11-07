@@ -152,7 +152,7 @@ func (s *Session) Exec(ctx context.Context, text string, rep *Report) (Outcome, 
 		st = nil
 	}
 	rep.Statements++
-	return s.s.compare(ctx, text, st, rep)
+	return s.s.compare(ctx, text, st, nil, rep)
 }
 
 // InTx reports whether an explicit transaction is open on both sides.
@@ -225,9 +225,13 @@ func (r *Runner) Run(ctx context.Context, c Case) (Report, error) {
 			_, _ = s.pg.ExecContext(context.Background(), "ROLLBACK")
 		}
 	}()
-	for _, st := range c.Statements {
+	for i, st := range c.Statements {
 		rep.Statements++
-		o, err := s.compare(ctx, ast.Render(st), st, &rep)
+		var args []any
+		if i < len(c.Args) {
+			args = c.Args[i]
+		}
+		o, err := s.compare(ctx, ast.Render(st), st, args, &rep)
 		if err != nil {
 			return rep, err
 		}
@@ -239,7 +243,7 @@ func (r *Runner) Run(ctx context.Context, c Case) (Report, error) {
 		default:
 			for _, check := range checks {
 				var r Report
-				if _, err := s.compare(ctx, ast.Render(check), check, &r); err != nil {
+				if _, err := s.compare(ctx, ast.Render(check), check, nil, &r); err != nil {
 					return rep, fmt.Errorf("state after %s: %w", ast.Render(st), err)
 				}
 				rep.Checks++
@@ -248,7 +252,7 @@ func (r *Runner) Run(ctx context.Context, c Case) (Report, error) {
 	}
 	if s.inTx {
 		var end Report
-		if _, err := s.compare(ctx, "ROLLBACK", &ast.Rollback{}, &end); err != nil {
+		if _, err := s.compare(ctx, "ROLLBACK", &ast.Rollback{}, nil, &end); err != nil {
 			return rep, err
 		}
 	}
@@ -281,7 +285,7 @@ type result struct {
 
 // compare runs a statement on both sides and compares the outcomes. The statement is text,
 // and st is its parse by maragudb, or nil when maragudb cannot parse it.
-func (s *sides) compare(ctx context.Context, text string, st ast.Statement, rep *Report) (Outcome, error) {
+func (s *sides) compare(ctx context.Context, text string, st ast.Statement, args []any, rep *Report) (Outcome, error) {
 	if rep.ErrorClasses == nil {
 		rep.ErrorClasses = map[string]int{}
 	}
@@ -289,13 +293,13 @@ func (s *sides) compare(ctx context.Context, text string, st ast.Statement, rep 
 		rep.RejectedFor = map[string]int{}
 	}
 	query := isQuery(text, st)
-	mg := run(ctx, s.m, text, query)
+	mg := run(ctx, s.m, text, args, query)
 	if errors.Is(mg.err, maragudb.ErrUnsupported) {
 		reason := rejectionReason(mg.err)
 		rep.Rejected++
 		rep.RejectedFor[reason]++
 		if s.inTx {
-			if res := run(ctx, s.pg, "SELECT 1 / 0", true); SQLState(res.err) != "22012" && SQLState(res.err) != "25P02" {
+			if res := run(ctx, s.pg, "SELECT 1 / 0", nil, true); SQLState(res.err) != "22012" && SQLState(res.err) != "25P02" {
 				return Outcome{}, fmt.Errorf("postgres: aborting the transaction after a rejection: %v", res.err)
 			}
 		}
@@ -308,9 +312,29 @@ func (s *sides) compare(ctx context.Context, text string, st ast.Statement, rep 
 			return executed, fmt.Errorf("postgres: %w", err)
 		}
 	}
-	pg := run(ctx, s.pg, text, query)
+	pg := run(ctx, s.pg, text, args, query)
 	mismatch := func(detail string) error {
+		if len(args) > 0 {
+			detail += fmt.Sprintf("\n    parameters: %#v", args)
+		}
 		return &Mismatch{Statement: text, Postgres: describe(pg), Maragudb: describe(mg), Detail: detail}
+	}
+	if len(args) > 0 && pg.err != nil && SQLState(pg.err) == "" {
+		// pgx refused to encode a parameter, such as an int64 for an integer that it does not
+		// fit, so the statement never reached Postgres. Postgres would refuse such a value too,
+		// and so must maragudb, whose transaction the failure aborts.
+		if mg.err == nil {
+			return executed, mismatch("pgx refused to encode a parameter, and maragudb ran the statement")
+		}
+		rep.Errors++
+		executed.Err = pg.err
+		rep.ErrorClasses[className(mg.err)+"/pgx"]++
+		if s.inTx {
+			if res := run(ctx, s.pg, "SELECT 1 / 0", nil, true); SQLState(res.err) != "22012" && SQLState(res.err) != "25P02" {
+				return executed, fmt.Errorf("postgres: aborting the transaction after a parameter pgx refused: %v", res.err)
+			}
+		}
+		return executed, nil
 	}
 	if (pg.err != nil) != (mg.err != nil) {
 		return executed, mismatch("one side failed and the other succeeded")
@@ -331,7 +355,7 @@ func (s *sides) compare(ctx context.Context, text string, st ast.Statement, rep 
 			if s.keys[table] == nil {
 				return executed, mismatch(fmt.Sprintf("both failed, for different reasons: postgres SQLSTATE %s, maragudb %s", SQLState(pg.err), className(mg.err)))
 			}
-			ordered, err := s.inKeyOrder(ctx, text, table, query)
+			ordered, err := s.inKeyOrder(ctx, text, args, table, query)
 			if err != nil {
 				return executed, err
 			}
@@ -477,7 +501,7 @@ var (
 // either, so its rows are the committed ones: the rerun ends it, runs in a transaction of its
 // own, and then begins a transaction that it aborts, which behaves like the aborted read-only
 // one until it ends.
-func (s *sides) inKeyOrder(ctx context.Context, text, table string, query bool) (error, error) {
+func (s *sides) inKeyOrder(ctx context.Context, text string, args []any, table string, query bool) (error, error) {
 	inTx := s.inTx && !s.readOnly
 	steps := []string{"BEGIN"}
 	switch {
@@ -525,7 +549,7 @@ func (s *sides) inKeyOrder(ctx context.Context, text, table string, query bool) 
 			return nil, fmt.Errorf("postgres: %s: %w", q, err)
 		}
 	}
-	err := run(ctx, s.pg, text, query).err
+	err := run(ctx, s.pg, text, args, query).err
 	end := []string{"ROLLBACK"}
 	switch {
 	case inTx:
@@ -539,7 +563,7 @@ func (s *sides) inKeyOrder(ctx context.Context, text, table string, query bool) 
 		}
 	}
 	if s.inTx {
-		if res := run(ctx, s.pg, "SELECT 1 / 0", true); SQLState(res.err) != "22012" {
+		if res := run(ctx, s.pg, "SELECT 1 / 0", nil, true); SQLState(res.err) != "22012" {
 			return nil, fmt.Errorf("postgres: aborting the transaction again: %v", res.err)
 		}
 	}
@@ -562,17 +586,17 @@ type querier interface {
 	QueryContext(ctx context.Context, query string, args ...any) (*sql.Rows, error)
 }
 
-// run a statement, as a query when it returns rows.
-func run(ctx context.Context, db querier, sqlText string, query bool) result {
+// run a statement with the values of its parameters, as a query when it returns rows.
+func run(ctx context.Context, db querier, sqlText string, args []any, query bool) result {
 	if !query {
-		res, err := db.ExecContext(ctx, sqlText)
+		res, err := db.ExecContext(ctx, sqlText, args...)
 		if err != nil {
 			return result{err: err}
 		}
 		n, err := res.RowsAffected()
 		return result{affected: n, err: err}
 	}
-	rows, err := db.QueryContext(ctx, sqlText)
+	rows, err := db.QueryContext(ctx, sqlText, args...)
 	if err != nil {
 		return result{err: err}
 	}

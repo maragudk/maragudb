@@ -26,8 +26,11 @@ var ErrorClasses = []ErrorClass{
 	{Name: "division by zero", Err: maragudb.ErrDivisionByZero, Codes: []string{"22012"}},
 	// 21000 is cardinality_violation.
 	{Name: "cardinality", Err: maragudb.ErrCardinality, Codes: []string{"21000"}},
-	// 22003 is numeric_value_out_of_range.
-	{Name: "out of range", Err: maragudb.ErrOutOfRange, Codes: []string{"22003"}},
+	// 22003 is numeric_value_out_of_range, and 22008 datetime_field_overflow, which Postgres
+	// reports for a timestamp out of range, whether text or a parameter's binary value.
+	{Name: "out of range", Err: maragudb.ErrOutOfRange, Codes: []string{"22003", "22008"}},
+	// 22021 is character_not_in_repertoire, a parameter's text that is not valid UTF-8.
+	{Name: "invalid UTF-8", Err: maragudb.ErrInvalidUTF8, Codes: []string{"22021"}},
 	{Name: "not null", Err: maragudb.ErrNotNull, Codes: []string{"23502"}},
 	{Name: "duplicate key", Err: maragudb.ErrDuplicateKey, Codes: []string{"23505"}},
 	// 23514 is check_violation.

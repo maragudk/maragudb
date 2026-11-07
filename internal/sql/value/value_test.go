@@ -40,7 +40,9 @@ func drawValue(ht hegel.TestCase, t value.Type, nullable bool) value.Value {
 	case value.Bytes:
 		return value.NewBytes(hegel.Draw(ht, hegel.Binary(0, 6)))
 	case value.Time:
-		sec := hegel.Draw(ht, hegel.OneOf(hegel.Integers[int64](-62135596800, 253402300799), hegel.Integers[int64](math.MinInt64, math.MaxInt64)))
+		// The common era up to 9999, and the whole range of timestamptz, from 4714-11-24 BC to the
+		// end of 294276.
+		sec := hegel.Draw(ht, hegel.OneOf(hegel.Integers[int64](-62135596800, 253402300799), hegel.Integers[int64](-210866803200, 9224318015999)))
 		nsec := hegel.Draw(ht, hegel.Integers[int64](0, 999999999))
 		return value.NewTime(time.Unix(sec, nsec))
 	}
@@ -266,8 +268,8 @@ func TestEncodeRow(t *testing.T) {
 		is.Error(t, value.ErrCorruptRow, err)
 	})
 
-	t.Run("rejects values that no write stores: text that is not UTF-8, and times finer than a microsecond", func(t *testing.T) {
-		verify.Covers(t, "a row of text that is not UTF-8, or of a time finer than a microsecond, fails to decode with ErrCorruptRow", "INV-DAMAGE-DETECTED")
+	t.Run("rejects values that no write stores: text that is not UTF-8, and times finer than a microsecond or outside the range of timestamptz", func(t *testing.T) {
+		verify.Covers(t, "a row of text that is not UTF-8, or of a time finer than a microsecond or before 4714-11-24 BC or after 294276, fails to decode with ErrCorruptRow", "INV-DAMAGE-DETECTED")
 		row := func(tag value.Type, rest ...byte) []byte {
 			return append([]byte{byte(tag)}, rest...)
 		}
@@ -281,12 +283,17 @@ func TestEncodeRow(t *testing.T) {
 		}{
 			{row(value.String, 2, 0xff, 0xfe), value.String},
 			{row(value.Time, times(0, 1)...), value.Time},
+			{row(value.Time, times(-210866803201, 0)...), value.Time},
+			{row(value.Time, times(9224318016000, 0)...), value.Time},
+			{row(value.Time, times(math.MinInt64, 0)...), value.Time},
 		} {
 			_, err := value.DecodeRow(test.b, []value.Type{test.typ})
 			is.Error(t, value.ErrCorruptRow, err, fmt.Sprintf("%x", test.b))
 		}
-		_, err := value.DecodeRow(row(value.Time, times(0, 1000)...), []value.Type{value.Time})
-		is.NotError(t, err)
+		for _, sec := range []int64{0, -210866803200, 9224318015999} {
+			_, err := value.DecodeRow(row(value.Time, times(sec, 1000)...), []value.Type{value.Time})
+			is.NotError(t, err)
+		}
 	})
 }
 

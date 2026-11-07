@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"math/rand/v2"
+	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -27,6 +28,9 @@ type Case struct {
 	// Statements run in order after the tables are created. Mutations are followed by a state
 	// check on both sides.
 	Statements []ast.Statement
+	// Args are the values of the parameters of each statement, by the statement's index, or nil
+	// for a statement without parameters.
+	Args [][]any
 }
 
 // Tables used by the cases.
@@ -58,6 +62,9 @@ type gen struct {
 	nowColumn string
 	// rows are the rows that INSERTs of the table wrote, or tried to.
 	rows [][]ast.Expr
+	// args are the values of the parameters of the statement being generated, shared with the
+	// generator of the other table.
+	args *[]any
 }
 
 // Source of the generator's choices.
@@ -150,24 +157,36 @@ func (s randSource) Bytes(max int) []byte {
 
 // Generate a case.
 func Generate(src Source) Case {
-	g := &gen{src: src, cols: map[value.Type][]string{}}
+	g := &gen{src: src, cols: map[value.Type][]string{}, args: &[]any{}}
 	var parent *ast.CreateTable
 	if g.bool() {
-		g.parent = &gen{src: src, cols: map[value.Type][]string{}}
+		g.parent = &gen{src: src, cols: map[value.Type][]string{}, args: g.args}
 		g.parent.parentSchema()
 		parent = g.parent.table
 	}
 	g.schema()
 	g.constraints()
 	c := Case{Parent: parent, Create: g.table, NowColumn: g.nowColumn}
-	if g.parent != nil {
-		c.Statements = append(c.Statements, g.parent.insert(g.draw(1, 5)))
+	add := func(st ast.Statement) {
+		// Postgres fails a statement that does not use each of its parameters.
+		text := ast.Render(st)
+		for i := range *g.args {
+			if !regexp.MustCompile(fmt.Sprintf(`\$%d\b`, i+1)).MatchString(text) {
+				panic(fmt.Sprintf("pgdiff: the statement does not use its parameter $%d: %s", i+1, text))
+			}
+		}
+		c.Statements = append(c.Statements, st)
+		c.Args = append(c.Args, *g.args)
+		*g.args = nil
 	}
-	c.Statements = append(c.Statements, g.insert(g.draw(0, 6)))
+	if g.parent != nil {
+		add(g.parent.insert(g.draw(1, 5)))
+	}
+	add(g.insert(g.draw(0, 6)))
 	// Indexes on the rows, so that later statements use them, and so that a unique index on rows
 	// that repeat its values fails.
 	for range g.draw(0, 2) {
-		c.Statements = append(c.Statements, g.createIndex())
+		add(g.createIndex())
 	}
 	// Two of the kinds of statements are joins, two are grouped, and two have subqueries, so that
 	// the others are as frequent as they were before there were any of these.
@@ -181,17 +200,17 @@ func Generate(src Source) Case {
 	}
 	for i := range n + 1 {
 		if i == begin {
-			c.Statements = append(c.Statements, &ast.Begin{ReadOnly: g.draw(0, 4) == 0})
+			add(&ast.Begin{ReadOnly: g.draw(0, 4) == 0})
 		}
 		if i == end && i > begin {
 			if g.bool() {
-				c.Statements = append(c.Statements, &ast.Commit{})
+				add(&ast.Commit{})
 			} else {
-				c.Statements = append(c.Statements, &ast.Rollback{})
+				add(&ast.Rollback{})
 			}
 		}
 		if i < n {
-			c.Statements = append(c.Statements, g.statement())
+			add(g.statement())
 		}
 	}
 	return c
@@ -826,10 +845,90 @@ func (g *gen) insert(n int) *ast.Insert {
 			key = g.rowKey(row)
 		}
 		seen[key] = true
-		ins.Rows = append(ins.Rows, row)
 		g.rows = append(g.rows, row)
+		ins.Rows = append(ins.Rows, g.parameterize(row))
 	}
 	return ins
+}
+
+// parameterize now and then a value of a row that is not of the key, by a parameter whose
+// value [gen.paramValue] draws. The row keeps its literals for [gen.rows], which later rows copy
+// from.
+func (g *gen) parameterize(row []ast.Expr) []ast.Expr {
+	out := append([]ast.Expr{}, row...)
+	for i, c := range g.table.Columns {
+		if g.isKey(c.Name) || !g.rarely(6) {
+			continue
+		}
+		if _, ok := row[i].(*ast.Default); ok {
+			continue
+		}
+		out[i] = g.param(g.paramValue(c.Type))
+	}
+	return out
+}
+
+// param of the statement being generated, with the value v.
+func (g *gen) param(v any) ast.Expr {
+	*g.args = append(*g.args, v)
+	return &ast.Param{Index: len(*g.args)}
+}
+
+// paramValue for a parameter in the place of a value of type t: mostly a value of the Go type of
+// t, sometimes its text as a string, which reads like a quoted literal, or nil, and now and then
+// one that Postgres refuses when it reads it, a time outside the range of timestamptz or a string
+// that is not valid UTF-8.
+func (g *gen) paramValue(t value.Type) any {
+	if g.rarely(10) {
+		return nil
+	}
+	if t == value.Time {
+		return g.paramTime()
+	}
+	v := g.value(t)
+	if g.rarely(5) {
+		return value.Format(v)
+	}
+	switch t {
+	case value.Int:
+		return v.I
+	case value.Float:
+		return v.F
+	case value.Bool:
+		return v.B
+	case value.String:
+		if g.rarely(6) {
+			return v.S + pick(g, []string{"\xff", "\x00", "\xc3", "\xed\xa0\x80"})
+		}
+		return v.S
+	}
+	return v.Raw
+}
+
+// timestampBounds are the ends of timestamptz, the start of the year 1, from which text reads
+// it, and times outside the range. Each is within 292,277 years of 2000, where pgx encodes a time
+// faithfully: beyond, its microseconds since 2000 overflow 64 bits and wrap around to another
+// time, which Postgres may accept.
+var timestampBounds = []time.Time{
+	time.Date(-4713, 11, 24, 0, 0, 0, 0, time.UTC),
+	time.Date(294277, 1, 1, 0, 0, 0, 0, time.UTC),
+	time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC),
+	time.Date(-100000, 1, 1, 0, 0, 0, 0, time.UTC),
+	time.Date(-300, 6, 1, 0, 0, 0, 0, time.UTC),
+	time.Date(294277, 1, 5, 0, 0, 0, 0, time.UTC),
+}
+
+// paramTime is a time with nanoseconds, which both sides floor to microseconds: mostly in the
+// range of the literals, and otherwise at or near one of [timestampBounds], inside or outside.
+func (g *gen) paramTime() time.Time {
+	if !g.rarely(3) {
+		return g.value(value.Time).T.Add(time.Duration(g.draw(0, 999)))
+	}
+	offset := pick(g, []time.Duration{0, 1, 999, 1000, 1001, time.Second, 24 * time.Hour})
+	if g.bool() {
+		offset = -offset
+	}
+	return pick(g, timestampBounds).Add(offset)
 }
 
 // references gives the columns of each foreign key of the table, most of the time, the values of
@@ -1018,7 +1117,10 @@ func (g *gen) update() *ast.Update {
 		}
 		seen[name] = true
 		var e ast.Expr = &ast.Default{}
-		if !g.rarely(8) {
+		switch {
+		case g.rarely(8):
+			e = g.param(g.paramValue(g.column(name).Type))
+		case !g.rarely(8):
 			e = g.expr(g.column(name).Type, scope{columns: true, null: !g.isKey(name)}, 0)
 		}
 		u.Set = append(u.Set, ast.Assignment{Column: name, Value: e})
@@ -2054,8 +2156,13 @@ func (g *gen) subqueryWrite() ast.Statement {
 		ins := g.insert(g.draw(1, 2))
 		for _, row := range ins.Rows {
 			i := g.draw(0, len(row)-1)
-			if _, ok := row[i].(*ast.Default); !ok && !g.isKey(g.table.Columns[i].Name) {
-				row[i] = g.subquery(g.table.Columns[i].Type, scope{sub: 1}, 1)
+			switch row[i].(type) {
+			case *ast.Default, *ast.Param:
+				// A parameter stays, because its value is the statement's.
+			default:
+				if !g.isKey(g.table.Columns[i].Name) {
+					row[i] = g.subquery(g.table.Columns[i].Type, scope{sub: 1}, 1)
+				}
 			}
 		}
 		return ins

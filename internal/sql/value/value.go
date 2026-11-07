@@ -480,7 +480,11 @@ func decodeValue(b []byte, t Type) (Value, []byte, error) {
 		if nsec >= 1e9 || nsec%1000 != 0 {
 			return Value{}, nil, fmt.Errorf("bad nanoseconds %d", nsec)
 		}
-		return NewTime(time.Unix(sec, int64(nsec))), b[12:], nil
+		t := time.Unix(sec, int64(nsec))
+		if !TimeInRange(t) {
+			return Value{}, nil, fmt.Errorf("time %d out of range", sec)
+		}
+		return NewTime(t), b[12:], nil
 	}
 	return Value{}, nil, fmt.Errorf("bad type %v", t)
 }

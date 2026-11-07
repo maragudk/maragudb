@@ -56,13 +56,26 @@ func run(t *testing.T, r *pgdiff.Runner, opts ...hegel.Option) pgdiff.Report {
 		mu.Unlock()
 		if err != nil {
 			ht.Note(ast.Render(c.Create))
-			for _, st := range c.Statements {
-				ht.Note(ast.Render(st))
+			for _, line := range statementLines(c) {
+				ht.Note(line)
 			}
 			ht.Fatalf("%v", err)
 		}
 	}, opts...)
 	return total
+}
+
+// statementLines renders the statements of a case, each with the values of its parameters.
+func statementLines(c pgdiff.Case) []string {
+	var lines []string
+	for i, st := range c.Statements {
+		line := ast.Render(st)
+		if i < len(c.Args) && len(c.Args[i]) > 0 {
+			line += fmt.Sprintf(" -- parameters %#v", c.Args[i])
+		}
+		lines = append(lines, line)
+	}
+	return lines
 }
 
 // ratchet is the committed baseline of the generator's executed statements.
@@ -124,11 +137,7 @@ func TestDifferential(t *testing.T) {
 			rep, err := r.Run(t.Context(), c)
 			total.Add(rep)
 			if err != nil {
-				var lines []string
-				lines = append(lines, ast.Render(c.Create))
-				for _, st := range c.Statements {
-					lines = append(lines, ast.Render(st))
-				}
+				lines := append([]string{ast.Render(c.Create)}, statementLines(c)...)
 				t.Fatalf("case %d:\n%s\n%v", i, strings.Join(lines, "\n"), err)
 			}
 		}

@@ -137,10 +137,15 @@ var (
 	// ErrDivisionByZero is a division or modulo by zero.
 	ErrDivisionByZero = exec.ErrDivisionByZero
 	// ErrOutOfRange is an integer or bigint overflow, a float overflow or underflow, or a cast
-	// or timestamp out of range.
+	// or timestamp out of range, such as a time.Time parameter outside the range of
+	// timestamptz, from 4714-11-24 BC to the end of 294276.
 	ErrOutOfRange = exec.ErrOutOfRange
 	// ErrCast is an invalid cast.
 	ErrCast = exec.ErrCast
+	// ErrInvalidUTF8 is a string parameter that is not valid UTF-8 or that holds a NUL byte,
+	// which no text in Postgres can hold, whatever type the parameter has. It corresponds to the
+	// Postgres SQLSTATE 22021, character_not_in_repertoire.
+	ErrInvalidUTF8 = exec.ErrInvalidUTF8
 	// ErrReadOnlyTx is a write in a read-only transaction.
 	ErrReadOnlyTx = exec.ErrReadOnlyTx
 	// ErrTxAborted is a statement in a transaction in which an earlier statement failed. As in

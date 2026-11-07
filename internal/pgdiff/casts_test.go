@@ -85,11 +85,12 @@ func TestCasts(t *testing.T) {
 
 func TestParameters(t *testing.T) {
 	t.Run("a parameter of every Go type in every context gives the same result as Postgres with pgx, or is rejected as unsupported", func(t *testing.T) {
-		verify.Covers(t, "hegel-drawn Go values bound as parameters in contexts that infer different types give the same result or error class as Postgres with pgx, or fail on both when pgx refuses to encode them, unless maragudb rejects them as unsupported", "INV-PLACEHOLDERS", "INV-PG-SUBSET")
+		verify.Covers(t, "hegel-drawn Go values bound as parameters in contexts that infer different types, among them times at and beyond both ends of timestamptz to the nanosecond and strings that are not UTF-8 or hold NUL, give the same result or error class as Postgres with pgx, or fail on both when pgx refuses to encode them, unless maragudb rejects them as unsupported", "INV-PLACEHOLDERS", "INV-PG-SUBSET")
 		b := newBoth(t, "")
 		contexts := []string{"SELECT $1::bigint", "SELECT $1 + 1", "SELECT $1 + 2147483647", "SELECT $1 + 0.5::float8", "SELECT $1 || 'x'", "SELECT CASE WHEN $1 THEN 1 END",
 			"SELECT length($1)", "SELECT $1 = 'a'", "SELECT coalesce($1, 1)", "SELECT $1 LIKE 'a%'", "SELECT abs($1)", "SELECT $1::timestamptz", "SELECT $1::bytea",
-			"SELECT $1::text", "SELECT $1 = 1.5::float8", "SELECT $1 = '\\x01'::bytea", "SELECT $1 < '2024-01-01'::timestamptz", "SELECT NOT $1", "SELECT 1 LIMIT $1"}
+			"SELECT $1::text", "SELECT $1 = 1.5::float8", "SELECT $1 = '\\x01'::bytea", "SELECT $1 < '2024-01-01'::timestamptz", "SELECT NOT $1", "SELECT 1 LIMIT $1",
+			"SELECT CAST($1::timestamptz AS text)", "SELECT 1 WHERE $1::timestamptz IS NULL"}
 		hegel.Test(t, func(ht *hegel.T) {
 			query := hegel.Draw(ht, hegel.SampledFrom(contexts))
 			var arg any
@@ -105,11 +106,26 @@ func TestParameters(t *testing.T) {
 				for range hegel.Draw(ht, hegel.Integers(0, 4)) {
 					text += hegel.Draw(ht, hegel.SampledFrom(castInputs))
 				}
+				if hegel.Draw(ht, hegel.Integers(0, 4)) == 0 {
+					// Text that is not valid UTF-8, or that holds a NUL, which Postgres refuses
+					// whatever type the parameter has.
+					text += hegel.Draw(ht, hegel.SampledFrom([]string{"\xff", "\x00", "\xc3", "\xed\xa0\x80", "\xf4\x90\x80\x80"}))
+				}
 				arg = text
 			case 4:
 				arg = hegel.Draw(ht, hegel.Binary(0, 3))
 			case 5:
 				arg = time.Unix(hegel.Draw(ht, hegel.Integers[int64](-1e10, 1e10)), hegel.Draw(ht, hegel.Integers[int64](0, 999999999)))
+				if hegel.Draw(ht, hegel.Booleans()) {
+					// Near either end of timestamptz, and at the year 1, by a few nanoseconds,
+					// microseconds, or more, inside and outside.
+					at := hegel.Draw(ht, hegel.SampledFrom(timestampBounds))
+					offset := hegel.Draw(ht, hegel.SampledFrom([]time.Duration{0, 1, 999, 1000, 1001, time.Second, 24 * time.Hour}))
+					if hegel.Draw(ht, hegel.Booleans()) {
+						offset = -offset
+					}
+					arg = at.Add(offset)
+				}
 			default:
 				arg = nil
 			}
@@ -135,6 +151,18 @@ func TestParameters(t *testing.T) {
 			}
 		}, hegel.WithTestCases(castCases()))
 	})
+}
+
+// timestampBounds are the ends of timestamptz in Postgres, the start of the year 1, which text
+// reads, and times outside the range. Each is within 292,277 years of 2000, where pgx encodes a
+// time faithfully: beyond, its microseconds since 2000 overflow 64 bits and wrap around to
+// another time, which Postgres may accept.
+var timestampBounds = []time.Time{
+	time.Date(-4713, 11, 24, 0, 0, 0, 0, time.UTC),
+	time.Date(294277, 1, 1, 0, 0, 0, 0, time.UTC),
+	time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC),
+	time.Date(-100000, 1, 1, 0, 0, 0, 0, time.UTC),
+	time.Date(294277, 1, 5, 0, 0, 0, 0, time.UTC),
 }
 
 // canonicalValue makes values that are equal compare equal: times as UTC instants, and every

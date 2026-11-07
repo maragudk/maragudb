@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"maragu.dev/is"
 
@@ -21,6 +22,7 @@ func TestErrorClasses(t *testing.T) {
 	tests := []struct {
 		setup []string
 		sql   string
+		args  []any
 		want  error
 		code  string
 	}{
@@ -29,6 +31,9 @@ func TestErrorClasses(t *testing.T) {
 		{sql: "SELECT 9223372036854775807 + 1", want: maragudb.ErrOutOfRange, code: "22003"},
 		{sql: "SELECT 2147483647 + 1", want: maragudb.ErrOutOfRange, code: "22003"},
 		{sql: "SELECT CAST(1e300::float8 AS bigint)", want: maragudb.ErrOutOfRange, code: "22003"},
+		{sql: "SELECT CAST('294277-01-01' AS timestamptz)", want: maragudb.ErrOutOfRange, code: "22008"},
+		{sql: "SELECT $1::timestamptz", args: []any{time.Date(294277, 1, 1, 0, 0, 0, 0, time.UTC)}, want: maragudb.ErrOutOfRange, code: "22008"},
+		{sql: "INSERT INTO dev VALUES (2, length($1))", args: []any{"a\xffb"}, want: maragudb.ErrInvalidUTF8, code: "22021"},
 		{sql: "INSERT INTO dev VALUES (2, NULL)", want: maragudb.ErrNotNull, code: "23502"},
 		{sql: "INSERT INTO dev VALUES (1, 1)", want: maragudb.ErrDuplicateKey, code: "23505"},
 		{setup: []string{"CREATE TABLE dev2 (a bigint PRIMARY KEY CHECK (a > 0))"}, sql: "INSERT INTO dev2 VALUES (0)", want: maragudb.ErrCheck, code: "23514"},
@@ -90,8 +95,8 @@ func TestErrorClasses(t *testing.T) {
 			for _, q := range test.setup {
 				b.exec(t, q)
 			}
-			_, mErr := b.m.ExecContext(t.Context(), test.sql)
-			_, pgErr := b.pg.ExecContext(t.Context(), test.sql)
+			_, mErr := b.m.ExecContext(t.Context(), test.sql, test.args...)
+			_, pgErr := b.pg.ExecContext(t.Context(), test.sql, test.args...)
 			is.Error(t, test.want, mErr)
 			is.True(t, pgErr != nil, "postgres fails too")
 			is.Equal(t, test.code, pgdiff.SQLState(pgErr))

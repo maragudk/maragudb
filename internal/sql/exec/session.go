@@ -99,6 +99,9 @@ type Session struct {
 	// snapshotReads is positive while a subquery runs, whose reads see the transaction as the
 	// statement began, without the statement's own writes, as in Postgres.
 	snapshotReads int
+	// bindErr is the first error with which Postgres would refuse a parameter's value of the
+	// statement, which it reports once it analyzed the statement, before it folds constants.
+	bindErr error
 }
 
 // NewSession over db.
@@ -426,8 +429,15 @@ func (s *Session) run(ctx context.Context, st *Statement, params []value.Value) 
 		defer func() { s.subqueries = nil }()
 	}
 	s.events = nil
+	s.bindErr = nil
 	rows, res, err := s.execute(ctx, st.ast, params)
 	s.events = nil
+	if err == nil {
+		// Every statement reports a refused parameter where it folds constants, and this is the
+		// last resort.
+		err = s.bindErr
+	}
+	s.bindErr = nil
 	ddl := false
 	switch st.ast.(type) {
 	case *ast.CreateTable, *ast.DropTable, *ast.CreateIndex, *ast.DropIndex:

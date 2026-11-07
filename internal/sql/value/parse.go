@@ -361,12 +361,20 @@ func parseBytea(s string) ([]byte, error) {
 
 var isoTimestamp = regexp.MustCompile(`^(\d{4,6})-(\d{1,2})-(\d{1,2})(?:(?:T|\s+)(\d{1,2}):(\d{1,2})(?::(\d{1,2})(?:\.(\d*))?)?)?\s*(?:([Zz])|([+-])(\d{1,2})(?::?(\d{2}))?)?$`)
 
-// Timestamptz range, as in Postgres. The lower bound is where maragudb stops: Postgres goes back
-// to 4714 BC, but writes those years with a BC suffix, which maragudb does not support.
+// The range of timestamptz, as in Postgres: from 4714-11-24 BC, the year -4713 in Go's
+// numbering, to the end of 294276. Text reads it only from minTime on: Postgres writes the years
+// before 1 with a BC suffix, which maragudb does not read.
 var (
-	minTime = time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC)
-	maxTime = time.Date(294277, 1, 1, 0, 0, 0, 0, time.UTC)
+	minTimestamp = time.Date(-4713, 11, 24, 0, 0, 0, 0, time.UTC)
+	minTime      = time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC)
+	maxTime      = time.Date(294277, 1, 1, 0, 0, 0, 0, time.UTC)
 )
+
+// TimeInRange reports whether t is within the range of timestamptz, from 4714-11-24 BC to the
+// end of 294276.
+func TimeInRange(t time.Time) bool {
+	return !t.Before(minTimestamp) && t.Before(maxTime)
+}
 
 // ParseTime parses a timestamptz as Postgres does for its ISO 8601 forms: a date, an optional
 // time with up to any number of fractional digits, which round half to even at microseconds,

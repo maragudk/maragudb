@@ -1,10 +1,12 @@
 package exec
 
 import (
+	"cmp"
 	"errors"
 	"fmt"
 	"math"
 	"strings"
+	"time"
 	"unicode/utf8"
 
 	"maragu.dev/maragudb/internal/sql/ast"
@@ -132,7 +134,14 @@ const (
 // Postgres folds the constants of a subquery when it plans it, after it merges the subqueries it
 // can into the query around, which changes their order, and never folds those of a CTE that no
 // query reads, so a subquery whose folding fails is not supported.
+//
+// Between the two, Postgres reads the values of the parameters, and refuses some, as
+// [paramError] says. Such an error comes first, except while a subquery is analyzed, whose
+// statement reports it when it folds.
 func (b *binder) folding() error {
+	if b.run != nil && b.run.s.bindErr != nil && !b.analyzing {
+		return b.run.s.bindErr
+	}
 	err := b.foldErr
 	if err == nil {
 		err = b.stableErr
@@ -291,6 +300,30 @@ func resolve(e *cexpr, t value.Type) (*cexpr, error) {
 		return nil, castError(err)
 	}
 	return constant(v), nil
+}
+
+// paramError is the error with which Postgres refuses the value v of parameter n when it reads
+// it, whatever the context: a string that is not valid UTF-8 or that holds a NUL byte, which a
+// client sends as text, and a time outside the range of timestamptz. A time can only be a
+// timestamptz in a statement that maragudb accepts.
+func paramError(n int, v value.Value) error {
+	switch {
+	case v.Null:
+	case v.Type == value.Unknown && (!utf8.ValidString(v.S) || strings.IndexByte(v.S, 0) >= 0):
+		return fmt.Errorf("%w: parameter $%d is a string that is not valid UTF-8 or that holds a NUL byte", ErrInvalidUTF8, n)
+	case v.Type == value.Time && !value.TimeInRange(v.T):
+		return fmt.Errorf("%w: timestamp out of range: parameter $%d is %v, and a timestamptz is from 4714-11-24 BC to the end of 294276", ErrOutOfRange, n, v.T.Format(time.RFC3339Nano))
+	}
+	return nil
+}
+
+// paramStandIn for a parameter whose value [paramError] refuses: NULL for a string, which any
+// type reads, and a time in range for a time.
+func paramStandIn(v value.Value) value.Value {
+	if v.Type == value.Time {
+		return value.NewTime(time.Unix(0, 0))
+	}
+	return value.NewNull(value.Unknown)
 }
 
 // resolveParam converts a parameter of a Go type other than string to the type t that its
@@ -606,6 +639,16 @@ func (b *binder) bind(e ast.Expr) (*cexpr, error) {
 		// like the type of a quoted literal. A Go string or nil is exactly such a literal; a
 		// value of another Go type converts to the inferred type when it can.
 		v := b.params[e.Index-1]
+		if err := paramError(e.Index, v); err != nil {
+			if b.run == nil {
+				return nil, err
+			}
+			// Postgres reads the parameters' values once it analyzed the statement, before it
+			// folds constants, so the error waits for [binder.folding], and the parameter stands
+			// for a value that analyzes the same.
+			b.run.s.bindErr = cmp.Or(b.run.s.bindErr, err)
+			v = paramStandIn(v)
+		}
 		if v.Type == value.Unknown {
 			return constant(v), nil
 		}
