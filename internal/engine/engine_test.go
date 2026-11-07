@@ -688,6 +688,211 @@ func TestDB_Compact(t *testing.T) {
 	})
 }
 
+// del the keys in one commit.
+func del(t *testing.T, db *engine.DB, keys ...string) {
+	t.Helper()
+	tx, err := db.Begin(t.Context())
+	is.NotError(t, err)
+	for _, key := range keys {
+		is.NotError(t, tx.Delete([]byte(key)))
+	}
+	is.NotError(t, tx.Commit(t.Context()))
+}
+
+// putOldest commits 50 keys, k00 to k49, of about 20 bytes each, as the oldest segment, which is
+// in a far higher tier than segments of a key or two with [smallTiers].
+func putOldest(t *testing.T, db *engine.DB) {
+	t.Helper()
+	var kv []string
+	for i := range 50 {
+		kv = append(kv, fmt.Sprintf("k%02d", i), fmt.Sprintf("old-value-%02d", i))
+	}
+	put(t, db, kv...)
+}
+
+// smallTiers put a segment of one key and a value of 20 bytes in tier 1, and one with a shorter
+// value or a tombstone in tier 0, and never merge the whole database.
+var smallTiers = engine.Tiers{FanIn: 2, BaseBytes: 16, FullRatio: 100}
+
+// segmentKeys of the live segments that the manifest in the store lists, oldest first.
+func segmentKeys(t *testing.T, w *world) []string {
+	t.Helper()
+	body, ok := w.fake.Body("db/manifest")
+	is.True(t, ok)
+	var m struct {
+		Segments []struct {
+			Key string `json:"key"`
+		} `json:"segments"`
+	}
+	is.NotError(t, json.Unmarshal(body, &m))
+	var keys []string
+	for _, seg := range m.Segments {
+		keys = append(keys, seg.Key)
+	}
+	return keys
+}
+
+// bodySize of an object in the store.
+func bodySize(t *testing.T, w *world, key string) int64 {
+	t.Helper()
+	body, ok := w.fake.Body(key)
+	is.True(t, ok, key)
+	return int64(len(body))
+}
+
+// state of the whole database as a fresh process without a cache reads it.
+func state(t *testing.T, w *world) map[string]string {
+	t.Helper()
+	fresh := w.open(99, engine.Options{MemoryCacheBytes: new(int64)})
+	tx, err := fresh.BeginReadOnly(t.Context())
+	is.NotError(t, err)
+	return scan(t, tx, "", "")
+}
+
+// oldState of the database that putOldest writes, with the given changes, where an empty value
+// is a deleted key.
+func oldState(changes ...string) map[string]string {
+	m := map[string]string{}
+	for i := range 50 {
+		m[fmt.Sprintf("k%02d", i)] = fmt.Sprintf("old-value-%02d", i)
+	}
+	for i := 0; i < len(changes); i += 2 {
+		if changes[i+1] == "" {
+			delete(m, changes[i])
+			continue
+		}
+		m[changes[i]] = changes[i+1]
+	}
+	return m
+}
+
+func TestDB_CompactTiers(t *testing.T) {
+	t.Run("merges segments that exclude the oldest one, keeps their tombstones, which still hide older values, and counts the bytes it reads and writes", func(t *testing.T) {
+		verify.Covers(t, "a tiered compaction of the two newest of three segments keeps the tombstone of one of them, which still hides the value in the oldest, and counts as read and written the bytes of its input and output objects", "AC-6.1", "AC-6.5")
+		w := newWorld(t)
+		db := w.open(1, engine.Options{})
+		putOldest(t, db)
+		del(t, db, "k01")
+		put(t, db, "k02", "new")
+		before := segmentKeys(t, w)
+		read := bodySize(t, w, before[1]) + bodySize(t, w, before[2])
+
+		merged, err := db.CompactTiers(t.Context(), smallTiers)
+		is.NotError(t, err)
+		is.True(t, merged)
+		after := segmentKeys(t, w)
+		is.Equal(t, 2, len(after))
+		is.Equal(t, before[0], after[0], "the oldest segment stays")
+		is.Equal(t, read, db.Stats().CompactionBytesRead)
+		is.Equal(t, bodySize(t, w, after[1]), db.Stats().CompactionBytesWritten)
+		is.Equal(t, 2, db.Stats().Garbage)
+		equalMap(t, oldState("k01", "", "k02", "new"), state(t, w))
+
+		merged, err = db.CompactTiers(t.Context(), smallTiers)
+		is.NotError(t, err)
+		is.True(t, !merged, "nothing is due")
+		is.NotError(t, db.Compact(t.Context()))
+		equalMap(t, oldState("k01", "", "k02", "new"), state(t, w))
+	})
+
+	t.Run("puts each merged segment in the place of the merged ones, around a segment that it leaves alone, and merges several windows in one compaction", func(t *testing.T) {
+		verify.Covers(t, "a tiered compaction that merges two windows of segments, one on each side of a segment that it leaves alone, keeps the older values shadowed by the merged segments, and the merged segments shadowed by newer ones", "AC-6.1")
+		w := newWorld(t)
+		db := w.open(1, engine.Options{})
+		putOldest(t, db)
+		// Tiers: far above 1, then 1, 1, 1, 0, 0. Three segments of tier 1 do not fit in tier 2, so
+		// the first two merge, and the third stays between them and the merge of the last two.
+		put(t, db, "k01", "aaaaaaaaaaaaaaaaaaaa")
+		put(t, db, "k02", "bbbbbbbbbbbbbbbbbbbb")
+		put(t, db, "k01", "cccccccccccccccccccc")
+		del(t, db, "k02")
+		put(t, db, "k03", "d")
+		before := segmentKeys(t, w)
+
+		merged, err := db.CompactTiers(t.Context(), smallTiers)
+		is.NotError(t, err)
+		is.True(t, merged)
+		after := segmentKeys(t, w)
+		is.Equal(t, 4, len(after))
+		is.Equal(t, before[0], after[0])
+		is.Equal(t, before[3], after[2], "the segment between the windows stays")
+		equalMap(t, oldState("k01", "cccccccccccccccccccc", "k02", "", "k03", "d"), state(t, w))
+	})
+
+	t.Run("merges the whole database once the newer segments delete twice as many entries of the oldest one as remain, with a full ratio of 2, which reclaims the space of the deleted values", func(t *testing.T) {
+		verify.Covers(t, "a tiered compaction with a full ratio of 2 merges the whole database, and drops its tombstones and deleted values, once three small segments after the oldest one hold tombstones for 34 of its 50 entries, and not before", "AC-6.1")
+		w := newWorld(t)
+		db := w.open(1, engine.Options{})
+		putOldest(t, db)
+		tiers := engine.Tiers{FanIn: 4, BaseBytes: 16, FullRatio: 2}
+		var deleted []string
+		for commit, n := range []int{11, 11, 12} {
+			var keys []string
+			for range n {
+				keys = append(keys, fmt.Sprintf("k%02d", len(deleted)/2))
+				deleted = append(deleted, keys[len(keys)-1], "")
+			}
+			del(t, db, keys...)
+			merged, err := db.CompactTiers(t.Context(), tiers)
+			is.NotError(t, err)
+			is.Equal(t, commit == 2, merged, fmt.Sprint("after commit ", commit))
+		}
+		is.Equal(t, 1, len(segmentKeys(t, w)))
+		equalMap(t, oldState(deleted...), state(t, w))
+		is.Equal(t, 16, len(state(t, w)))
+	})
+
+	t.Run("rebases a merge of some segments on commits that landed meanwhile, which go after the segments it left alone", func(t *testing.T) {
+		verify.Covers(t, "a tiered compaction that lost to a commit rebases on it, and the commit's value of a key that the merged segments deleted stays visible", "AC-6.1")
+		w := newWorld(t)
+		db1 := w.open(1, engine.Options{})
+		db2 := w.open(2, engine.Options{})
+		putOldest(t, db1)
+		del(t, db1, "k01")
+		put(t, db1, "k02", "new")
+		w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
+			if kind == s3.KindPut {
+				w.decide = nil
+				put(t, db1, "k01", "back")
+			}
+			return s3fake.OutcomeNormal
+		}
+		merged, err := db2.CompactTiers(t.Context(), smallTiers)
+		is.NotError(t, err)
+		is.True(t, merged)
+		is.Equal(t, int64(1), db2.Stats().CompactionRebases)
+		is.Equal(t, 3, len(segmentKeys(t, w)), "the oldest, the merged, and the newer segment")
+		equalMap(t, oldState("k01", "back", "k02", "new"), state(t, w))
+	})
+
+	t.Run("fails with ErrConflict when another compaction merged segments meanwhile, and can be retried", func(t *testing.T) {
+		verify.Covers(t, "a tiered compaction that lost to a compaction of other segments fails with ErrConflict, and the other compaction and the commits after it keep their values", "AC-6.1")
+		w := newWorld(t)
+		db1 := w.open(1, engine.Options{})
+		db2 := w.open(2, engine.Options{})
+		putOldest(t, db1)
+		del(t, db1, "k01")
+		put(t, db1, "k02", "new")
+		w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
+			if kind == s3.KindPut {
+				w.decide = nil
+				is.NotError(t, db1.Compact(t.Context()))
+				put(t, db1, "k03", "x")
+				put(t, db1, "k04", "y")
+			}
+			return s3fake.OutcomeNormal
+		}
+		_, err := db2.CompactTiers(t.Context(), smallTiers)
+		is.Error(t, engine.ErrConflict, err)
+		want := oldState("k01", "", "k02", "new", "k03", "x", "k04", "y")
+		equalMap(t, want, state(t, w))
+		merged, err := db2.CompactTiers(t.Context(), smallTiers)
+		is.NotError(t, err)
+		is.True(t, merged)
+		equalMap(t, want, state(t, w))
+	})
+}
+
 func TestDB_GC(t *testing.T) {
 	grace := 10 * time.Minute
 
@@ -1474,6 +1679,90 @@ func TestMutations(t *testing.T) {
 		is.NotError(t, err)
 		_, _, err = tx.Get(t.Context(), []byte("a"))
 		is.Error(t, engine.ErrSnapshotExpired, err, "the compacted segment is gone")
+	})
+
+	t.Run("CompactNonAdjacent leaves a segment behind a merge of the ones around it, which then shadows newer values", func(t *testing.T) {
+		verify.Covers(t, "with the mutant, a tiered compaction merges the first and the third of the newer segments, and the second, left behind the merged one, hides the third's newer value", "MUT-COMPACT-NON-ADJACENT")
+		read := func(t *testing.T, mutations engine.Mutations) map[string]string {
+			w := newWorld(t)
+			db := w.open(1, engine.Options{Mutations: mutations})
+			putOldest(t, db)
+			// Tiers 1, 1, and 0, which counts as 1 too.
+			put(t, db, "k01", "aaaaaaaaaaaaaaaaaaaa")
+			put(t, db, "k01", "bbbbbbbbbbbbbbbbbbbb")
+			put(t, db, "k01", "c")
+			merged, err := db.CompactTiers(t.Context(), smallTiers)
+			is.NotError(t, err)
+			is.True(t, merged)
+			return state(t, w)
+		}
+		equalMap(t, oldState("k01", "bbbbbbbbbbbbbbbbbbbb"), read(t, engine.Mutations{CompactNonAdjacent: true}))
+		equalMap(t, oldState("k01", "c"), read(t, engine.Mutations{}))
+	})
+
+	t.Run("CompactDropTombstones lets a merge that excludes the oldest segment bring a deleted value back", func(t *testing.T) {
+		verify.Covers(t, "with the mutant, a tiered compaction of the two newest of three segments drops a tombstone, and the deleted value of the oldest segment shows again", "MUT-COMPACT-DROP-TOMBSTONES")
+		read := func(t *testing.T, mutations engine.Mutations) map[string]string {
+			w := newWorld(t)
+			db := w.open(1, engine.Options{Mutations: mutations})
+			putOldest(t, db)
+			del(t, db, "k01")
+			put(t, db, "k02", "new")
+			merged, err := db.CompactTiers(t.Context(), smallTiers)
+			is.NotError(t, err)
+			is.True(t, merged)
+			return state(t, w)
+		}
+		equalMap(t, oldState("k02", "new"), read(t, engine.Mutations{CompactDropTombstones: true}))
+		equalMap(t, oldState("k01", "", "k02", "new"), read(t, engine.Mutations{}))
+	})
+
+	t.Run("CompactRebaseLosesSegment loses a commit that landed during a compaction", func(t *testing.T) {
+		verify.Covers(t, "with the mutant, a tiered compaction that rebases on a commit leaves the commit's segment out of the manifest, and the committed value is gone", "MUT-COMPACT-REBASE-LOSES-SEGMENT")
+		read := func(t *testing.T, mutations engine.Mutations) map[string]string {
+			w := newWorld(t)
+			db1 := w.open(1, engine.Options{})
+			db2 := w.open(2, engine.Options{Mutations: mutations})
+			putOldest(t, db1)
+			del(t, db1, "k01")
+			put(t, db1, "k02", "new")
+			w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
+				if kind == s3.KindPut {
+					w.decide = nil
+					put(t, db1, "k03", "committed")
+				}
+				return s3fake.OutcomeNormal
+			}
+			merged, err := db2.CompactTiers(t.Context(), smallTiers)
+			is.NotError(t, err)
+			is.True(t, merged)
+			return state(t, w)
+		}
+		equalMap(t, oldState("k01", "", "k02", "new"), read(t, engine.Mutations{CompactRebaseLosesSegment: true}))
+		equalMap(t, oldState("k01", "", "k02", "new", "k03", "committed"), read(t, engine.Mutations{}))
+	})
+
+	t.Run("CompactRebaseOnCompaction rebases on another compaction and loses the commits after it", func(t *testing.T) {
+		verify.Covers(t, "with the mutant, a tiered compaction rebases on a manifest in which another compaction merged every segment, and the commits after that one are gone", "MUT-COMPACT-REBASE-ON-COMPACTION")
+		w := newWorld(t)
+		db1 := w.open(1, engine.Options{})
+		db2 := w.open(2, engine.Options{Mutations: engine.Mutations{CompactRebaseOnCompaction: true}})
+		putOldest(t, db1)
+		del(t, db1, "k01")
+		put(t, db1, "k02", "new")
+		w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
+			if kind == s3.KindPut {
+				w.decide = nil
+				is.NotError(t, db1.Compact(t.Context()))
+				put(t, db1, "k03", "x")
+				put(t, db1, "k04", "y")
+			}
+			return s3fake.OutcomeNormal
+		}
+		merged, err := db2.CompactTiers(t.Context(), smallTiers)
+		is.NotError(t, err, "the mutant rebases")
+		is.True(t, merged)
+		equalMap(t, oldState("k01", "", "k02", "new"), state(t, w))
 	})
 
 	t.Run("AckBeforeConfirm reports success for a write that never happened", func(t *testing.T) {

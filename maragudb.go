@@ -158,8 +158,8 @@ type Options struct {
 	// the clock skew between processes must be much smaller than it.
 	GCGracePeriod *time.Duration
 	// Maintenance runs compaction and garbage collection in the background, for every database
-	// opened through the driver, whenever there is work: at least CompactionThreshold segments,
-	// or garbage that is new or older than the grace period. Defaults to true. The processes that share a database
+	// opened through the driver, whenever there is work: segments that CompactionFanIn makes due
+	// for a merge, or garbage that is new or older than the grace period. Defaults to true. The processes that share a database
 	// coordinate through a lease object at <prefix>/maintenance-lease, so that the work of one
 	// trigger is done about once rather than once per process. The lease only saves work;
 	// correctness never depends on it. A process checks for work on the manifest it already
@@ -170,10 +170,16 @@ type Options struct {
 	// MaintenanceInterval is the time between two checks for maintenance work, with a jitter of
 	// half the interval either way. Defaults to 10 seconds.
 	MaintenanceInterval *time.Duration
-	// CompactionThreshold is the number of segments, which every commit adds one of, at which
-	// background maintenance compacts the database into one. Defaults to 8, and is at least 2.
-	// A lower threshold keeps reads cheaper, and a higher one rewrites the database less often.
-	CompactionThreshold *int
+	// CompactionFanIn is the number of segments of similar size that background maintenance
+	// merges into one. Every commit adds a small segment, and segments are in tiers by size, each
+	// tier CompactionFanIn times larger than the one below it. Maintenance merges CompactionFanIn
+	// adjacent segments of one tier into a segment of the next tier, and merges the whole database
+	// into one segment when the segments after the oldest one are together as large as it, or
+	// delete at least as many of its rows as remain. So a
+	// byte is rewritten about once per tier, and the database has a number of segments that grows
+	// with the logarithm of its size. Defaults to 4, and is at least 2. A lower fan-in keeps reads
+	// cheaper, and a higher one rewrites data less often.
+	CompactionFanIn *int
 	// Store is the object store for every DSN, in place of the default AWS SDK client for the
 	// DSN's bucket. The DSN's bucket is then ignored and its prefix still applies. Any value with
 	// these methods can be set:
@@ -213,8 +219,8 @@ func (o Options) withDefaults() Options {
 	if o.MaintenanceInterval == nil {
 		o.MaintenanceInterval = new(10 * time.Second)
 	}
-	if o.CompactionThreshold == nil {
-		o.CompactionThreshold = new(8)
+	if o.CompactionFanIn == nil {
+		o.CompactionFanIn = new(4)
 	}
 	return o
 }
@@ -237,7 +243,7 @@ func newDriver(opts Options) *sqldriver.Driver {
 		Maintenance: sqldriver.MaintenanceOptions{
 			Disabled: !*opts.Maintenance,
 			Interval: *opts.MaintenanceInterval,
-			Engine:   engine.MaintenanceOptions{SegmentThreshold: *opts.CompactionThreshold},
+			Engine:   engine.MaintenanceOptions{Tiers: engine.Tiers{FanIn: *opts.CompactionFanIn}},
 		},
 		Logger: opts.Logger,
 		NewClient: func(ctx context.Context, bucket string) (s3.Client, error) {
@@ -346,12 +352,14 @@ func withConn(ctx context.Context, db *sql.DB, fn func(c *sqldriver.Conn) error)
 	})
 }
 
-// Compact the database behind db: every segment object is merged into one, and the old ones
-// become garbage for [GC]. Commits that happen meanwhile are kept ahead of the merged segment,
-// and only a competing compaction makes it return [ErrConflict], after which it can be retried.
-// It returns [ErrSnapshotExpired] when it took longer than the grace period. It is safe to run
-// while other processes use the database, and background maintenance does it on its own unless
-// [Options.Maintenance] is off.
+// Compact the database behind db: every segment object is merged into one, whatever the tiers
+// of [Options.CompactionFanIn], and the old ones become garbage for [GC]. Commits that happen
+// meanwhile are kept ahead of the merged segment, and only a competing compaction makes it return
+// [ErrConflict], after which it can be retried. It returns [ErrSnapshotExpired] when it took
+// longer than half the grace period. It is safe to run while other processes use the database.
+// Background maintenance merges segments by tiers on its own unless [Options.Maintenance] is
+// off, and merges every segment when the newer segments are together as large as the oldest,
+// or delete at least as many of its rows as remain.
 func Compact(ctx context.Context, db *sql.DB) error {
 	return withConn(ctx, db, func(c *sqldriver.Conn) error {
 		return c.DB().Compact(ctx)

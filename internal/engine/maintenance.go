@@ -21,9 +21,8 @@ var ErrLeaseLost = errors.New("engine: maintenance lease lost")
 type MaintenanceOptions struct {
 	// Holder identifies the maintainer in the lease. Defaults to a random ID.
 	Holder string
-	// SegmentThreshold is the segment count at which compaction is due. Defaults to 8, and is
-	// at least 2, because one segment cannot be compacted.
-	SegmentThreshold int
+	// Tiers decide when compaction is due and which segments it merges. Their defaults apply.
+	Tiers Tiers
 	// LeaseDuration is how long an acquired lease lasts without renewal. Defaults to one minute.
 	// During long work the lease is renewed once half of it has passed.
 	LeaseDuration time.Duration
@@ -60,10 +59,7 @@ func (db *DB) NewMaintainer(opts MaintenanceOptions) *Maintainer {
 	if opts.Holder == "" {
 		opts.Holder = db.newID()
 	}
-	if opts.SegmentThreshold <= 0 {
-		opts.SegmentThreshold = 8
-	}
-	opts.SegmentThreshold = max(opts.SegmentThreshold, 2)
+	opts.Tiers = opts.Tiers.withDefaults()
 	if opts.LeaseDuration <= 0 {
 		opts.LeaseDuration = time.Minute
 	}
@@ -84,9 +80,9 @@ type StepResult struct {
 	Ran bool
 }
 
-// Step runs maintenance once if there is work: compaction when the manifest has at least
-// SegmentThreshold segments, and garbage collection when it has garbage that is unstamped or
-// older than the grace period. It decides from the manifest the database already has, so a
+// Step runs maintenance once if there is work: compaction while the tiers make a merge of
+// segments due, and garbage collection when the manifest has garbage that is unstamped or older
+// than the grace period. It decides from the manifest the database already has, so a
 // step without work makes no requests. With the lease, the step first acquires it, and gives
 // it up again at the end, so that an idle process holds nothing.
 func (m *Maintainer) Step(ctx context.Context) (StepResult, error) {
@@ -117,7 +113,12 @@ func (m *Maintainer) Step(ctx context.Context) (StepResult, error) {
 
 // due reports whether the manifest has work.
 func (m *Maintainer) due(man *manifest) bool {
-	return len(man.Segments) >= m.opts.SegmentThreshold || m.garbageDue(man)
+	return m.compactionDue(man) || m.garbageDue(man)
+}
+
+// compactionDue reports whether the tiers make a merge of the manifest's segments due.
+func (m *Maintainer) compactionDue(man *manifest) bool {
+	return len(m.db.plan(&m.opts.Tiers, man.Segments)) > 0
 }
 
 // garbageDue reports whether the manifest has garbage to stamp or to delete.
@@ -137,13 +138,22 @@ func (m *Maintainer) garbageDue(man *manifest) bool {
 func (m *Maintainer) maintain(ctx context.Context, res *StepResult) error {
 	man, _ := m.db.cachedManifest()
 	progress := func() error { return m.progress(ctx) }
-	if len(man.Segments) >= m.opts.SegmentThreshold {
-		merged, err := m.db.compact(ctx, progress)
+	// A merge can make the next tier due, so compaction runs again while a merge is due, a
+	// bounded number of times, so that the tiers settle within one step.
+	for range 16 {
+		if !m.compactionDue(man) {
+			break
+		}
+		merged, err := m.db.compact(ctx, &m.opts.Tiers, progress)
 		if err != nil {
 			return err
 		}
-		res.Compacted = merged
+		res.Compacted = res.Compacted || merged
 		res.Ran = res.Ran || merged
+		if !merged {
+			break
+		}
+		man, _ = m.db.cachedManifest()
 	}
 	if err := progress(); err != nil {
 		return err

@@ -212,6 +212,7 @@ func (tx *Tx) Commit(ctx context.Context) error {
 		db.log.Debug("commit failed", "seq", next.Seq, "id", id, "error", err)
 		return err
 	}
+	db.committedBytes.Add(meta.Size)
 	db.log.Debug("committed", "seq", next.Seq, "id", id, "writes", len(keys))
 	return nil
 }
@@ -238,10 +239,14 @@ func (s *sliceSource) Err() error   { return nil }
 type Iterator struct {
 	sources []source
 	end     []byte
-	key     []byte
-	value   []byte
-	valid   bool
-	err     error
+	// keepTombstones makes the iterator stop at a tombstone that wins, with tombstone set,
+	// instead of skipping it.
+	keepTombstones bool
+	key            []byte
+	value          []byte
+	tombstone      bool
+	valid          bool
+	err            error
 }
 
 func (it *Iterator) advance() {
@@ -279,11 +284,12 @@ func (it *Iterator) advance() {
 				}
 			}
 		}
-		if e.tombstone {
+		if e.tombstone && !it.keepTombstones {
 			continue
 		}
 		it.key = e.key
 		it.value = e.value
+		it.tombstone = e.tombstone
 		it.valid = true
 		return
 	}

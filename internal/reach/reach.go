@@ -17,26 +17,30 @@ type State string
 
 // States.
 const (
-	LostAckLanded           State = "STATE-LOST-ACK-LANDED"
-	LostAckConflict         State = "STATE-LOST-ACK-CONFLICT"
-	LiveUnknown             State = "STATE-LIVE-UNKNOWN"
-	AutocommitRetry         State = "STATE-AUTOCOMMIT-RETRY"
-	CompactionRebase        State = "STATE-COMPACTION-REBASE"
-	GCRebase                State = "STATE-GC-REBASE"
-	GCKeepsLiveGarbage      State = "STATE-GC-KEEPS-LIVE-GARBAGE"
-	GCBatchRewritten        State = "STATE-GC-BATCH-REWRITTEN"
-	GCChainDropped          State = "STATE-GC-CHAIN-DROPPED"
-	LeaseTakeover           State = "STATE-LEASE-TAKEOVER"
-	LeaseOverlap            State = "STATE-LEASE-OVERLAP"
-	SnapshotExpiredRefused  State = "STATE-SNAPSHOT-EXPIRED-REFUSED"
-	BlockReadRetrySucceeded State = "STATE-BLOCK-READ-RETRY-SUCCEEDED"
-	CrashMidCommitRecovered State = "STATE-CRASH-MID-COMMIT-RECOVERED"
-	CrashMidCompaction      State = "STATE-CRASH-MID-COMPACTION"
-	CrashMidGC              State = "STATE-CRASH-MID-GC"
-	UniqueAfterConflict     State = "STATE-UNIQUE-AFTER-CONFLICT"
-	UniqueValueReused       State = "STATE-UNIQUE-VALUE-REUSED"
-	ForeignKeyAfterConflict State = "STATE-FK-AFTER-CONFLICT"
-	ForeignKeyCascadeTables State = "STATE-FK-CASCADE-TABLES"
+	LostAckLanded            State = "STATE-LOST-ACK-LANDED"
+	LostAckConflict          State = "STATE-LOST-ACK-CONFLICT"
+	LiveUnknown              State = "STATE-LIVE-UNKNOWN"
+	AutocommitRetry          State = "STATE-AUTOCOMMIT-RETRY"
+	CompactionRebase         State = "STATE-COMPACTION-REBASE"
+	CompactionPartialRebase  State = "STATE-COMPACTION-PARTIAL-REBASE"
+	CompactionKeepsTombstone State = "STATE-COMPACTION-KEEPS-TOMBSTONE"
+	CompactionUpperTier      State = "STATE-COMPACTION-UPPER-TIER"
+	CompactionWindows        State = "STATE-COMPACTION-WINDOWS"
+	GCRebase                 State = "STATE-GC-REBASE"
+	GCKeepsLiveGarbage       State = "STATE-GC-KEEPS-LIVE-GARBAGE"
+	GCBatchRewritten         State = "STATE-GC-BATCH-REWRITTEN"
+	GCChainDropped           State = "STATE-GC-CHAIN-DROPPED"
+	LeaseTakeover            State = "STATE-LEASE-TAKEOVER"
+	LeaseOverlap             State = "STATE-LEASE-OVERLAP"
+	SnapshotExpiredRefused   State = "STATE-SNAPSHOT-EXPIRED-REFUSED"
+	BlockReadRetrySucceeded  State = "STATE-BLOCK-READ-RETRY-SUCCEEDED"
+	CrashMidCommitRecovered  State = "STATE-CRASH-MID-COMMIT-RECOVERED"
+	CrashMidCompaction       State = "STATE-CRASH-MID-COMPACTION"
+	CrashMidGC               State = "STATE-CRASH-MID-GC"
+	UniqueAfterConflict      State = "STATE-UNIQUE-AFTER-CONFLICT"
+	UniqueValueReused        State = "STATE-UNIQUE-VALUE-REUSED"
+	ForeignKeyAfterConflict  State = "STATE-FK-AFTER-CONFLICT"
+	ForeignKeyCascadeTables  State = "STATE-FK-CASCADE-TABLES"
 )
 
 // Declared state, with what it means and the message of the Antithesis assertion that marks it.
@@ -54,6 +58,10 @@ func Declarations() []Declared {
 		{LiveUnknown, "a commit outcome is unknown in a client process that did not crash", "a commit outcome is unknown in a process that keeps running"},
 		{AutocommitRetry, "an autocommit statement retries after a conflict", "an autocommit statement retries after a conflict"},
 		{CompactionRebase, "a compaction reapplies its swap on top of commits that landed meanwhile", "a compaction rebases on commits that only added segments"},
+		{CompactionPartialRebase, "a compaction that left the oldest or the newest segments alone reapplies its swap on top of commits that landed meanwhile, which go after the segments it left alone", "a compaction that left some segments alone rebases on newer commits"},
+		{CompactionKeepsTombstone, "a merge of segments that excludes the oldest one keeps a tombstone, because an older segment may still hold the key", "a compaction that excludes the oldest segment keeps a tombstone"},
+		{CompactionUpperTier, "a tiered compaction merges segments of tier 2 or higher, which earlier merges made", "a compaction merges segments of tier 2 or higher"},
+		{CompactionWindows, "one compaction merges several separate windows of adjacent segments, and swaps them all in one manifest write", "a compaction merges several windows of segments at once"},
 		{GCRebase, "a GC pass reapplies its manifest change on top of commits that landed meanwhile", "a GC pass rebases on commits that landed meanwhile"},
 		{GCKeepsLiveGarbage, "an expired garbage batch lists a live segment, the output of a compaction that a GC pass stamped as an orphan before the compaction's rebase landed, and GC keeps it", "GC keeps a live segment that an expired garbage batch lists"},
 		{GCBatchRewritten, "a GC pass that rebases writes its garbage batch again, because the chain it was to join changed meanwhile, and the first one becomes an orphan", "a GC pass writes its garbage batch again for another chain"},

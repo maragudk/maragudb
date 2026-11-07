@@ -29,6 +29,7 @@ import (
 	"github.com/antithesishq/antithesis-sdk-go/lifecycle"
 	"github.com/antithesishq/antithesis-sdk-go/random"
 
+	"maragu.dev/maragudb/internal/engine"
 	"maragu.dev/maragudb/internal/s3"
 	"maragu.dev/maragudb/internal/sim"
 	"maragu.dev/maragudb/internal/workload"
@@ -203,9 +204,10 @@ func store(ctx context.Context, w sim.Workload, useSQL bool) error {
 		GracePeriod: time.Duration(1+rng.IntN(10)) * time.Second,
 		// Short enough that compaction and GC run several times in a run of a few seconds.
 		MaintenanceInterval: time.Duration(10+rng.IntN(190)) * time.Millisecond,
-		CompactionThreshold: 2 + rng.IntN(7),
-		Rand:                rng,
-		Log:                 func(line string) { fmt.Println(line) },
+		// Small tiers, so that compaction merges segments of several tiers in a short run.
+		Tiers: engine.Tiers{FanIn: 2 + rng.IntN(4), BaseBytes: int64(64 << rng.IntN(6))},
+		Rand:  rng,
+		Log:   func(line string) { fmt.Println(line) },
 	}
 	fmt.Printf("running %v (SQL %v) in %s with %d clients of %d transactions on %d keys\n", w, useSQL, cfg.Prefix, cfg.Clients, cfg.TxPerClient, cfg.Keys)
 	// The run gets a few minutes; a store that stays unreachable longer is not a finding.

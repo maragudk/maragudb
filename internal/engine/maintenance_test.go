@@ -1,7 +1,11 @@
 package engine_test
 
 import (
+	"encoding/json"
 	"fmt"
+	"math"
+	"math/rand/v2"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -17,18 +21,18 @@ import (
 func TestMaintainer_Step(t *testing.T) {
 	grace := 10 * time.Minute
 
-	t.Run("compacts at the segment threshold, collects garbage after the grace period, and makes no requests in between", func(t *testing.T) {
-		verify.Covers(t, "maintenance compacts at the segment threshold, deletes garbage after the grace period, and makes no requests when idle", "AC-6.1")
+	t.Run("compacts when four segments are in one tier, collects garbage after the grace period, and makes no requests in between", func(t *testing.T) {
+		verify.Covers(t, "maintenance compacts when four segments are in one tier, deletes garbage after the grace period, and makes no requests when idle", "AC-6.1")
 		w := newWorld(t)
 		db := w.open(1, engine.Options{GCGracePeriod: &grace})
-		m := db.NewMaintainer(engine.MaintenanceOptions{SegmentThreshold: 4})
+		m := db.NewMaintainer(engine.MaintenanceOptions{Tiers: engine.Tiers{FanIn: 4, FullRatio: 100}})
 		for i := range 3 {
 			put(t, db, fmt.Sprint("k", i), "v")
 		}
 		before := db.Stats().S3
 		res, err := m.Step(t.Context())
 		is.NotError(t, err)
-		is.Equal(t, engine.StepResult{}, res, "below the threshold there is no work")
+		is.Equal(t, engine.StepResult{}, res, "with three segments in one tier there is no work")
 		is.Equal(t, int64(0), db.Stats().S3.Sub(before).Total())
 
 		put(t, db, "k3", "v")
@@ -85,7 +89,7 @@ func TestMaintainer_Step(t *testing.T) {
 		for i := range n {
 			db := w.open(uint64(i+1), engine.Options{GCGracePeriod: &grace})
 			dbs = append(dbs, db)
-			ms = append(ms, db.NewMaintainer(engine.MaintenanceOptions{SegmentThreshold: 4}))
+			ms = append(ms, db.NewMaintainer(engine.MaintenanceOptions{Tiers: engine.Tiers{FanIn: 4, FullRatio: 100}}))
 		}
 		for i := range 4 {
 			put(t, dbs[0], fmt.Sprint("k", i), "v")
@@ -125,7 +129,7 @@ func TestMaintainer_Step(t *testing.T) {
 		for i := range 3 {
 			db := w.open(uint64(i+1), engine.Options{GCGracePeriod: &grace})
 			dbs = append(dbs, db)
-			ms = append(ms, db.NewMaintainer(engine.MaintenanceOptions{SegmentThreshold: 4, DisableLease: true}))
+			ms = append(ms, db.NewMaintainer(engine.MaintenanceOptions{Tiers: engine.Tiers{FanIn: 4, FullRatio: 100}, DisableLease: true}))
 		}
 		for i := range 4 {
 			put(t, dbs[0], fmt.Sprint("k", i), fmt.Sprint(i))
@@ -161,8 +165,8 @@ func TestMaintainer_Step(t *testing.T) {
 		db1 := w.open(1, engine.Options{GCGracePeriod: &grace, MemoryCacheBytes: new(int64)})
 		db2 := w.open(2, engine.Options{GCGracePeriod: &grace, MemoryCacheBytes: new(int64)})
 		lease := 100 * time.Millisecond
-		m1 := db1.NewMaintainer(engine.MaintenanceOptions{Holder: "one", SegmentThreshold: 2, LeaseDuration: lease})
-		m2 := db2.NewMaintainer(engine.MaintenanceOptions{Holder: "two", SegmentThreshold: 2, LeaseDuration: lease})
+		m1 := db1.NewMaintainer(engine.MaintenanceOptions{Holder: "one", Tiers: engine.Tiers{FanIn: 2}, LeaseDuration: lease})
+		m2 := db2.NewMaintainer(engine.MaintenanceOptions{Holder: "two", Tiers: engine.Tiers{FanIn: 2}, LeaseDuration: lease})
 		for i := range 4 {
 			put(t, db1, fmt.Sprint("k", i), "v")
 		}
@@ -226,8 +230,8 @@ func TestMaintainer_Step(t *testing.T) {
 		db1 := w.open(1, engine.Options{GCGracePeriod: &grace, MemoryCacheBytes: new(int64)})
 		db2 := w.open(2, engine.Options{GCGracePeriod: &grace, MemoryCacheBytes: new(int64)})
 		lease := 100 * time.Millisecond
-		m1 := db1.NewMaintainer(engine.MaintenanceOptions{Holder: "one", SegmentThreshold: 2, LeaseDuration: lease, IgnoreLeaseExpiry: true})
-		m2 := db2.NewMaintainer(engine.MaintenanceOptions{Holder: "two", SegmentThreshold: 2, LeaseDuration: lease})
+		m1 := db1.NewMaintainer(engine.MaintenanceOptions{Holder: "one", Tiers: engine.Tiers{FanIn: 2}, LeaseDuration: lease, IgnoreLeaseExpiry: true})
+		m2 := db2.NewMaintainer(engine.MaintenanceOptions{Holder: "two", Tiers: engine.Tiers{FanIn: 2}, LeaseDuration: lease})
 		for i := range 4 {
 			put(t, db1, fmt.Sprint("k", i), fmt.Sprint(i))
 		}
@@ -261,6 +265,106 @@ func TestMaintainer_Step(t *testing.T) {
 			}
 			is.Equal(t, 1, db.Stats().Segments)
 		}
+	})
+}
+
+// amplification of compaction for commits on a database that loadKeys loaded with n keys, or an
+// empty one for n of 0: the bytes that the compactions of maintenance read and write for each
+// committed byte. Each commit inserts the given number of new keys, updates a random key, and
+// deletes another, and maintenance then steps once. Without mutations, it checks after every step
+// that fewer than four segments, the default fan-in, count in each tier, where a segment counts in
+// the highest tier of itself and the newer segments.
+func amplification(t *testing.T, n, commits, inserts int, mutations engine.Mutations) float64 {
+	t.Helper()
+	w := newWorld(t)
+	db := w.open(1, engine.Options{Mutations: mutations})
+	if n > 0 {
+		loadKeys(t, db, n)
+	}
+	m := db.NewMaintainer(engine.MaintenanceOptions{DisableLease: true})
+	rng := rand.New(rand.NewPCG(1, 2))
+	before := db.Stats()
+	most := 0
+	for i := range commits {
+		tx, err := db.Begin(t.Context())
+		is.NotError(t, err)
+		for j := range inserts {
+			key := n + i*inserts + j
+			is.NotError(t, tx.Put(fmt.Appendf(nil, "key-%08d", key), fmt.Appendf(nil, "value-%d", key)))
+		}
+		keys := n + (i+1)*inserts
+		is.NotError(t, tx.Put(fmt.Appendf(nil, "key-%08d", rng.IntN(keys)), fmt.Appendf(nil, "updated-%d", i)))
+		is.NotError(t, tx.Delete(fmt.Appendf(nil, "key-%08d", rng.IntN(keys))))
+		is.NotError(t, tx.Commit(t.Context()))
+		_, err = m.Step(t.Context())
+		is.NotError(t, err)
+		if mutations != (engine.Mutations{}) {
+			continue
+		}
+		// Tier 0 is below 1 KiB, and every tier above is four times as large.
+		perTier := map[int]int{}
+		tier := 0
+		sizes := segmentSizes(t, w)
+		for _, size := range slices.Backward(sizes) {
+			own := 0
+			for limit := int64(1 << 10); size >= limit; limit *= 4 {
+				own++
+			}
+			tier = max(tier, own)
+			perTier[tier]++
+			is.True(t, perTier[tier] < 4, fmt.Sprintf("commit %d: %d segments in tier %d: %v", i, perTier[tier], tier, sizes))
+		}
+		most = max(most, len(sizes))
+	}
+	if mutations == (engine.Mutations{}) {
+		t.Logf("%d keys and %d commits: at most %d segments", n, commits, most)
+	}
+	s := db.Stats()
+	moved := s.CompactionBytesRead + s.CompactionBytesWritten - before.CompactionBytesRead - before.CompactionBytesWritten
+	return float64(moved) / float64(s.CommittedBytes-before.CommittedBytes)
+}
+
+// segmentSizes of the live segments that the manifest in the store lists, oldest first.
+func segmentSizes(t *testing.T, w *world) []int64 {
+	t.Helper()
+	body, ok := w.fake.Body("db/manifest")
+	is.True(t, ok)
+	var man struct {
+		Segments []struct {
+			Size int64 `json:"size"`
+		} `json:"segments"`
+	}
+	is.NotError(t, json.Unmarshal(body, &man))
+	var sizes []int64
+	for _, seg := range man.Segments {
+		sizes = append(sizes, seg.Size)
+	}
+	return sizes
+}
+
+func TestMaintainer_Compaction(t *testing.T) {
+	t.Run("reads and writes about as many bytes per committed byte for the same commits on a database ten times as large", func(t *testing.T) {
+		verify.Covers(t, "the same 1,000 commits of an insert, an update, and a delete each, with maintenance after every commit, make compaction read and write at most 1.5 times as many bytes per committed byte on a database of 20,000 keys as on one of 2,000, and with the mutant that merges every segment, at least 5 times as many", "AC-6.5")
+		verify.Covers(t, "1,000 commits on databases of 2,000 and 20,000 keys, with a maintenance step after every commit, leave fewer than four segments in each tier, where a segment counts in the highest tier of itself and the newer segments", "AC-5.3")
+		small := amplification(t, 2_000, 1_000, 1, engine.Mutations{})
+		large := amplification(t, 20_000, 1_000, 1, engine.Mutations{})
+		t.Logf("bytes moved per committed byte: %.1f at 2,000 keys, %.1f at 20,000", small, large)
+		is.True(t, large <= 1.5*small, fmt.Sprintf("%.1f and %.1f", small, large))
+
+		small = amplification(t, 2_000, 1_000, 1, engine.Mutations{CompactAll: true})
+		large = amplification(t, 20_000, 1_000, 1, engine.Mutations{CompactAll: true})
+		t.Logf("with every segment merged: %.1f at 2,000 keys, %.1f at 20,000", small, large)
+		is.True(t, large >= 5*small, fmt.Sprintf("%.1f and %.1f", small, large))
+	})
+
+	t.Run("reads and writes a number of bytes per committed byte that grows with the logarithm of the size, while it grows a database tenfold", func(t *testing.T) {
+		verify.Covers(t, "growing an empty database by commits of ten new keys, an update, and a delete each, with maintenance after every commit, from 500 commits to 5,000, makes compaction read and write at most two bytes more per committed byte for every fourfold of the size, plus two, and leaves fewer than four segments in each tier after every maintenance step", "AC-6.5", "AC-5.3")
+		small := amplification(t, 0, 500, 10, engine.Mutations{})
+		large := amplification(t, 0, 5_000, 10, engine.Mutations{})
+		t.Logf("bytes moved per committed byte: %.1f after 500 commits, %.1f after 5,000", small, large)
+		// Every tier is four times as large as the one below, and a merge into the next tier reads
+		// and writes a byte once. Merges of the whole database add a bounded number per byte.
+		is.True(t, large <= small+2*(math.Log(10)/math.Log(4)+1), fmt.Sprintf("%.1f and %.1f", small, large))
 	})
 }
 

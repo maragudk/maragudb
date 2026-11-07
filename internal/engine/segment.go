@@ -50,11 +50,13 @@ type segmentBuilder struct {
 	blockFirst []byte
 	leaves     []indexEntry
 	// blocks written so far, in object order, for priming caches.
-	blocks  []blockRef
-	count   int
-	lastKey []byte
-	minKey  []byte
-	maxKey  []byte
+	blocks []blockRef
+	count  int
+	// tombstones among the entries.
+	tombstones int
+	lastKey    []byte
+	minKey     []byte
+	maxKey     []byte
 }
 
 func newSegmentBuilder(blockSize int) *segmentBuilder {
@@ -75,6 +77,7 @@ func (b *segmentBuilder) add(key, value []byte, tombstone bool) error {
 	b.block.Write(key)
 	if tombstone {
 		b.block.WriteByte(1)
+		b.tombstones++
 	} else {
 		b.block.WriteByte(0)
 		b.block.Write(binary.AppendUvarint(nil, uint64(len(value))))
@@ -145,11 +148,12 @@ func (b *segmentBuilder) finish() ([]byte, segmentMeta, error) {
 		level = next
 	}
 	meta := segmentMeta{
-		Size:   int64(b.buf.Len()),
-		Root:   level[0].ref,
-		MinKey: b.minKey,
-		MaxKey: b.maxKey,
-		Count:  b.count,
+		Size:       int64(b.buf.Len()),
+		Root:       level[0].ref,
+		MinKey:     b.minKey,
+		MaxKey:     b.maxKey,
+		Count:      b.count,
+		Tombstones: b.tombstones,
 	}
 	return b.buf.Bytes(), meta, nil
 }

@@ -256,7 +256,7 @@ func TestSimulator(t *testing.T) {
 		verify.Covers(t, "the fixed corpus, with the foreign key workload under the same faults, finds no reference to a missing row and no row that violates a CHECK in any snapshot a reader saw, and after every run through SQL every foreign key and CHECK of the store holds", "INV-FK", "INV-CHECK")
 		verify.Covers(t, "the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, and unique and foreign key violations that only a concurrent commit causes",
 			"AC-1.3", "AC-1.4", "STATE-LOST-ACK-LANDED", "STATE-LOST-ACK-CONFLICT", "STATE-LIVE-UNKNOWN", "STATE-AUTOCOMMIT-RETRY",
-			"STATE-COMPACTION-REBASE", "STATE-GC-REBASE", "STATE-GC-KEEPS-LIVE-GARBAGE", "STATE-GC-BATCH-REWRITTEN", "STATE-GC-CHAIN-DROPPED", "STATE-LEASE-TAKEOVER", "STATE-LEASE-OVERLAP",
+			"STATE-COMPACTION-REBASE", "STATE-COMPACTION-PARTIAL-REBASE", "STATE-COMPACTION-KEEPS-TOMBSTONE", "STATE-COMPACTION-UPPER-TIER", "STATE-COMPACTION-WINDOWS", "STATE-GC-REBASE", "STATE-GC-KEEPS-LIVE-GARBAGE", "STATE-GC-BATCH-REWRITTEN", "STATE-GC-CHAIN-DROPPED", "STATE-LEASE-TAKEOVER", "STATE-LEASE-OVERLAP",
 			"STATE-SNAPSHOT-EXPIRED-REFUSED", "STATE-BLOCK-READ-RETRY-SUCCEEDED", "STATE-CRASH-MID-COMMIT-RECOVERED",
 			"STATE-CRASH-MID-COMPACTION", "STATE-CRASH-MID-GC", "STATE-UNIQUE-AFTER-CONFLICT", "STATE-UNIQUE-VALUE-REUSED",
 			"STATE-FK-AFTER-CONFLICT", "STATE-FK-CASCADE-TABLES")
@@ -615,9 +615,9 @@ type mutant struct {
 	// cells of the others do not apply, for the reason only.
 	workloads []sim.Workload
 	only      string
-	// maintained is true for a mutant of code that only runs with maintainers, so that the cells
-	// without them do not apply.
-	maintained bool
+	// unmaintained, for a mutant of code that only runs with maintainers, is why the cells without
+	// them do not apply.
+	unmaintained string
 }
 
 // cell of the kill matrix: a workload, through an API, with a number of maintainers.
@@ -668,6 +668,7 @@ const (
 	noCheck           = "the workload has no CHECK constraints"
 	ackConserves      = "an acknowledged transfer that never landed is missing as a whole, which conserves money, and without maintainers its segment is an orphan that GC collects like that of any failed commit"
 	noMaintainedGC    = "without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete"
+	noMaintainedMerge = "without maintainers nothing compacts"
 )
 
 // mutants in the kill matrix.
@@ -725,38 +726,76 @@ func mutants() []mutant {
 		},
 		{
 			id: "MUT-GC-BATCH-OBJECTS-FIRST", replay: "gc-batch-objects-first", name: "garbage batches deleted before their garbage",
-			description: "`engine.Mutations.GCBatchObjectsFirst` deletes the objects of an expired chain of garbage batches before the garbage they list and before the manifest write that drops the chain, so that a failed delete or a crash leaves the manifest referencing a missing batch.",
-			mutations:   engine.Mutations{GCBatchObjectsFirst: true},
-			maintained:  true,
-			checkers:    []string{sim.CheckerStorage},
+			description:  "`engine.Mutations.GCBatchObjectsFirst` deletes the objects of an expired chain of garbage batches before the garbage they list and before the manifest write that drops the chain, so that a failed delete or a crash leaves the manifest referencing a missing batch.",
+			mutations:    engine.Mutations{GCBatchObjectsFirst: true},
+			unmaintained: noMaintainedGC,
+			checkers:     []string{sim.CheckerStorage},
 		},
 		{
 			id: "MUT-GC-SWEEP-SEGMENTS-ONLY", replay: "gc-sweep-segments-only", name: "an orphan sweep that misses garbage batches",
-			description: "`engine.Mutations.GCSweepSegmentsOnly` lists only segments when GC sweeps for orphans, so that a garbage batch whose GC pass lost or crashed, or whose delete failed after its chain was dropped, is never deleted.",
-			mutations:   engine.Mutations{GCSweepSegmentsOnly: true},
-			maintained:  true,
-			checkers:    []string{sim.CheckerStorage},
+			description:  "`engine.Mutations.GCSweepSegmentsOnly` lists only segments when GC sweeps for orphans, so that a garbage batch whose GC pass lost or crashed, or whose delete failed after its chain was dropped, is never deleted.",
+			mutations:    engine.Mutations{GCSweepSegmentsOnly: true},
+			unmaintained: noMaintainedGC,
+			checkers:     []string{sim.CheckerStorage},
 		},
 		{
 			id: "MUT-GC-CHAIN-FIRST-STAMP", replay: "gc-chain-first-stamp", name: "a chain of garbage batches with the stamp of its first batch",
-			description: "`engine.Mutations.GCChainKeepsFirstStamp` adds every GC pass's garbage batch to the newest chain, however old, and keeps the stamp of the chain's first batch, so that garbage is deleted before it is a grace period old.",
-			mutations:   engine.Mutations{GCChainKeepsFirstStamp: true},
-			maintained:  true,
-			checkers:    []string{sim.CheckerGracePeriod},
+			description:  "`engine.Mutations.GCChainKeepsFirstStamp` adds every GC pass's garbage batch to the newest chain, however old, and keeps the stamp of the chain's first batch, so that garbage is deleted before it is a grace period old.",
+			mutations:    engine.Mutations{GCChainKeepsFirstStamp: true},
+			unmaintained: noMaintainedGC,
+			checkers:     []string{sim.CheckerGracePeriod},
 		},
 		{
 			id: "MUT-GC-DELETE-REFERENCED", replay: "gc-delete-referenced", name: "GC deleting expired garbage that is referenced again",
-			description: "`engine.Mutations.GCDeleteReferenced` deletes the garbage of an expired chain of garbage batches also when the manifest references it otherwise, such as the output of a compaction that GC stamped as an orphan before the compaction's rebase landed.",
-			mutations:   engine.Mutations{GCDeleteReferenced: true},
-			maintained:  true,
+			description:  "`engine.Mutations.GCDeleteReferenced` deletes the garbage of an expired chain of garbage batches also when the manifest references it otherwise, such as the output of a compaction that GC stamped as an orphan before the compaction's rebase landed.",
+			mutations:    engine.Mutations{GCDeleteReferenced: true},
+			unmaintained: noMaintainedGC,
 			cannot: func() map[cell]string {
 				m := map[cell]string{}
-				for _, w := range []sim.Workload{sim.ListAppend, sim.Bank, sim.ForeignKey} {
-					m[cell{workload: w, sql: true, maintainers: 2}] = "in 20 seeds, no GC pass stamps the output of a compaction as an orphan between the compaction's segment write and its rebased manifest write, which the mutant needs; `TestMutations` of the engine makes that happen and detects the mutant"
+				for _, c := range []cell{{workload: sim.ListAppend}, {workload: sim.ListAppend, sql: true}, {workload: sim.Bank, sql: true}} {
+					c.maintainers = 2
+					m[c] = "in 20 seeds, no GC pass stamps the output of a compaction as an orphan between the compaction's segment write and its rebased manifest write, which the mutant needs; `TestMutations` of the engine makes that happen and detects the mutant"
 				}
 				return m
 			}(),
 			checkers: []string{sim.CheckerStorage},
+		},
+		{
+			id: "MUT-COMPACT-NON-ADJACENT", replay: "compact-non-adjacent", name: "a merge of segments that are not adjacent",
+			description:  "`engine.Mutations.CompactNonAdjacent` leaves the second-oldest segment of every merge where it is, and merges the segment after the merge's window instead, so that the segment left behind the merged one shadows the newer values in it.",
+			mutations:    engine.Mutations{CompactNonAdjacent: true},
+			unmaintained: noMaintainedMerge,
+			checkers:     []string{sim.CheckerListAppend},
+		},
+		{
+			id: "MUT-COMPACT-DROP-TOMBSTONES", replay: "compact-drop-tombstones", name: "tombstones dropped in a merge that excludes the oldest segment",
+			description:  "`engine.Mutations.CompactDropTombstones` drops tombstones in every merge, also in one that excludes the oldest segment, so that a value that an older segment holds shows again after its delete.",
+			mutations:    engine.Mutations{CompactDropTombstones: true},
+			unmaintained: noMaintainedMerge,
+			cannot: map[cell]string{
+				{workload: sim.Bank, maintainers: 2}:                  "the bank workload through the engine never deletes a key, so no merge meets a tombstone",
+				{workload: sim.ListAppend, sql: true, maintainers: 2}: "the list-append workload through SQL never deletes a row, and its tables have no index besides the primary key, so no merge meets a tombstone",
+				{workload: sim.ForeignKey, sql: true, maintainers: 2}: "a row that the workload deleted comes back together with the rows that its delete cascaded to, which is an older consistent state, unless a later commit changed a row that they reference; 2 of the first 100 seeds reach that, the first at seed 71",
+			},
+			checkers: []string{sim.CheckerListAppend},
+		},
+		{
+			id: "MUT-COMPACT-REBASE-LOSES-SEGMENT", replay: "compact-rebase-loses-segment", name: "a rebase that loses a segment added meanwhile",
+			description:  "`engine.Mutations.CompactRebaseLosesSegment` leaves out the oldest of the segments that commits added during a compaction when the compaction rebases on them, so that an acknowledged commit is lost.",
+			mutations:    engine.Mutations{CompactRebaseLosesSegment: true},
+			unmaintained: noMaintainedMerge,
+			checkers:     []string{sim.CheckerDurability},
+		},
+		{
+			id: "MUT-COMPACT-REBASE-ON-COMPACTION", replay: "compact-rebase-on-compaction", name: "a rebase on another compaction",
+			description:  "`engine.Mutations.CompactRebaseOnCompaction` rebases a compaction on any newer manifest with at least as many segments, also on one in which another compaction replaced segments, so that the segments of that compaction and of the commits after it are lost or put back.",
+			mutations:    engine.Mutations{CompactRebaseOnCompaction: true},
+			unmaintained: noMaintainedMerge,
+			cannot: map[cell]string{
+				{workload: sim.Bank, maintainers: 2}:              "a rebase on another compaction loses whole commits and puts back merged segments with the same values, a lost transfer conserves money, and the bank checker only checks totals",
+				{workload: sim.Unique, sql: true, maintainers: 2}: "a rebase on another compaction loses whole commits and puts back merged segments with the same values, which leaves a consistent state in which no value repeats, and the unique workload does not check that acknowledged writes survive",
+			},
+			checkers: []string{sim.CheckerDurability},
 		},
 		{
 			id: "MUT-SKIP-FRESHNESS", replay: "freshness", name: "serving the cache without a freshness check",
@@ -796,6 +835,7 @@ func mutants() []mutant {
 			id: "MUT-FRESH-SNAPSHOT", replay: "fresh-snapshot", name: "a fresh snapshot per statement",
 			description:  "`exec.Mutations.FreshSnapshotPerStatement` starts every statement of an explicit transaction that has not written yet from the latest commit, so an audit can straddle a transfer and a reader can see two states.",
 			sqlMutations: exec.Mutations{FreshSnapshotPerStatement: true},
+			cannot:       map[cell]string{{workload: sim.ForeignKey, sql: true, maintainers: 2}: "the mutant shows in the foreign key workload only when a reader's statements straddle a commit that changes what they read, which 8 of the first 100 seeds with two maintainers reach, the first at seed 31; the cell without maintainers detects it"},
 			checkers:     []string{sim.CheckerBank, sim.CheckerListAppend},
 		},
 		{
@@ -890,8 +930,8 @@ func (m mutant) applicable(c cell) (bool, string) {
 	if len(m.workloads) > 0 && !slices.Contains(m.workloads, c.workload) {
 		return false, m.only
 	}
-	if m.maintained && c.maintainers == 0 {
-		return false, noMaintainedGC
+	if m.unmaintained != "" && c.maintainers == 0 {
+		return false, m.unmaintained
 	}
 	return true, ""
 }

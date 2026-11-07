@@ -88,7 +88,7 @@ func TestConnector(t *testing.T) {
 			fake := s3fake.New()
 			d := sqldriver.New(sqldriver.Options{
 				Engine:      engine.Options{Client: fake},
-				Maintenance: sqldriver.MaintenanceOptions{Interval: time.Second, Engine: engine.MaintenanceOptions{SegmentThreshold: 3}},
+				Maintenance: sqldriver.MaintenanceOptions{Interval: time.Second, Engine: engine.MaintenanceOptions{Tiers: engine.Tiers{FanIn: 3}}},
 			})
 			c, err := sqldriver.NewConnector(d, "s3://bucket/db")
 			is.NotError(t, err)
@@ -101,7 +101,7 @@ func TestConnector(t *testing.T) {
 			is.NotError(t, err)
 			is.Equal(t, 2, engineDB.Stats().Segments)
 			time.Sleep(2 * time.Second)
-			is.Equal(t, 2, engineDB.Stats().Segments, "below the threshold")
+			is.Equal(t, 2, engineDB.Stats().Segments, "two segments in tier 0 are not merged")
 			_, err = db.ExecContext(t.Context(), "INSERT INTO t VALUES (2)")
 			is.NotError(t, err)
 			time.Sleep(2 * time.Second)

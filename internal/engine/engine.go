@@ -100,6 +100,23 @@ type Mutations struct {
 	// manifest still references it otherwise: as a live segment, as unstamped garbage, or in a
 	// chain that has not expired.
 	GCDeleteReferenced bool
+	// CompactNonAdjacent leaves the second-oldest segment of every merge where it is, and merges
+	// the segment after the merge's window instead, so that the skipped segment shadows newer
+	// values in the merged one.
+	CompactNonAdjacent bool
+	// CompactDropTombstones drops tombstones in every merge, also in one that excludes the
+	// oldest segment, whose older values then show again.
+	CompactDropTombstones bool
+	// CompactRebaseLosesSegment leaves out the oldest of the segments that commits added during
+	// a compaction when the compaction rebases on them.
+	CompactRebaseLosesSegment bool
+	// CompactRebaseOnCompaction rebases a compaction on every newer manifest, also on one in which
+	// another compaction replaced segments, instead of only on one that commits extended, and
+	// takes the segments after as many as the compaction began with as the newer ones.
+	CompactRebaseOnCompaction bool
+	// CompactAll merges every segment whenever there are at least [Tiers.FanIn] segments, instead
+	// of the segments that the tiers make due, as compaction did before tiers.
+	CompactAll bool
 }
 
 // Stats about store requests and cache effectiveness.
@@ -123,6 +140,11 @@ type Stats struct {
 	// LeaseAcquisitions and LeaseLosses the times a maintainer acquired the maintenance lease
 	// and lost it to another maintainer.
 	MaintenanceRuns, LeaseAcquisitions, LeaseLosses int64
+	// CommittedBytes counts the bytes of the segments of the commits that succeeded,
+	// CompactionBytesRead the bytes of the blocks that compactions merged, from the caches or the
+	// store, and CompactionBytesWritten the bytes of the segments that they wrote, also of the
+	// compactions that failed afterwards.
+	CommittedBytes, CompactionBytesRead, CompactionBytesWritten int64
 }
 
 // DB is an open database. It is safe for concurrent use.
@@ -154,6 +176,7 @@ type DB struct {
 	memHits, memMisses, diskHits, diskMisses                    atomic.Int64
 	compactionsStarted, compactions, compactionRebases, deleted atomic.Int64
 	maintenanceRuns, leaseAcquisitions, leaseLosses             atomic.Int64
+	committedBytes, compactionBytesRead, compactionBytesWritten atomic.Int64
 }
 
 // Open a database, creating it when no manifest exists.
@@ -250,6 +273,10 @@ func (db *DB) Stats() Stats {
 		MaintenanceRuns:    db.maintenanceRuns.Load(),
 		LeaseAcquisitions:  db.leaseAcquisitions.Load(),
 		LeaseLosses:        db.leaseLosses.Load(),
+
+		CommittedBytes:         db.committedBytes.Load(),
+		CompactionBytesRead:    db.compactionBytesRead.Load(),
+		CompactionBytesWritten: db.compactionBytesWritten.Load(),
 	}
 	if m != nil {
 		s.Seq = m.Seq

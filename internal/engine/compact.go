@@ -5,14 +5,204 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"slices"
 	"strings"
+	"time"
 
 	"github.com/antithesishq/antithesis-sdk-go/assert"
 
 	"maragu.dev/maragudb/internal/reach"
 	"maragu.dev/maragudb/internal/s3"
 )
+
+// Tiers of size-tiered compaction. A segment's tier follows from its size: tier 0 holds the
+// segments smaller than BaseBytes, and tier i, for i of at least 1, the segments of at least
+// BaseBytes·FanIn^(i-1) and less than BaseBytes·FanIn^i bytes.
+//
+// Only segments that are adjacent in age order are merged, and the merged segment takes their
+// place, because a newer segment shadows the older ones. A compaction is due when FanIn adjacent
+// segments are in the same tier, counted as the highest tier of the segment and of every newer
+// one, so that a segment that deletes made smaller than a newer one goes along with that one.
+// It merges as many adjacent segments of the tier as fit in the next tier.
+// The whole database is merged into one segment when there are at least FanIn segments, and
+// those after the oldest one are together FullRatio times as large as it, or hold tombstones for
+// FullRatio times as many of its entries as remain. This keeps the newer segments, with their shadowed values and
+// tombstones, below about FullRatio times the size of the oldest one, and reclaims the space of
+// mass deletes, whose tombstones are small. Only a merge that includes the oldest segment drops
+// tombstones.
+//
+// Each merge of FanIn segments of one tier makes a segment of the next tier, so a byte is
+// rewritten about once per tier, and there are O(log n) tiers for a database of n bytes. Once no
+// compaction is due, every tier holds fewer than FanIn segments, so there are O(log n) segments.
+type Tiers struct {
+	// FanIn is the number of adjacent segments of one tier that are merged into one. Defaults to
+	// 4, and is at least 2.
+	FanIn int
+	// BaseBytes bounds the segments of tier 0. Defaults to 1 KiB.
+	BaseBytes int64
+	// FullRatio is how many times as large as the oldest segment the segments after it are
+	// together when the whole database is merged, or how many times as many of its entries as
+	// remain they delete. Defaults to 1.
+	FullRatio int
+}
+
+func (t Tiers) withDefaults() Tiers {
+	if t.FanIn <= 0 {
+		t.FanIn = 4
+	}
+	t.FanIn = max(t.FanIn, 2)
+	if t.BaseBytes <= 0 {
+		t.BaseBytes = 1 << 10
+	}
+	if t.FullRatio <= 0 {
+		t.FullRatio = 1
+	}
+	return t
+}
+
+// tier of a segment of the given size.
+func (t Tiers) tier(size int64) int {
+	tier := 0
+	for limit := t.BaseBytes; size >= limit; tier++ {
+		if limit > math.MaxInt64/int64(t.FanIn) {
+			// The next limit does not fit, so no size reaches it.
+			return tier + 1
+		}
+		limit *= int64(t.FanIn)
+	}
+	return tier
+}
+
+// limit of the sizes of the segments of a tier, BaseBytes·FanIn^tier, or [math.MaxInt64] when
+// that does not fit.
+func (t Tiers) limit(tier int) int64 {
+	limit := t.BaseBytes
+	for range tier {
+		if limit > math.MaxInt64/int64(t.FanIn) {
+			return math.MaxInt64
+		}
+		limit *= int64(t.FanIn)
+	}
+	return limit
+}
+
+// window of adjacent segments [start, end) in age order, which one merge replaces.
+type window struct {
+	start, end int
+}
+
+// plan the windows that a compaction of segs merges, oldest first. They do not overlap.
+func (t Tiers) plan(segs []segmentMeta) []window {
+	t = t.withDefaults()
+	k := len(segs)
+	if k < 2 {
+		return nil
+	}
+	// The newer segments are measured in bytes, and in tombstones, which are small but can each
+	// hide an entry of the oldest segment. With t tombstones for its c entries, at most c-t remain,
+	// so t·(FullRatio+1) >= FullRatio·c holds when the deleted ones can be FullRatio times as many.
+	var newer int64
+	var tombstones int
+	for _, seg := range segs[1:] {
+		newer += seg.Size
+		tombstones += seg.Tombstones
+	}
+	if k >= t.FanIn && (newer >= int64(t.FullRatio)*segs[0].Size || tombstones > 0 && tombstones*(t.FullRatio+1) >= t.FullRatio*segs[0].Count) {
+		return []window{{0, k}}
+	}
+	// The tier of a segment counts as the highest tier of it and of every newer segment, so that
+	// tiers never rise from the oldest segment to the newest.
+	tiers := make([]int, k)
+	for i := k - 1; i >= 0; i-- {
+		tiers[i] = t.tier(segs[i].Size)
+		if i < k-1 {
+			tiers[i] = max(tiers[i], tiers[i+1])
+		}
+	}
+	// A run of segments of one tier is merged in windows of at least FanIn, from the oldest, each
+	// with as many segments as fit in the tier above, so that a merged segment is at most one tier
+	// above the run, and no higher than the segment before it. Fan-in segments of the run always
+	// fit, because each is smaller than the limit of the run's tier.
+	var ws []window
+	for start := 0; start < k; {
+		end := start
+		for end < k && tiers[end] == tiers[start] {
+			end++
+		}
+		limit := t.limit(tiers[start] + 1)
+		for s := start; s < end; {
+			e, size := s, int64(0)
+			for e < end && (e-s < t.FanIn || segs[e].Size < limit-size) {
+				size += segs[e].Size
+				e++
+			}
+			if e-s < t.FanIn {
+				break
+			}
+			ws = append(ws, window{s, e})
+			s = e
+		}
+		start = end
+	}
+	return ws
+}
+
+// merge of some segments of a manifest into one.
+type merge struct {
+	// members are the indexes of the merged segments in the manifest, oldest first. They are
+	// adjacent, except with [Mutations.CompactNonAdjacent].
+	members []int
+	// out is the merged segment, which takes the place of the oldest member, or nil when nothing
+	// is left of the members.
+	out *segmentMeta
+}
+
+// members of the merges of the windows of a manifest with k segments.
+func (db *DB) members(ws []window, k int) [][]int {
+	var ms [][]int
+	for _, w := range ws {
+		var members []int
+		for i := w.start; i < w.end; i++ {
+			members = append(members, i)
+		}
+		if db.mutations.CompactNonAdjacent {
+			// The second-oldest member stays where it is, and the segment after the window takes its
+			// place in the merge.
+			members = append([]int{w.start}, members[2:]...)
+			if w.end < k {
+				members = append(members, w.end)
+			}
+			if len(members) < 2 {
+				continue
+			}
+		}
+		ms = append(ms, members)
+	}
+	return ms
+}
+
+// replaceMerged segments of segs with the outputs of the merges.
+func replaceMerged(segs []segmentMeta, merges []merge) []segmentMeta {
+	outAt := map[int]*segmentMeta{}
+	merged := map[int]bool{}
+	for _, mg := range merges {
+		outAt[mg.members[0]] = mg.out
+		for _, i := range mg.members {
+			merged[i] = true
+		}
+	}
+	var out []segmentMeta
+	for i, seg := range segs {
+		if o := outAt[i]; o != nil {
+			out = append(out, *o)
+		}
+		if !merged[i] {
+			out = append(out, seg)
+		}
+	}
+	return out
+}
 
 // Compact merges all segments into one, dropping tombstones and overwritten values. The old
 // segments become garbage for [DB.GC]. It is safe to run concurrently with transactions in any
@@ -22,19 +212,45 @@ import (
 // longer than half the GC grace period, because its output is collected as an orphan after a
 // whole one.
 func (db *DB) Compact(ctx context.Context) error {
-	_, err := db.compact(ctx, nil)
+	_, err := db.compact(ctx, nil, nil)
 	return err
 }
 
-// compact with an optional progress hook, called now and then during long work. An error from it
-// aborts the compaction. It reports whether segments were merged.
-func (db *DB) compact(ctx context.Context, progress func() error) (bool, error) {
+// CompactTiers merges the segments that the tiers make due, as [Tiers] describes, and reports
+// whether it merged any. It is as safe to run concurrently as [DB.Compact], and fails in the same
+// ways.
+func (db *DB) CompactTiers(ctx context.Context, tiers Tiers) (bool, error) {
+	tiers = tiers.withDefaults()
+	return db.compact(ctx, &tiers, nil)
+}
+
+// plan the windows that a compaction of segs merges: every segment, or with tiers the windows
+// that they make due.
+func (db *DB) plan(tiers *Tiers, segs []segmentMeta) []window {
+	switch {
+	case len(segs) < 2:
+		return nil
+	case tiers == nil:
+		return []window{{0, len(segs)}}
+	case db.mutations.CompactAll && len(segs) >= tiers.FanIn:
+		return []window{{0, len(segs)}}
+	case db.mutations.CompactAll:
+		return nil
+	}
+	return tiers.plan(segs)
+}
+
+// compact the windows that [DB.plan] picks in the current manifest, with an optional progress
+// hook, called now and then during long work, whose error aborts the compaction. It reports
+// whether segments were merged.
+func (db *DB) compact(ctx context.Context, tiers *Tiers, progress func() error) (bool, error) {
 	startedAt := db.now()
 	m, etag, err := db.refreshManifest(ctx)
 	if err != nil {
 		return false, fmt.Errorf("engine: compacting: %w", err)
 	}
-	if len(m.Segments) < 2 {
+	ws := db.plan(tiers, m.Segments)
+	if len(ws) == 0 {
 		return false, nil
 	}
 	db.compactionsStarted.Add(1)
@@ -42,83 +258,68 @@ func (db *DB) compact(ctx context.Context, progress func() error) (bool, error) 
 		progress = func() error { return nil }
 	}
 
-	// Merging every segment is what makes dropping tombstones safe: no older segment remains
-	// whose values a tombstone would have to keep hiding.
-	it := &Iterator{}
-	for i := len(m.Segments) - 1; i >= 0; i-- {
-		fetch := db.fetcher(ctx, startedAt, m.Segments[i])
-		// Block reads are the slow part of the merge, so progress is reported before each.
-		it.sources = append(it.sources, newSegmentIterator(m.Segments[i].Root, nil, func(ref blockRef) (*decodedBlock, error) {
-			if err := progress(); err != nil {
-				return nil, err
-			}
-			return fetch(ref)
-		}))
-	}
-	b := newSegmentBuilder(db.blockSize)
-	var count int
-	for it.Next() {
-		if err := b.add(it.Key(), it.Value(), false); err != nil {
-			return false, err
-		}
-		count++
-	}
-	if err := it.Err(); err != nil {
-		return false, fmt.Errorf("engine: compacting: %w", err)
-	}
-
-	id := db.newID()
-	var compacted []segmentMeta
-	if count > 0 {
-		body, meta, err := b.finish()
+	var merges []merge
+	for _, members := range db.members(ws, len(m.Segments)) {
+		out, err := db.mergeSegments(ctx, startedAt, m, members, progress)
 		if err != nil {
 			return false, err
 		}
-		meta.Key = db.key(segmentKey(m.Seq, id))
-		if err := progress(); err != nil {
-			return false, err
+		merges = append(merges, merge{members: members, out: out})
+		if tiers != nil && tiers.tier(m.Segments[members[len(members)-1]].Size) >= 2 {
+			assert.Sometimes(true, "a compaction merges segments of tier 2 or higher", nil)
+			reach.Hit(ctx, reach.CompactionUpperTier)
 		}
-		if err := db.putObject(ctx, meta.Key, body); err != nil {
-			return false, err
-		}
-		// The whole segment is in memory, so the memory cache is primed with every block when the
-		// segment leaves room for other blocks, and reads in this process stay warm across the
-		// compaction. The disk cache is left to fill with the blocks that are read.
-		if db.mem != nil && int64(len(body)) <= db.memBytes/2 {
-			for _, ref := range b.blocks {
-				// A copy per block, so that a cached block does not pin the whole segment.
-				db.mem.Put(blockCacheKey(meta.Key, ref), bytes.Clone(body[ref.Offset:ref.Offset+ref.Length]))
-			}
-		}
-		compacted = []segmentMeta{meta}
+	}
+	if len(merges) == 0 {
+		return false, nil
+	}
+	if len(merges) > 1 {
+		assert.Sometimes(true, "a compaction merges several windows of segments at once", nil)
+		reach.Hit(ctx, reach.CompactionWindows)
 	}
 
-	// The swap replaces the merged segments with the compacted one. When the write loses to
-	// commits that only added segments, the swap is applied again on top of the new manifest,
-	// with the newer segments ahead of the compacted one.
+	// The swap replaces the merged segments with their outputs. When the write loses to commits
+	// that only added segments, the swap is applied again on top of the new manifest, with the
+	// newer segments after the merged ones.
+	id := db.newID()
 	base, baseEtag := m, etag
 	for attempt := 0; ; attempt++ {
 		if age := db.now().Sub(startedAt); age >= db.grace/2 {
-			// GC may delete the compacted segment as an orphan once the compaction is a grace
-			// period old, and a manifest write that lands after that would reference a missing
-			// object for good, so the write is not even started past half of it.
+			// GC may delete the merged segments as orphans once the compaction is a grace period
+			// old, and a manifest write that lands after that would reference a missing object for
+			// good, so the write is not even started past half of it.
 			return false, fmt.Errorf("%w: compaction is %v old", ErrSnapshotExpired, age)
 		}
 		if err := progress(); err != nil {
 			return false, err
 		}
-		newer := base.Segments[len(m.Segments):]
-		next := base.next(id, db.now())
-		next.Segments = append(append([]segmentMeta{}, compacted...), newer...)
-		if db.mutations.CompactedSegmentAhead {
-			next.Segments = append(append([]segmentMeta{}, newer...), compacted...)
+		newer := base.Segments[min(len(m.Segments), len(base.Segments)):]
+		if db.mutations.CompactRebaseLosesSegment && len(newer) > 0 {
+			newer = newer[1:]
 		}
-		// A GC pass may have stamped the compacted segment as an orphan meanwhile, in a garbage
-		// batch that keeps the stamp. GC never deletes garbage that the manifest it read has as a
-		// live segment, and the stamp is later than the start of the compaction, which writes no
+		next := base.next(id, db.now())
+		next.Segments = append(replaceMerged(m.Segments, merges), newer...)
+		if db.mutations.CompactedSegmentAhead {
+			// The merged segments go after the newer ones, which they then shadow.
+			var outs []segmentMeta
+			for _, mg := range merges {
+				if mg.out != nil {
+					outs = append(outs, *mg.out)
+				}
+			}
+			next.Segments = slices.DeleteFunc(next.Segments, func(seg segmentMeta) bool {
+				return slices.ContainsFunc(outs, func(o segmentMeta) bool { return o.Key == seg.Key })
+			})
+			next.Segments = append(next.Segments, outs...)
+		}
+		// A GC pass may have stamped a merged segment as an orphan meanwhile, in a garbage batch
+		// that keeps the stamp. GC never deletes garbage that the manifest it read has as a live
+		// segment, and the stamp is later than the start of the compaction, which writes no
 		// manifest once it is half a grace period old.
-		for _, seg := range m.Segments {
-			next.Garbage = append(next.Garbage, seg.Key)
+		for _, mg := range merges {
+			for _, i := range mg.members {
+				next.Garbage = append(next.Garbage, m.Segments[i].Key)
+			}
 		}
 		_, err := db.casManifest(ctx, baseEtag, next)
 		if err == nil {
@@ -134,20 +335,88 @@ func (db *DB) compact(ctx context.Context, progress func() error) (bool, error) 
 			db.log.Debug("compaction failed", "error", err)
 			return false, err
 		}
-		if !cur.extends(m) {
+		if !cur.extends(m) && !db.mutations.CompactRebaseOnCompaction {
 			assert.Sometimes(true, "a compaction loses to another compaction", nil)
 			db.log.Debug("compaction failed", "error", err)
 			return false, err
 		}
 		assert.Sometimes(true, "a compaction rebases on commits that only added segments", nil)
 		reach.Hit(ctx, reach.CompactionRebase)
+		if last := merges[len(merges)-1].members; merges[0].members[0] > 0 || last[len(last)-1] < len(m.Segments)-1 {
+			assert.Sometimes(true, "a compaction that left some segments alone rebases on newer commits", nil)
+			reach.Hit(ctx, reach.CompactionPartialRebase)
+		}
 		db.compactionRebases.Add(1)
 		base, baseEtag = cur, curEtag
 	}
 	assert.Reachable("compaction succeeded", nil)
 	db.compactions.Add(1)
-	db.log.Info("compacted", "segments", len(m.Segments), "entries", count, "seq", db.Stats().Seq)
+	db.log.Info("compacted", "windows", len(merges), "segments", len(m.Segments), "seq", db.Stats().Seq)
 	return true, nil
+}
+
+// mergeSegments of m with the given indexes into one segment, which it writes, or returns nil
+// when nothing is left of them. Tombstones are dropped only when the oldest segment is among the
+// members, because no older segment then remains whose values a tombstone would have to keep
+// hiding.
+func (db *DB) mergeSegments(ctx context.Context, startedAt time.Time, m *manifest, members []int, progress func() error) (*segmentMeta, error) {
+	dropTombstones := members[0] == 0 || db.mutations.CompactDropTombstones
+	it := &Iterator{keepTombstones: !dropTombstones}
+	for _, i := range slices.Backward(members) {
+		seg := m.Segments[i]
+		fetch := db.fetcher(ctx, startedAt, seg)
+		// Block reads are the slow part of the merge, so progress is reported before each.
+		it.sources = append(it.sources, newSegmentIterator(seg.Root, nil, func(ref blockRef) (*decodedBlock, error) {
+			if err := progress(); err != nil {
+				return nil, err
+			}
+			db.compactionBytesRead.Add(ref.Length)
+			return fetch(ref)
+		}))
+	}
+	b := newSegmentBuilder(db.blockSize)
+	var count, tombstones int
+	for it.Next() {
+		if err := b.add(it.Key(), it.Value(), it.tombstone); err != nil {
+			return nil, err
+		}
+		count++
+		if it.tombstone {
+			tombstones++
+		}
+	}
+	if err := it.Err(); err != nil {
+		return nil, fmt.Errorf("engine: compacting: %w", err)
+	}
+	if tombstones > 0 {
+		assert.Sometimes(true, "a compaction that excludes the oldest segment keeps a tombstone", nil)
+		reach.Hit(ctx, reach.CompactionKeepsTombstone)
+	}
+	if count == 0 {
+		return nil, nil
+	}
+	body, meta, err := b.finish()
+	if err != nil {
+		return nil, err
+	}
+	meta.Key = db.key(segmentKey(m.Seq, db.newID()))
+	if err := progress(); err != nil {
+		return nil, err
+	}
+	if err := db.putObject(ctx, meta.Key, body); err != nil {
+		return nil, err
+	}
+	db.compactionBytesWritten.Add(int64(len(body)))
+	// The whole segment is in memory, so the memory cache is primed with every block when the
+	// segment leaves room for other blocks, and reads in this process stay warm across the
+	// compaction. The disk cache is left to fill with the blocks that are read.
+	if db.mem != nil && int64(len(body)) <= db.memBytes/2 {
+		for _, ref := range b.blocks {
+			// A copy per block, so that a cached block does not pin the whole segment.
+			db.mem.Put(blockCacheKey(meta.Key, ref), bytes.Clone(body[ref.Offset:ref.Offset+ref.Length]))
+		}
+	}
+	return &meta, nil
 }
 
 // extends reports whether base's segments are all still live in m, unchanged and in the same

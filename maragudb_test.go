@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math/rand/v2"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -15,9 +16,11 @@ import (
 	"maragu.dev/is"
 
 	"maragu.dev/maragudb"
+	"maragu.dev/maragudb/internal/engine"
 	"maragu.dev/maragudb/internal/s3"
 	"maragu.dev/maragudb/internal/s3fake"
 	"maragu.dev/maragudb/internal/s3test"
+	"maragu.dev/maragudb/internal/sqldriver"
 	"maragu.dev/maragudb/internal/verify"
 )
 
@@ -531,7 +534,7 @@ func TestStats(t *testing.T) {
 
 func TestMaintenance(t *testing.T) {
 	t.Run("writes manifests no larger after 10,000 commits than after 1,000, with the default grace period and maintenance interval", func(t *testing.T) {
-		verify.Covers(t, "with the default grace period and maintenance, a commit every 300 ms for 50 minutes, so that no garbage expires, writes manifests whose bytes beside the live segments grow by at most 2 KiB from the first 1,000 commits to the last, with at most 60 live segments", "AC-6.4")
+		verify.Covers(t, "with the default grace period and maintenance, a commit every 300 ms for 50 minutes, so that no garbage expires, writes manifests whose bytes beside the live segments grow by at most 2 KiB from the first 1,000 commits to the last, with at most 68 live segments: the 50 commits of the longest interval between maintenance steps, and three per tier of a database of 10,000 rows", "AC-6.4")
 		synctest.Test(t, func(t *testing.T) {
 			w := newWorld(t)
 			db := w.open(maragudb.Options{Maintenance: new(true)})
@@ -569,7 +572,11 @@ func TestMaintenance(t *testing.T) {
 			}
 			t.Logf("largest manifest of a commit: %d bytes, beside the segments %d bytes after 1,000 commits and %d after 10,000, at most %d segments", most, early, late, segments)
 			is.True(t, late <= early+2048, fmt.Sprintf("%d bytes after 1,000 commits, %d after 10,000", early, late))
-			is.True(t, segments <= 60, fmt.Sprint(segments, " segments"))
+			// The longest interval between two steps is one and a half intervals, 15 seconds, in which
+			// 50 commits add a segment each. Below them, the tiers of a database of 10,000 rows of at
+			// most 100 bytes hold fewer than four segments each: tier 0 below 1 KiB, and five tiers
+			// four times larger each.
+			is.True(t, segments <= 50+3*6, fmt.Sprint(segments, " segments"))
 			s, err := maragudb.Stats(t.Context(), db)
 			is.NotError(t, err)
 			is.True(t, s.Garbage > 9_000, fmt.Sprintf("the garbage of the last 50 minutes is kept: %d objects", s.Garbage))
@@ -582,7 +589,7 @@ func TestMaintenance(t *testing.T) {
 			w := newWorld(t)
 			grace := time.Minute
 			interval := time.Second
-			db := w.open(maragudb.Options{Maintenance: new(true), MaintenanceInterval: &interval, CompactionThreshold: new(4), GCGracePeriod: &grace})
+			db := w.open(maragudb.Options{Maintenance: new(true), MaintenanceInterval: &interval, CompactionFanIn: new(4), GCGracePeriod: &grace})
 			mustExec(t, db, "CREATE TABLE t (id bigint PRIMARY KEY)")
 			for i := range 3 {
 				mustExec(t, db, "INSERT INTO t VALUES ($1)", i)
@@ -593,7 +600,7 @@ func TestMaintenance(t *testing.T) {
 			time.Sleep(2 * interval)
 			s, err = maragudb.Stats(t.Context(), db)
 			is.NotError(t, err)
-			is.Equal(t, 1, s.Segments, "compacted at the threshold")
+			is.Equal(t, 1, s.Segments, "four segments in tier 0 are merged")
 			is.Equal(t, 5, s.Garbage, "the old segments are stamped, in a garbage batch")
 			is.Equal(t, int64(1), s.MaintenanceRuns)
 			is.Equal(t, int64(1), s.LeaseAcquisitions)
@@ -612,7 +619,7 @@ func TestMaintenance(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			w := newWorld(t)
 			interval := time.Second
-			db := w.open(maragudb.Options{Maintenance: new(true), MaintenanceInterval: &interval, CompactionThreshold: new(4)})
+			db := w.open(maragudb.Options{Maintenance: new(true), MaintenanceInterval: &interval, CompactionFanIn: new(4)})
 			mustExec(t, db, "CREATE TABLE t (id bigint PRIMARY KEY, name text)")
 			stats := func() maragudb.Statistics {
 				s, err := maragudb.Stats(t.Context(), db)
@@ -651,7 +658,7 @@ func TestMaintenance(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			w := newWorld(t)
 			interval := time.Second
-			db := w.open(maragudb.Options{Maintenance: new(true), MaintenanceInterval: &interval, CompactionThreshold: new(4)})
+			db := w.open(maragudb.Options{Maintenance: new(true), MaintenanceInterval: &interval, CompactionFanIn: new(4)})
 			mustExec(t, db, "CREATE TABLE t (id bigint PRIMARY KEY)")
 			for i := range 3 {
 				mustExec(t, db, "INSERT INTO t VALUES ($1)", i)
@@ -672,7 +679,7 @@ func TestMaintenance(t *testing.T) {
 		synctest.Test(t, func(t *testing.T) {
 			w := newWorld(t)
 			interval := time.Second
-			db := w.open(maragudb.Options{Maintenance: new(false), MaintenanceInterval: &interval, CompactionThreshold: new(2)})
+			db := w.open(maragudb.Options{Maintenance: new(false), MaintenanceInterval: &interval, CompactionFanIn: new(2)})
 			mustExec(t, db, "CREATE TABLE t (id bigint PRIMARY KEY)")
 			for i := range 3 {
 				mustExec(t, db, "INSERT INTO t VALUES ($1)", i)
@@ -684,6 +691,53 @@ func TestMaintenance(t *testing.T) {
 			is.Equal(t, int64(0), s.MaintenanceRuns)
 		})
 	})
+}
+
+// maintain the database behind db as background maintenance does, with the default tiers and
+// without the lease, until no compaction is due.
+func maintain(t *testing.T, db *sql.DB) {
+	t.Helper()
+	conn, err := db.Conn(t.Context())
+	is.NotError(t, err)
+	defer func() { _ = conn.Close() }()
+	is.NotError(t, conn.Raw(func(dc any) error {
+		m := dc.(*sqldriver.Conn).DB().NewMaintainer(engine.MaintenanceOptions{DisableLease: true})
+		for {
+			res, err := m.Step(t.Context())
+			if err != nil || !res.Compacted {
+				return err
+			}
+		}
+	}))
+}
+
+// churn the database behind db with small commits, each a statement that stmt makes from a
+// random number source, and with maintenance after each, so that the database has segments of
+// several tiers, as it does after many commits, instead of the one that a full compaction leaves.
+func churn(t *testing.T, db *sql.DB, commits int, stmt func(rng *rand.Rand, i int) (string, []any)) {
+	t.Helper()
+	rng := rand.New(rand.NewPCG(1, 2))
+	for i := range commits {
+		q, args := stmt(rng, i)
+		mustExec(t, db, q, args...)
+		maintain(t, db)
+	}
+}
+
+// segments of the database behind db, which must be the bound of the tiers on the bytes of a
+// database of n rows of at most rowBytes bytes each in the store, with the default fan-in of
+// four: fewer than four segments in each tier up to that of all the bytes.
+func segments(t *testing.T, db *sql.DB, n, rowBytes int) int {
+	t.Helper()
+	s, err := maragudb.Stats(t.Context(), db)
+	is.NotError(t, err)
+	// Tier 0 is below 1 KiB, and every tier above is four times as large.
+	tiers := 1
+	for limit := 1 << 10; limit <= n*rowBytes; limit *= 4 {
+		tiers++
+	}
+	is.True(t, s.Segments <= 3*tiers, fmt.Sprintf("n=%d: %d segments, at most %d", n, s.Segments, 3*tiers))
+	return s.Segments
 }
 
 func TestRequestBudgets(t *testing.T) {
@@ -702,8 +756,18 @@ func TestRequestBudgets(t *testing.T) {
 				fmt.Fprintf(&b, "(%d, 'name-%d', %d.5)", j, j, j)
 			}
 			mustExec(t, db, b.String())
+			maintain(t, db)
 		}
-		is.NotError(t, maragudb.Compact(t.Context(), db))
+		// Updates of random rows, inserts of rows that the tests do not use, and deletes of them.
+		churn(t, db, 150, func(rng *rand.Rand, i int) (string, []any) {
+			switch i % 3 {
+			case 0:
+				return "UPDATE t SET f = f + 1 WHERE id = $1", []any{rng.IntN(n)}
+			case 1:
+				return "INSERT INTO t VALUES ($1, 'churn', 0.5)", []any{2*n + i}
+			}
+			return "DELETE FROM t WHERE id = $1", []any{2*n + i - 1}
+		})
 	}
 	stats := func(t *testing.T, db *sql.DB) maragudb.Requests {
 		t.Helper()
@@ -722,31 +786,38 @@ func TestRequestBudgets(t *testing.T) {
 	}
 
 	t.Run("an autocommit INSERT makes one conditional GET and two PUTs regardless of database size", func(t *testing.T) {
-		verify.Covers(t, "an autocommit INSERT makes one conditional GET and two PUTs at every database size", "AC-5.1")
+		verify.Covers(t, "an autocommit INSERT makes one conditional GET and two PUTs at every database size, after many commits with the merges of the tiers, and after a compaction of every segment", "AC-5.1")
+		verify.Covers(t, "an autocommit INSERT with a cold cache makes at most one GET per tree level of every segment for the table definition and the duplicate key check, after many commits with the merges of the tiers, which leave fewer than four segments per tier, and after a compaction of every segment", "AC-5.3")
 		for _, n := range sizes {
 			w := newWorld(t)
 			db := w.open(maragudb.Options{})
 			load(t, db, n)
-			// Warm the cache with a point lookup, which reads the table definition and a row.
-			is.Equal(t, fmt.Sprintf("%q", fmt.Sprint("name-", n/2)), queryRows(t, db, "SELECT name FROM t WHERE id = $1", n/2))
-			before := stats(t, db)
-			mustExec(t, db, "INSERT INTO t VALUES ($1, $2, $3)", n+1, "new", 0.5)
-			d := stats(t, db).Sub(before)
-			t.Logf("n=%d warm insert: %+v", n, d)
-			verify.CheckBudget(t, "SQL autocommit INSERT, warm: requests", n, d.Total(), 3)
-			is.Equal(t, maragudb.Requests{GetConditional: 1, Put: 1, PutConditional: 1}, d)
+			for phase, state := range []string{"tiered", "compacted"} {
+				if state == "compacted" {
+					is.NotError(t, maragudb.Compact(t.Context(), db))
+				}
+				// Warm the cache with a point lookup, which reads the table definition and a row.
+				is.Equal(t, fmt.Sprintf("%q", fmt.Sprint("name-", n/2+phase)), queryRows(t, db, "SELECT name FROM t WHERE id = $1", n/2+phase))
+				before := stats(t, db)
+				mustExec(t, db, "INSERT INTO t VALUES ($1, $2, $3)", n+1+phase, "new", 0.5)
+				d := stats(t, db).Sub(before)
+				t.Logf("n=%d %s warm insert: %+v", n, state, d)
+				verify.CheckBudget(t, "SQL autocommit INSERT, warm, "+state+": requests", n, d.Total(), 3)
+				is.Equal(t, maragudb.Requests{GetConditional: 1, Put: 1, PutConditional: 1}, d)
 
-			// Cold, the duplicate key check and the table definition each cost a descent of the tree.
-			mustExec(t, db, "DELETE FROM t WHERE id = $1", n/2)
-			cold := w.open(maragudb.Options{MemoryCacheBytes: new(int64)})
-			before = stats(t, cold)
-			mustExec(t, cold, "INSERT INTO t VALUES ($1, $2, $3)", n/2, "back", 0.5)
-			d = stats(t, cold).Sub(before)
-			t.Logf("n=%d cold insert: %+v", n, d)
-			verify.CheckBudget(t, "SQL autocommit INSERT, cold: PUTs", n, d.Put+d.PutConditional, 2)
-			verify.CheckBudget(t, "SQL autocommit INSERT, cold: GETs", n, d.Get, int64(2*maxDepth(n)))
-			is.Equal(t, maragudb.Requests{Get: d.Get, GetConditional: 1, Put: 1, PutConditional: 1}, d)
-			is.True(t, d.Get <= int64(2*maxDepth(n)), fmt.Sprintf("n=%d: %d GETs, max depth %d", n, d.Get, maxDepth(n)))
+				// Cold, the duplicate key check and the table definition each cost a descent of the
+				// tree of every segment.
+				mustExec(t, db, "DELETE FROM t WHERE id = $1", n/2)
+				cold := w.open(maragudb.Options{MemoryCacheBytes: new(int64)})
+				limit := int64(2 * segments(t, cold, n, 100) * maxDepth(n))
+				before = stats(t, cold)
+				mustExec(t, cold, "INSERT INTO t VALUES ($1, $2, $3)", n/2, fmt.Sprint("name-", n/2), 0.5)
+				d = stats(t, cold).Sub(before)
+				t.Logf("n=%d %s cold insert: %+v, limit %d", n, state, d, limit)
+				verify.CheckBudget(t, "SQL autocommit INSERT, cold, "+state+": PUTs", n, d.Put+d.PutConditional, 2)
+				verify.CheckBudget(t, "SQL autocommit INSERT, cold, "+state+": GETs", n, d.Get, limit)
+				is.Equal(t, maragudb.Requests{Get: d.Get, GetConditional: 1, Put: 1, PutConditional: 1}, d)
+			}
 		}
 	})
 
@@ -767,22 +838,27 @@ func TestRequestBudgets(t *testing.T) {
 	})
 
 	t.Run("a SELECT by primary key with a cold cache makes a logarithmic number of GETs", func(t *testing.T) {
-		verify.Covers(t, "a SELECT by primary key with a cold cache makes a logarithmic number of GETs", "AC-5.3")
+		verify.Covers(t, "a SELECT by primary key with a cold cache makes at most one GET per tree level of every segment for the table definition and the row, after many commits with the merges of the tiers, which leave fewer than four segments per tier, and one GET per tree level after a compaction of every segment", "AC-5.3")
 		for _, n := range sizes {
 			w := newWorld(t)
 			db := w.open(maragudb.Options{})
 			load(t, db, n)
-			cold := w.open(maragudb.Options{MemoryCacheBytes: new(int64)})
-			before := stats(t, cold)
-			is.Equal(t, fmt.Sprintf("%q", fmt.Sprint("name-", n/2)), queryRows(t, cold, "SELECT name FROM t WHERE id = $1", n/2))
-			d := stats(t, cold).Sub(before)
-			t.Logf("n=%d cold select: %+v", n, d)
-			verify.CheckBudget(t, "SQL SELECT by key, cold: GETs", n, d.Get, int64(2*maxDepth(n)))
-			// The table definition and the row are each found by one descent of the tree,
-			// one block per level.
-			is.True(t, d.Get <= int64(2*maxDepth(n)), fmt.Sprintf("n=%d: %d GETs, max depth %d", n, d.Get, maxDepth(n)))
-			is.Equal(t, int64(1), d.GetConditional, "one freshness check")
-			is.Equal(t, int64(0), d.Put+d.PutConditional+d.List+d.Delete)
+			for _, state := range []string{"tiered", "compacted"} {
+				if state == "compacted" {
+					is.NotError(t, maragudb.Compact(t.Context(), db))
+				}
+				cold := w.open(maragudb.Options{MemoryCacheBytes: new(int64)})
+				// The table definition and the row are each found by one descent of the tree of each
+				// segment, one block per level.
+				limit := int64(2 * segments(t, cold, n, 100) * maxDepth(n))
+				before := stats(t, cold)
+				is.Equal(t, fmt.Sprintf("%q", fmt.Sprint("name-", n/2)), queryRows(t, cold, "SELECT name FROM t WHERE id = $1", n/2))
+				d := stats(t, cold).Sub(before)
+				t.Logf("n=%d %s cold select: %+v, limit %d", n, state, d, limit)
+				verify.CheckBudget(t, "SQL SELECT by key, cold, "+state+": GETs", n, d.Get, limit)
+				is.Equal(t, int64(1), d.GetConditional, "one freshness check")
+				is.Equal(t, int64(0), d.Put+d.PutConditional+d.List+d.Delete)
+			}
 		}
 	})
 }
@@ -808,11 +884,19 @@ func TestRequestBudgets_Indexes(t *testing.T) {
 			mustExec(t, db, b.String())
 			// The unique check of every row looks in every segment whose keys span the index, so
 			// the load compacts as it goes.
-			if i/batch%4 == 3 {
-				is.NotError(t, maragudb.Compact(t.Context(), db))
-			}
+			maintain(t, db)
 		}
-		is.NotError(t, maragudb.Compact(t.Context(), db))
+		// Updates of the indexed column n of random rows, inserts of rows that the tests do not
+		// use, and deletes of them.
+		churn(t, db, 150, func(rng *rand.Rand, i int) (string, []any) {
+			switch i % 3 {
+			case 0:
+				return "UPDATE t SET n = n + 1 WHERE id = $1", []any{rng.IntN(n)}
+			case 1:
+				return "INSERT INTO t VALUES ($1, $2, 1, 'churn')", []any{2*n + i, fmt.Sprintf("churn-%d@example.com", i)}
+			}
+			return "DELETE FROM t WHERE id = $1", []any{2*n + i - 1}
+		})
 	}
 	stats := func(t *testing.T, db *sql.DB) maragudb.Requests {
 		t.Helper()
@@ -831,20 +915,25 @@ func TestRequestBudgets_Indexes(t *testing.T) {
 	loaded := loadedWorlds(t, load)
 
 	t.Run("a point lookup through a unique index with a cold cache makes a logarithmic number of GETs", func(t *testing.T) {
-		verify.Covers(t, "a SELECT by a unique secondary index with a cold cache makes a logarithmic number of GETs: one descent each for the table definition, the index entry, and the row", "AC-5.5")
+		verify.Covers(t, "a SELECT by a unique secondary index with a cold cache makes a logarithmic number of GETs: one descent of the tree of every segment each for the table definition, the index entry, and the row, after many commits with the merges of the tiers, which leave fewer than four segments per tier, and after a compaction of every segment", "AC-5.5")
 		for _, n := range sizes {
 			w := loaded(t, n)
-			cold := w.open(maragudb.Options{MemoryCacheBytes: new(int64)})
-			before := stats(t, cold)
-			is.Equal(t, fmt.Sprint(n/2), queryRows(t, cold, "SELECT id FROM t WHERE email = $1", fmt.Sprintf("user-%d@example.com", n/2)))
-			d := stats(t, cold).Sub(before)
-			t.Logf("n=%d cold select through the index: %+v", n, d)
-			// A scan of the entry can read the next leaf too.
-			limit := int64(3*maxDepth(3*n) + 1)
-			verify.CheckBudget(t, "SQL SELECT by unique index, cold: GETs", n, d.Get, limit)
-			is.True(t, d.Get <= limit, fmt.Sprintf("n=%d: %d GETs, max %d", n, d.Get, limit))
-			is.Equal(t, int64(1), d.GetConditional, "one freshness check")
-			is.Equal(t, int64(0), d.Put+d.PutConditional+d.List+d.Delete)
+			for _, state := range []string{"tiered", "compacted"} {
+				if state == "compacted" {
+					is.NotError(t, maragudb.Compact(t.Context(), w.open(maragudb.Options{})))
+				}
+				cold := w.open(maragudb.Options{MemoryCacheBytes: new(int64)})
+				// A scan of the entry can read the next leaf of every segment too.
+				segs := segments(t, cold, n, 300)
+				limit := int64(segs * (3*maxDepth(3*n) + 1))
+				before := stats(t, cold)
+				is.Equal(t, fmt.Sprint(n/2), queryRows(t, cold, "SELECT id FROM t WHERE email = $1", fmt.Sprintf("user-%d@example.com", n/2)))
+				d := stats(t, cold).Sub(before)
+				t.Logf("n=%d %s cold select through the index: %+v, limit %d", n, state, d, limit)
+				verify.CheckBudget(t, "SQL SELECT by unique index, cold, "+state+": GETs", n, d.Get, limit)
+				is.Equal(t, int64(1), d.GetConditional, "one freshness check")
+				is.Equal(t, int64(0), d.Put+d.PutConditional+d.List+d.Delete)
+			}
 		}
 	})
 
@@ -888,8 +977,19 @@ func TestRequestBudgets_ForeignKeys(t *testing.T) {
 				fmt.Fprintf(&b, "(%d, 'name-%d')", j, j)
 			}
 			mustExec(t, db, b.String())
+			maintain(t, db)
 		}
-		is.NotError(t, maragudb.Compact(t.Context(), db))
+		// Updates of random parents, inserts of parents that the tests do not use, and deletes of
+		// them.
+		churn(t, db, 150, func(rng *rand.Rand, i int) (string, []any) {
+			switch i % 3 {
+			case 0:
+				return "UPDATE p SET name = 'churn' WHERE id = $1", []any{rng.IntN(n)}
+			case 1:
+				return "INSERT INTO p VALUES ($1, 'churn')", []any{2*n + i}
+			}
+			return "DELETE FROM p WHERE id = $1", []any{2*n + i - 1}
+		})
 	}
 	stats := func(t *testing.T, db *sql.DB) maragudb.Requests {
 		t.Helper()
@@ -907,37 +1007,41 @@ func TestRequestBudgets_ForeignKeys(t *testing.T) {
 	}
 
 	t.Run("an insert of a row with a foreign key adds no request with a warm cache, and a logarithmic number of GETs with a cold one", func(t *testing.T) {
-		verify.Covers(t, "an autocommit INSERT of a row that references a parent makes one conditional GET and two PUTs with a warm cache at every database size, and with a cold cache one descent of the tree each for the table definitions, the duplicate key check, and the lookup of the parent", "AC-5.7", "AC-5.1")
+		verify.Covers(t, "an autocommit INSERT of a row that references a parent makes one conditional GET and two PUTs with a warm cache at every database size, and with a cold cache one descent of the tree of every segment each for the table definitions, the duplicate key check, and the lookup of the parent, after many commits with the merges of the tiers, and after a compaction of every segment", "AC-5.7", "AC-5.1")
 		for _, n := range sizes {
 			w := newWorld(t)
 			db := w.open(maragudb.Options{})
 			load(t, db, n)
-			// Warm the cache with a child of the same parent.
-			mustExec(t, db, "INSERT INTO c VALUES ($1, $2)", 1, n/2)
-			before := stats(t, db)
-			mustExec(t, db, "INSERT INTO c VALUES ($1, $2)", 2, n/2)
-			d := stats(t, db).Sub(before)
-			t.Logf("n=%d warm insert of a child: %+v", n, d)
-			verify.CheckBudget(t, "SQL autocommit INSERT with a foreign key, warm: requests", n, d.Total(), 3)
-			is.Equal(t, maragudb.Requests{GetConditional: 1, Put: 1, PutConditional: 1}, d)
+			for phase, state := range []string{"tiered", "compacted"} {
+				if state == "compacted" {
+					is.NotError(t, maragudb.Compact(t.Context(), db))
+				}
+				// Warm the cache with a child of the same parent.
+				mustExec(t, db, "INSERT INTO c VALUES ($1, $2)", 10*phase+1, n/2)
+				before := stats(t, db)
+				mustExec(t, db, "INSERT INTO c VALUES ($1, $2)", 10*phase+2, n/2)
+				d := stats(t, db).Sub(before)
+				t.Logf("n=%d %s warm insert of a child: %+v", n, state, d)
+				verify.CheckBudget(t, "SQL autocommit INSERT with a foreign key, warm, "+state+": requests", n, d.Total(), 3)
+				is.Equal(t, maragudb.Requests{GetConditional: 1, Put: 1, PutConditional: 1}, d)
 
-			cold := w.open(maragudb.Options{MemoryCacheBytes: new(int64)})
-			before = stats(t, cold)
-			mustExec(t, cold, "INSERT INTO c VALUES ($1, $2)", 3, n/3)
-			d = stats(t, cold).Sub(before)
-			t.Logf("n=%d cold insert of a child: %+v", n, d)
-			// The table definitions, the duplicate key in the small child table, and the parent.
-			limit := int64(3*maxDepth(n) + 2)
-			verify.CheckBudget(t, "SQL autocommit INSERT with a foreign key, cold: GETs", n, d.Get, limit)
-			is.True(t, d.Get <= limit, fmt.Sprintf("n=%d: %d GETs, max %d", n, d.Get, limit))
-			is.Equal(t, maragudb.Requests{Get: d.Get, GetConditional: 1, Put: 1, PutConditional: 1}, d)
+				cold := w.open(maragudb.Options{MemoryCacheBytes: new(int64)})
+				// The table definitions, the duplicate key in the small child table, and the parent.
+				limit := int64(segments(t, cold, n, 100) * (3*maxDepth(n) + 2))
+				before = stats(t, cold)
+				mustExec(t, cold, "INSERT INTO c VALUES ($1, $2)", 10*phase+3, n/3)
+				d = stats(t, cold).Sub(before)
+				t.Logf("n=%d %s cold insert of a child: %+v, limit %d", n, state, d, limit)
+				verify.CheckBudget(t, "SQL autocommit INSERT with a foreign key, cold, "+state+": GETs", n, d.Get, limit)
+				is.Equal(t, maragudb.Requests{Get: d.Get, GetConditional: 1, Put: 1, PutConditional: 1}, d)
+			}
 		}
 	})
 }
 
 func TestRequestBudgets_Joins(t *testing.T) {
 	t.Run("a join from one parent row to its children through an index on their foreign key makes a logarithmic number of GETs per row with a cold cache", func(t *testing.T) {
-		verify.Covers(t, "a SELECT that joins one parent row to its children with ON c.pid = p.id, through an index on c (pid), makes with a cold cache one descent of the tree for each table definition, for the parent, for the index entries, and for each child, at every database size", "AC-5.8")
+		verify.Covers(t, "a SELECT that joins one parent row to its children with ON c.pid = p.id, through an index on c (pid), makes with a cold cache one descent of the tree of every segment for each table definition, for the parent, for the index entries, and for each child, at every database size, after many commits with the merges of the tiers, which leave fewer than four segments per tier, and after a compaction of every segment", "AC-5.8")
 		const children = 3
 		for _, n := range []int{100, 1_000, 10_000, 100_000} {
 			w := newWorld(t)
@@ -967,40 +1071,55 @@ func TestRequestBudgets_Joins(t *testing.T) {
 						}
 					}
 					mustExec(t, db, b.String())
+					maintain(t, db)
 				}
 			}
 			for k := range children {
 				mustExec(t, db, "INSERT INTO c VALUES ($1, $2)", n+k, n/2+1)
+				maintain(t, db)
 			}
-			is.NotError(t, maragudb.Compact(t.Context(), db))
-
-			cold := w.open(maragudb.Options{MemoryCacheBytes: new(int64)})
-			s, err := maragudb.Stats(t.Context(), cold)
-			is.NotError(t, err)
-			rows, err := cold.QueryContext(t.Context(), "SELECT p.name, c.id FROM p JOIN c ON c.pid = p.id WHERE p.id = $1", n/2+1)
-			is.NotError(t, err)
-			found := 0
-			for rows.Next() {
-				found++
+			// Renames of random parents, inserts of children without a parent that the join does
+			// not read, and deletes of them.
+			churn(t, db, 150, func(rng *rand.Rand, i int) (string, []any) {
+				switch i % 3 {
+				case 0:
+					return "UPDATE p SET name = 'churn' WHERE id = $1", []any{rng.IntN(n)}
+				case 1:
+					return "INSERT INTO c VALUES ($1, NULL)", []any{2*n + i}
+				}
+				return "DELETE FROM c WHERE id = $1", []any{2*n + i - 1}
+			})
+			for _, state := range []string{"tiered", "compacted"} {
+				if state == "compacted" {
+					is.NotError(t, maragudb.Compact(t.Context(), db))
+				}
+				cold := w.open(maragudb.Options{MemoryCacheBytes: new(int64)})
+				// Blocks of 16 KiB hold at least 64 rows or entries, so a descent of the tree of a
+				// segment is at most 1 + log64(n) GETs.
+				depth := int64(1)
+				for m := 2 * n; m > 1; m = (m + 63) / 64 {
+					depth++
+				}
+				// The two table definitions, the parent, the index entries, and each child.
+				limit := int64(segments(t, cold, 2*n, 100)) * depth * (2 + 1 + 1 + children)
+				s, err := maragudb.Stats(t.Context(), cold)
+				is.NotError(t, err)
+				rows, err := cold.QueryContext(t.Context(), "SELECT p.name, c.id FROM p JOIN c ON c.pid = p.id WHERE p.id = $1", n/2+1)
+				is.NotError(t, err)
+				found := 0
+				for rows.Next() {
+					found++
+				}
+				is.NotError(t, rows.Err())
+				is.NotError(t, rows.Close())
+				is.Equal(t, children, found)
+				after, err := maragudb.Stats(t.Context(), cold)
+				is.NotError(t, err)
+				d := after.Requests.Sub(s.Requests)
+				t.Logf("n=%d %s cold join of a parent to its %d children: %+v, limit %d", n, state, children, d, limit)
+				verify.CheckBudget(t, "SQL SELECT that joins a parent to its children through an index, cold, "+state+": GETs", n, d.Get, limit)
+				is.Equal(t, maragudb.Requests{Get: d.Get, GetConditional: 1}, d)
 			}
-			is.NotError(t, rows.Err())
-			is.NotError(t, rows.Close())
-			is.Equal(t, children, found)
-			after, err := maragudb.Stats(t.Context(), cold)
-			is.NotError(t, err)
-			d := after.Requests.Sub(s.Requests)
-			// Blocks of 16 KiB hold at least 64 rows or entries, so a descent is at most 1 + log64(n)
-			// GETs.
-			depth := int64(1)
-			for m := n; m > 1; m = (m + 63) / 64 {
-				depth++
-			}
-			// The two table definitions, the parent, the index entries, and each child.
-			limit := depth * (2 + 1 + 1 + children)
-			t.Logf("n=%d cold join of a parent to its %d children: %+v, limit %d", n, children, d, limit)
-			verify.CheckBudget(t, "SQL SELECT that joins a parent to its children through an index, cold: GETs", n, d.Get, limit)
-			is.True(t, d.Get <= limit, fmt.Sprintf("n=%d: %d GETs, max %d", n, d.Get, limit))
-			is.Equal(t, maragudb.Requests{Get: d.Get, GetConditional: 1}, d)
 		}
 	})
 }

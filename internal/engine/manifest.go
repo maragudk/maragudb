@@ -37,6 +37,9 @@ type segmentMeta struct {
 	MinKey []byte   `json:"minKey"`
 	MaxKey []byte   `json:"maxKey"`
 	Count  int      `json:"count"`
+	// Tombstones among the Count entries. Manifests written before it was recorded lack it, and
+	// read as none, which only delays a merge of the whole database.
+	Tombstones int `json:"tombstones,omitempty"`
 }
 
 // batchRef references a chain of garbage batch objects: the newest one, which names the one

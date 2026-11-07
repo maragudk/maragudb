@@ -123,6 +123,8 @@ type Config struct {
 	OutageTimeout time.Duration
 	// GracePeriod for GC.
 	GracePeriod time.Duration
+	// Tiers of the compaction that the clients' maintenance and the maintainers run.
+	Tiers engine.Tiers
 	// Mutations to break the engine with.
 	Mutations engine.Mutations
 	// SQL runs the clients through the SQL layer and the database/sql driver instead of the
@@ -153,6 +155,9 @@ func DefaultConfig(seed uint64) Config {
 		MaxOutage:     time.Second,
 		OutageTimeout: 50 * time.Millisecond,
 		GracePeriod:   2 * time.Second,
+		// Tiers far smaller than the defaults, for the small databases of a run, so that
+		// compaction merges segments of several tiers, and rarely merges the whole database.
+		Tiers: engine.Tiers{FanIn: 3, BaseBytes: 64, FullRatio: 2},
 	}
 }
 
@@ -507,7 +512,7 @@ func (r *run) open(ctx context.Context, id int, rng *rand.Rand, disk cache.Cache
 
 // maintenanceOptions for a client in the configured mode, or false in [MaintenanceOff].
 func (r *run) maintenanceOptions(id int) (engine.MaintenanceOptions, bool) {
-	opts := engine.MaintenanceOptions{Holder: fmt.Sprint("client", id), SegmentThreshold: 8, LeaseDuration: 400 * time.Millisecond}
+	opts := engine.MaintenanceOptions{Holder: fmt.Sprint("client", id), Tiers: r.cfg.Tiers, LeaseDuration: 400 * time.Millisecond}
 	switch r.cfg.Maintenance {
 	case MaintenanceOff:
 		return opts, false
@@ -564,7 +569,12 @@ func (r *run) readFinal() (map[string][]int64, map[string]int64, error) {
 			key := string(it.Key())
 			switch r.cfg.Workload {
 			case ListAppend:
-				lists[key] = decodeList(it.Value())
+				// The overflow of a list follows its packed part in key order.
+				list, overflow := strings.CutSuffix(key, overflowSuffix)
+				lists[list] = append(lists[list], decodeList(it.Value())...)
+				if !overflow && lists[list] == nil {
+					lists[list] = []int64{}
+				}
 			case Bank:
 				balances[key], err = strconv.ParseInt(string(it.Value()), 10, 64)
 				if err != nil {
@@ -629,6 +639,10 @@ func (r *run) checkStorage() {
 	})
 	r.sched.Run()
 }
+
+// overflowSuffix of the key that holds the values appended to a list since it was last packed
+// in the list-append workload through the engine.
+const overflowSuffix = "+"
 
 func keyName(i int) string {
 	return fmt.Sprintf("k%02d", i)
@@ -743,9 +757,8 @@ func (c *client) step(ctx context.Context) {
 	if res.Ran {
 		s.MaintenanceRuns++
 	}
-	if res.Compacted {
-		s.Compactions++
-	}
+	// A step compacts again while a merge is due, so it can land several compactions.
+	s.Compactions += int(after.Compactions - before.Compactions)
 	if res.Ran && !res.Compacted {
 		s.GCs++
 	}
@@ -887,7 +900,13 @@ func (c *client) listAppendTx(ctx context.Context) {
 	}
 	for _, p := range plans {
 		c.pause(ctx)
+		// A list is kept in two keys: its packed part under the key, and the values appended
+		// since it was last packed under the key with overflowSuffix.
 		v, _, err := tx.Get(ctx, []byte(p.key))
+		var w []byte
+		if err == nil {
+			w, _, err = tx.Get(ctx, []byte(p.key+overflowSuffix))
+		}
 		if err != nil {
 			c.readError(ctx, tx, err)
 			c.run.trace("client %d: read: %v", c.id, err)
@@ -900,12 +919,26 @@ func (c *client) listAppendTx(ctx context.Context) {
 			}
 			return
 		}
-		list := decodeList(v)
+		overflow := decodeList(w)
+		list := append(decodeList(v), overflow...)
 		h.Ops = append(h.Ops, history.Op{Kind: history.Read, Key: p.key, List: list})
 		if p.append {
 			value := c.value()
-			if err := tx.Put([]byte(p.key), encodeList(append(list, value))); err != nil {
-				panic(err)
+			// Half of the appends go to the overflow, and the others pack the whole list and delete
+			// the overflow, so that compaction meets tombstones that hide older overflows.
+			if c.rng.IntN(2) == 0 {
+				if err := tx.Put([]byte(p.key+overflowSuffix), encodeList(append(overflow, value))); err != nil {
+					panic(err)
+				}
+			} else {
+				if err := tx.Put([]byte(p.key), encodeList(append(list, value))); err != nil {
+					panic(err)
+				}
+				if w != nil {
+					if err := tx.Delete([]byte(p.key + overflowSuffix)); err != nil {
+						panic(err)
+					}
+				}
 			}
 			h.Ops = append(h.Ops, history.Op{Kind: history.Append, Key: p.key, Value: value})
 		}
@@ -1028,11 +1061,17 @@ func (m *maintainer) loop(ctx context.Context) {
 		}
 		pctx := s3fake.WithProcess(ctx, m.proc)
 		if m.rng.IntN(2) == 0 {
-			// Compaction loses to concurrent commits, so retry a few times.
+			// Compaction loses to concurrent commits, so retry a few times. Most compactions merge
+			// the segments that the tiers make due, and some merge the whole database.
+			full := m.rng.IntN(2) == 0
 			var err error
 			for range 5 {
 				rebases := m.db.Stats().CompactionRebases
-				err = m.db.Compact(pctx)
+				if full {
+					err = m.db.Compact(pctx)
+				} else {
+					_, err = m.db.CompactTiers(pctx, m.run.cfg.Tiers)
+				}
 				m.run.stats.CompactionAttempts++
 				m.run.stats.CompactionRebases += int(m.db.Stats().CompactionRebases - rebases)
 				if !errors.Is(err, engine.ErrConflict) {

@@ -55,7 +55,7 @@ type MaintenanceOptions struct {
 	// [Interval/2, 3*Interval/2), so that the clients of one database do not check in lockstep.
 	// Defaults to 10 seconds.
 	Interval time.Duration
-	// Engine options of the maintainer: the thresholds and the lease.
+	// Engine options of the maintainer: the tiers of compaction and the lease.
 	Engine engine.MaintenanceOptions
 }
 
