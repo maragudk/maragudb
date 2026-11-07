@@ -875,14 +875,24 @@ func TestSession_Select(t *testing.T) {
 	t.Run("uses composite primary keys for ranges", func(t *testing.T) {
 		s := newSession(t)
 		mustExec(t, s, "CREATE TABLE c (a text, b bigint, v bigint, PRIMARY KEY (a, b))")
-		mustExec(t, s, "INSERT INTO c VALUES ('x', 1, 1), ('x', 2, 2), ('x\u0000', 1, 3), ('y', 1, 4), ('', 0, 5)")
+		mustExec(t, s, "INSERT INTO c VALUES ('x', 1, 1), ('x', 2, 2), ('x\u0001', 1, 3), ('y', 1, 4), ('', 0, 5)")
 		is.Equal(t, "1\n2", query(t, s, "SELECT v FROM c WHERE a = 'x'"))
 		is.Equal(t, "2", query(t, s, "SELECT v FROM c WHERE a = 'x' AND b = 2"))
 		is.Equal(t, "2", query(t, s, "SELECT v FROM c WHERE a = 'x' AND b > 1"))
 		is.Equal(t, "1\n2\n3\n4", query(t, s, "SELECT v FROM c WHERE a >= 'x'"))
-		is.Equal(t, "3", query(t, s, "SELECT v FROM c WHERE a = 'x\u0000'"))
+		is.Equal(t, "3", query(t, s, "SELECT v FROM c WHERE a = 'x\u0001'"))
 		is.Equal(t, "5\n1\n2\n3\n4", query(t, s, "SELECT v FROM c"))
 		is.Equal(t, "5\n1\n3\n4", query(t, s, "SELECT v FROM c WHERE b = 1 OR v = 5"), "equality on a non-prefix key column is a filter")
+	})
+
+	t.Run("uses composite primary keys whose first column holds a NUL byte", func(t *testing.T) {
+		s := newSession(t)
+		mustExec(t, s, "CREATE TABLE cb (a bytea, b bigint, v bigint, PRIMARY KEY (a, b))")
+		mustExec(t, s, "INSERT INTO cb VALUES ('\\x78', 1, 1), ('\\x78', 2, 2), ('\\x7800', 1, 3), ('\\x7820', 1, 4), ('\\x79', 1, 5), ('\\x', 0, 6)")
+		is.Equal(t, "1\n2", query(t, s, "SELECT v FROM cb WHERE a = '\\x78'"))
+		is.Equal(t, "3", query(t, s, "SELECT v FROM cb WHERE a = '\\x7800'"))
+		is.Equal(t, "2\n3\n4\n5", query(t, s, "SELECT v FROM cb WHERE a >= '\\x78' AND v > 1"))
+		is.Equal(t, "6\n1\n2\n3\n4\n5", query(t, s, "SELECT v FROM cb"))
 	})
 }
 
@@ -1238,5 +1248,12 @@ func TestPrepare(t *testing.T) {
 	t.Run("reports syntax errors", func(t *testing.T) {
 		_, err := exec.Prepare("SELEC 1")
 		is.True(t, errors.Is(err, exec.ErrSyntax))
+	})
+
+	t.Run("refuses SQL text that is not valid UTF-8 or holds a NUL byte, anywhere and before a syntax error", func(t *testing.T) {
+		for _, sql := range []string{"SELECT 'a\xffb'", "SELECT 1 -- \xff", "SELECT 1 /* \xc3 */", "SELECT \"a\xed\xa0\x80\" FROM t", "SELEC 1 \xff", "SELECT 'a\xf4\x90\x80\x80'", "SELECT 'a\x00b'", "SELECT 1 -- \x00"} {
+			_, err := exec.Prepare(sql)
+			is.Error(t, exec.ErrInvalidUTF8, err, sql)
+		}
 	})
 }

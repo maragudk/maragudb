@@ -416,19 +416,28 @@ func (s *Session) query(ctx context.Context, st *ast.Select, b *binder) (*Rows, 
 	var collected []sortable
 	var out [][]value.Value
 	var skipped int64
+	// failures are the errors of every row, when Postgres may read the rows in another order
+	// than maragudb, so that which row fails first depends on its plan.
+	var failures []error
+	if t != nil && !orderFixed(t, order) {
+		f.failures = &failures
+	}
 	visit := func(_ []byte, row []value.Value) (bool, error) {
 		if !collecting && limit >= 0 && int64(len(out)) >= limit {
 			return false, nil
 		}
 		r, err := project(o.items, row)
-		if err != nil {
-			return false, err
+		var keys []value.Value
+		if err == nil && collecting {
+			keys, err = sortKeys(order, r, row)
 		}
-		if collecting {
-			keys, err := sortKeys(order, r, row)
-			if err != nil {
-				return false, err
-			}
+		switch {
+		case err != nil && f.failures != nil:
+			failures = append(failures, err)
+			return true, nil
+		case err != nil:
+			return false, err
+		case collecting:
 			collected = append(collected, sortable{r, keys})
 			return true, nil
 		}
@@ -454,6 +463,9 @@ func (s *Session) query(ctx context.Context, st *ast.Select, b *binder) (*Rows, 
 	} else if err := s.scanRows(ctx, t, a, f, visit); err != nil {
 		return nil, err
 	}
+	if err := sameFailure(failures, "rows of this query"); err != nil {
+		return nil, err
+	}
 	if collecting {
 		if out, err = finish(collected, st.Distinct, order, len(order) > 0 && !a.ordered, offset, limit); err != nil {
 			return nil, err
@@ -463,6 +475,39 @@ func (s *Session) query(ctx context.Context, st *ast.Select, b *binder) (*Rows, 
 		out = [][]value.Value{}
 	}
 	return &Rows{Columns: o.columns, Rows: out}, nil
+}
+
+// orderFixed reports whether Postgres reads the rows of the table t of a SELECT on one table in
+// key order, which is the order in which maragudb evaluates them, in every plan with its primary
+// key index, and so fails on the first row in key order that fails. A sort key in descending
+// order lets Postgres scan the index backward instead of sorting, as it does for `ORDER BY id
+// DESC`, also when the key follows a constant one, which it drops, or a column that a condition
+// equates with a constant; and a subquery in FROM or a CTE is merged into the query or read in
+// the order of its own plan.
+func orderFixed(t *table, order []orderKey) bool {
+	if t.derived != nil {
+		return false
+	}
+	return !slices.ContainsFunc(order, func(k orderKey) bool { return k.desc })
+}
+
+// sameFailure is the error of a statement whose rows, which Postgres may evaluate in any order,
+// failed with failures: an [ErrUnsupported] when one is, the error when all are of one class,
+// as Postgres reports in every order, and otherwise an [errOrderDependent] one.
+func sameFailure(failures []error, what string) error {
+	if len(failures) == 0 {
+		return nil
+	}
+	if i := slices.IndexFunc(failures, func(err error) bool { return errors.Is(err, ErrUnsupported) }); i >= 0 {
+		return failures[i]
+	}
+	kind := errorKind(failures[0])
+	for _, err := range failures[1:] {
+		if !errors.Is(err, kind) {
+			return fmt.Errorf("%w: %w: %s fail with different errors, %v and %v, and which of them Postgres reports depends on the order in which its plan reads the rows; select the rows first, and compute the expressions on them", ErrUnsupported, errOrderDependent, what, kind, errorKind(err))
+		}
+	}
+	return failures[0]
 }
 
 // limits binds the OFFSET and the LIMIT of a SELECT, in that order, as Postgres checks and

@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -151,6 +152,89 @@ func TestParameters(t *testing.T) {
 			}
 		}, hegel.WithTestCases(castCases()))
 	})
+
+	t.Run("a statement whose parameters repeat in several contexts or skip a number gives the same result as Postgres with pgx, or is rejected as unsupported", func(t *testing.T) {
+		verify.Covers(t, "hegel-drawn statements that reference parameters in several contexts each, skip parameter numbers, or put a parameter only where its type is not determined, such as IS NULL and count(), next to analysis and folding errors, give the same result or error class as Postgres with pgx, among them 42P18 for a parameter whose type Postgres cannot determine and the error of the lowest refused value after every analysis error, unless maragudb rejects them as unsupported", "INV-PLACEHOLDERS", "INV-PG-SUBSET")
+		b := newBoth(t, "")
+		// Each context is an expression with $%[1]d for a parameter, or none.
+		contexts := []string{"$%[1]d::bigint", "$%[1]d + 1", "$%[1]d || 'x'", "$%[1]d = 'a'", "$%[1]d IS NULL", "count($%[1]d)", "coalesce($%[1]d, 1)", "length($%[1]d)", "$%[1]d::text",
+			"CASE WHEN $%[1]d THEN 1 END", "$%[1]d = 1.5::float8", "NOT $%[1]d", "$%[1]d", "CASE WHEN false THEN $%[1]d = 5 END", "$%[1]d::bigint + $%[1]d::bigint", "nope", "1 / 0"}
+		hegel.Test(t, func(ht *hegel.T) {
+			var items []string
+			n := 0
+			for range hegel.Draw(ht, hegel.Integers(1, 3)) {
+				p := hegel.Draw(ht, hegel.Integers(1, 3))
+				n = max(n, p)
+				items = append(items, fmt.Sprintf(hegel.Draw(ht, hegel.SampledFrom(contexts)), p))
+			}
+			query := "SELECT " + strings.Join(items, ", ")
+			if !strings.Contains(query, "$") {
+				return
+			}
+			args := make([]any, n)
+			for i := range args {
+				switch hegel.Draw(ht, hegel.Integers(0, 4)) {
+				case 0:
+					args[i] = hegel.Draw(ht, hegel.SampledFrom([]int64{0, 1, -7, math.MaxInt64}))
+				case 1:
+					args[i] = hegel.Draw(ht, hegel.SampledFrom([]string{"1", "t", "a", "abc", "9223372036854775807", "1.5", "a\xffb"}))
+				case 2:
+					args[i] = nil
+				default:
+					args[i] = hegel.Draw(ht, hegel.SampledFrom([]string{"5", "0", "-1", "x", ""}))
+				}
+			}
+			ht.Note(fmt.Sprintf("%s with %#v", query, args))
+			m, mErr := queryRow(t, b.m, query, args)
+			if errors.Is(mErr, maragudb.ErrUnsupported) {
+				return
+			}
+			pg, pgErr := queryRow(t, b.pg, query, args)
+			switch {
+			case pgErr != nil && pgdiff.SQLState(pgErr) == "" && strings.Contains(pgErr.Error(), "failed to encode"):
+				// pgx refused to encode a value, which maragudb refuses as out of range.
+				if !errors.Is(mErr, maragudb.ErrOutOfRange) {
+					ht.Fatalf("maragudb %v, %v; postgres client %v", m, mErr, pgErr)
+				}
+			case (mErr == nil) != (pgErr == nil):
+				ht.Fatalf("maragudb %#v, %v; postgres %#v, %v", m, mErr, pg, pgErr)
+			case mErr != nil && !pgdiff.SameClass(mErr, pgErr):
+				ht.Fatalf("maragudb %v; postgres SQLSTATE %s, %v", mErr, pgdiff.SQLState(pgErr), pgErr)
+			case mErr == nil && fmt.Sprint(m) != fmt.Sprint(pg):
+				ht.Fatalf("maragudb %#v, postgres %#v", m, pg)
+			}
+		}, hegel.WithTestCases(castCases()/4))
+	})
+}
+
+// queryRow runs a query with the arguments args and returns its one row, with each value made
+// comparable by [canonicalValue].
+func queryRow(t *testing.T, db *sql.DB, query string, args []any) ([]any, error) {
+	t.Helper()
+	rows, err := db.QueryContext(t.Context(), query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = rows.Close() }()
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+	var out []any
+	for rows.Next() {
+		vals := make([]any, len(cols))
+		ptrs := make([]any, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
+		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return nil, err
+		}
+		for _, v := range vals {
+			out = append(out, canonicalValue(v))
+		}
+	}
+	return out, rows.Err()
 }
 
 // timestampBounds are the ends of timestamptz in Postgres, the start of the year 1, which text

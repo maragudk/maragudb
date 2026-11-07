@@ -70,6 +70,45 @@ type subqueryInfo struct {
 	// around it, refsParent when it reads a column of the query it is in, and deeper when it
 	// reads a column of a query further out.
 	correlated, refsParent, deeper bool
+	// cte is set when the subquery reads a CTE of a query around it.
+	cte bool
+	// uses are its references to columns outside of itself, its own and those of the subqueries
+	// in it, which [subqueryInfo.live] reads.
+	uses []*outerUse
+}
+
+// outerUse is a reference to a column of a query around a subquery, through the subqueries hops
+// from the innermost out, which dies when folding drops the expression that has it.
+type outerUse struct {
+	hops []*subqueryInfo
+	dead bool
+}
+
+// live reports correlated and refsParent as Postgres sees them after it folds the subquery,
+// which drops the expressions that a constant decides, such as the left side of AND FALSE, the
+// branches of a CASE that never match, and a WHERE clause that is FALSE, with their references
+// to the queries around. Postgres decides whether a subquery is correlated from what remains, so
+// a subquery whose references all fold away is an InitPlan. A reference to a CTE of a query
+// around counts as live.
+func (info *subqueryInfo) live() (correlated, refsParent bool) {
+	correlated = info.cte
+	for _, u := range info.uses {
+		if !u.dead {
+			correlated = true
+			refsParent = refsParent || u.hops[len(u.hops)-1] == info
+		}
+	}
+	return correlated, refsParent
+}
+
+// dropped marks the references to the queries around in the expressions es dead, because
+// folding drops the expressions.
+func dropped(es ...*cexpr) {
+	for _, e := range es {
+		for _, u := range e.outer {
+			u.dead = true
+		}
+	}
 }
 
 // subqueryResult is the rows of an evaluation of a subquery, or its error.
@@ -85,13 +124,14 @@ func (s *Session) newRun(ctx context.Context) *stmtRun {
 
 // newBinder for a statement with the parameters params.
 func (s *Session) newBinder(ctx context.Context, params []value.Value) *binder {
-	return &binder{params: params, now: s.now(), run: s.newRun(ctx), level: &levelState{}}
+	return &binder{params: params, now: s.now(), run: s.newRun(ctx), level: &levelState{}, top: true}
 }
 
 // snapshot of the binder as it is now, in which the names of a subquery bound now resolve
 // whenever it is evaluated.
 func (b *binder) snapshot() *binder {
 	c := *b
+	c.top = false
 	return &c
 }
 
@@ -151,6 +191,7 @@ func (b *binder) columnRef(e *ast.ColumnRef) (*cexpr, error) {
 				}
 			}
 		}
+		use := &outerUse{}
 		for i, h := range hops {
 			h.sub.correlated = true
 			if i == len(hops)-1 {
@@ -158,9 +199,11 @@ func (b *binder) columnRef(e *ast.ColumnRef) (*cexpr, error) {
 			} else {
 				h.sub.deeper = true
 			}
+			use.hops = append(use.hops, h.sub)
+			h.sub.uses = append(h.sub.uses, use)
 		}
 		info := cur.sub
-		return &cexpr{typ: oce.typ, refs: true, fallible: oce.fallible, eval: func([]value.Value) (value.Value, error) {
+		return &cexpr{typ: oce.typ, refs: true, fallible: oce.fallible, outer: []*outerUse{use}, eval: func([]value.Value) (value.Value, error) {
 			return oce.value(info.row)
 		}}, nil
 	}
@@ -276,6 +319,8 @@ func (b *binder) subquery(e *ast.Subquery) (*cexpr, error) {
 		// its evaluation, which a semi-join makes on the subquery's rows.
 		selfFallible = selfFallible || convert
 	}
+	// The subquery's references reach the expressions around it, whose folding can drop them.
+	ce.outer = append(ce.outer, info.uses...)
 	if ce.fallible && b.pruned == 0 && b.level != nil {
 		b.level.fallible = true
 	}
@@ -288,7 +333,11 @@ func (b *binder) subquery(e *ast.Subquery) (*cexpr, error) {
 	// A semi-join or an anti-join evaluates the conditions of a correlated EXISTS on its own rows
 	// also when no row of the query around reaches them, and the output of a correlated IN on
 	// rows that no row of the query around matches.
-	if selfFallible && (b.phase == phaseWhere || b.phase == phaseOn || b.phase == phaseHaving) {
+	// A statement with a parameter value that Postgres refuses fails with that error before any
+	// subquery is evaluated.
+	refused := b.run.s.params.refusal() != nil
+	if selfFallible && !refused && (b.phase == phaseWhere || b.phase == phaseOn || b.phase == phaseHaving) {
+		liveCorrelated, liveRefsParent := info.live()
 		switch {
 		case !info.correlated:
 			rows, err := evaluate(nil)
@@ -298,7 +347,24 @@ func (b *binder) subquery(e *ast.Subquery) (*cexpr, error) {
 			if err != nil {
 				return nil, planDependent(err)
 			}
-		case !info.refsParent:
+		case e.Kind == ast.SubScalar && !liveCorrelated:
+			// Postgres folds the subquery before it decides whether it is correlated, so one
+			// whose references to the queries around all fold away is evaluated as an
+			// uncorrelated one. The references read NULL, which the folded subquery never
+			// reads.
+			rows, err := b.nullRun(e.Select, sel, outer)
+			if err != nil {
+				return nil, planDependent(err)
+			}
+			if len(rows) > 1 && !b.analyzing {
+				// Postgres fails with 21000 before it reads any row, or at the first row that
+				// reaches the subquery, where maragudb, which evaluates it on that row, fails
+				// with it too. When no row reaches it, the outcome depends on the plan. Inside
+				// a subquery that is only analyzed, this is decided again when the subquery is
+				// evaluated, and never when it is not.
+				b.run.s.uncertain = cmp.Or(b.run.s.uncertain, planDependent(fmt.Errorf("%w: more than one row returned by a subquery used as an expression", ErrCardinality)))
+			}
+		case !info.refsParent, e.Kind == ast.SubScalar && !liveRefsParent:
 			// A subquery that reads only the columns of queries further out is a constant of
 			// the query it is in, which Postgres can evaluate before any row, as an uncorrelated
 			// one.
@@ -310,7 +376,7 @@ func (b *binder) subquery(e *ast.Subquery) (*cexpr, error) {
 			// output of the subquery on its rows as the key of the join.
 			return nil, fmt.Errorf("%w: %w: a correlated IN or EXISTS whose subquery can fail is not supported in a condition, because Postgres can evaluate it as a semi-join, on rows of the subquery that no row of the query around evaluates it on; write the subquery so that it cannot fail", ErrUnsupported, errPlanDependentSubquery)
 		case e.Kind == ast.SubExists:
-			if err := b.nullRun(e.Select, sel, outer); err != nil {
+			if _, err := b.nullRun(e.Select, sel, outer); err != nil {
 				return nil, err
 			}
 		}
@@ -327,10 +393,11 @@ func planDependent(err error) error {
 	return fmt.Errorf("%w: %w: a subquery fails with %v, and whether Postgres evaluates it on the rows where it fails depends on its plan; write the subquery so that it cannot fail", ErrUnsupported, errPlanDependentSubquery, err)
 }
 
-// nullRun evaluates the query of a correlated EXISTS with NULL for every column of the query
-// around, which makes its correlated conditions reject every row, so that the conditions that
-// can fail are evaluated on every row that its scans could read.
-func (b *binder) nullRun(orig, sel *ast.Select, outer *binder) error {
+// nullRun evaluates the query of a correlated subquery with NULL for every column of the query
+// around, which makes the correlated conditions of an EXISTS reject every row, so that the
+// conditions that can fail are evaluated on every row that its scans could read, and returns its
+// rows.
+func (b *binder) nullRun(orig, sel *ast.Select, outer *binder) ([][]value.Value, error) {
 	width := 0
 	if sc, _ := b.names(); sc != nil {
 		width = sc.width
@@ -342,14 +409,15 @@ func (b *binder) nullRun(orig, sel *ast.Select, outer *binder) error {
 	info := &subqueryInfo{sel: orig, row: row}
 	b.run.evals++
 	if b.run.evals > maxSubqueryEvals {
-		return errTooManyEvals()
+		return nil, errTooManyEvals()
 	}
 	b.run.s.snapshotReads++
 	defer func() { b.run.s.snapshotReads-- }()
-	if _, err := b.run.s.query(b.run.ctx, sel, b.inner(outer, info, false)); err != nil {
-		return planDependent(err)
+	res, err := b.run.s.query(b.run.ctx, sel, b.inner(outer, info, false))
+	if err != nil {
+		return nil, planDependent(err)
 	}
-	return nil
+	return res.Rows, nil
 }
 
 // inSubquery binds `x [NOT] IN (subquery)`, whose subquery has the columns cols: true when x

@@ -29,8 +29,10 @@ var ErrorClasses = []ErrorClass{
 	// 22003 is numeric_value_out_of_range, and 22008 datetime_field_overflow, which Postgres
 	// reports for a timestamp out of range, whether text or a parameter's binary value.
 	{Name: "out of range", Err: maragudb.ErrOutOfRange, Codes: []string{"22003", "22008"}},
-	// 22021 is character_not_in_repertoire, a parameter's text that is not valid UTF-8.
-	{Name: "invalid UTF-8", Err: maragudb.ErrInvalidUTF8, Codes: []string{"22021"}},
+	// 22021 is character_not_in_repertoire, a parameter's text or a statement's text that is not
+	// valid UTF-8 or that holds a NUL byte, and 08P01 protocol_violation, which Postgres reports
+	// for a NUL byte in the text of a statement, where its protocol ends the text.
+	{Name: "invalid UTF-8", Err: maragudb.ErrInvalidUTF8, Codes: []string{"22021", "08P01"}},
 	{Name: "not null", Err: maragudb.ErrNotNull, Codes: []string{"23502"}},
 	{Name: "duplicate key", Err: maragudb.ErrDuplicateKey, Codes: []string{"23505"}},
 	// 23514 is check_violation.
@@ -51,9 +53,11 @@ var ErrorClasses = []ErrorClass{
 	// 54011 is too_many_columns.
 	{Name: "program limit", Err: maragudb.ErrProgramLimit, Codes: []string{"54011"}},
 	// 42804 is datatype_mismatch and 42883 is undefined_function, which Postgres reports for an
-	// operator without a variant for its operand types, and 42725 ambiguous_function, for a
-	// function or operator whose argument of unknown type fits several variants.
-	{Name: "type", Err: maragudb.ErrType, Codes: []string{"42804", "42883", "42725"}},
+	// operator without a variant for its operand types, 42725 ambiguous_function, for a
+	// function or operator whose argument of unknown type fits several variants, and 42P18
+	// indeterminate_datatype, for a parameter that the statement skips or whose contexts give it
+	// no type.
+	{Name: "type", Err: maragudb.ErrType, Codes: []string{"42804", "42883", "42725", "42P18"}},
 	// 42803 is grouping_error.
 	{Name: "grouping", Err: maragudb.ErrGrouping, Codes: []string{"42803"}},
 	// 22P02 is invalid_text_representation, 22007 invalid_datetime_format, 22008

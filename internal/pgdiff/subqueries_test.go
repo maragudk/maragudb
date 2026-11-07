@@ -179,7 +179,7 @@ func TestCTEs(t *testing.T) {
 
 func TestSubqueryPlans(t *testing.T) {
 	t.Run("rejects a subquery whose evaluation fails where some plan evaluates it and another does not, and accepts it otherwise", func(t *testing.T) {
-		verify.Covers(t, "a subquery that can fail is evaluated on every row and in every place that a plan of Postgres could evaluate it, an uncorrelated one in a condition before any row, the conditions of a correlated EXISTS also without a row of the query around, and a subquery in FROM or a CTE before the statement reads any row, and the statement is rejected when the evaluation fails, while a scalar subquery with more than one row fails with 21000 where every plan evaluates it", "INV-PG-SUBSET", "UNS-PLAN-DEPENDENT-SUBQUERY")
+		verify.Covers(t, "a subquery that can fail is evaluated on every row and in every place that a plan of Postgres could evaluate it, an uncorrelated one in a condition before any row, also one whose references to the query around fold away, the conditions of a correlated EXISTS also without a row of the query around, and a subquery in FROM or a CTE before the statement reads any row, and the statement is rejected when the evaluation fails, while a scalar subquery with more than one row fails with 21000 where every plan evaluates it", "INV-PG-SUBSET", "UNS-PLAN-DEPENDENT-SUBQUERY")
 		s := newSubquerySession(t)
 		for _, e := range []struct {
 			sql  string
@@ -216,6 +216,18 @@ func TestSubqueryPlans(t *testing.T) {
 			{"UPDATE sa SET v = 1 WHERE id = 1 AND EXISTS (SELECT 1 FROM sb WHERE 10 / w > 0)", dependsOnPlan},
 			{"SELECT id, (SELECT count(*) FROM sb WHERE sb.aid = sa.id) FROM sa ORDER BY id LIMIT 2", succeeds},
 			{"SELECT id, (SELECT sb.id FROM sb WHERE sb.aid = sa.id) FROM sa ORDER BY 1 LIMIT 1", dependsOnPlan},
+			// A subquery whose references to the query around fold away is uncorrelated, and
+			// evaluated before any row, also of an empty table.
+			{"SELECT id FROM sd WHERE (SELECT max(10 / w) FROM sb WHERE sb.aid = sd.id) > 0", succeeds},
+			{"SELECT id FROM sd WHERE (SELECT max(10 / w) FROM sb WHERE sb.aid = sd.id OR TRUE) > 0", dependsOnPlan},
+			{"SELECT id FROM sd WHERE (SELECT max(10 / w) FROM sb WHERE sb.aid = sd.id AND CAST('off' AS boolean)) > 0", succeeds},
+			{"SELECT id FROM sd WHERE (SELECT max(CASE WHEN false THEN sd.v ELSE 10 / w END) FROM sb) > 0", dependsOnPlan},
+			{"SELECT id FROM sd WHERE (SELECT max(coalesce(1, sd.v) + 10 / w) FROM sb) > 0", dependsOnPlan},
+			{"SELECT id FROM sd WHERE (SELECT max(10 / w) FROM sb WHERE sd.v > 0 AND (SELECT 1 FROM sc WHERE sc.id = sd.id AND false) IS NULL) > 0", succeeds},
+			{"SELECT id FROM sd WHERE (SELECT CASE WHEN (SELECT FALSE FROM sc WHERE sc.id = sd.id AND CAST('off' AS boolean)) THEN 1 END FROM sb WHERE 10 / w > 0) IS NULL", dependsOnPlan},
+			{"DELETE FROM sd WHERE (SELECT CASE WHEN (SELECT FALSE FROM sc WHERE sc.id = sd.id AND CAST('off' AS boolean)) THEN 1 END FROM sb WHERE 10 / w > 0) IS NULL", dependsOnPlan},
+			{"SELECT id FROM sa WHERE (SELECT max(w) FROM sb WHERE sb.aid = sa.id OR TRUE) > 1 ORDER BY id", succeeds},
+			{"SELECT id FROM sa WHERE (SELECT max(w) + count(*) FROM sb WHERE sb.aid = sa.id AND FALSE) IS NULL ORDER BY id", succeeds},
 		} {
 			var rep pgdiff.Report
 			o, err := s.Exec(t.Context(), e.sql, &rep)
@@ -231,7 +243,7 @@ func TestSubqueryPlans(t *testing.T) {
 	})
 
 	t.Run("Postgres evaluates a subquery lazily, before a scan, as a semi-join, or not at all, and stops at the row that decides it", func(t *testing.T) {
-		verify.Covers(t, "EXPLAIN and the outcomes on Postgres 18 with sequential scans off show that an uncorrelated subquery in an index condition is evaluated before the scan, also of an empty table, and in a filter only when a row reaches it, that IN, also correlated, and EXISTS become semi-joins and NOT EXISTS an anti-join, which evaluate a condition of the query around on rows that the subquery rejects, that NOT IN is a hashed SubPlan, that EXISTS drops the output of its query, that a subquery in FROM and a CTE read once are merged into the query around and their unread outputs never evaluated, that a CTE read twice is evaluated as a whole, that an unread CTE is never evaluated, and that a scalar subquery stops at its second row", "INV-PG-SUBSET")
+		verify.Covers(t, "EXPLAIN and the outcomes on Postgres 18 with sequential scans off show that an uncorrelated subquery in an index condition is evaluated before the scan, also of an empty table, and in a filter only when a row reaches it, that IN, also correlated, and EXISTS become semi-joins and NOT EXISTS an anti-join, which evaluate a condition of the query around on rows that the subquery rejects, that NOT IN is a hashed SubPlan, that EXISTS drops the output of its query, that a subquery in FROM and a CTE read once are merged into the query around and their unread outputs never evaluated, that a CTE read twice is evaluated as a whole, that an unread CTE is never evaluated, that a scalar subquery stops at its second row, and that a subquery whose references to the query around fold away, also in a subquery in it, is an uncorrelated InitPlan, evaluated before the scan of an empty table", "INV-PG-SUBSET")
 		b := newBoth(t, "")
 		for _, q := range []string{
 			"DROP TABLE IF EXISTS dev_e, dev_two, dev_t, dev_u",
@@ -274,6 +286,16 @@ func TestSubqueryPlans(t *testing.T) {
 		plan, err = run("SELECT * FROM dev_e WHERE v = (SELECT x FROM dev_two)")
 		is.True(t, strings.Contains(plan, "Filter: (v = (InitPlan 1).col1)"), plan)
 		is.NotError(t, err, "a filter evaluates the subquery only when a row reaches it")
+
+		plan, err = run("SELECT id FROM dev_e WHERE (SELECT max(10 / w) FROM dev_two WHERE dev_two.id = dev_e.id OR TRUE) > 0")
+		is.True(t, strings.Contains(plan, "One-Time Filter") && strings.Contains(plan, "InitPlan") && !strings.Contains(plan, "SubPlan"), "folding drops the reference, and the subquery is uncorrelated:\n"+plan)
+		is.Equal(t, "22012", pgdiff.SQLState(err), "the uncorrelated subquery is evaluated before the scan of the empty table")
+		plan, err = run("SELECT id FROM dev_e WHERE (SELECT CASE WHEN (SELECT FALSE FROM dev_two x WHERE x.id = dev_e.id AND CAST('off' AS boolean)) THEN 1 END FROM dev_two WHERE id = 3 AND 10 / w > 0) IS NULL")
+		is.True(t, strings.Contains(plan, "One-Time Filter") && !strings.Contains(plan, "SubPlan"), "also through a subquery in it:\n"+plan)
+		is.Equal(t, "22012", pgdiff.SQLState(err))
+		plan, err = run("SELECT id FROM dev_e WHERE (SELECT max(10 / w) FROM dev_two WHERE dev_two.id = dev_e.id) > 0")
+		is.True(t, strings.Contains(plan, "SubPlan"), plan)
+		is.NotError(t, err, "a correlated subquery is evaluated only on rows")
 
 		plan, _ = run("SELECT * FROM dev_t WHERE a IN (SELECT b FROM dev_u)")
 		is.True(t, strings.Contains(plan, "Semi Join"), plan)

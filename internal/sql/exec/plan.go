@@ -207,10 +207,13 @@ func negate(e ast.Expr) ast.Expr {
 func (b *binder) whereConjuncts(e ast.Expr) []ast.Expr {
 	var out []ast.Expr
 	for _, c := range conjuncts(e) {
-		if in, ok := c.(*ast.In); ok && mixedIn(in) && b.commonInType(in) {
-			d, _ := desugar(in)
-			out = append(out, b.whereConjuncts(d)...)
-			continue
+		if in, ok := c.(*ast.In); ok && mixedIn(in) {
+			// An IN that fails to bind stays as it is, so that binding it reports the error.
+			if common, err := b.commonInType(in); err == nil && common {
+				d, _ := desugar(in)
+				out = append(out, b.whereConjuncts(d)...)
+				continue
+			}
 		}
 		if canon, ok := b.canonicalQual(c); ok {
 			c = canon
@@ -451,6 +454,7 @@ func (b *binder) where(e ast.Expr, what string) (filter, error) {
 func (b *binder) filterOf(conjs []ast.Expr, what string) (filter, error) {
 	var f filter
 	var clauses []clause
+	var bound []*cexpr
 	pruned := false
 	null := false
 	for _, c := range conjs {
@@ -470,6 +474,7 @@ func (b *binder) filterOf(conjs []ast.Expr, what string) (filter, error) {
 		if ce.typ != value.Bool {
 			return filter{}, fmt.Errorf("%w: argument of %s must be type boolean, not type %v", ErrType, what, ce.typ)
 		}
+		bound = append(bound, ce)
 		if pruned {
 			continue
 		}
@@ -494,6 +499,10 @@ func (b *binder) filterOf(conjs []ast.Expr, what string) (filter, error) {
 			continue
 		}
 		clauses = append(clauses, clause{expr: c, ce: ce})
+	}
+	if f.never {
+		// Postgres folds the whole clause to FALSE.
+		dropped(bound...)
 	}
 	if f.never || null {
 		return filter{never: true}, nil
@@ -1324,11 +1333,19 @@ func (f filter) open() (bool, error) {
 	return open, failure
 }
 
-// failed returns the error of a row on which conjunct i failed with err.
+// failed returns the error of a row on which conjunct i failed with err. Postgres evaluates the
+// conjuncts in the order of their estimated cost, so when a later conjunct fails on the row with
+// another class of error, which error it reports depends on that order; the row fails in every
+// order, so the statement is rejected whatever the other rows do.
 func (f filter) failed(row []value.Value, i int, err error) error {
 	for j := i + 1; j < len(f.conds); j++ {
-		if v, cerr := f.conds[j].value(row); cerr == nil && (v.Null || !v.B) {
+		v, cerr := f.conds[j].value(row)
+		switch {
+		case cerr == nil && (v.Null || !v.B):
 			return f.orderDependent(i, f.conjuncts[j])
+		case cerr != nil && !errors.Is(cerr, errorKind(err)):
+			failed, other := ast.RenderExpr(f.conjuncts[i]), ast.RenderExpr(f.conjuncts[j])
+			return fmt.Errorf("%w: whether this statement fails with %v or %v depends on the order in which Postgres evaluates its WHERE conditions, because %s and %s fail on the same row; write CASE to decide which one is evaluated", ErrUnsupported, errorKind(err), errorKind(cerr), failed, other)
 		}
 	}
 	for _, c := range f.implied {

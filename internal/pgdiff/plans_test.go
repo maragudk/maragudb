@@ -2,6 +2,7 @@ package pgdiff_test
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"maragu.dev/is"
@@ -138,12 +139,122 @@ func TestIndexConditions(t *testing.T) {
 			"SELECT i FROM plan_i WHERE CAST('\\x' AS bytea) IN (s, '\\', CAST('' AS text))",
 			"SELECT i FROM plan_i WHERE coalesce('' || CAST('\\x' AS bytea) IN (s, '\\', CAST('' AS text)))",
 			"SELECT i FROM plan_i WHERE CAST('\\x' AS bytea) NOT IN (s, '\\', CAST('' AS text))",
+			// Postgres analyzes every element of an IN in the order they are written before it
+			// splits the elements that read no columns from the others.
+			"SELECT i FROM plan_i WHERE j IN (CASE 'x' WHEN i THEN 1::bigint END, 2::bigint, CAST('' AS bigint))",
+			"SELECT i FROM plan_i WHERE coalesce(j IN (CASE 'x' WHEN i THEN 1::bigint END, 2::bigint, CAST('' AS bigint)))",
 		} {
 			var rep pgdiff.Report
 			o, err := s.Exec(t.Context(), sql, &rep)
 			is.NotError(t, err, sql)
 			is.True(t, o.Executed && o.Err != nil, fmt.Sprintf("%s fails on both", sql))
 		}
+	})
+}
+
+func TestRowOrder(t *testing.T) {
+	t.Run("reports the error of rows that fail with one class in any order, and rejects rows that fail with different classes where Postgres may read them in another order than the key", func(t *testing.T) {
+		verify.Covers(t, "a SELECT on one table whose rows fail with different classes of error is rejected when a sort key in descending order lets Postgres scan the primary key backward, or its rows come from a subquery in FROM or a CTE, and fails with the class of every failing row when they agree, or with the class of the first row in key order when Postgres reads them in key order, and two WHERE conditions that fail on one row with different classes are rejected", "INV-PG-SUBSET", "AC-4.3")
+		s := newPlanSession(t)
+		// In plan_i, 10 / j fails on row 1, abs(j) on row 4, and j + 1 on row 3.
+		for _, e := range []struct {
+			sql  string
+			want planOutcome
+		}{
+			{"SELECT abs(j), 10 / j FROM plan_i ORDER BY i DESC", dependsOnPlan},
+			{"SELECT abs(j), 10 / j FROM plan_i ORDER BY i", fails},
+			{"SELECT abs(j), 10 / j FROM plan_i", fails},
+			{"SELECT abs(j), 10 / j FROM plan_i ORDER BY s DESC", dependsOnPlan},
+			{"SELECT abs(j), 10 / j FROM plan_i ORDER BY 1 + 1, i DESC", dependsOnPlan},
+			{"SELECT abs(j), 10 / j FROM plan_i ORDER BY i DESC NULLS LAST", dependsOnPlan},
+			{"SELECT i FROM plan_i WHERE abs(j) >= 0 AND 10 / j >= 0 ORDER BY i DESC", dependsOnPlan},
+			{"SELECT i FROM plan_i WHERE abs(j) >= 0 ORDER BY i DESC", fails},
+			{"SELECT i, 10 / j FROM plan_i WHERE abs(j) >= 0 ORDER BY i DESC", dependsOnPlan},
+			{"SELECT abs(j) FROM plan_i ORDER BY i DESC", fails},
+			{"SELECT abs(j), j * 2 FROM plan_i ORDER BY i DESC", fails},
+			{"SELECT 10 / j FROM plan_i ORDER BY abs(i) DESC", fails},
+			{"SELECT i FROM plan_i ORDER BY 10 / j, abs(j) DESC", dependsOnPlan},
+			{"SELECT DISTINCT i, abs(j), 10 / j FROM plan_i ORDER BY i DESC", dependsOnPlan},
+			{"SELECT abs(o.j), NULL FROM plan_i AS o ORDER BY (SELECT min(x.i) FROM plan_i AS x WHERE 10 / (x.i - x.i) >= 0), o.i DESC", dependsOnPlan},
+			{"SELECT abs(x.j), 10 / x.j FROM (SELECT * FROM plan_i) AS x ORDER BY x.i", dependsOnPlan},
+			{"WITH x AS (SELECT * FROM plan_i) SELECT abs(x.j), 10 / x.j FROM x ORDER BY x.i DESC", dependsOnPlan},
+			{"SELECT abs(x.j) FROM (SELECT * FROM plan_i) AS x ORDER BY x.i DESC", fails},
+			{"SELECT a, b, 10 / j FROM plan_ab ORDER BY a DESC, b", fails},
+			{"SELECT i, j FROM plan_i ORDER BY i DESC", succeeds},
+			// Postgres evaluates the conditions of a row in the order of their cost, so two
+			// conditions that fail on one row with different errors depend on that order.
+			{"SELECT i FROM plan_i WHERE CAST(s AS bigint) > 1 AND 10 / j > 0", dependsOnPlan},
+			{"SELECT i FROM plan_i WHERE i = 1 AND 10 / j > 0 AND CAST(s AS bigint) > 1", dependsOnPlan},
+			{"SELECT i FROM plan_i WHERE i = 1 AND 10 / j > 0 AND 5 / j > 0", fails},
+			{"SELECT count(*) FROM plan_i WHERE CAST(s AS bigint) > 1 GROUP BY j HAVING 10 / j > 0", dependsOnPlan},
+		} {
+			var rep pgdiff.Report
+			o, err := s.Exec(t.Context(), e.sql, &rep)
+			is.NotError(t, err, e.sql)
+			switch e.want {
+			case dependsOnPlan:
+				is.True(t, !o.Executed, fmt.Sprintf("%s: rejected as order-dependent, got %+v", e.sql, o))
+			default:
+				is.True(t, o.Executed, fmt.Sprintf("%s: rejected: %s", e.sql, o.Rejection))
+				is.Equal(t, e.want == fails, o.Err != nil, fmt.Sprintf("%s: fails on both: %v", e.sql, o.Err))
+			}
+		}
+	})
+
+	t.Run("Postgres reads the rows backward through the primary key for a descending sort key, and so fails on another row first", func(t *testing.T) {
+		verify.Covers(t, "EXPLAIN and the outcomes on Postgres 18 with sequential scans off show that ORDER BY a primary key column in descending order scans the index backward, also after a constant sort key, which Postgres drops, such as an uncorrelated subquery, and before an incremental sort of the keys after it, and evaluates the output on the rows in that order, so that a SELECT whose rows fail with different errors fails with the error of the last row in key order; that a full sort evaluates the output in key order; that within a row the output comes before the sort keys, and that the conditions of WHERE are evaluated in the order of their cost, whatever the written order", "INV-PG-SUBSET")
+		b := newBoth(t, "")
+		for _, q := range []string{
+			"DROP TABLE IF EXISTS dev_r, dev_rab",
+			"CREATE TABLE dev_r (i bigint PRIMARY KEY, j bigint)",
+			"INSERT INTO dev_r VALUES (1, 0), (2, 5), (3, -9223372036854775808)",
+			"CREATE TABLE dev_rab (a bigint, b bigint, j bigint, PRIMARY KEY (a, b))",
+			"INSERT INTO dev_rab VALUES (1, 1, 0), (1, 2, -9223372036854775808)",
+		} {
+			_, err := b.pg.ExecContext(t.Context(), q)
+			is.NotError(t, err, q)
+		}
+		t.Cleanup(func() { _, _ = b.pg.ExecContext(t.Context(), "DROP TABLE IF EXISTS dev_r, dev_rab") })
+		conn, err := b.pg.Conn(t.Context())
+		is.NotError(t, err)
+		defer func() { _ = conn.Close() }()
+		run := func(sql string) (string, error) {
+			t.Helper()
+			rows, err := conn.QueryContext(t.Context(), "EXPLAIN (COSTS OFF) "+sql)
+			is.NotError(t, err)
+			var lines []string
+			for rows.Next() {
+				var line string
+				is.NotError(t, rows.Scan(&line))
+				lines = append(lines, strings.TrimSpace(line))
+			}
+			is.NotError(t, rows.Close())
+			_, qerr := conn.ExecContext(t.Context(), sql)
+			return strings.Join(lines, "\n"), qerr
+		}
+		plan, err := run("SELECT abs(j), 10 / j FROM dev_r ORDER BY i")
+		is.True(t, strings.Contains(plan, "Index Scan using") && !strings.Contains(plan, "Backward"), plan)
+		is.Equal(t, "22012", pgdiff.SQLState(err), "the first row in key order fails first")
+		plan, err = run("SELECT abs(j), 10 / j FROM dev_r ORDER BY i DESC")
+		is.True(t, strings.Contains(plan, "Index Scan Backward"), plan)
+		is.Equal(t, "22003", pgdiff.SQLState(err), "the last row in key order fails first")
+		plan, err = run("SELECT abs(j), 10 / j FROM dev_r ORDER BY (SELECT min(i) FROM dev_r), i DESC")
+		is.True(t, strings.Contains(plan, "Index Scan Backward") && !strings.Contains(plan, "Sort"), "the constant sort key is dropped:\n"+plan)
+		is.Equal(t, "22003", pgdiff.SQLState(err))
+		plan, err = run("SELECT abs(j), 10 / j FROM dev_r ORDER BY 1 + 1, i DESC")
+		is.True(t, strings.Contains(plan, "Index Scan Backward"), plan)
+		is.Equal(t, "22003", pgdiff.SQLState(err))
+		plan, err = run("SELECT abs(j), 10 / j FROM dev_r ORDER BY i DESC NULLS LAST")
+		is.True(t, strings.Contains(plan, "Sort"), "a sort key that the index does not give is a sort:\n"+plan)
+		is.Equal(t, "22012", pgdiff.SQLState(err), "which evaluates the output on the rows in key order")
+		plan, err = run("SELECT abs(j), 10 / j FROM dev_rab ORDER BY a DESC, b")
+		is.True(t, strings.Contains(plan, "Incremental Sort") && strings.Contains(plan, "Backward"), "a descending first key scans backward and sorts the rest:\n"+plan)
+		is.Equal(t, "22003", pgdiff.SQLState(err))
+		_, err = run("SELECT abs(j) FROM dev_r WHERE i = 3 ORDER BY 10 / (j - j)")
+		is.Equal(t, "22003", pgdiff.SQLState(err), "the output of a row comes before its sort keys")
+		plan, err = run("SELECT i FROM dev_r WHERE i = 1 AND CAST(CAST(j AS text) || 'x' AS bigint) > 1 AND 10 / j > 0")
+		is.True(t, strings.Contains(plan, "Filter: (((10 / j) > 0) AND"), "the cheaper condition comes first:\n"+plan)
+		is.Equal(t, "22012", pgdiff.SQLState(err), "whatever the written order")
 	})
 }
 

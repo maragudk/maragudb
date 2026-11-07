@@ -1,10 +1,10 @@
 package exec
 
 import (
-	"cmp"
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -45,6 +45,12 @@ type cexpr struct {
 	// sublink reports that the expression has a subquery, which Postgres never folds, so that
 	// it is evaluated when the statement runs, even when it reads no columns.
 	sublink bool
+	// outer are the references to columns of queries around the subquery that the expression
+	// is in, which die when folding drops the expression.
+	outer []*outerUse
+	// use is the reference to a parameter that the expression is, whose type the context gives
+	// it, as [resolve] records.
+	use *paramUse
 }
 
 // value of the expression for row.
@@ -111,6 +117,9 @@ type binder struct {
 	// analyzing is set while a subquery is bound to analyze it, which stops before it reads any
 	// row.
 	analyzing bool
+	// top is set for the binder of the statement itself, whose folding comes once the whole
+	// statement is analyzed.
+	top bool
 }
 
 // Phases of a statement, in the order in which Postgres folds their constants: the output
@@ -139,12 +148,24 @@ const (
 // [paramError] says. Such an error comes first, except while a subquery is analyzed, whose
 // statement reports it when it folds.
 func (b *binder) folding() error {
-	if b.run != nil && b.run.s.bindErr != nil && !b.analyzing {
-		return b.run.s.bindErr
+	if b.top {
+		if err := b.run.s.params.check(); err != nil {
+			return err
+		}
+	}
+	if b.run != nil && !b.analyzing {
+		if err := b.run.s.params.refusal(); err != nil {
+			return err
+		}
 	}
 	err := b.foldErr
 	if err == nil {
 		err = b.stableErr
+	}
+	if b.top && err == nil {
+		// Postgres reports the errors of the parameters and of folding before it runs the
+		// statement, and so before any subquery that [Session.uncertain] is about.
+		b.run.s.running = true
 	}
 	if err != nil && b.analyzing {
 		return planDependent(err)
@@ -162,6 +183,7 @@ func (b *binder) fold(e *cexpr, children ...*cexpr) (*cexpr, error) {
 		e.stable = e.stable || c.stable
 		e.sublink = e.sublink || c.sublink
 		e.aggs = append(e.aggs, c.aggs...)
+		e.outer = append(e.outer, c.outer...)
 	}
 	if e.fallible && b.pruned == 0 && b.level != nil {
 		b.level.fallible = true
@@ -250,13 +272,15 @@ func (b *binder) forEntry(i int) *binder {
 	return nb
 }
 
-// bindPruned binds a branch that is known never to be evaluated.
+// bindPruned binds a branch that is known never to be evaluated, which Postgres folds away, so
+// that its references to the queries around a subquery die.
 func (b *binder) bindPruned(e ast.Expr) (*cexpr, error) {
 	b.pruned++
 	defer func() { b.pruned-- }()
 	ce, err := b.bind(e)
 	if ce != nil {
 		ce.pruned = true
+		dropped(ce)
 	}
 	return ce, err
 }
@@ -279,12 +303,20 @@ func resolve(e *cexpr, t value.Type) (*cexpr, error) {
 	if e.typ != value.Unknown || !e.folded {
 		return e, nil
 	}
+	if e.use != nil {
+		e.use.typed(t)
+	}
 	if e.val.Null {
 		return constant(value.NewNull(t)), nil
 	}
 	if e.param > 0 {
 		v, err := resolveParam(e.param, e.val, t)
 		if err != nil {
+			if e.use != nil && errors.Is(err, ErrOutOfRange) {
+				// The client library refuses to encode the value.
+				e.use.ledger.refuse(e.use.n, err, true)
+				return constant(value.NewNull(t)), nil
+			}
 			return nil, err
 		}
 		return constant(v), nil
@@ -297,9 +329,134 @@ func resolve(e *cexpr, t value.Type) (*cexpr, error) {
 	}
 	v, err := value.Parse(e.val.S, t)
 	if err != nil {
-		return nil, castError(err)
+		err = castError(err)
+		if e.use != nil && !errors.Is(err, ErrUnsupported) {
+			// Postgres reads a parameter's text as its type when it binds the parameters, after it
+			// analyzed the statement, so the error waits, and the parameter stands in as NULL.
+			e.use.ledger.refuse(e.use.n, err, false)
+			return constant(value.NewNull(t)), nil
+		}
+		return nil, err
 	}
 	return constant(v), nil
+}
+
+// paramLedger is what the analysis of a statement learns of its parameters, as Postgres learns it
+// when it parses the statement: the type that the contexts of each parameter give it, from which
+// Postgres infers one type per parameter; and the errors with which it refuses their values when
+// it binds them, after the analysis and before it folds constants, in the order of their numbers.
+type paramLedger struct {
+	// n is the highest parameter number of the statement, and used the numbers it references.
+	n    int
+	used map[int]bool
+	// types are the types that the contexts of each parameter give it, and untyped the
+	// parameters in a context that gives none.
+	types   map[int][]value.Type
+	untyped map[int]bool
+	// refused and encode are the errors of the values that Postgres refuses and that the client
+	// library refuses to encode, which it tries for every parameter before it sends any, by
+	// parameter number.
+	refused, encode map[int]error
+	// checked is set once the analysis of the statement is complete.
+	checked bool
+}
+
+// paramUse is a reference to the parameter n.
+type paramUse struct {
+	n      int
+	ledger *paramLedger
+}
+
+// newParamLedger for a statement that references the parameter numbers used, up to n.
+func newParamLedger(n int, used map[int]bool) *paramLedger {
+	return &paramLedger{n: n, used: used}
+}
+
+// use records a reference to the parameter n.
+func (l *paramLedger) use(n int) *paramUse {
+	return &paramUse{n: n, ledger: l}
+}
+
+// typed records that a context gives the parameter the type t, which is text for an unknown.
+func (u *paramUse) typed(t value.Type) {
+	if t == value.Unknown {
+		t = value.String
+	}
+	l := u.ledger
+	if l.types == nil {
+		l.types = map[int][]value.Type{}
+	}
+	if !slices.Contains(l.types[u.n], t) {
+		l.types[u.n] = append(l.types[u.n], t)
+	}
+}
+
+// untyped records that a context gives the parameter no type, as IS NULL and count() do.
+func (u *paramUse) untyped() {
+	if u.ledger.untyped == nil {
+		u.ledger.untyped = map[int]bool{}
+	}
+	u.ledger.untyped[u.n] = true
+}
+
+// refuse records the error err for the value of parameter n, which the client library refuses to
+// encode when client is set.
+func (l *paramLedger) refuse(n int, err error, client bool) {
+	m := &l.refused
+	if client {
+		m = &l.encode
+	}
+	if *m == nil {
+		*m = map[int]error{}
+	}
+	if _, ok := (*m)[n]; !ok {
+		(*m)[n] = err
+	}
+}
+
+// check reports, once the statement is analyzed, a parameter whose type Postgres does not
+// determine: one that the statement skips, or whose contexts give it no type, which fails with
+// 42P18, as Postgres fails it when it parses the statement. A parameter whose contexts give it
+// different types, or a type and none, is not supported: Postgres gives a parameter the type of
+// its first context in the order of its analysis, which can then fail in a later context, or
+// fails with 42P08, where a quoted literal takes the type of each context.
+func (l *paramLedger) check() error {
+	if l == nil || l.checked {
+		return nil
+	}
+	l.checked = true
+	for n := 1; n <= l.n; n++ {
+		switch types := l.types[n]; {
+		case len(types) > 1:
+			return fmt.Errorf("%w: parameter $%d in contexts of the types %v and %v is not supported, because Postgres gives a parameter one type; cast the parameter, such as $%d::%v, or pass the value twice", ErrUnsupported, n, types[0], types[1], n, types[0])
+		case len(types) == 1 && l.untyped[n]:
+			return fmt.Errorf("%w: parameter $%d in IS NULL or count() and in a context of type %v is not supported, because whether Postgres determines its type depends on their order; cast the parameter, such as $%d::%v", ErrUnsupported, n, types[0], n, types[0])
+		case len(types) == 0 && l.used[n] && !l.untyped[n]:
+			return fmt.Errorf("%w: parameter $%d in a context whose type maragudb does not determine as Postgres does is not supported; cast the parameter, such as $%d::text", ErrUnsupported, n, n)
+		}
+	}
+	for n := 1; n <= l.n; n++ {
+		if len(l.types[n]) == 0 {
+			return fmt.Errorf("%w: could not determine data type of parameter $%d; cast it, such as $%d::bigint", ErrType, n, n)
+		}
+	}
+	return nil
+}
+
+// refusal is the error of the first parameter, by number, whose value the client library refuses
+// to encode, or else that Postgres refuses.
+func (l *paramLedger) refusal() error {
+	if l == nil || l.encode == nil && l.refused == nil {
+		return nil
+	}
+	for _, m := range []map[int]error{l.encode, l.refused} {
+		for n := 1; n <= l.n; n++ {
+			if err, ok := m[n]; ok {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // paramError is the error with which Postgres refuses the value v of parameter n when it reads
@@ -430,7 +587,7 @@ func widen(e *cexpr, t value.Type) *cexpr {
 	if e.folded {
 		return constant(conv(e.val))
 	}
-	return &cexpr{typ: t, refs: e.refs, fallible: e.fallible, stable: e.stable, sublink: e.sublink, aggs: e.aggs, eval: func(row []value.Value) (value.Value, error) {
+	return &cexpr{typ: t, refs: e.refs, fallible: e.fallible, stable: e.stable, sublink: e.sublink, aggs: e.aggs, outer: e.outer, eval: func(row []value.Value) (value.Value, error) {
 		v, err := e.value(row)
 		if err != nil {
 			return value.Value{}, err
@@ -450,7 +607,7 @@ func toDecimal(e *cexpr) *cexpr {
 	if e.folded {
 		return constant(conv(e.val))
 	}
-	return &cexpr{typ: value.Decimal, refs: e.refs, fallible: e.fallible, stable: e.stable, sublink: e.sublink, aggs: e.aggs, eval: func(row []value.Value) (value.Value, error) {
+	return &cexpr{typ: value.Decimal, refs: e.refs, fallible: e.fallible, stable: e.stable, sublink: e.sublink, aggs: e.aggs, outer: e.outer, eval: func(row []value.Value) (value.Value, error) {
 		v, err := e.value(row)
 		if err != nil {
 			return value.Value{}, err
@@ -639,20 +796,24 @@ func (b *binder) bind(e ast.Expr) (*cexpr, error) {
 		// like the type of a quoted literal. A Go string or nil is exactly such a literal; a
 		// value of another Go type converts to the inferred type when it can.
 		v := b.params[e.Index-1]
+		var use *paramUse
+		if b.run != nil && b.run.s.params != nil {
+			use = b.run.s.params.use(e.Index)
+		}
 		if err := paramError(e.Index, v); err != nil {
-			if b.run == nil {
+			if use == nil {
 				return nil, err
 			}
 			// Postgres reads the parameters' values once it analyzed the statement, before it
 			// folds constants, so the error waits for [binder.folding], and the parameter stands
 			// for a value that analyzes the same.
-			b.run.s.bindErr = cmp.Or(b.run.s.bindErr, err)
+			use.ledger.refuse(e.Index, err, false)
 			v = paramStandIn(v)
 		}
 		if v.Type == value.Unknown {
-			return constant(v), nil
+			return &cexpr{typ: value.Unknown, folded: true, val: v, use: use}, nil
 		}
-		return &cexpr{typ: value.Unknown, folded: true, val: v, param: e.Index}, nil
+		return &cexpr{typ: value.Unknown, folded: true, val: v, param: e.Index, use: use}, nil
 	case *ast.ColumnRef:
 		return b.columnRef(e)
 	case *ast.Subquery:
@@ -665,6 +826,13 @@ func (b *binder) bind(e ast.Expr) (*cexpr, error) {
 		x, err := b.bind(e.Expr)
 		if err != nil {
 			return nil, err
+		}
+		if x.use != nil {
+			// IS NULL gives a parameter no type, as in Postgres.
+			x.use.untyped()
+			c := *x
+			c.use = nil
+			x = &c
 		}
 		if x, err = resolve(x, value.String); err != nil {
 			return nil, err
@@ -684,10 +852,16 @@ func (b *binder) bind(e ast.Expr) (*cexpr, error) {
 		d, _ := desugar(e)
 		return b.bind(d)
 	case *ast.In:
-		if mixedIn(e) && !b.commonInType(e) {
-			// Without a common type of the elements that read no columns, Postgres compares every
-			// element in turn, in the order they are written.
-			return b.bind(inChain(e, e.List))
+		if mixedIn(e) {
+			common, err := b.commonInType(e)
+			if err != nil {
+				return nil, err
+			}
+			if !common {
+				// Without a common type of the elements that read no columns, Postgres compares
+				// every element in turn, in the order they are written.
+				return b.bind(inChain(e, e.List))
+			}
 		}
 		if d, ok := desugar(e); ok {
 			return b.bind(d)
@@ -869,7 +1043,7 @@ func (b *binder) concat(l, r *cexpr) (*cexpr, error) {
 		if e.folded && e.typ != value.Time {
 			return constant(value.NewString(value.Format(e.val))), nil
 		}
-		return &cexpr{typ: value.String, refs: e.refs, fallible: e.fallible, stable: e.stable || e.typ == value.Time, sublink: e.sublink, aggs: e.aggs, eval: func(row []value.Value) (value.Value, error) {
+		return &cexpr{typ: value.String, refs: e.refs, fallible: e.fallible, stable: e.stable || e.typ == value.Time, sublink: e.sublink, aggs: e.aggs, outer: e.outer, eval: func(row []value.Value) (value.Value, error) {
 			v, err := e.value(row)
 			if err != nil || v.Null {
 				return value.NewNull(value.String), err
@@ -939,6 +1113,7 @@ func (b *binder) logical(e *ast.Binary) (*cexpr, error) {
 	// not constant, because Postgres drops the other arguments of an AND with a FALSE constant
 	// or an OR with a TRUE one wherever it is.
 	if decided || r.folded && !r.val.Null && r.val.B != and {
+		dropped(l, r)
 		return constant(value.NewBool(!and)), nil
 	}
 	return b.fold(&cexpr{typ: value.Bool, eval: func(row []value.Value) (value.Value, error) {
@@ -1168,26 +1343,29 @@ func mixedIn(e *ast.In) bool {
 }
 
 // commonInType reports whether the left side and the elements that read no columns of an IN
-// have a common type, so that Postgres compares them as an array. It reports true when binding
-// them fails otherwise, so that binding the IN reports the error.
-func (b *binder) commonInType(e *ast.In) bool {
+// have a common type, so that Postgres compares them as an array. Postgres analyzes the left
+// side and every element in the order they are written before it splits the IN, so an error of
+// that analysis is returned first.
+func (b *binder) commonInType(e *ast.In) (bool, error) {
 	x, err := b.bindPruned(e.Expr)
 	if err != nil {
-		return true
+		return false, err
 	}
 	es := []*cexpr{x}
 	for _, item := range e.List {
-		if readsColumns(item) {
-			continue
-		}
 		c, err := b.bindPruned(item)
 		if err != nil {
-			return true
+			return false, err
 		}
-		es = append(es, c)
+		if !readsColumns(item) {
+			es = append(es, c)
+		}
 	}
 	_, _, err = b.unifyAll(es, "IN mixes")
-	return !errors.Is(err, ErrType)
+	if err != nil && !errors.Is(err, ErrType) {
+		return false, err
+	}
+	return err == nil, nil
 }
 
 // inChain is the comparisons of an IN with the items, joined with OR, or for NOT IN the

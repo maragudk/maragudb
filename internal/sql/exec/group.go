@@ -253,6 +253,13 @@ func (b *binder) aggregateType(agg *aggregate, e *ast.Call, args []*cexpr) error
 		return notExist()
 	}
 	x := args[0]
+	if x.use != nil && e.Name == "count" && x.typ == value.Unknown {
+		// count() gives a parameter no type, as in Postgres.
+		x.use.untyped()
+		c := *x
+		c.use = nil
+		x = &c
+	}
 	if x.param > 0 {
 		return fmt.Errorf("%w: parameter $%d as the argument of %s is not supported, because its type is not known; cast it, such as $%d::bigint", ErrUnsupported, x.param, e.Name, x.param)
 	}
@@ -574,6 +581,7 @@ func (b *binder) having(st *ast.Select, groupBy bool) (havingConds, error) {
 		return h, nil
 	}
 	pruned := false
+	var bound []*cexpr
 	for _, c := range b.whereConjuncts(b.normalize(st.Having)) {
 		var ce *cexpr
 		var err error
@@ -591,14 +599,19 @@ func (b *binder) having(st *ast.Select, groupBy bool) (havingConds, error) {
 		if ce.typ != value.Bool {
 			return havingConds{}, fmt.Errorf("%w: argument of HAVING must be type boolean, not type %v", ErrType, ce.typ)
 		}
+		bound = append(bound, ce)
 		switch {
 		case pruned:
 			continue
 		case ce.folded && !ce.val.Null && ce.val.B:
 			continue
 		case ce.folded:
-			// A FALSE stops the folding of the conjuncts after it, and a NULL does not.
+			// A FALSE stops the folding of the conjuncts after it, and a NULL does not. Postgres
+			// folds the clause to FALSE.
 			pruned = !ce.val.Null
+			if pruned {
+				dropped(bound...)
+			}
 			h.never = true
 			h.moved = append(h.moved, &ast.Literal{Value: value.NewBool(false)})
 			continue

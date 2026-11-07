@@ -244,7 +244,7 @@ func (b *binder) fromItem(ctx context.Context, s *Session, item ast.TableExpr, d
 			t = &cp
 			for cur := b; cur != nil && cur.level != c.level; cur = cur.outer {
 				if cur.sub != nil {
-					cur.sub.correlated = true
+					cur.sub.correlated, cur.sub.cte = true, true
 				}
 			}
 		} else {

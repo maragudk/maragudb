@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"slices"
+	"unicode/utf8"
 
 	"github.com/antithesishq/antithesis-sdk-go/assert"
 
@@ -99,9 +100,15 @@ type Session struct {
 	// snapshotReads is positive while a subquery runs, whose reads see the transaction as the
 	// statement began, without the statement's own writes, as in Postgres.
 	snapshotReads int
-	// bindErr is the first error with which Postgres would refuse a parameter's value of the
-	// statement, which it reports once it analyzed the statement, before it folds constants.
-	bindErr error
+	// params is what the analysis of the statement learns of its parameters.
+	params *paramLedger
+	// uncertain is the error of the statement unless it fails with [ErrCardinality], for a
+	// subquery that Postgres evaluates either before it reads any row or on the first row that
+	// reaches it, and that then fails with 21000.
+	uncertain error
+	// running is set once the statement is analyzed and folded without an error, from where
+	// Postgres may evaluate such a subquery.
+	running bool
 }
 
 // NewSession over db.
@@ -117,6 +124,8 @@ func NewSession(db *engine.DB, opts Options) *Session {
 type Statement struct {
 	ast     ast.Statement
 	nparams int
+	// used are the parameter numbers that the statement references.
+	used map[int]bool
 }
 
 // NumParams is the highest parameter number used.
@@ -124,17 +133,23 @@ func (st *Statement) NumParams() int {
 	return st.nparams
 }
 
-// Prepare parses sql.
+// Prepare parses sql. As in Postgres, which checks the encoding of the text of a statement when
+// it receives it, text that is not valid UTF-8 or that holds a NUL byte fails before it parses,
+// wherever the bytes are, also in a comment.
 func Prepare(sql string) (*Statement, error) {
+	if err := checkText(sql); err != nil {
+		return nil, err
+	}
 	s, err := parser.Parse(sql)
 	if err != nil {
 		return nil, err
 	}
-	st := &Statement{ast: s}
+	st := &Statement{ast: s, used: map[int]bool{}}
 	params := func(e ast.Expr) {
 		ast.Walk(e, func(x ast.Expr) bool {
-			if p, ok := x.(*ast.Param); ok && p.Index > st.nparams {
-				st.nparams = p.Index
+			if p, ok := x.(*ast.Param); ok {
+				st.used[p.Index] = true
+				st.nparams = max(st.nparams, p.Index)
 			}
 			return true
 		})
@@ -167,6 +182,22 @@ func Prepare(sql string) (*Statement, error) {
 		ast.SubqueriesOf(e, query)
 	}
 	return st, nil
+}
+
+// checkText reports the first byte of sql that is not part of valid UTF-8, or a NUL byte, which
+// no text in Postgres can hold.
+func checkText(sql string) error {
+	for i, r := range sql {
+		switch r {
+		case 0:
+			return fmt.Errorf("%w: 0x00 at byte %d of the statement", ErrInvalidUTF8, i)
+		case utf8.RuneError:
+			if _, size := utf8.DecodeRuneInString(sql[i:]); size == 1 {
+				return fmt.Errorf("%w: 0x%02x at byte %d of the statement", ErrInvalidUTF8, sql[i], i)
+			}
+		}
+	}
+	return nil
 }
 
 // Prepare parses sql in the session. As in Postgres, a statement that does not parse, or that
@@ -429,15 +460,22 @@ func (s *Session) run(ctx context.Context, st *Statement, params []value.Value) 
 		defer func() { s.subqueries = nil }()
 	}
 	s.events = nil
-	s.bindErr = nil
+	s.params = newParamLedger(st.nparams, st.used)
+	s.uncertain, s.running = nil, false
 	rows, res, err := s.execute(ctx, st.ast, params)
 	s.events = nil
 	if err == nil {
-		// Every statement reports a refused parameter where it folds constants, and this is the
-		// last resort.
-		err = s.bindErr
+		// Every statement checks its parameters where it folds constants, and this is the last
+		// resort.
+		if err = s.params.check(); err == nil {
+			err = s.params.refusal()
+		}
 	}
-	s.bindErr = nil
+	// A read-only transaction refuses a write when the statement starts, before any subquery.
+	if s.uncertain != nil && s.running && !errors.Is(err, ErrCardinality) && !errors.Is(err, ErrReadOnlyTx) {
+		err = s.uncertain
+	}
+	s.params, s.uncertain, s.running = nil, nil, false
 	ddl := false
 	switch st.ast.(type) {
 	case *ast.CreateTable, *ast.DropTable, *ast.CreateIndex, *ast.DropIndex:
