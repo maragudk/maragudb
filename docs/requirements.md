@@ -100,11 +100,11 @@ These apply to every section, for the SQL surface that exists at that point.
 5. **S3 request budgets.** These are deterministic and are checked against the fake S3 via `Stats()`:
    - A commit uses O(1) PUTs, independent of database size. `AC-5.1`
    - A transaction with a warm cache uses one conditional GET (or HEAD) for the freshness check, plus nothing else for cached data. `AC-5.2`
-   - A point lookup with a cold cache uses O(log n) GETs. `AC-5.3`
-   - A point lookup through a secondary index with a cold cache uses O(log n) GETs. `AC-5.5`
+   - A point lookup with a cold cache uses at most one GET per tree level of each live segment, so O(log n) GETs per segment, and compaction keeps O(log n) live segments. `AC-5.3`
+   - A point lookup through a secondary index with a cold cache uses that budget for the index entry and again for the row. `AC-5.5`
    - A commit that changes indexed columns still uses O(1) PUTs, independent of database size and of the number of indexes. `AC-5.6`
-   - An insert of a row with a foreign key with a warm cache uses no request beyond those of any other commit, and with a cold cache O(log n) GETs for the lookup of the referenced row. `AC-5.7`
-   - A join from one row of a table to the rows that reference it, through an index on the referencing columns, with a cold cache uses O(log n) GETs for each row it reads. `AC-5.8`
+   - An insert of a row with a foreign key with a warm cache uses no request beyond those of any other commit, and with a cold cache the budget of a point lookup for the referenced row. `AC-5.7`
+   - A join from one row of a table to the rows that reference it, through an index on the referencing columns, with a cold cache uses the budget of a point lookup for each row it reads. `AC-5.8`
 
    Latency against Tigris is measured and reported, but it does not gate. `AC-5.4`
 6. **Bounded storage.** After compaction, the object count grows with data size, not with commit count. `AC-6.1` GC never deletes an object that a snapshot within the configured grace period still references. `AC-6.2` A reader older than the grace period gets a clear error, never wrong data. `AC-6.3` The manifest that a commit writes has a size independent of the number of commits within the grace period: it is bounded by the live segments, the window of commit records, and the number of maintenance passes within the grace period. `AC-6.4` The bytes that compaction reads and writes for each committed byte grow at most logarithmically with the database size. `AC-6.5`

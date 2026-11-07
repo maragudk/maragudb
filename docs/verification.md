@@ -193,7 +193,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 ### `AC-5.3`
 
-> S3 request budgets: A point lookup with a cold cache uses O(log n) GETs.
+> S3 request budgets: A point lookup with a cold cache uses at most one GET per tree level of each live segment, so O(log n) GETs per segment, and compaction keeps O(log n) live segments.
 
 - `.` `TestRequestBudgets/a_SELECT_by_primary_key_with_a_cold_cache_makes_a_logarithmic_number_of_GETs`: a SELECT by primary key with a cold cache makes at most one GET per tree level of every segment for the table definition and the row, after many commits with the merges of the tiers, which leave fewer than four segments per tier, and one GET per tree level after a compaction of every segment
 - `.` `TestRequestBudgets/an_autocommit_INSERT_makes_one_conditional_GET_and_two_PUTs_regardless_of_database_size`: an autocommit INSERT with a cold cache makes at most one GET per tree level of every segment for the table definition and the duplicate key check, after many commits with the merges of the tiers, which leave fewer than four segments per tier, and after a compaction of every segment
@@ -205,7 +205,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 ### `AC-5.5`
 
-> S3 request budgets: A point lookup through a secondary index with a cold cache uses O(log n) GETs.
+> S3 request budgets: A point lookup through a secondary index with a cold cache uses that budget for the index entry and again for the row.
 
 - `.` `TestRequestBudgets_Indexes/a_point_lookup_through_a_unique_index_with_a_cold_cache_makes_a_logarithmic_number_of_GETs`: a SELECT by a unique secondary index with a cold cache makes a logarithmic number of GETs: one descent of the tree of every segment each for the table definition, the index entry, and the row, after many commits with the merges of the tiers, which leave fewer than four segments per tier, and after a compaction of every segment
 
@@ -217,13 +217,13 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 ### `AC-5.7`
 
-> S3 request budgets: An insert of a row with a foreign key with a warm cache uses no request beyond those of any other commit, and with a cold cache O(log n) GETs for the lookup of the referenced row.
+> S3 request budgets: An insert of a row with a foreign key with a warm cache uses no request beyond those of any other commit, and with a cold cache the budget of a point lookup for the referenced row.
 
 - `.` `TestRequestBudgets_ForeignKeys/an_insert_of_a_row_with_a_foreign_key_adds_no_request_with_a_warm_cache,_and_a_logarithmic_number_of_GETs_with_a_cold_one`: an autocommit INSERT of a row that references a parent makes one conditional GET and two PUTs with a warm cache at every database size, and with a cold cache one descent of the tree of every segment each for the table definitions, the duplicate key check, and the lookup of the parent, after many commits with the merges of the tiers, and after a compaction of every segment
 
 ### `AC-5.8`
 
-> S3 request budgets: A join from one row of a table to the rows that reference it, through an index on the referencing columns, with a cold cache uses O(log n) GETs for each row it reads.
+> S3 request budgets: A join from one row of a table to the rows that reference it, through an index on the referencing columns, with a cold cache uses the budget of a point lookup for each row it reads.
 
 - `.` `TestRequestBudgets_Joins/a_join_from_one_parent_row_to_its_children_through_an_index_on_their_foreign_key_makes_a_logarithmic_number_of_GETs_per_row_with_a_cold_cache`: a SELECT that joins one parent row to its children with ON c.pid = p.id, through an index on c (pid), makes with a cold cache one descent of the tree of every segment for each table definition, for the parent, for the index entries, and for each child, at every database size, after many commits with the merges of the tiers, which leave fewer than four segments per tier, and after a compaction of every segment
 
