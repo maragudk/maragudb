@@ -183,8 +183,10 @@ type Delete struct {
 
 // Select statement. An empty From selects a single row without a table. Several items in From
 // are joined as with CROSS JOIN, and the WHERE clause filters their rows. GroupBy and Having
-// group the rows, as do aggregates in Items, Having, or OrderBy.
+// group the rows, as do aggregates in Items, Having, or OrderBy. With are the queries of its
+// WITH clause, which its FROM, and the FROM of its subqueries, can read by name.
 type Select struct {
+	With     []CTE
 	Distinct bool
 	Items    []SelectItem
 	From     []TableExpr
@@ -204,7 +206,14 @@ type SelectItem struct {
 	Alias string
 }
 
-// TableExpr is an item of FROM: a [TableRef] or a [Join].
+// CTE is a query of a WITH clause, with names for its first columns.
+type CTE struct {
+	Name    string
+	Columns []string
+	Select  *Select
+}
+
+// TableExpr is an item of FROM: a [TableRef], a [Derived], or a [Join].
 type TableExpr interface {
 	tableExpr()
 }
@@ -213,6 +222,13 @@ type TableExpr interface {
 // references it, and optional names for its first columns.
 type TableRef struct {
 	Name    string
+	Alias   string
+	Columns []string
+}
+
+// Derived is a subquery in FROM, under its alias, with optional names for its first columns.
+type Derived struct {
+	Select  *Select
 	Alias   string
 	Columns []string
 }
@@ -238,6 +254,7 @@ type Join struct {
 }
 
 func (*TableRef) tableExpr() {}
+func (*Derived) tableExpr()  {}
 func (*Join) tableExpr()     {}
 
 // FromTable is the table of a SELECT that reads exactly one table, or "".
@@ -251,7 +268,7 @@ func FromTable(s *Select) string {
 	return ""
 }
 
-// Tables of a FROM item, in the order they are written.
+// Tables of a FROM item, in the order they are written. A [Derived] has none.
 func Tables(e TableExpr) []*TableRef {
 	switch e := e.(type) {
 	case *TableRef:
@@ -435,6 +452,30 @@ func HasAggregate(e Expr) bool {
 	return found
 }
 
+// SubqueryKind of a [Subquery].
+type SubqueryKind int
+
+// Subquery kinds.
+const (
+	// SubScalar is a subquery as an expression, whose value is that of its one row and one
+	// column, or NULL without a row.
+	SubScalar SubqueryKind = iota
+	// SubExists is EXISTS, which is true when the subquery has a row.
+	SubExists
+	// SubIn is `expr [NOT] IN (subquery)`.
+	SubIn
+)
+
+// Subquery in an expression. Its Select reads the tables of its own FROM, and its names can
+// also reference the columns of the statements around it. Walk and Map do not descend into it.
+type Subquery struct {
+	Kind   SubqueryKind
+	Select *Select
+	// Expr is the left side of an IN, and Not makes it NOT IN.
+	Expr Expr
+	Not  bool
+}
+
 // Default is the DEFAULT keyword in the VALUES of an INSERT or the SET of an UPDATE, which
 // stands for the default value of the column.
 type Default struct{}
@@ -469,6 +510,7 @@ func (*Case) expr()      {}
 func (*Call) expr()      {}
 func (*Cast) expr()      {}
 func (*Default) expr()   {}
+func (*Subquery) expr()  {}
 
 // Walk calls fn on e and then on every subexpression, depth first, while fn returns true.
 func Walk(e Expr, fn func(Expr) bool) {
@@ -507,6 +549,8 @@ func Walk(e Expr, fn func(Expr) bool) {
 			Walk(x, fn)
 		}
 	case *Cast:
+		Walk(e.Expr, fn)
+	case *Subquery:
 		Walk(e.Expr, fn)
 	}
 }
@@ -551,6 +595,72 @@ func Map(e Expr, fn func(Expr) Expr) Expr {
 		return fn(&Call{Name: e.Name, Args: list(e.Args), Keyword: e.Keyword, Star: e.Star, Distinct: e.Distinct})
 	case *Cast:
 		return fn(&Cast{Expr: m(e.Expr), Type: e.Type, Style: e.Style})
+	case *Subquery:
+		if e.Expr == nil {
+			return fn(e)
+		}
+		return fn(&Subquery{Kind: e.Kind, Select: e.Select, Expr: m(e.Expr), Not: e.Not})
 	}
 	return fn(e)
+}
+
+// Selects calls fn on every SELECT of s, s first, then those of its WITH clause, of its
+// derived tables, and of the subqueries of its expressions, depth first.
+func Selects(s *Select, fn func(*Select)) {
+	fn(s)
+	for _, c := range s.With {
+		Selects(c.Select, fn)
+	}
+	var from func(e TableExpr)
+	from = func(e TableExpr) {
+		switch e := e.(type) {
+		case *Derived:
+			Selects(e.Select, fn)
+		case *Join:
+			from(e.Left)
+			from(e.Right)
+			SubqueriesOf(e.On, func(sub *Select) { Selects(sub, fn) })
+		}
+	}
+	for _, f := range s.From {
+		from(f)
+	}
+	for _, e := range SelectExprs(s) {
+		SubqueriesOf(e, func(sub *Select) { Selects(sub, fn) })
+	}
+}
+
+// SelectExprs are the expressions of the clauses of s itself, without the conditions of its
+// joins.
+func SelectExprs(s *Select) []Expr {
+	var out []Expr
+	add := func(e Expr) {
+		if e != nil {
+			out = append(out, e)
+		}
+	}
+	for _, item := range s.Items {
+		add(item.Expr)
+	}
+	add(s.Where)
+	for _, e := range s.GroupBy {
+		add(e)
+	}
+	add(s.Having)
+	for _, o := range s.OrderBy {
+		add(o.Expr)
+	}
+	add(s.Limit)
+	add(s.Offset)
+	return out
+}
+
+// SubqueriesOf calls fn on the SELECT of every subquery in e that is not inside another one.
+func SubqueriesOf(e Expr, fn func(*Select)) {
+	Walk(e, func(x Expr) bool {
+		if sub, ok := x.(*Subquery); ok {
+			fn(sub.Select)
+		}
+		return true
+	})
 }

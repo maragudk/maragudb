@@ -138,7 +138,8 @@ func (s *Session) insert(ctx context.Context, st *ast.Insert, params []value.Val
 		}
 	}
 	// Every row is bound and folded before any is evaluated, as in Postgres.
-	b := &binder{params: params, now: s.now(), aggClause: "VALUES"}
+	b := s.newBinder(ctx, params)
+	b.aggClause = "VALUES"
 	var bound [][]*cexpr
 	rows := st.Rows
 	width := 0
@@ -324,11 +325,7 @@ func (s *Session) scanRows(ctx context.Context, t *table, a access, f filter, fn
 	}
 	types := t.types()
 	var orderDependent error
-	visit := func(key, val []byte) (bool, error) {
-		row, err := value.DecodeRow(val, types)
-		if err != nil {
-			return false, fmt.Errorf("exec: table %q: %w", t.Name, err)
-		}
+	match := func(key []byte, row []value.Value) (bool, error) {
 		ok, err := f.matches(row)
 		if errors.Is(err, errOrderDependent) {
 			if orderDependent == nil {
@@ -345,8 +342,31 @@ func (s *Session) scanRows(ctx context.Context, t *table, a access, f filter, fn
 		}
 		return fn(key, row)
 	}
+	if t.derived != nil {
+		rows, err := t.derived.get()
+		if err != nil {
+			return err
+		}
+		for _, row := range rows {
+			if more, err := match(nil, row); err != nil || !more {
+				return err
+			}
+		}
+		return orderDependent
+	}
+	visit := func(key, val []byte) (bool, error) {
+		row, err := value.DecodeRow(val, types)
+		if err != nil {
+			return false, fmt.Errorf("exec: table %q: %w", t.Name, err)
+		}
+		return match(key, row)
+	}
 	if a.point != nil {
-		val, ok, err := s.kv.get(ctx, a.point)
+		get := s.kv.get
+		if s.snapshotReads > 0 {
+			get = s.kv.tx.Get
+		}
+		val, ok, err := get(ctx, a.point)
 		if err != nil || !ok {
 			return err
 		}
@@ -452,7 +472,8 @@ func (s *Session) update(ctx context.Context, st *ast.Update, params []value.Val
 	if err != nil {
 		return Result{}, err
 	}
-	b := &binder{table: t, params: params, now: s.now(), aggClause: "UPDATE"}
+	b := s.newBinder(ctx, params)
+	b.table, b.aggClause = t, "UPDATE"
 	b.scope, b.ns = singleScope(t, cmp.Or(st.Alias, t.Name))
 	type assignment struct {
 		col int
@@ -850,7 +871,8 @@ func (s *Session) delete(ctx context.Context, st *ast.Delete, params []value.Val
 	if err != nil {
 		return Result{}, err
 	}
-	b := &binder{table: t, params: params, phase: phaseWhere, now: s.now(), aggClause: "WHERE"}
+	b := s.newBinder(ctx, params)
+	b.table, b.phase, b.aggClause = t, phaseWhere, "WHERE"
 	b.scope, b.ns = singleScope(t, cmp.Or(st.Alias, t.Name))
 	f, err := b.where(st.Where, "WHERE")
 	if err != nil {
@@ -926,6 +948,9 @@ func fallible(f filter, items []*cexpr, order []orderKey) bool {
 // one that can fail, because an index scan under a LIMIT evaluates them on fewer rows than a
 // sequential scan and a sort.
 func limitable(t *table, order []orderKey, items []*cexpr, f filter, distinct bool, outputs int) error {
+	if err := t.derivedLimit(); err != nil {
+		return err
+	}
 	if !distinct || !sortsByEveryOutput(order, outputs) {
 		for _, col := range t.PrimaryKey {
 			found := false
@@ -966,6 +991,13 @@ func sortsByEveryOutput(order []orderKey, outputs int) bool {
 func (b *binder) limit(e ast.Expr, what string) (*cexpr, error) {
 	if e == nil {
 		return nil, nil
+	}
+	if readsColumns(e) {
+		found := false
+		ast.SubqueriesOf(e, func(*ast.Select) { found = true })
+		if found {
+			return nil, fmt.Errorf("%w: a subquery in %s is not supported, write a constant or a parameter", ErrUnsupported, what)
+		}
 	}
 	c, err := b.bind(e)
 	if err != nil {
@@ -1042,13 +1074,14 @@ func compareKeys(order []orderKey, a, b []value.Value) int {
 // otherwise, a cast keeps the name of what it casts or takes the type's name, and anything else
 // is "?column?".
 func OutputName(e ast.Expr) string {
-	name, _ := outputNameStrength(e)
+	name, _ := outputNameStrength(e, nil)
 	return name
 }
 
 // outputNameStrength is the name and how good it is: 2 for a column or function name, 1 for a
-// generic name, and 0 for none.
-func outputNameStrength(e ast.Expr) (string, int) {
+// generic name, and 0 for none. A scalar subquery has the name of its column, which names has
+// when its query is bound, and which is otherwise the name of its first output expression.
+func outputNameStrength(e ast.Expr, names map[*ast.Select]string) (string, int) {
 	switch e := e.(type) {
 	case *ast.ColumnRef:
 		return e.Name, 2
@@ -1056,16 +1089,32 @@ func outputNameStrength(e ast.Expr) (string, int) {
 		return e.Name, 2
 	case *ast.Case:
 		if e.Else != nil {
-			if name, strength := outputNameStrength(e.Else); strength > 1 {
+			if name, strength := outputNameStrength(e.Else, names); strength > 1 {
 				return name, strength
 			}
 		}
 		return "case", 1
 	case *ast.Cast:
-		if name, strength := outputNameStrength(e.Expr); strength > 1 {
+		if name, strength := outputNameStrength(e.Expr, names); strength > 1 {
 			return name, strength
 		}
 		return e.Type.OutputName(), 1
+	case *ast.Subquery:
+		switch e.Kind {
+		case ast.SubExists:
+			return "exists", 2
+		case ast.SubScalar:
+			if name, ok := names[e.Select]; ok {
+				return name, 2
+			}
+			if len(e.Select.Items) > 0 && !e.Select.Items[0].Star {
+				if e.Select.Items[0].Alias != "" {
+					return e.Select.Items[0].Alias, 2
+				}
+				name, _ := outputNameStrength(e.Select.Items[0].Expr, names)
+				return name, 2
+			}
+		}
 	}
 	return "?column?", 0
 }

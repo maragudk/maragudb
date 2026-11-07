@@ -272,6 +272,11 @@ func descend(n *fromNode, tables tableSet) *fromNode {
 // every plan: the ORDER BY sorts by every primary key column of every table, or with DISTINCT by
 // every output column, and nothing can fail, as [limitable] requires of one table.
 func (p *joinPlan) limitable(order []orderKey, o output, distinct bool) error {
+	for _, e := range p.b.scope.entries {
+		if err := e.t.derivedLimit(); err != nil {
+			return err
+		}
+	}
 	if !distinct || !sortsByEveryOutput(order, len(o.columns)) {
 		for i, e := range p.b.scope.entries {
 			for _, col := range e.t.PrimaryKey {
@@ -501,7 +506,8 @@ func nullRow(t *table) []value.Value {
 
 // fresh is a binder of the same names and rows, whose folding errors are its own.
 func (b *binder) fresh() *binder {
-	return &binder{scope: b.scope, ns: b.ns, layout: b.layout, table: b.table, entry: b.entry, params: b.params, now: b.now, phase: b.phase, aggClause: b.aggClause}
+	return &binder{scope: b.scope, ns: b.ns, layout: b.layout, table: b.table, entry: b.entry, params: b.params, now: b.now, phase: b.phase, aggClause: b.aggClause,
+		run: b.run, outer: b.outer, sub: b.sub, ctes: b.ctes, level: b.level, wide: b.wide, analyzing: b.analyzing}
 }
 
 // joinRun is a run of a join plan, which fills the row of the join as it goes.

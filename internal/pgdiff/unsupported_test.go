@@ -246,7 +246,6 @@ func TestUnsupported(t *testing.T) {
 	t.Run("UNS-STATEMENTS other statements and transaction modes", func(t *testing.T) {
 		verify.Covers(t, "statements other than CREATE TABLE, DROP TABLE, INSERT, UPDATE, DELETE, SELECT, and the transaction statements, transaction modes other than SERIALIZABLE, and savepoints are rejected, and Postgres accepts them", "UNS-STATEMENTS")
 		rejects(t, create,
-			example{SQL: "WITH x AS (SELECT 1) SELECT * FROM x"},
 			example{SQL: "EXPLAIN SELECT 1"},
 			example{SQL: "SET TIME ZONE 'UTC'"},
 			example{SQL: "TRUNCATE dev"},
@@ -257,11 +256,11 @@ func TestUnsupported(t *testing.T) {
 	})
 
 	t.Run("UNS-CLAUSES other clauses of queries and writes", func(t *testing.T) {
-		verify.Covers(t, "DISTINCT ON, subqueries, set operations, FOR UPDATE, RETURNING, ON CONFLICT, INSERT ... SELECT, an alias in INSERT, UPDATE ... FROM, and DELETE ... USING are rejected, and Postgres accepts them", "UNS-CLAUSES")
+		verify.Covers(t, "DISTINCT ON, set operations, also in a subquery, FOR UPDATE, RETURNING, ON CONFLICT, INSERT ... SELECT, an alias in INSERT, UPDATE ... FROM, and DELETE ... USING are rejected, and Postgres accepts them", "UNS-CLAUSES")
 		rejects(t, create,
 			example{SQL: "SELECT DISTINCT ON (j) j FROM dev"},
 			example{SQL: "SELECT i FROM dev UNION SELECT 1"},
-			example{SQL: "SELECT i FROM dev WHERE i IN (SELECT 1)"},
+			example{SQL: "SELECT i FROM dev WHERE i IN (SELECT 1 UNION SELECT 2)"},
 			example{SQL: "SELECT i FROM dev FOR UPDATE"},
 			example{SQL: "INSERT INTO dev VALUES (5, 1, 'x') RETURNING i"},
 			example{SQL: "INSERT INTO dev SELECT 6, 1, 'x'"},
@@ -273,14 +272,14 @@ func TestUnsupported(t *testing.T) {
 	})
 
 	t.Run("UNS-JOINS other forms of FROM and of names", func(t *testing.T) {
-		verify.Covers(t, "RIGHT and FULL joins, LATERAL, an alias for a join or for the columns of USING, subqueries and functions in FROM, names with a schema, a reference to a whole row, and a repeated name in the names of a table's columns are rejected, and Postgres accepts them", "UNS-JOINS")
+		verify.Covers(t, "RIGHT and FULL joins, LATERAL, an alias for a join or for the columns of USING, VALUES and functions in FROM, names with a schema, a reference to a whole row, and a repeated name in the names of a table's columns are rejected, and Postgres accepts them", "UNS-JOINS")
 		rejects(t, create,
 			example{SQL: "SELECT * FROM dev a RIGHT JOIN dev b ON a.i = b.j"},
 			example{SQL: "SELECT * FROM dev a FULL JOIN dev b ON a.i = b.j"},
 			example{SQL: "SELECT * FROM dev a JOIN LATERAL (SELECT a.i) b ON true"},
 			example{SQL: "SELECT * FROM (dev a JOIN dev b ON a.i = b.j) AS c"},
 			example{SQL: "SELECT * FROM dev a JOIN dev b USING (i) AS c"},
-			example{SQL: "SELECT * FROM (SELECT 1) AS a"},
+			example{SQL: "SELECT * FROM (VALUES (1)) AS a"},
 			example{SQL: "SELECT * FROM generate_series(1, 2)"},
 			example{SQL: "SELECT i FROM public.dev"},
 			example{SQL: "INSERT INTO public.dev VALUES (9, 1, 'x')"},
@@ -390,6 +389,45 @@ func TestUnsupported(t *testing.T) {
 			example{SQL: "SELECT DISTINCT j, s FROM dev ORDER BY j LIMIT 1", Setup: []string{rows}},
 			example{SQL: "SELECT j, count(*) FROM dev GROUP BY j LIMIT 1", Setup: []string{rows}},
 			example{SQL: "SELECT j, s, count(*) FROM dev GROUP BY j, s ORDER BY j LIMIT 1", Setup: []string{rows}},
+		)
+	})
+
+	t.Run("UNS-SUBQUERIES other forms of subqueries and of WITH", func(t *testing.T) {
+		verify.Covers(t, "ANY, SOME, and ALL, a row on the left of IN, WITH RECURSIVE, MATERIALIZED and NOT MATERIALIZED, a query that writes in WITH, WITH in front of INSERT, UPDATE, or DELETE, a subquery in FROM without an alias, an aggregate of the columns of a query around a subquery, t.* of a table of a query around, and a subquery in the list of an IN, in GROUP BY, or in LIMIT or OFFSET are rejected, and Postgres accepts them", "UNS-SUBQUERIES")
+		rejects(t, create,
+			example{SQL: "SELECT i FROM dev WHERE i = ANY (SELECT j FROM dev)"},
+			example{SQL: "SELECT i FROM dev WHERE i > SOME (SELECT j FROM dev)"},
+			example{SQL: "SELECT i FROM dev WHERE i > ALL (SELECT j FROM dev)"},
+			example{SQL: "SELECT i FROM dev WHERE (i, j) IN (SELECT j, i FROM dev)"},
+			example{SQL: "WITH RECURSIVE x (n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM x WHERE n < 3) SELECT * FROM x"},
+			example{SQL: "WITH x AS MATERIALIZED (SELECT 1) SELECT * FROM x"},
+			example{SQL: "WITH x AS NOT MATERIALIZED (SELECT 1) SELECT * FROM x"},
+			example{SQL: "WITH x AS (INSERT INTO dev VALUES (3, 1, 'c') RETURNING i) SELECT * FROM x"},
+			example{SQL: "WITH x AS (SELECT 4 AS i) INSERT INTO dev SELECT i, 1, 'd' FROM x"},
+			example{SQL: "WITH x AS (SELECT 1 AS i) UPDATE dev SET j = 1 WHERE i IN (SELECT i FROM x)"},
+			example{SQL: "WITH x AS (SELECT 1 AS i) DELETE FROM dev WHERE i IN (SELECT i FROM x)"},
+			example{SQL: "SELECT * FROM (SELECT 1)"},
+			example{SQL: "SELECT (SELECT sum(dev.j)) FROM dev"},
+			example{SQL: "SELECT (SELECT count(*) FROM dev d WHERE d.i < sum(dev.j)) FROM dev"},
+			example{SQL: "SELECT EXISTS (SELECT dev.* FROM dev d) FROM dev"},
+			example{SQL: "SELECT i FROM dev WHERE i IN ((SELECT 1), 2)"},
+			example{SQL: "SELECT count(*) FROM dev GROUP BY (SELECT 1)"},
+			example{SQL: "SELECT i FROM dev ORDER BY i LIMIT (SELECT 1)"},
+			example{SQL: "SELECT i FROM dev ORDER BY i OFFSET (SELECT 1)"},
+		)
+	})
+
+	t.Run("UNS-PLAN-DEPENDENT-SUBQUERY a subquery that fails where some plan evaluates it and another does not", func(t *testing.T) {
+		verify.Covers(t, "a statement whose subquery fails on rows or in places that one plan of Postgres evaluates it on and another does not is rejected: an uncorrelated subquery in a condition, a correlated EXISTS whose conditions fail on rows that no row of the query around reaches, a correlated IN that can fail, a subquery in FROM or a CTE that fails, and a condition that can fail on their columns, and Postgres accepts the statement when its plan does not evaluate the subquery there", "UNS-PLAN-DEPENDENT-SUBQUERY")
+		setup := []string{rows, "CREATE TABLE dev2 (i bigint PRIMARY KEY, j bigint)"}
+		rejects(t, create,
+			example{SQL: "SELECT * FROM dev2 WHERE j = (SELECT j FROM dev)", Setup: setup},
+			example{SQL: "SELECT * FROM dev2 WHERE j IN (SELECT 10 / j FROM dev)", Setup: setup},
+			example{SQL: "SELECT * FROM dev2 WHERE EXISTS (SELECT 1 FROM dev WHERE dev.i = dev2.j AND 10 / dev.j > 0)", Setup: setup},
+			example{SQL: "SELECT * FROM dev2 WHERE j IN (SELECT dev.i FROM dev WHERE dev.j = dev2.i AND dev.i + 1 > 0)", Setup: setup},
+			example{SQL: "SELECT count(*) FROM (SELECT 10 / j AS q FROM dev) x", Setup: setup},
+			example{SQL: "WITH x AS (SELECT 10 / j AS q FROM dev) SELECT count(*) FROM x", Setup: setup},
+			example{SQL: "SELECT * FROM (SELECT * FROM dev WHERE j <> 0) x WHERE 10 / x.j > 0", Setup: setup},
 		)
 	})
 

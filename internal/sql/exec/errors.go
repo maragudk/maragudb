@@ -56,6 +56,8 @@ var (
 	// its aggregates, or an aggregate where none is allowed, such as in WHERE or in the arguments
 	// of another aggregate.
 	ErrGrouping = errors.New("grouping error")
+	// ErrCardinality is a scalar subquery that returns more than one row.
+	ErrCardinality = errors.New("more than one row returned by a subquery used as an expression")
 	// ErrDivisionByZero is a division or modulo by zero.
 	ErrDivisionByZero = errors.New("division by zero")
 	// ErrOutOfRange is an integer or bigint overflow, a float overflow or underflow, a cast out

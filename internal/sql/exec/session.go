@@ -57,6 +57,10 @@ type Mutations struct {
 	// ForeignKeyOwnWrites makes the lookups of foreign keys read the transaction without the
 	// statement's own writes.
 	ForeignKeyOwnWrites bool
+	// SubqueryStaleAcrossRetries keeps the results of the uncorrelated subqueries of an
+	// autocommit statement when the statement retries after a conflict, so that the retry reads
+	// them from the snapshot whose commit lost.
+	SubqueryStaleAcrossRetries bool
 }
 
 // Session runs statements for one client, serially. It is not safe for concurrent use.
@@ -82,6 +86,12 @@ type Session struct {
 	events   []rowEvent
 	cascaded map[string]bool
 	kv       kvstore
+	// subqueries are the results of the uncorrelated subqueries of the statement, which are the
+	// same in its whole run.
+	subqueries map[*ast.Select]subqueryResult
+	// snapshotReads is positive while a subquery runs, whose reads see the transaction as the
+	// statement began, without the statement's own writes, as in Postgres.
+	snapshotReads int
 }
 
 // NewSession over db.
@@ -111,13 +121,29 @@ func Prepare(sql string) (*Statement, error) {
 		return nil, err
 	}
 	st := &Statement{ast: s}
-	for _, e := range exprs(s) {
+	params := func(e ast.Expr) {
 		ast.Walk(e, func(x ast.Expr) bool {
 			if p, ok := x.(*ast.Param); ok && p.Index > st.nparams {
 				st.nparams = p.Index
 			}
 			return true
 		})
+	}
+	// The expressions of every query, those of subqueries and CTEs too.
+	query := func(q *ast.Select) {
+		ast.Selects(q, func(q *ast.Select) {
+			for _, e := range exprs(q) {
+				params(e)
+			}
+		})
+	}
+	if sel, ok := s.(*ast.Select); ok {
+		query(sel)
+		return st, nil
+	}
+	for _, e := range exprs(s) {
+		params(e)
+		ast.SubqueriesOf(e, query)
 	}
 	return st, nil
 }
@@ -287,6 +313,8 @@ func (s *Session) end() {
 // one do nothing but warn, and COMMIT of a transaction in which a statement failed rolls it
 // back.
 func (s *Session) Execute(ctx context.Context, st *Statement, params []value.Value) (*Rows, Result, error) {
+	s.subqueries = nil
+	defer func() { s.subqueries = nil }()
 	switch stmt := st.ast.(type) {
 	case *ast.Begin:
 		if s.explicit {
@@ -371,6 +399,10 @@ func (s *Session) Execute(ctx context.Context, st *Statement, params []value.Val
 // run one statement in the current transaction, applying its writes only when it succeeds. A
 // failure in an explicit transaction aborts it.
 func (s *Session) run(ctx context.Context, st *Statement, params []value.Value) (*Rows, Result, error) {
+	if !s.opts.Mutations.SubqueryStaleAcrossRetries {
+		s.subqueries = nil
+		defer func() { s.subqueries = nil }()
+	}
 	s.events = nil
 	rows, res, err := s.execute(ctx, st.ast, params)
 	s.events = nil

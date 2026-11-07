@@ -40,6 +40,9 @@ type cexpr struct {
 	// aggs are the aggregates of a grouped SELECT whose results the expression reads, by their
 	// index in its [grouping].
 	aggs []int
+	// sublink reports that the expression has a subquery, which Postgres never folds, so that
+	// it is evaluated when the statement runs, even when it reads no columns.
+	sublink bool
 }
 
 // value of the expression for row.
@@ -86,6 +89,26 @@ type binder struct {
 	// clause that aggClause names.
 	agg       *aggScope
 	aggClause string
+	// run is the execution of the statement, in which subqueries are evaluated, or nil where
+	// subqueries are not allowed.
+	run *stmtRun
+	// outer is the binder of the query around a subquery, in which the names that the
+	// subquery's own FROM does not have resolve, and sub is the subquery, both nil outside of
+	// subqueries.
+	outer *binder
+	sub   *subqueryInfo
+	// ctes are the queries of the WITH clauses around, by name.
+	ctes *cteScope
+	// level is shared by the binders of one query.
+	level *levelState
+	// wide makes a WHERE clause take no condition as a condition of an index scan, so that the
+	// conditions that can fail are evaluated on every row, for the queries of a subquery in FROM
+	// whose rows Postgres may read through other scans after it merges the query into the one
+	// around.
+	wide bool
+	// analyzing is set while a subquery is bound to analyze it, which stops before it reads any
+	// row.
+	analyzing bool
 }
 
 // Phases of a statement, in the order in which Postgres folds their constants: the output
@@ -105,11 +128,19 @@ const (
 // reports that before a folding error such as division by zero. The binder therefore records
 // folding errors instead of returning them, and the statement reports one only once it has bound
 // everything.
+//
+// Postgres folds the constants of a subquery when it plans it, after it merges the subqueries it
+// can into the query around, which changes their order, and never folds those of a CTE that no
+// query reads, so a subquery whose folding fails is not supported.
 func (b *binder) folding() error {
-	if b.foldErr != nil {
-		return b.foldErr
+	err := b.foldErr
+	if err == nil {
+		err = b.stableErr
 	}
-	return b.stableErr
+	if err != nil && b.analyzing {
+		return planDependent(err)
+	}
+	return err
 }
 
 // fold a node whose children are all constants by evaluating it now, which also reports errors
@@ -120,9 +151,13 @@ func (b *binder) fold(e *cexpr, children ...*cexpr) (*cexpr, error) {
 		e.fallible = e.fallible || c.fallible
 		e.refs = e.refs || c.refs
 		e.stable = e.stable || c.stable
+		e.sublink = e.sublink || c.sublink
 		e.aggs = append(e.aggs, c.aggs...)
 	}
-	if e.refs {
+	if e.fallible && b.pruned == 0 && b.level != nil {
+		b.level.fallible = true
+	}
+	if e.refs || e.sublink {
 		return e, nil
 	}
 	if e.stable {
@@ -362,7 +397,7 @@ func widen(e *cexpr, t value.Type) *cexpr {
 	if e.folded {
 		return constant(conv(e.val))
 	}
-	return &cexpr{typ: t, refs: e.refs, fallible: e.fallible, stable: e.stable, aggs: e.aggs, eval: func(row []value.Value) (value.Value, error) {
+	return &cexpr{typ: t, refs: e.refs, fallible: e.fallible, stable: e.stable, sublink: e.sublink, aggs: e.aggs, eval: func(row []value.Value) (value.Value, error) {
 		v, err := e.value(row)
 		if err != nil {
 			return value.Value{}, err
@@ -382,7 +417,7 @@ func toDecimal(e *cexpr) *cexpr {
 	if e.folded {
 		return constant(conv(e.val))
 	}
-	return &cexpr{typ: value.Decimal, refs: e.refs, fallible: e.fallible, stable: e.stable, aggs: e.aggs, eval: func(row []value.Value) (value.Value, error) {
+	return &cexpr{typ: value.Decimal, refs: e.refs, fallible: e.fallible, stable: e.stable, sublink: e.sublink, aggs: e.aggs, eval: func(row []value.Value) (value.Value, error) {
 		v, err := e.value(row)
 		if err != nil {
 			return value.Value{}, err
@@ -576,11 +611,9 @@ func (b *binder) bind(e ast.Expr) (*cexpr, error) {
 		}
 		return &cexpr{typ: value.Unknown, folded: true, val: v, param: e.Index}, nil
 	case *ast.ColumnRef:
-		r, err := b.resolve(e)
-		if err != nil {
-			return nil, err
-		}
-		return b.column(r), nil
+		return b.columnRef(e)
+	case *ast.Subquery:
+		return b.subquery(e)
 	case *ast.Unary:
 		return b.unary(e)
 	case *ast.Binary:
@@ -793,7 +826,7 @@ func (b *binder) concat(l, r *cexpr) (*cexpr, error) {
 		if e.folded && e.typ != value.Time {
 			return constant(value.NewString(value.Format(e.val))), nil
 		}
-		return &cexpr{typ: value.String, refs: e.refs, fallible: e.fallible, stable: e.stable || e.typ == value.Time, aggs: e.aggs, eval: func(row []value.Value) (value.Value, error) {
+		return &cexpr{typ: value.String, refs: e.refs, fallible: e.fallible, stable: e.stable || e.typ == value.Time, sublink: e.sublink, aggs: e.aggs, eval: func(row []value.Value) (value.Value, error) {
 			v, err := e.value(row)
 			if err != nil || v.Null {
 				return value.NewNull(value.String), err
@@ -1132,11 +1165,12 @@ func inChain(e *ast.In, items []ast.Expr) ast.Expr {
 	return chain
 }
 
-// readsColumns reports whether e references a column.
+// readsColumns reports whether e references a column, or has a subquery, which can.
 func readsColumns(e ast.Expr) bool {
 	found := false
 	ast.Walk(e, func(x ast.Expr) bool {
-		if _, ok := x.(*ast.ColumnRef); ok {
+		switch x.(type) {
+		case *ast.ColumnRef, *ast.Subquery:
 			found = true
 		}
 		return !found

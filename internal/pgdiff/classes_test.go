@@ -25,6 +25,7 @@ func TestErrorClasses(t *testing.T) {
 		code  string
 	}{
 		{sql: "SELECT 1 / 0", want: maragudb.ErrDivisionByZero, code: "22012"},
+		{setup: []string{"INSERT INTO dev VALUES (2, 2)"}, sql: "SELECT (SELECT j FROM dev)", want: maragudb.ErrCardinality, code: "21000"},
 		{sql: "SELECT 9223372036854775807 + 1", want: maragudb.ErrOutOfRange, code: "22003"},
 		{sql: "SELECT 2147483647 + 1", want: maragudb.ErrOutOfRange, code: "22003"},
 		{sql: "SELECT CAST(1e300::float8 AS bigint)", want: maragudb.ErrOutOfRange, code: "22003"},

@@ -60,7 +60,11 @@ func (b *binder) selectList(st *ast.Select) (output, error) {
 		o.exprs = append(o.exprs, item.Expr)
 		col := Column{Name: item.Alias, Type: e.typ, Nullable: true}
 		if col.Name == "" {
-			col.Name = OutputName(item.Expr)
+			var names map[*ast.Select]string
+			if b.run != nil {
+				names = b.run.names
+			}
+			col.Name, _ = outputNameStrength(item.Expr, names)
 		}
 		if ref, ok := item.Expr.(*ast.ColumnRef); ok {
 			if r, err := b.resolve(ref); err == nil {
@@ -75,6 +79,13 @@ func (b *binder) selectList(st *ast.Select) (output, error) {
 // star returns the columns of `*`, every column that a name alone can reference, in order, or
 // of `table.*`, every column of the entry of that name.
 func (b *binder) star(table string) ([]nsCol, error) {
+	if table != "" && !b.visible(&ast.ColumnRef{Table: table}) {
+		for cur := b.outer; cur != nil; cur = cur.outer {
+			if cur.visible(&ast.ColumnRef{Table: table}) {
+				return nil, fmt.Errorf("%w: %s.* of a table of a query around a subquery is not supported, name its columns", ErrUnsupported, table)
+			}
+		}
+	}
 	sc, ns := b.names()
 	if sc == nil {
 		if table != "" {
@@ -298,7 +309,19 @@ func distinctRows(rows []sortable) ([]sortable, error) {
 
 // selectStmt runs a SELECT.
 func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value.Value) (*Rows, error) {
-	b := &binder{params: params, now: s.now(), aggClause: "JOIN conditions"}
+	b := s.newBinder(ctx, params)
+	b.aggClause = "JOIN conditions"
+	return s.query(ctx, st, b)
+}
+
+// query runs a SELECT, the statement or the query of a subquery, with the binder b, which only
+// analyzes it when b.analyzing is set.
+func (s *Session) query(ctx context.Context, st *ast.Select, b *binder) (*Rows, error) {
+	if len(st.With) > 0 {
+		if err := b.with(ctx, st.With); err != nil {
+			return nil, err
+		}
+	}
 	var nodes []*fromNode
 	if len(st.From) > 0 {
 		var err error
@@ -343,6 +366,12 @@ func (s *Session) selectStmt(ctx context.Context, st *ast.Select, params []value
 	}
 	if f.unsupported != nil {
 		return nil, f.unsupported
+	}
+	if b.analyzing {
+		return &Rows{Columns: o.columns}, nil
+	}
+	if err := b.materialize(); err != nil {
+		return nil, err
 	}
 	if t == nil && len(nodes) > 0 {
 		return s.selectJoin(ctx, st, b, nodes, f, o, order, offsetExpr, limitExpr, nil)
@@ -522,11 +551,16 @@ func (b *binder) columnsOf(ns namespace, e ast.Expr, i int, fn func(col int)) {
 		}
 		return true
 	})
+	b.subqueryRefs(e, func(r colRef) {
+		if r.entry == i {
+			fn(r.col)
+		}
+	})
 }
 
 // errorKinds are the errors whose class Postgres's SQLSTATE codes tell apart, which a statement
 // that fails reports with the same class as Postgres.
-var errorKinds = []error{ErrDivisionByZero, ErrOutOfRange, ErrCast, ErrType, ErrInvalid, ErrNotNull, ErrDuplicateKey, ErrCheck, ErrForeignKey, ErrRestrict}
+var errorKinds = []error{ErrCardinality, ErrDivisionByZero, ErrOutOfRange, ErrCast, ErrType, ErrInvalid, ErrNotNull, ErrDuplicateKey, ErrCheck, ErrForeignKey, ErrRestrict}
 
 // errorKind is the one of [errorKinds] that err is, or err.
 func errorKind(err error) error {

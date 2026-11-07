@@ -121,6 +121,8 @@ var (
 	// its aggregates, or an aggregate where none is allowed, such as in WHERE or in the arguments
 	// of another aggregate.
 	ErrGrouping = exec.ErrGrouping
+	// ErrCardinality is a scalar subquery that returns more than one row.
+	ErrCardinality = exec.ErrCardinality
 	// ErrDivisionByZero is a division or modulo by zero.
 	ErrDivisionByZero = exec.ErrDivisionByZero
 	// ErrOutOfRange is an integer or bigint overflow, a float overflow or underflow, or a cast

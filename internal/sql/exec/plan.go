@@ -537,6 +537,12 @@ func (b *binder) filterOf(conjs []ast.Expr, what string) (filter, error) {
 		f.touched[c.col] = true
 	}
 	f.keyed = append(f.keyed, keyed...)
+	if b.wide {
+		f.certain = nil
+	}
+	if err := b.derivedConditions(clauses); err != nil {
+		return filter{}, err
+	}
 	f.unsupported = b.infallibleIndexConditions(clauses)
 	if f.fallible {
 		if f.implied, err = b.implied(classes); err != nil {
@@ -705,17 +711,32 @@ func (b *binder) touch(e ast.Expr, cols map[int]bool) {
 			cols[col] = true
 		}
 	}
+	// A subquery reads no column of the query for its index conditions, and a semi-join can scan
+	// an index on any column that it reads, with the values of the other side.
+	b.subqueryRefs(e, func(r colRef) {
+		if b.table != nil && r.entry == b.entry && r.cast == value.Unknown {
+			cols[r.col] = true
+		}
+	})
+	constantSide := func(e ast.Expr) bool {
+		_, sub := e.(*ast.Subquery)
+		return sub || !readsColumns(e)
+	}
 	switch x := e.(type) {
+	case *ast.Subquery:
+		if x.Kind == ast.SubIn {
+			mark(x.Expr)
+		}
 	case *ast.Binary:
 		switch x.Op {
 		case ast.And, ast.Or:
 			b.touch(x.Left, cols)
 			b.touch(x.Right, cols)
 		case ast.Eq, ast.Lt, ast.Le, ast.Gt, ast.Ge:
-			if !readsColumns(x.Right) {
+			if constantSide(x.Right) {
 				mark(x.Left)
 			}
-			if !readsColumns(x.Left) {
+			if constantSide(x.Left) {
 				mark(x.Right)
 			}
 		}
@@ -942,6 +963,9 @@ type scan struct {
 
 // scans of the table: the primary key first, then the other indexes.
 func (t *table) scans() []scan {
+	if t.derived != nil {
+		return nil
+	}
 	out := []scan{{index: t.keyIndex(), pk: true}}
 	for i := range t.Indexes {
 		out = append(out, scan{index: &t.Indexes[i]})

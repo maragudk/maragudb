@@ -213,6 +213,25 @@ func (r *renderer) stmt(s Statement) {
 		r.alias(s.Alias)
 		r.where(s.Where)
 	case *Select:
+		for i, c := range s.With {
+			if i == 0 {
+				r.b.WriteString("WITH ")
+			} else {
+				r.b.WriteString(", ")
+			}
+			r.ident(c.Name)
+			if len(c.Columns) > 0 {
+				r.b.WriteString(" (")
+				r.idents(c.Columns)
+				r.b.WriteByte(')')
+			}
+			r.b.WriteString(" AS (")
+			r.stmt(c.Select)
+			r.b.WriteByte(')')
+			if i == len(s.With)-1 {
+				r.b.WriteByte(' ')
+			}
+		}
 		r.b.WriteString("SELECT ")
 		if s.Distinct {
 			r.b.WriteString("DISTINCT ")
@@ -316,6 +335,14 @@ func (r *renderer) from(e TableExpr) {
 			r.idents(e.Columns)
 			r.b.WriteByte(')')
 		}
+	case *Derived:
+		r.subselect(e.Select)
+		r.alias(e.Alias)
+		if len(e.Columns) > 0 {
+			r.b.WriteString(" (")
+			r.idents(e.Columns)
+			r.b.WriteByte(')')
+		}
 	case *Join:
 		r.from(e.Left)
 		switch {
@@ -350,6 +377,16 @@ func (r *renderer) from(e TableExpr) {
 	default:
 		panic(fmt.Sprintf("ast: rendering %T", e))
 	}
+}
+
+// subselect writes a SELECT in parentheses, outside of any restricted expression.
+func (r *renderer) subselect(s *Select) {
+	restricted := r.restricted
+	r.restricted = false
+	r.b.WriteByte('(')
+	r.stmt(s)
+	r.b.WriteByte(')')
+	r.restricted = restricted
 }
 
 // constraintName writes CONSTRAINT and the name, when there is one.
@@ -453,6 +490,10 @@ func bindingPower(e Expr) int {
 		return bpIs
 	case *Between, *In, *Like:
 		return bpLike
+	case *Subquery:
+		if e.Kind == SubIn {
+			return bpLike
+		}
 	case *Cast:
 		if e.Style == CastColons {
 			return bpCast
@@ -467,6 +508,8 @@ func restrictable(e Expr) bool {
 	switch e := e.(type) {
 	case *IsNull, *Between, *In, *Like:
 		return false
+	case *Subquery:
+		return e.Kind != SubIn
 	case *Unary:
 		return e.Op != Not
 	case *Binary:
@@ -591,6 +634,18 @@ func (r *renderer) expr(e Expr, minimum int) {
 		r.b.WriteString(" END")
 	case *Default:
 		r.b.WriteString("DEFAULT")
+	case *Subquery:
+		switch e.Kind {
+		case SubExists:
+			r.b.WriteString("EXISTS ")
+		case SubIn:
+			r.expr(e.Expr, bpLike+1)
+			if e.Not {
+				r.b.WriteString(" NOT")
+			}
+			r.b.WriteString(" IN ")
+		}
+		r.subselect(e.Select)
 	case *Call:
 		if e.Keyword {
 			r.b.WriteString(strings.ToUpper(e.Name))

@@ -222,7 +222,7 @@ var unsupportedClauses = map[string]string{
 
 // unsupportedStatements that Postgres accepts and maragudb does not.
 var unsupportedStatements = map[string]string{
-	"with": "WITH is not supported", "explain": "EXPLAIN is not supported", "set": "SET is not supported, maragudb has no session settings",
+	"explain": "EXPLAIN is not supported", "set": "SET is not supported, maragudb has no session settings",
 	"show": "SHOW is not supported", "alter": "ALTER is not supported", "truncate": "TRUNCATE is not supported, write DELETE FROM",
 	"values": "VALUES as a statement is not supported, write a SELECT", "table": "TABLE is not supported, write SELECT * FROM",
 	"grant": "GRANT is not supported", "revoke": "REVOKE is not supported", "copy": "COPY is not supported", "vacuum": "VACUUM is not supported",
@@ -248,8 +248,8 @@ func (p *parser) statement() (ast.Statement, error) {
 		return p.update()
 	case p.isWord("delete"):
 		return p.delete()
-	case p.isKeyword("select"):
-		return p.selectStmt()
+	case p.isKeyword("select"), p.isKeyword("with"):
+		return p.query()
 	case p.isWord("begin"), p.isWord("start"):
 		return p.begin()
 	case p.isWord("commit"), p.isKeyword("end"):
@@ -1343,7 +1343,129 @@ func (p *parser) where() (ast.Expr, error) {
 	return p.expr(0)
 }
 
-func (p *parser) selectStmt() (ast.Statement, error) {
+// query is a SELECT with an optional WITH clause in front.
+func (p *parser) query() (*ast.Select, error) {
+	var with []ast.CTE
+	if p.isKeyword("with") {
+		var err error
+		if with, err = p.with(); err != nil {
+			return nil, err
+		}
+	}
+	switch {
+	case p.isKeyword("select"):
+	case p.isWord("insert"), p.isWord("update"), p.isWord("delete"), p.isWord("merge"):
+		return nil, p.unsupportedf("WITH in front of %s is not supported, run the queries of WITH as a SELECT first", strings.ToUpper(p.tok.text))
+	case p.isWord("values"):
+		return nil, p.unsupportedf("VALUES as a query is not supported, write a SELECT")
+	case p.isOp("("):
+		return nil, p.unsupportedf("a parenthesized SELECT after WITH is not supported, write the SELECT without parentheses")
+	default:
+		return nil, p.errorf("expected SELECT, got %v", p.tok)
+	}
+	s, err := p.selectStmt()
+	if err != nil {
+		return nil, err
+	}
+	s.With = with
+	return s, nil
+}
+
+// with parses a WITH clause, up to the statement after it.
+func (p *parser) with() ([]ast.CTE, error) {
+	if err := p.advance(); err != nil {
+		return nil, err
+	}
+	if p.isWord("recursive") {
+		return nil, p.unsupportedf("WITH RECURSIVE is not supported")
+	}
+	var out []ast.CTE
+	for {
+		var c ast.CTE
+		var err error
+		if c.Name, err = p.ident(); err != nil {
+			return nil, err
+		}
+		if p.isOp("(") {
+			if c.Columns, err = p.columnList(); err != nil {
+				return nil, err
+			}
+		}
+		if err := p.expectWord("as"); err != nil {
+			return nil, err
+		}
+		if p.isWord("materialized") || p.isKeyword("not") && p.peekIsWord("materialized") {
+			return nil, p.unsupportedf("MATERIALIZED and NOT MATERIALIZED are not supported, leave them out")
+		}
+		if err := p.expectOp("("); err != nil {
+			return nil, err
+		}
+		switch {
+		case p.isWord("insert"), p.isWord("update"), p.isWord("delete"), p.isWord("merge"):
+			return nil, p.unsupportedf("%s in WITH is not supported, run it as a statement of its own", strings.ToUpper(p.tok.text))
+		case p.isWord("values"):
+			return nil, p.unsupportedf("VALUES as a query is not supported, write a SELECT")
+		}
+		if c.Select, err = p.innerQuery(); err != nil {
+			return nil, err
+		}
+		if err := p.closeQuery(); err != nil {
+			return nil, err
+		}
+		if p.isWord("search") || p.isWord("cycle") {
+			return nil, p.unsupportedf("SEARCH and CYCLE are not supported")
+		}
+		out = append(out, c)
+		if !p.isOp(",") {
+			return out, nil
+		}
+		if err := p.advance(); err != nil {
+			return nil, err
+		}
+	}
+}
+
+// innerQuery is the query in the parentheses of a subquery, after the opening one: a query, or
+// a query in more parentheses.
+func (p *parser) innerQuery() (*ast.Select, error) {
+	defer p.unrestricted()()
+	if p.isOp("(") {
+		if err := p.advance(); err != nil {
+			return nil, err
+		}
+		s, err := p.innerQuery()
+		if err != nil {
+			return nil, err
+		}
+		return s, p.closeQuery()
+	}
+	if p.isWord("values") {
+		return nil, p.unsupportedf("VALUES as a query is not supported, write a SELECT")
+	}
+	return p.query()
+}
+
+// closeQuery expects the parenthesis that closes a subquery.
+func (p *parser) closeQuery() error {
+	if p.isOp(")") {
+		return p.advance()
+	}
+	if msg, ok := unsupportedClauses[p.tok.text]; ok && (p.tok.kind == tokKeyword || (p.tok.kind == tokIdent && !p.tok.quoted)) {
+		return p.unsupportedf("%s", msg)
+	}
+	return p.errorf("expected ), got %v", p.tok)
+}
+
+// startsQuery reports whether the current token, after an opening parenthesis, starts a query,
+// possibly in more parentheses.
+func (p *parser) startsQuery() bool {
+	if p.isKeyword("select") || p.isKeyword("with") {
+		return true
+	}
+	return p.isOp("(") && p.peekIsWord("select", "with")
+}
+
+func (p *parser) selectStmt() (*ast.Select, error) {
 	if err := p.advance(); err != nil {
 		return nil, err
 	}
@@ -1688,7 +1810,35 @@ func (p *parser) join(left ast.TableExpr) (ast.TableExpr, error) {
 	return j, nil
 }
 
-// tablePrimary is a table with an optional alias, or a join in parentheses.
+// derived is a subquery in FROM, after its opening parenthesis, with its alias.
+func (p *parser) derived() (ast.TableExpr, error) {
+	sel, err := p.innerQuery()
+	if err != nil {
+		return nil, err
+	}
+	if err := p.closeQuery(); err != nil {
+		return nil, err
+	}
+	d := &ast.Derived{Select: sel}
+	if d.Alias, err = p.alias(true); err != nil {
+		return nil, err
+	}
+	if d.Alias == "" {
+		return nil, p.unsupportedf("a subquery in FROM without an alias is not supported, add one, such as (SELECT ...) AS s")
+	}
+	if p.isOp("(") {
+		if d.Columns, err = p.columnList(); err != nil {
+			return nil, err
+		}
+	}
+	if p.isKeyword("tablesample") {
+		return nil, p.unsupportedf("TABLESAMPLE is not supported")
+	}
+	return d, nil
+}
+
+// tablePrimary is a table with an optional alias, a subquery with an alias, or a join in
+// parentheses.
 func (p *parser) tablePrimary() (ast.TableExpr, error) {
 	switch {
 	case p.isKeyword("only"):
@@ -1699,8 +1849,8 @@ func (p *parser) tablePrimary() (ast.TableExpr, error) {
 		if err := p.advance(); err != nil {
 			return nil, err
 		}
-		if p.isKeyword("select") || p.isKeyword("with") || p.isKeyword("values") || p.isOp("(") && p.peekIsWord("select", "with", "values") {
-			return nil, p.unsupportedf("subqueries in FROM are not supported")
+		if p.startsQuery() || p.isWord("values") || p.isOp("(") && p.peekIsWord("values") {
+			return p.derived()
 		}
 		inner, err := p.tableRef()
 		if err != nil {
@@ -1888,7 +2038,15 @@ func (p *parser) expr(minBp int) (ast.Expr, error) {
 					return nil, err
 				}
 				if p.isKeyword("select") || p.isKeyword("with") {
-					return nil, p.unsupportedf("subqueries are not supported")
+					sel, err := p.innerQuery()
+					if err != nil {
+						return nil, err
+					}
+					if err := p.closeQuery(); err != nil {
+						return nil, err
+					}
+					left = &ast.Subquery{Kind: ast.SubIn, Select: sel, Expr: left, Not: not}
+					continue
 				}
 				list, err := p.exprList()
 				if err != nil {
@@ -1896,6 +2054,16 @@ func (p *parser) expr(minBp int) (ast.Expr, error) {
 				}
 				if err := p.expectOp(")"); err != nil {
 					return nil, err
+				}
+				if sub, ok := list[0].(*ast.Subquery); ok && len(list) == 1 && sub.Kind == ast.SubScalar && sub.Expr == nil {
+					// IN ((SELECT ...)) is a subquery in parentheses, as in Postgres's grammar.
+					left = &ast.Subquery{Kind: ast.SubIn, Select: sub.Select, Expr: left, Not: not}
+					continue
+				}
+				for _, item := range list {
+					if _, ok := item.(*ast.Subquery); ok {
+						return nil, p.unsupportedf("a subquery in the list of an IN is not supported, write IN (SELECT ...) or compare with it alone")
+					}
 				}
 				left = &ast.In{Expr: left, List: list, Not: not}
 			case p.isKeyword("like"):
@@ -2143,7 +2311,7 @@ func (p *parser) primary() (ast.Expr, error) {
 		case "current_user", "current_role", "current_catalog", "current_schema", "session_user", "system_user", "user":
 			return nil, p.unsupportedf("%s is not supported, pass the value as a parameter", strings.ToUpper(tok.text))
 		case "select", "with":
-			return nil, p.unsupportedf("subqueries are not supported")
+			return nil, p.errorf("syntax error at or near %v, a subquery needs parentheses", tok)
 		case "any", "all", "some":
 			return nil, p.unsupportedf("%s is not supported, write IN or several comparisons", strings.ToUpper(tok.text))
 		}
@@ -2167,7 +2335,17 @@ func (p *parser) primary() (ast.Expr, error) {
 		switch tok.text {
 		case "exists":
 			if p.peek().kind == tokOp && p.peek().text == "(" {
-				return nil, p.unsupportedf("subqueries are not supported")
+				if err := p.advance(); err != nil {
+					return nil, err
+				}
+				if err := p.advance(); err != nil {
+					return nil, err
+				}
+				sel, err := p.innerQuery()
+				if err != nil {
+					return nil, err
+				}
+				return &ast.Subquery{Kind: ast.SubExists, Select: sel}, p.closeQuery()
 			}
 		case "row":
 			if p.peek().kind == tokOp && p.peek().text == "(" {
@@ -2194,7 +2372,11 @@ func (p *parser) primary() (ast.Expr, error) {
 				return nil, err
 			}
 			if p.isKeyword("select") || p.isKeyword("with") || p.isKeyword("values") {
-				return nil, p.unsupportedf("subqueries are not supported")
+				sel, err := p.innerQuery()
+				if err != nil {
+					return nil, err
+				}
+				return &ast.Subquery{Kind: ast.SubScalar, Select: sel}, p.closeQuery()
 			}
 			e, err := p.expr(0)
 			if err != nil {

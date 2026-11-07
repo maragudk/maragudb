@@ -224,12 +224,34 @@ func (b *binder) checkNames(l, r namespace) error {
 	return nil
 }
 
-func (b *binder) fromItem(ctx context.Context, s *Session, item ast.TableExpr) (*fromNode, error) {
+func (b *binder) fromItem(ctx context.Context, s *Session, item ast.TableExpr, def ...*table) (*fromNode, error) {
 	switch item := item.(type) {
-	case *ast.TableRef:
-		t, err := s.getTable(ctx, item.Name)
+	case *ast.Derived:
+		t, err := b.derived(ctx, item.Select, item.Alias, item.Columns, func(have, want int) error {
+			return fmt.Errorf("%w: table %q has %d columns available but %d columns specified", ErrInvalid, item.Alias, have, want)
+		})
 		if err != nil {
 			return nil, err
+		}
+		return b.fromItem(ctx, s, &ast.TableRef{Name: item.Alias}, t)
+	case *ast.TableRef:
+		var t *table
+		if len(def) > 0 {
+			t = def[0]
+		} else if c := b.ctes.find(item.Name); c != nil {
+			// A CTE is read before a table of its name, as in Postgres.
+			cp := *c.def
+			t = &cp
+			for cur := b; cur != nil && cur.level != c.level; cur = cur.outer {
+				if cur.sub != nil {
+					cur.sub.correlated = true
+				}
+			}
+		} else {
+			var err error
+			if t, err = s.getTable(ctx, item.Name); err != nil {
+				return nil, err
+			}
 		}
 		if len(item.Columns) > len(t.Columns) {
 			name := item.Alias
@@ -420,5 +442,6 @@ func (b *binder) tablesOf(e ast.Expr) tableSet {
 		}
 		return true
 	})
+	b.subqueryRefs(e, func(r colRef) { set = set.with(r.entry) })
 	return set
 }

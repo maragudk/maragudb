@@ -46,6 +46,9 @@ type table struct {
 	// them, as Postgres names those. Each is also at `k/<name>\x00<table>`, because the
 	// constraints of all tables share the namespace in which Postgres chooses their names.
 	Constraints []string `json:"constraints,omitempty"`
+	// derived holds the rows of a subquery in FROM or of a CTE, which is a table only within a
+	// statement, without indexes, and whose primary key is every column.
+	derived *derivedRows
 }
 
 // check is a CHECK constraint, with its expression as SQL text.
@@ -137,6 +140,9 @@ func (t *table) constrains(i int) bool {
 
 // indexed reports whether column i is in the primary key or any index.
 func (t *table) indexed(i int) bool {
+	if t.derived != nil {
+		return false
+	}
 	if t.isPrimaryKey(i) {
 		return true
 	}

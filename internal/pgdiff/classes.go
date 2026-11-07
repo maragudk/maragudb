@@ -24,6 +24,8 @@ type ErrorClass struct {
 // be cast (42846), and [maragudb.ErrInvalid] covers every reference that does not resolve.
 var ErrorClasses = []ErrorClass{
 	{Name: "division by zero", Err: maragudb.ErrDivisionByZero, Codes: []string{"22012"}},
+	// 21000 is cardinality_violation.
+	{Name: "cardinality", Err: maragudb.ErrCardinality, Codes: []string{"21000"}},
 	// 22003 is numeric_value_out_of_range.
 	{Name: "out of range", Err: maragudb.ErrOutOfRange, Codes: []string{"22003"}},
 	{Name: "not null", Err: maragudb.ErrNotNull, Codes: []string{"23502"}},

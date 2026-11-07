@@ -147,7 +147,8 @@ func (b *binder) groupedExpr(e ast.Expr) (*cexpr, bool, error) {
 		}
 	}
 	ref, ok := e.(*ast.ColumnRef)
-	if !ok {
+	if !ok || b.outer != nil && !b.visible(ref) {
+		// A column of a query around is a constant in the groups of a subquery.
 		return nil, false, nil
 	}
 	r, err := b.resolve(ref)
@@ -170,6 +171,9 @@ func (b *binder) groupedExpr(e ast.Expr) (*cexpr, bool, error) {
 // type, and then whether an aggregate is allowed where it is, in the order in which Postgres
 // checks them.
 func (b *binder) aggregate(e *ast.Call) (*cexpr, error) {
+	if b.outerOnly(e.Args) {
+		return nil, fmt.Errorf("%w: an aggregate of the columns of a query around a subquery is not supported, compute it in that query", ErrUnsupported)
+	}
 	saved := b.agg
 	found := false
 	b.agg = &aggScope{nested: true, found: &found}
@@ -394,6 +398,12 @@ func (s *Session) selectGrouped(ctx context.Context, st *ast.Select, b *binder, 
 	if f.unsupported != nil {
 		return nil, f.unsupported
 	}
+	if b.analyzing {
+		return &Rows{Columns: o.columns}, nil
+	}
+	if err := b.materialize(); err != nil {
+		return nil, err
+	}
 
 	r := newAggRun(g, o, order, h)
 	if st.Limit != nil || st.Offset != nil {
@@ -462,6 +472,11 @@ func (b *binder) grouping(st *ast.Select, o output) (*grouping, error) {
 	eb := b.fresh()
 	eb.phase, eb.aggClause = phaseOutput, "GROUP BY"
 	for _, item := range st.GroupBy {
+		found := false
+		ast.SubqueriesOf(item, func(*ast.Select) { found = true })
+		if found {
+			return nil, fmt.Errorf("%w: a subquery in GROUP BY is not supported", ErrUnsupported)
+		}
 		output := -1
 		switch e := item.(type) {
 		case *ast.Literal:
