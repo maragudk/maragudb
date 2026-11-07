@@ -1,6 +1,6 @@
 ---
 sut_path: /
-updated: 2026-11-03
+updated: 2026-11-07
 ---
 
 # Deployment topology
@@ -17,6 +17,6 @@ Every client of the database is a goroutine in the workload process with an engi
 There are two kinds of test command.
 
 - `parallel_driver_s3_*` run the bank and list-append workloads through the engine and through SQL against versitygw over the network. Here Antithesis's own faults are what the run explores: a partition in the middle of a manifest write is a real lost answer, a killed store is a real outage, and the AWS SDK client, its retries, and its error mapping are in the path. No in-process fake can show those, because faults injected on the network do not reach a store in the same process.
-- `parallel_driver_sim` runs the deterministic simulator with the in-process fake, with seeds and configurations drawn from the SDK's random source. It covers what the network cannot inject on demand: crashes at every step, including mid-commit and mid-compaction, lost acknowledgements, and outages, all reproducible from the seed.
+- `parallel_driver_sim` runs the deterministic simulator with the in-process fake, with seeds and configurations drawn from the SDK's random source. It covers what the network cannot inject on demand: crashes at every step, including mid-commit and mid-compaction, lost acknowledgements, and outages, all reproducible from the seed. A quarter of its runs have disk faults, small disk caches that evict and whose files crashes damage, and a quarter have reads whose bodies the store damages, each drawn independently from the seed.
 
 MinIO was not an option: its images are no longer published on Docker Hub.

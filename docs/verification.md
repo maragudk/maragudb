@@ -13,7 +13,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - 36 acceptance criteria (`AC-`), 27 key invariants (`INV-`), 31 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
 - 28 mutants (`MUT-`), deliberate bugs, of which 26 are detected by the simulator's checkers within 20 seeds.
 - 27 interesting states (`STATE-`) that the simulator's fixed corpus must reach.
-- 274 declarations of coverage in the tests.
+- 275 declarations of coverage in the tests.
 
 ## Acceptance criteria
 
@@ -323,6 +323,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 - `antithesis/workload` `TestCommands/every_test_command_of_the_harness_runs_a_command_of_the_workload,_against_the_store_the_compose_file_runs`: every test command in /antithesis/test/maragudb has a valid prefix and names a workload command, and the compose file runs versitygw and the workload image
 - `antithesis/workload` `TestCommands/the_sim_command_runs_simulator_seeds_without_anomalies`: the sim test command's simulation runs eight seeds with random configurations, drawn here from a fixed source, and reports no anomalies
+- `antithesis/workload` `TestCommands/the_sim_command_turns_on_disk_faults_and_damaged_reads_from_the_store_in_some_runs_and_not_in_others`: of the configurations that the sim test command draws for 400 seeds, between a sixth and a third have disk faults, between a sixth and a third have damaged reads from the store, and some have both
 - `internal/workload` `TestRun/*`: the real-store workload that the Antithesis harness runs finds no anomalies under errors and lost acknowledgements, with commits, conflicts, and background compactions
 
 ### `AC-8.3`

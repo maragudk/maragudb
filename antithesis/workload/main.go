@@ -117,28 +117,13 @@ func ready(ctx context.Context) error {
 	return nil
 }
 
-// simulate runs simulator seeds with random configurations, through the engine and through SQL.
-// A seed makes a whole run deterministic, so Antithesis steers the runs by choosing seeds.
+// simulate runs simulator seeds with random configurations, through the engine and through SQL,
+// some with disk faults and some with damaged reads from the store. A seed makes a whole run
+// deterministic, so Antithesis steers the runs by choosing seeds.
 func simulate(seeds rand.Source) error {
 	failed := 0
 	for range 8 {
-		cfg := sim.DefaultConfig(seeds.Uint64())
-		rng := rand.New(rand.NewPCG(cfg.Seed, 0x5ea))
-		cfg.Workload = sim.Workload(rng.IntN(2))
-		cfg.SQL = rng.IntN(2) == 0
-		cfg.Clients = 2 + rng.IntN(10)
-		cfg.TxPerClient = 10 + rng.IntN(40)
-		cfg.Keys = 1 + rng.IntN(6)
-		cfg.Maintainers = rng.IntN(3)
-		cfg.Maintenance = sim.MaintenanceMode(rng.IntN(4))
-		cfg.ErrorRate = rng.Float64() * 0.3
-		cfg.LostAckRate = rng.Float64() * 0.3
-		cfg.CrashRate = rng.Float64() * 0.05
-		cfg.OutageRate = rng.Float64() * 0.03
-		cfg.MaxOutage = time.Duration(1+rng.IntN(3000)) * time.Millisecond
-		cfg.OutageTimeout = time.Duration(rng.IntN(200)) * time.Millisecond
-		cfg.MaxLatency = time.Duration(1+rng.IntN(50)) * time.Millisecond
-		cfg.GracePeriod = time.Duration(50+rng.IntN(3000)) * time.Millisecond
+		cfg := simConfig(seeds.Uint64())
 		res := sim.Run(cfg)
 		fmt.Println(res.Report())
 		if res.Failed() {
@@ -150,6 +135,32 @@ func simulate(seeds rand.Source) error {
 		return fmt.Errorf("%d simulator runs found anomalies", failed)
 	}
 	return nil
+}
+
+// simConfig is the random configuration of the simulator run of seed.
+func simConfig(seed uint64) sim.Config {
+	cfg := sim.DefaultConfig(seed)
+	rng := rand.New(rand.NewPCG(cfg.Seed, 0x5ea))
+	cfg.Workload = sim.Workload(rng.IntN(2))
+	cfg.SQL = rng.IntN(2) == 0
+	cfg.Clients = 2 + rng.IntN(10)
+	cfg.TxPerClient = 10 + rng.IntN(40)
+	cfg.Keys = 1 + rng.IntN(6)
+	cfg.Maintainers = rng.IntN(3)
+	cfg.Maintenance = sim.MaintenanceMode(rng.IntN(4))
+	cfg.ErrorRate = rng.Float64() * 0.3
+	cfg.LostAckRate = rng.Float64() * 0.3
+	cfg.CrashRate = rng.Float64() * 0.05
+	cfg.OutageRate = rng.Float64() * 0.03
+	cfg.MaxOutage = time.Duration(1+rng.IntN(3000)) * time.Millisecond
+	cfg.OutageTimeout = time.Duration(rng.IntN(200)) * time.Millisecond
+	cfg.MaxLatency = time.Duration(1+rng.IntN(50)) * time.Millisecond
+	cfg.GracePeriod = time.Duration(50+rng.IntN(3000)) * time.Millisecond
+	// A quarter of the runs evict from small disk caches whose files crashes damage, and a
+	// quarter get reads whose bodies the store damages, independently.
+	cfg.DiskFaults = rng.IntN(4) == 0
+	cfg.StoreDamage = rng.IntN(4) == 0
+	return cfg
 }
 
 // unreachable reports whether err means that the store did not answer: a network error, a
