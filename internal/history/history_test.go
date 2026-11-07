@@ -330,6 +330,144 @@ func TestCheckBank(t *testing.T) {
 	})
 }
 
+func transfer(id int, outcome history.Outcome, from, to string, amount int64) history.Tx {
+	return tx(id, id*10, id*10+5, outcome, app(from, -amount), app(to, amount))
+}
+
+func TestCheckBankDurability(t *testing.T) {
+	verify.Covers(t, "the bank durability checker accepts final balances that the acknowledged transfers and a set of the unknown ones explain, and rejects a lost acknowledged transfer and an applied failed one", "AC-3.1", "AC-3.2")
+	tests := []struct {
+		name  string
+		txs   []history.Tx
+		final map[string]int64
+		want  string
+	}{
+		{
+			name:  "accepts balances that the acknowledged transfers explain",
+			txs:   []history.Tx{transfer(1, history.OK, "a", "b", 10), transfer(2, history.OK, "b", "c", 30)},
+			final: map[string]int64{"a": 90, "b": 80, "c": 130},
+		},
+		{
+			name:  "accepts balances without the transfers that failed or have an unknown outcome",
+			txs:   []history.Tx{transfer(1, history.Failed, "a", "b", 10), transfer(2, history.Unknown, "b", "c", 30)},
+			final: map[string]int64{"a": 100, "b": 100, "c": 100},
+		},
+		{
+			name: "accepts balances with some of the transfers that have an unknown outcome",
+			txs: []history.Tx{
+				transfer(1, history.Unknown, "a", "b", 10), transfer(2, history.Unknown, "b", "c", 30),
+				transfer(3, history.OK, "c", "a", 5), transfer(4, history.Unknown, "a", "c", 7),
+			},
+			final: map[string]int64{"a": 98, "b": 70, "c": 132},
+		},
+		{
+			name:  "accepts a transfer that read nothing, such as an audit",
+			txs:   []history.Tx{tx(1, 0, 5, history.OK), transfer(2, history.OK, "a", "b", 10)},
+			final: map[string]int64{"a": 90, "b": 110},
+		},
+		{
+			name:  "rejects balances without an acknowledged transfer",
+			txs:   []history.Tx{transfer(1, history.OK, "a", "b", 10), transfer(2, history.OK, "b", "c", 30)},
+			final: map[string]int64{"a": 90, "b": 110, "c": 100},
+			want:  "lost acknowledged write",
+		},
+		{
+			name:  "rejects balances with half of an acknowledged transfer, which conserve no money",
+			txs:   []history.Tx{transfer(1, history.OK, "a", "b", 10)},
+			final: map[string]int64{"a": 90, "b": 100},
+			want:  "lost acknowledged write",
+		},
+		{
+			name:  "rejects balances with a failed transfer",
+			txs:   []history.Tx{transfer(1, history.Failed, "a", "b", 10)},
+			final: map[string]int64{"a": 90, "b": 110},
+			want:  "lost acknowledged write",
+		},
+		{
+			name:  "rejects balances that only a transfer with an unknown outcome applied twice explains",
+			txs:   []history.Tx{transfer(1, history.Unknown, "a", "b", 10)},
+			final: map[string]int64{"a": 80, "b": 120},
+			want:  "lost acknowledged write",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := history.CheckBankDurability(test.txs, 100, test.final)
+			if test.want == "" {
+				is.NotError(t, err)
+				return
+			}
+			is.Equal(t, test.want, anomalyKind(t, err), fmt.Sprint(err))
+		})
+	}
+
+	t.Run("decides many transfers with an unknown outcome that move the same amounts", func(t *testing.T) {
+		var txs []history.Tx
+		for id := 1; id <= 60; id++ {
+			txs = append(txs, transfer(id, history.Unknown, "a", "b", 1))
+		}
+		txs = append(txs, transfer(61, history.OK, "b", "c", 2))
+		is.NotError(t, history.CheckBankDurability(txs, 100, map[string]int64{"a": 63, "b": 135, "c": 102}))
+		err := history.CheckBankDurability(txs, 100, map[string]int64{"a": 63, "b": 137, "c": 100})
+		is.Equal(t, "lost acknowledged write", anomalyKind(t, err), fmt.Sprint(err))
+	})
+
+	t.Run("reports that it cannot decide too many combinations of transfers with an unknown outcome", func(t *testing.T) {
+		var txs []history.Tx
+		for id := 1; id <= 44; id++ {
+			txs = append(txs, transfer(id, history.Unknown, "a", "b", int64(id)))
+		}
+		err := history.CheckBankDurability(txs, 100, map[string]int64{"a": 100, "b": 100})
+		is.True(t, errors.Is(err, history.ErrUndecided), fmt.Sprint(err))
+		is.Equal(t, "", anomalyKind(t, err))
+	})
+
+	t.Run("accepts every serial history of transfers, and rejects it without one of its acknowledged transfers", func(t *testing.T) {
+		hegel.Test(t, func(ht *hegel.T) {
+			accounts := []string{"a", "b", "c", "d"}
+			balances := map[string]int64{}
+			for _, a := range accounts {
+				balances[a] = 100
+			}
+			// Without unknown outcomes, no other set of transfers can make up for a lost one.
+			outcomes := []history.Outcome{history.OK, history.OK, history.Failed}
+			withUnknown := hegel.Draw(ht, hegel.Booleans())
+			if withUnknown {
+				outcomes = append(outcomes, history.Unknown)
+			}
+			var txs, acked []history.Tx
+			n := hegel.Draw(ht, hegel.Integers(1, 30))
+			for id := 1; id <= n; id++ {
+				outcome := hegel.Draw(ht, hegel.SampledFrom(outcomes))
+				from := hegel.Draw(ht, hegel.SampledFrom(accounts))
+				to := hegel.Draw(ht, hegel.SampledFrom(accounts))
+				amount := int64(hegel.Draw(ht, hegel.Integers(1, 50)))
+				if outcome == history.OK || outcome == history.Unknown && hegel.Draw(ht, hegel.Booleans()) {
+					balances[from] -= amount
+					balances[to] += amount
+				}
+				txs = append(txs, transfer(id, outcome, from, to, amount))
+				if outcome == history.OK && from != to {
+					acked = append(acked, txs[len(txs)-1])
+				}
+			}
+			if err := history.CheckBankDurability(txs, 100, balances); err != nil {
+				ht.Fatalf("rejected a serial history: %v", err)
+			}
+			if withUnknown || len(acked) == 0 {
+				return
+			}
+			lost := hegel.Draw(ht, hegel.SampledFrom(acked))
+			for _, op := range lost.Ops {
+				balances[op.Key] -= op.Value
+			}
+			if err := history.CheckBankDurability(txs, 100, balances); err == nil {
+				ht.Fatalf("accepted balances without %v", lost)
+			}
+		}, hegel.WithTestCases(500))
+	})
+}
+
 // serialHistory generates transactions that ran one after another over a model, so the
 // history is strictly serializable by construction.
 func serialHistory(ht *hegel.T) ([]history.Tx, map[string][]int64) {

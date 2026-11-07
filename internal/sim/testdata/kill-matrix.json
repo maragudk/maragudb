@@ -44,17 +44,17 @@
         {
           "cell": "bank through the engine, no maintainers",
           "status": "detected",
-          "seed": 12,
+          "seed": 1,
           "checkers": [
-            "storage"
+            "durability"
           ]
         },
         {
           "cell": "bank through the engine, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
-            "storage"
+            "durability"
           ]
         },
         {
@@ -77,33 +77,46 @@
         },
         {
           "cell": "bank through SQL, no maintainers",
-          "status": "undetected",
-          "reason": "an unconditional manifest write drops whole concurrent commits, a dropped transfer conserves money, and the bank checker only checks totals; without maintainers, only the storage checker finds the objects of a dropped commit that GC cannot collect, in 2 of the first 100 seeds, the first at seed 80"
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "durability"
+          ]
         },
         {
           "cell": "bank through SQL, 2 maintainers",
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "durability",
             "storage"
           ]
         },
         {
           "cell": "unique through SQL, no maintainers",
-          "status": "undetected",
-          "reason": "an unconditional manifest write drops whole concurrent commits, which leaves a consistent state in which no value repeats, the unique workload does not check that acknowledged writes survive, and in 20 seeds no dropped commit leaves the store with objects that GC cannot collect"
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "durability",
+            "real-time order"
+          ]
         },
         {
           "cell": "unique through SQL, 2 maintainers",
-          "status": "undetected",
-          "reason": "an unconditional manifest write drops whole concurrent commits, which leaves a consistent state in which no value repeats, and the unique workload does not check that acknowledged writes survive; only the storage checker finds the objects of a dropped commit that GC cannot collect, in 11 of the first 100 seeds, the first at seed 21"
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "durability",
+            "real-time order"
+          ]
         },
         {
           "cell": "foreign-key through SQL, no maintainers",
           "status": "detected",
           "seed": 2,
           "checkers": [
-            "real-time order"
+            "real-time order",
+            "durability"
           ]
         },
         {
@@ -111,7 +124,8 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
-            "real-time order"
+            "real-time order",
+            "durability"
           ]
         }
       ]
@@ -467,7 +481,7 @@
       "id": "MUT-GC-DELETE-REFERENCED",
       "name": "GC deleting expired garbage that is referenced again",
       "replay": "gc-delete-referenced",
-      "description": "`engine.Mutations.GCDeleteReferenced` deletes the garbage of an expired chain of garbage batches also when the manifest references it otherwise, such as the output of a compaction that GC stamped as an orphan before the compaction's rebase landed.",
+      "description": "`engine.Mutations.GCDeleteReferenced` deletes the garbage of an expired chain of garbage batches also when the manifest references it otherwise, such as the output of a compaction that GC stamped as an orphan before the compaction's rebase landed. It runs with maintainers that stall for up to 900 ms between the segment write and the manifest write of a compaction, and with one maintainer that compacts while the other only collects garbage.",
       "results": [
         {
           "cell": "list-append through the engine, no maintainers",
@@ -477,9 +491,11 @@
         {
           "cell": "list-append through the engine, 2 maintainers",
           "status": "detected",
-          "seed": 3,
+          "seed": 1,
           "checkers": [
-            "grace period"
+            "final read",
+            "list-append",
+            "storage"
           ]
         },
         {
@@ -489,8 +505,11 @@
         },
         {
           "cell": "bank through the engine, 2 maintainers",
-          "status": "undetected",
-          "reason": "a GC pass rarely stamps the output of a compaction as an orphan between the compaction's segment write and its rebased manifest write, which the mutant needs: 3 of the first 100 seeds do, the first at seed 40; `TestMutations` of the engine makes that happen and detects the mutant"
+          "status": "detected",
+          "seed": 4,
+          "checkers": [
+            "storage"
+          ]
         },
         {
           "cell": "list-append through SQL, no maintainers",
@@ -499,8 +518,14 @@
         },
         {
           "cell": "list-append through SQL, 2 maintainers",
-          "status": "undetected",
-          "reason": "in 20 seeds, no GC pass stamps the output of a compaction as an orphan between the compaction's segment write and its rebased manifest write, which the mutant needs; `TestMutations` of the engine makes that happen and detects the mutant"
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "grace period",
+            "final read",
+            "list-append",
+            "storage"
+          ]
         },
         {
           "cell": "bank through SQL, no maintainers",
@@ -510,7 +535,7 @@
         {
           "cell": "bank through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 14,
+          "seed": 1,
           "checkers": [
             "grace period",
             "final read",
@@ -527,6 +552,8 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "grace period",
+            "final read",
             "storage"
           ]
         },
@@ -537,8 +564,11 @@
         },
         {
           "cell": "foreign-key through SQL, 2 maintainers",
-          "status": "undetected",
-          "reason": "a GC pass rarely stamps the output of a compaction as an orphan between the compaction's segment write and its rebased manifest write, which the mutant needs: 5 of the first 100 seeds do, the first at seed 44; `TestMutations` of the engine makes that happen and detects the mutant"
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "storage"
+          ]
         }
       ]
     },
@@ -572,7 +602,8 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
-            "bank"
+            "bank",
+            "durability"
           ]
         },
         {
@@ -740,9 +771,9 @@
         {
           "cell": "bank through the engine, 2 maintainers",
           "status": "detected",
-          "seed": 6,
+          "seed": 1,
           "checkers": [
-            "bank"
+            "durability"
           ]
         },
         {
@@ -767,9 +798,9 @@
         {
           "cell": "bank through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
-            "index consistency"
+            "durability"
           ]
         },
         {
@@ -780,10 +811,10 @@
         {
           "cell": "unique through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 14,
+          "seed": 1,
           "checkers": [
-            "unique",
-            "index consistency"
+            "durability",
+            "real-time order"
           ]
         },
         {
@@ -796,7 +827,8 @@
           "status": "detected",
           "seed": 3,
           "checkers": [
-            "real-time order"
+            "real-time order",
+            "durability"
           ]
         }
       ]
@@ -805,7 +837,7 @@
       "id": "MUT-COMPACT-REBASE-ON-COMPACTION",
       "name": "a rebase on another compaction",
       "replay": "compact-rebase-on-compaction",
-      "description": "`engine.Mutations.CompactRebaseOnCompaction` rebases a compaction on any newer manifest with at least as many segments, also on one in which another compaction replaced segments, so that the segments of that compaction and of the commits after it are lost or put back.",
+      "description": "`engine.Mutations.CompactRebaseOnCompaction` rebases a compaction on any newer manifest with at least as many segments, also on one in which another compaction replaced segments, so that the segments of that compaction and of the commits after it are lost or put back. It runs with maintainers that stall for up to 500 ms between the segment write and the manifest write of a compaction.",
       "results": [
         {
           "cell": "list-append through the engine, no maintainers",
@@ -817,7 +849,6 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
-            "durability",
             "list-append"
           ]
         },
@@ -828,8 +859,12 @@
         },
         {
           "cell": "bank through the engine, 2 maintainers",
-          "status": "undetected",
-          "reason": "a rebase on another compaction loses whole commits and puts back merged segments with the same values, a lost transfer conserves money, and the bank checker only checks totals"
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "bank",
+            "durability"
+          ]
         },
         {
           "cell": "list-append through SQL, no maintainers",
@@ -839,7 +874,7 @@
         {
           "cell": "list-append through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 1,
+          "seed": 2,
           "checkers": [
             "durability",
             "list-append"
@@ -852,8 +887,11 @@
         },
         {
           "cell": "bank through SQL, 2 maintainers",
-          "status": "undetected",
-          "reason": "a rebase on another compaction loses whole commits and puts back merged segments with the same values, a lost transfer conserves money, and the bank checker only checks totals; only the index consistency checker finds a lost commit that wrote an index entry, in 2 of the first 100 seeds, the first at seed 27"
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "durability"
+          ]
         },
         {
           "cell": "unique through SQL, no maintainers",
@@ -862,8 +900,11 @@
         },
         {
           "cell": "unique through SQL, 2 maintainers",
-          "status": "undetected",
-          "reason": "a rebase on another compaction loses whole commits and puts back merged segments with the same values, which leaves a consistent state in which no value repeats, and the unique workload does not check that acknowledged writes survive"
+          "status": "detected",
+          "seed": 2,
+          "checkers": [
+            "durability"
+          ]
         },
         {
           "cell": "foreign-key through SQL, no maintainers",
@@ -872,8 +913,12 @@
         },
         {
           "cell": "foreign-key through SQL, 2 maintainers",
-          "status": "undetected",
-          "reason": "a rebase on another compaction loses whole commits and puts back merged segments with the same values, which mostly leaves an older consistent state; only the real-time order checker finds a lost commit that a later read missed, in 5 of the first 100 seeds, the first at seed 27"
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "real-time order",
+            "durability"
+          ]
         }
       ]
     },
@@ -902,7 +947,7 @@
         {
           "cell": "bank through the engine, no maintainers",
           "status": "undetected",
-          "reason": "a stale snapshot makes a transfer conflict or read an older consistent state, which conserves money"
+          "reason": "a transfer from a stale snapshot conflicts at commit, so that none is lost, and an audit from one reads an older state that conserves money; the bank workload checks no audit against the transfers acknowledged before it"
         },
         {
           "cell": "bank through the engine, 2 maintainers",
@@ -931,7 +976,7 @@
         {
           "cell": "bank through SQL, no maintainers",
           "status": "undetected",
-          "reason": "a stale snapshot makes a transfer conflict or read an older consistent state, which conserves money"
+          "reason": "a transfer from a stale snapshot conflicts at commit, so that none is lost, and an audit from one reads an older state that conserves money; the bank workload checks no audit against the transfers acknowledged before it"
         },
         {
           "cell": "bank through SQL, 2 maintainers",
@@ -943,15 +988,18 @@
         },
         {
           "cell": "unique through SQL, no maintainers",
-          "status": "undetected",
-          "reason": "a stale snapshot is an older consistent state in which no value repeats, and a write from it conflicts at commit; without maintainers no reader loses an object either"
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "real-time order"
+          ]
         },
         {
           "cell": "unique through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 10,
+          "seed": 2,
           "checkers": [
-            "grace period"
+            "real-time order"
           ]
         },
         {
@@ -965,7 +1013,7 @@
         {
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 10,
+          "seed": 2,
           "checkers": [
             "real-time order"
           ]
@@ -996,15 +1044,18 @@
         },
         {
           "cell": "bank through the engine, no maintainers",
-          "status": "undetected",
-          "reason": "an acknowledged transfer that never landed is missing as a whole, which conserves money, and without maintainers its segment is an orphan that GC collects like that of any failed commit"
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "durability"
+          ]
         },
         {
           "cell": "bank through the engine, 2 maintainers",
           "status": "detected",
-          "seed": 3,
+          "seed": 1,
           "checkers": [
-            "storage"
+            "durability"
           ]
         },
         {
@@ -1025,28 +1076,37 @@
         },
         {
           "cell": "bank through SQL, no maintainers",
-          "status": "undetected",
-          "reason": "an acknowledged transfer that never landed is missing as a whole, which conserves money, and without maintainers its segment is an orphan that GC collects like that of any failed commit"
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "durability"
+          ]
         },
         {
           "cell": "bank through SQL, 2 maintainers",
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "durability",
             "storage"
           ]
         },
         {
           "cell": "unique through SQL, no maintainers",
-          "status": "undetected",
-          "reason": "an acknowledged write that never landed is missing as a whole, which leaves a consistent state, the unique workload does not check that acknowledged writes survive, and without maintainers the segment of such a write is an orphan that GC collects like any other"
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "durability",
+            "real-time order"
+          ]
         },
         {
           "cell": "unique through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
-            "storage"
+            "durability",
+            "real-time order"
           ]
         },
         {
@@ -1054,7 +1114,8 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
-            "real-time order"
+            "real-time order",
+            "durability"
           ]
         },
         {
@@ -1062,7 +1123,8 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
-            "real-time order"
+            "real-time order",
+            "durability"
           ]
         }
       ]
@@ -1094,8 +1156,11 @@
         },
         {
           "cell": "bank through the engine, 2 maintainers",
-          "status": "undetected",
-          "reason": "resurrected balances are a consistent older state, which conserves money, and the engine workload has no index"
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "durability"
+          ]
         },
         {
           "cell": "list-append through SQL, no maintainers",
@@ -1121,7 +1186,8 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
-            "index consistency"
+            "index consistency",
+            "durability"
           ]
         },
         {
@@ -1147,7 +1213,8 @@
           "status": "detected",
           "seed": 3,
           "checkers": [
-            "real-time order"
+            "real-time order",
+            "durability"
           ]
         }
       ]
@@ -1200,7 +1267,8 @@
           "seed": 1,
           "checkers": [
             "workload invariants",
-            "bank"
+            "bank",
+            "durability"
           ]
         },
         {
@@ -1209,7 +1277,8 @@
           "seed": 1,
           "checkers": [
             "workload invariants",
-            "bank"
+            "bank",
+            "durability"
           ]
         },
         {
@@ -1250,7 +1319,7 @@
       "id": "MUT-RETRY-UNKNOWN",
       "name": "retrying an autocommit statement after an unknown commit outcome",
       "replay": "retry-unknown",
-      "description": "`exec.Mutations.RetryAfterUnknownCommit` retries an autocommit statement whose commit outcome is unknown, which can apply it twice.",
+      "description": "`exec.Mutations.RetryAfterUnknownCommit` retries an autocommit statement whose commit outcome is unknown, which can apply it twice. It runs with clients that are partitioned right after four in ten of their manifest writes land, so that the outcome of their commits is unknown.",
       "results": [
         {
           "cell": "list-append through the engine, no maintainers",
@@ -1284,7 +1353,7 @@
         {
           "cell": "list-append through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 7,
+          "seed": 1,
           "checkers": [
             "durability",
             "list-append"
@@ -1302,23 +1371,38 @@
         },
         {
           "cell": "unique through SQL, no maintainers",
-          "status": "undetected",
-          "reason": "a retried insert fails on its own primary key, and a retried move or delete finds its row moved or gone, so a statement applied twice leaves a consistent state"
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "durability",
+            "real-time order"
+          ]
         },
         {
           "cell": "unique through SQL, 2 maintainers",
-          "status": "undetected",
-          "reason": "a retried insert fails on its own primary key, and a retried move or delete finds its row moved or gone, so a statement applied twice leaves a consistent state"
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "durability",
+            "real-time order"
+          ]
         },
         {
           "cell": "foreign-key through SQL, no maintainers",
-          "status": "undetected",
-          "reason": "a retried statement is checked again against every foreign key and check, so even one applied twice, such as an increment, leaves a consistent state, and the counter is incremented only in transactions, which are never retried"
+          "status": "detected",
+          "seed": 2,
+          "checkers": [
+            "durability",
+            "real-time order"
+          ]
         },
         {
           "cell": "foreign-key through SQL, 2 maintainers",
-          "status": "undetected",
-          "reason": "a retried statement is checked again against every foreign key and check, so even one applied twice, such as an increment, leaves a consistent state, and the counter is incremented only in transactions, which are never retried"
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "durability"
+          ]
         }
       ]
     },
@@ -2200,7 +2284,8 @@
           "status": "detected",
           "seed": 2,
           "checkers": [
-            "bank"
+            "bank",
+            "durability"
           ]
         },
         {
@@ -2311,7 +2396,8 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
-            "bank"
+            "bank",
+            "durability"
           ]
         },
         {
@@ -2320,7 +2406,8 @@
           "seed": 1,
           "checkers": [
             "workload invariants",
-            "bank"
+            "bank",
+            "durability"
           ]
         },
         {
@@ -2348,7 +2435,8 @@
           "checkers": [
             "workload invariants",
             "index consistency",
-            "bank"
+            "bank",
+            "durability"
           ]
         },
         {
@@ -2358,7 +2446,8 @@
           "checkers": [
             "workload invariants",
             "index consistency",
-            "bank"
+            "bank",
+            "durability"
           ]
         },
         {

@@ -39,7 +39,10 @@ verification:
 # corpus configuration of that seed, workload, and API, MAINTAINERS=<n> (default 2),
 # MAINTENANCE=lease|none|overlap, DISK_FAULTS=1 for small disk caches whose files are damaged,
 # STORE_DAMAGE=1 for reads whose bodies the store damages, BLOCK_SIZE=<n> for segment blocks of
-# n bytes, and MUTATION=<name>, where the names
+# n bytes, COMPACTION_STALL=<duration> for maintainers that stall between the output and the
+# manifest write of a compaction, ONE_COMPACTOR=1 for one maintainer that compacts and others that
+# only collect garbage, COMMIT_PARTITIONS=<rate> for clients partitioned right after a manifest
+# write lands, and MUTATION=<name>, where the names
 # are in the kill matrix in
 # docs/verification.md: cas, gc, gc-batch-objects-first, gc-sweep-segments-only,
 # gc-chain-first-stamp, gc-delete-referenced, compact-non-adjacent, compact-drop-tombstones,
@@ -50,7 +53,7 @@ verification:
 # segment-unchecked, filter-omits-keys, filter-unchecked, and maintenance-unrecovered.
 .PHONY: replay
 replay:
-	MARAGUDB_SEED=$(SEED) MARAGUDB_WORKLOAD=$(WORKLOAD) MARAGUDB_API=$(API) MARAGUDB_CORPUS=$(CORPUS) MARAGUDB_MAINTAINERS=$(MAINTAINERS) MARAGUDB_MAINTENANCE=$(MAINTENANCE) MARAGUDB_DISK_FAULTS=$(DISK_FAULTS) MARAGUDB_STORE_DAMAGE=$(STORE_DAMAGE) MARAGUDB_BLOCK_SIZE=$(BLOCK_SIZE) MARAGUDB_MUTATION=$(MUTATION) go test ./internal/sim -run 'TestSimulator/replay' -count 1 -v
+	MARAGUDB_SEED=$(SEED) MARAGUDB_WORKLOAD=$(WORKLOAD) MARAGUDB_API=$(API) MARAGUDB_CORPUS=$(CORPUS) MARAGUDB_MAINTAINERS=$(MAINTAINERS) MARAGUDB_MAINTENANCE=$(MAINTENANCE) MARAGUDB_DISK_FAULTS=$(DISK_FAULTS) MARAGUDB_STORE_DAMAGE=$(STORE_DAMAGE) MARAGUDB_BLOCK_SIZE=$(BLOCK_SIZE) MARAGUDB_COMPACTION_STALL=$(COMPACTION_STALL) MARAGUDB_ONE_COMPACTOR=$(ONE_COMPACTOR) MARAGUDB_COMMIT_PARTITIONS=$(COMMIT_PARTITIONS) MARAGUDB_MUTATION=$(MUTATION) go test ./internal/sim -run 'TestSimulator/replay' -count 1 -v
 
 # Run the mutant kill matrix with every seed in every cell, then the simulator with random seeds
 # and configurations for SOAK_DURATION (default 5m), and then the full sqllogictest corpus.

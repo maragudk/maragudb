@@ -317,6 +317,23 @@ func TestClient_Unavailable(t *testing.T) {
 		is.Error(t, s3fake.ErrUnavailable, err, "a restarted process with the same name is still partitioned")
 	})
 
+	t.Run("extending a partition never ends it earlier", func(t *testing.T) {
+		c, clock := newClient(0)
+		pctx := s3fake.WithProcess(t.Context(), &s3fake.Process{Name: "p"})
+		c.Unavailable("p", clock.Now().Add(time.Second))
+		c.ExtendUnavailable("p", clock.Now().Add(100*time.Millisecond))
+		clock.Sleep(t.Context(), 500*time.Millisecond)
+		_, err := c.Put(pctx, "k", []byte("v"), s3.PutOptions{})
+		is.Error(t, s3fake.ErrUnavailable, err, "the longer partition still holds")
+		c.ExtendUnavailable("p", clock.Now().Add(time.Second))
+		clock.Sleep(t.Context(), 700*time.Millisecond)
+		_, err = c.Put(pctx, "k", []byte("v"), s3.PutOptions{})
+		is.Error(t, s3fake.ErrUnavailable, err, "the extended partition holds")
+		clock.Sleep(t.Context(), 300*time.Millisecond)
+		_, err = c.Put(pctx, "k", []byte("v"), s3.PutOptions{})
+		is.NotError(t, err)
+	})
+
 	t.Run("a fault-free view ignores outages", func(t *testing.T) {
 		c, clock := newClient(0)
 		c.Unavailable("", clock.Now().Add(time.Second))

@@ -151,6 +151,23 @@ type Config struct {
 	// trees of several levels and filter blocks, which the default blocks never give a database
 	// of a run.
 	BlockSize int
+	// CompactionStall stalls every maintainer of [Config.Maintainers] once in every compaction
+	// that writes output, for between half of CompactionStall and all of it, after the output and
+	// before the manifest write that swaps it in, like a process that a pause holds up between
+	// the two writes. Commits, GC passes,
+	// and the compactions of other maintainers land meanwhile, so that the compaction rebases on
+	// them or loses to them, and GC passes see its output before the manifest has it. Zero
+	// stalls nothing.
+	CompactionStall time.Duration
+	// OneCompactor makes only the first maintainer of [Config.Maintainers] compact, and the
+	// others only collect garbage, so that no compaction of a maintainer loses to another one. It
+	// leaves the clients' maintenance as it is.
+	OneCompactor bool
+	// CommitPartitions is the probability that a manifest write of a client that lands is
+	// followed by a partition of the client for 300 ms of virtual time, which loses the answer of
+	// the write and of the reads that would learn whether it landed, so that the client's commit
+	// has an unknown outcome while its process keeps running.
+	CommitPartitions float64
 	// Trace receives one line per event when non-nil.
 	Trace func(string)
 }
@@ -233,7 +250,10 @@ type Stats struct {
 	// steps that did nothing because they backed off after one, and MaintenanceResumed the
 	// maintainers that changed the database again after one.
 	MaintenancePanics, MaintenanceBackoffs, MaintenanceResumed int
-	Elapsed                                                    time.Duration
+	// Undecided counts the runs of the bank workload whose final balances
+	// [history.CheckBankDurability] could not decide.
+	Undecided int
+	Elapsed   time.Duration
 }
 
 // Add the counts of o, for totals over several runs.
@@ -264,6 +284,7 @@ func (s *Stats) Add(o Stats) {
 	s.MaintenancePanics += o.MaintenancePanics
 	s.MaintenanceBackoffs += o.MaintenanceBackoffs
 	s.MaintenanceResumed += o.MaintenanceResumed
+	s.Undecided += o.Undecided
 	s.Elapsed += o.Elapsed
 }
 
@@ -271,7 +292,11 @@ func (s *Stats) Add(o Stats) {
 const (
 	// CheckerListAppend is [history.CheckListAppend], the strict serializability checker.
 	CheckerListAppend = "list-append"
-	// CheckerDurability is [history.CheckDurability] on the final state.
+	// CheckerDurability finds an acknowledged write that the final state lost, or a failed one
+	// that it has: [history.CheckDurability] for the list-append workload,
+	// [history.CheckBankDurability] for the bank workload, and for the unique and foreign key
+	// workloads the rows that no statement could have changed since an acknowledged statement
+	// inserted them, the rows of failed statements, and a counter that only grows.
 	CheckerDurability = "durability"
 	// CheckerBank is [history.CheckBank], the conservation of money.
 	CheckerBank = "bank"
@@ -299,7 +324,8 @@ const (
 	// objects of writes that the manifest has not moved past.
 	CheckerStorage = "storage"
 	// CheckerRealTime finds a reader that misses a commit acknowledged before it began, through
-	// a counter that only grows.
+	// a counter that only grows, or through a row that no statement could have changed since an
+	// acknowledged statement inserted it, or that sees a row of a failed statement.
 	CheckerRealTime = "real-time order"
 	// CheckerDiskCache finds a client whose disk cache holds files that take more bytes than its
 	// bound, or more than it counts, after any of its operations.
@@ -358,6 +384,9 @@ func (r Result) Report() string {
 	if r.Stats.MaintenancePanics > 0 {
 		fmt.Fprintf(&b, ", %d injected maintenance panics recovered (%d steps backed off, %d maintainers resumed)", r.Stats.MaintenancePanics, r.Stats.MaintenanceBackoffs, r.Stats.MaintenanceResumed)
 	}
+	if r.Stats.Undecided > 0 {
+		b.WriteString(", final balances undecided")
+	}
 	for _, a := range r.Anomalies {
 		fmt.Fprintf(&b, "\nANOMALY: %v", a)
 	}
@@ -388,6 +417,16 @@ type run struct {
 	// ticked is the highest value of the counter of the foreign key workload that an
 	// acknowledged commit wrote.
 	ticked int64
+	// userWrites are the writes of the unique workload, and userReads the rows that its readers
+	// saw, which are checked against the writes after the run.
+	userWrites []userWrite
+	userReads  []userRead
+	// fkWrites are the writes of the foreign key workload with fresh keys or deletes of parents,
+	// fkReads the rows that its readers saw, and ticks the values of its counter that acknowledged
+	// increments wrote.
+	fkWrites []fkWrite
+	fkReads  []fkRead
+	ticks    []int64
 	// panicked is the first panic that the SQL driver or a maintenance step recovered, other
 	// than an injected one, with the stack where it happened, which the task that made the call
 	// panics with again once the call returned.
@@ -492,6 +531,7 @@ func Run(cfg Config) (res Result) {
 	r.activeClients = cfg.Clients
 	for i := range cfg.Clients {
 		c := &client{run: r, id: i, rng: rand.New(rand.NewPCG(cfg.Seed, uint64(i)+1)), freed: map[string]bool{}}
+		c.partitionRng = rand.New(rand.NewPCG(cfg.Seed, 0x9a27+uint64(i)))
 		c.diskRng = rand.New(rand.NewPCG(cfg.Seed, 0xd15c+uint64(i)))
 		c.diskBytes = 1 << 40
 		if cfg.DiskFaults {
@@ -502,6 +542,7 @@ func Run(cfg Config) (res Result) {
 	}
 	for i := range cfg.Maintainers {
 		m := &maintainer{run: r, id: i, rng: rand.New(rand.NewPCG(cfg.Seed, 0xaaaa+uint64(i)))}
+		m.stallRng = rand.New(rand.NewPCG(cfg.Seed, 0x57a1+uint64(i)))
 		r.goTask(fmt.Sprint("maintainer", i), m.loop)
 	}
 	r.sched.Run()
@@ -514,6 +555,8 @@ func Run(cfg Config) (res Result) {
 	var err error
 	if cfg.SQL {
 		final, balances, res.Users, err = r.readFinalSQL()
+		r.checkUserReads()
+		r.checkForeignKeyReads()
 		r.checkIndexes()
 		r.checkConstraints()
 	} else {
@@ -542,6 +585,15 @@ func Run(cfg Config) (res Result) {
 		res.Audits = r.audits
 		if err := history.CheckBank(r.audits, r.total); err != nil {
 			r.anoms = append(r.anoms, &Anomaly{Checker: CheckerBank, Err: err})
+		}
+		if err == nil {
+			switch err := history.CheckBankDurability(r.txs, initialBalance, balances); {
+			case errors.Is(err, history.ErrUndecided):
+				r.stats.Undecided++
+				r.trace("the final balances are undecided: %v", err)
+			case err != nil:
+				r.anoms = append(r.anoms, &Anomaly{Checker: CheckerDurability, Err: err})
+			}
 		}
 	}
 	r.checkStorage()
@@ -610,11 +662,6 @@ func (r *run) blockSize() *int {
 		return nil
 	}
 	return &r.cfg.BlockSize
-}
-
-// open an engine for a process.
-func (r *run) open(ctx context.Context, id int, rng *rand.Rand, disk cache.Cache) (*engine.DB, error) {
-	return engine.Open(ctx, r.engineOptions(id, rng, disk))
 }
 
 // maintenanceOptions for a client in the configured mode, or false in [MaintenanceOff].
@@ -818,6 +865,8 @@ type client struct {
 	crashedInCommit bool
 	// freed are the unique values that the client's committed writes freed.
 	freed map[string]bool
+	// partitionRng draws the partitions of [Config.CommitPartitions].
+	partitionRng *rand.Rand
 }
 
 func (c *client) loop(ctx context.Context) {
@@ -830,12 +879,16 @@ func (c *client) loop(ctx context.Context) {
 			c.proc = &s3fake.Process{Name: fmt.Sprint("client", c.id)}
 			pctx := s3fake.WithProcess(ctx, c.proc)
 			c.openDisk(ctx)
+			opts := c.run.engineOptions(c.id, c.rng, c.disk)
+			if c.run.cfg.CommitPartitions > 0 {
+				opts.Client = partitioningStore{Client: opts.Client, c: c}
+			}
 			var err error
 			var db *engine.DB
 			if c.run.cfg.SQL {
-				c.sql, db, err = c.run.openSQL(pctx, c.run.engineOptions(c.id, c.rng, c.disk))
+				c.sql, db, err = c.run.openSQL(pctx, opts)
 			} else {
-				c.db, err = c.run.open(pctx, c.id, c.rng, c.disk)
+				c.db, err = engine.Open(pctx, opts)
 				db = c.db
 			}
 			if err != nil {
@@ -1337,6 +1390,10 @@ type maintainer struct {
 	rng  *rand.Rand
 	proc *s3fake.Process
 	db   *engine.DB
+	// stallRng draws the stalls of [Config.CompactionStall], and wroteOutput is the last segment
+	// that the maintainer wrote since its last read of the manifest, if any.
+	stallRng    *rand.Rand
+	wroteOutput string
 }
 
 func (m *maintainer) loop(ctx context.Context) {
@@ -1344,7 +1401,11 @@ func (m *maintainer) loop(ctx context.Context) {
 		m.run.sched.Sleep(ctx, time.Duration(m.rng.Int64N(int64(200*time.Millisecond))))
 		if m.db == nil {
 			m.proc = &s3fake.Process{Name: fmt.Sprint("maintainer", m.id)}
-			db, err := m.run.open(s3fake.WithProcess(ctx, m.proc), 0, m.rng, nil)
+			opts := m.run.engineOptions(0, m.rng, nil)
+			if m.run.cfg.CompactionStall > 0 {
+				opts.Client = stallingStore{Client: opts.Client, m: m}
+			}
+			db, err := engine.Open(s3fake.WithProcess(ctx, m.proc), opts)
 			if err != nil {
 				m.afterCrash()
 				continue
@@ -1352,7 +1413,7 @@ func (m *maintainer) loop(ctx context.Context) {
 			m.db = db
 		}
 		pctx := s3fake.WithProcess(ctx, m.proc)
-		if m.rng.IntN(2) == 0 {
+		if m.rng.IntN(2) == 0 && (m.id == 0 || !m.run.cfg.OneCompactor) {
 			// Compaction loses to concurrent commits, so retry a few times. Most compactions merge
 			// the segments that the tiers make due, and some merge the whole database.
 			full := m.rng.IntN(2) == 0
@@ -1407,6 +1468,57 @@ func (m *maintainer) afterCrash() {
 		m.db = nil
 		m.proc = nil
 	}
+}
+
+// stallingStore is the store as a maintainer sees it with [Config.CompactionStall]: it stalls
+// the maintainer before the first manifest write after it wrote a segment, which is the output
+// of a compaction. A read of the manifest begins another compaction or GC pass, or the rebase of
+// the compaction, and none of those stalls.
+type stallingStore struct {
+	s3.Client
+	m *maintainer
+}
+
+func (s stallingStore) Get(ctx context.Context, key string, opts s3.GetOptions) (s3.Object, error) {
+	if key == "db/manifest" {
+		s.m.wroteOutput = ""
+	}
+	return s.Client.Get(ctx, key, opts)
+}
+
+func (s stallingStore) Put(ctx context.Context, key string, body []byte, opts s3.PutOptions) (string, error) {
+	switch {
+	case key == "db/manifest" && s.m.wroteOutput != "":
+		half := s.m.run.cfg.CompactionStall / 2
+		d := half + time.Duration(s.m.stallRng.Int64N(int64(half)+1))
+		s.m.run.trace("maintainer %d: stalls for %v after writing %s", s.m.id, d, s.m.wroteOutput)
+		s.m.wroteOutput = ""
+		s.m.run.sched.Sleep(ctx, d)
+	}
+	etag, err := s.Client.Put(ctx, key, body, opts)
+	if err == nil && strings.HasPrefix(key, "db/seg/") {
+		s.m.wroteOutput = key
+	}
+	return etag, err
+}
+
+// partitioningStore is the store as a client sees it with [Config.CommitPartitions]: now and
+// then it partitions the client right after a manifest write of the client landed, and loses the
+// answer of the write.
+type partitioningStore struct {
+	s3.Client
+	c *client
+}
+
+func (s partitioningStore) Put(ctx context.Context, key string, body []byte, opts s3.PutOptions) (string, error) {
+	etag, err := s.Client.Put(ctx, key, body, opts)
+	c := s.c
+	if err == nil && key == "db/manifest" && c.partitionRng.Float64() < c.run.cfg.CommitPartitions {
+		c.run.trace("client %d: partitioned after its manifest write landed", c.id)
+		c.run.fake.ExtendUnavailable(c.proc.Name, c.run.sched.Now().Add(300*time.Millisecond))
+		return "", fmt.Errorf("%w: PUT %s timed out after apply", s3fake.ErrUnavailable, key)
+	}
+	return etag, err
 }
 
 // leaseWatch is the store as the clients see it. Before every request it looks at whether two

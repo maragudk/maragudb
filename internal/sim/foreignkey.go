@@ -8,6 +8,7 @@ import (
 	"math/rand/v2"
 	"slices"
 	"strings"
+	"time"
 
 	"maragu.dev/maragudb/internal/engine"
 	"maragu.dev/maragudb/internal/history"
@@ -22,7 +23,10 @@ import (
 // concurrently deleted, and with values that violate the checks now and then, as autocommit
 // statements and in transactions. Readers check that no snapshot has a reference to a missing
 // row or a row that violates a check. A counter that transactions increment shows that a reader
-// sees every commit acknowledged before it began.
+// sees every commit acknowledged before it began, and the final state every acknowledged
+// increment. Children and toys with ids outside of the pools are only ever deleted with their
+// parent, so that readers and the final state show those of acknowledged writes whose parent no
+// write could have deleted since, and never those of a failed write.
 
 // ForeignKeyTablesSQL are the statements that create the tables of the foreign key workload.
 func ForeignKeyTablesSQL() []string {
@@ -61,22 +65,29 @@ func (c *client) nullableKey() any {
 
 func (c *client) foreignKeySQL(ctx context.Context) {
 	h := history.Tx{Client: c.id, Invoke: c.run.stamp()}
+	var w fkWrite
+	var res sql.Result
 	var err error
 	switch c.rng.IntN(19) {
 	case 0, 1:
 		c.auditForeignKeys(ctx, h)
 		return
 	case 16:
-		_, err = c.sql.ExecContext(ctx, "INSERT INTO children (id, pid) VALUES ($1, 0)", c.value())
+		id := c.value()
+		w.children = []fkChild{{id: id, pid: 0}}
+		_, err = c.sql.ExecContext(ctx, "INSERT INTO children (id, pid) VALUES ($1, 0)", id)
 	case 17:
-		_, err = c.sql.ExecContext(ctx, "DELETE FROM parents WHERE id = 0")
+		w.deletes = []int64{0}
+		res, err = c.sql.ExecContext(ctx, "DELETE FROM parents WHERE id = 0")
 	case 18:
 		_, err = c.sql.ExecContext(ctx, "INSERT INTO parents (id) VALUES (0)")
 	case 2:
 		_, err = c.sql.ExecContext(ctx, "INSERT INTO parents (id, n) VALUES ($1, $2)", c.hotParent(), c.rng.IntN(6)-1)
 	case 3:
 		if c.rng.IntN(2) == 0 {
-			_, err = c.sql.ExecContext(ctx, "INSERT INTO children (id, pid) VALUES ($1, $2)", c.value(), c.hotParent())
+			id, pid := c.value(), c.hotParent()
+			w.children = []fkChild{{id: id, pid: pid}}
+			_, err = c.sql.ExecContext(ctx, "INSERT INTO children (id, pid) VALUES ($1, $2)", id, pid)
 			break
 		}
 		_, err = c.sql.ExecContext(ctx, "INSERT INTO children VALUES ($1, $2, $3)", c.fkKey(), c.nullableKey(), c.rng.IntN(21)-1)
@@ -85,7 +96,9 @@ func (c *client) foreignKeySQL(ctx context.Context) {
 	case 6:
 		_, err = c.sql.ExecContext(ctx, "UPDATE parents SET n = n + $1 WHERE id = $2", c.rng.IntN(5)-2, c.fkKey())
 	case 7:
-		_, err = c.sql.ExecContext(ctx, "DELETE FROM parents WHERE id = $1", c.hotParent())
+		pid := c.hotParent()
+		w.deletes = []int64{pid}
+		res, err = c.sql.ExecContext(ctx, "DELETE FROM parents WHERE id = $1", pid)
 	case 8:
 		_, err = c.sql.ExecContext(ctx, "INSERT INTO toys (id, cid, label) VALUES ($1, $2, $3)", c.fkKey(), c.fkKey(), []string{"ball", "", "kite"}[c.rng.IntN(3)])
 	case 9, 10:
@@ -109,7 +122,7 @@ func (c *client) foreignKeySQL(ctx context.Context) {
 	case 13:
 		_, err = c.sql.ExecContext(ctx, []string{"DELETE FROM nodes WHERE id = $1", "DELETE FROM children WHERE id = $1", "UPDATE nodes SET owner = NULL WHERE owner = $1"}[c.rng.IntN(3)], c.fkKey())
 	case 14:
-		err = c.foreignKeyTx(ctx)
+		err = c.foreignKeyTx(ctx, &w)
 	case 15:
 		err = c.tick(ctx)
 	}
@@ -125,6 +138,17 @@ func (c *client) foreignKeySQL(ctx context.Context) {
 		h.Err = err.Error()
 	}
 	c.record(h)
+	w.invoke, w.complete, w.outcome = h.Invoke, h.Complete, h.Outcome
+	if res != nil && h.Outcome == history.OK {
+		if n, _ := res.RowsAffected(); n == 0 {
+			// The statement found no parent, so it deleted nothing.
+			w.deletes = nil
+		}
+	}
+	w.children = slices.DeleteFunc(w.children, func(ch fkChild) bool { return !c.run.freshKey(ch.id) })
+	if len(w.children) > 0 || len(w.deletes) > 0 {
+		c.run.fkWrites = append(c.run.fkWrites, w)
+	}
 }
 
 // tick increments the counter in a transaction, and records its new value when the commit is
@@ -147,6 +171,7 @@ func (c *client) tick(ctx context.Context) error {
 		return err
 	}
 	c.run.ticked = max(c.run.ticked, n+1)
+	c.run.ticks = append(c.run.ticks, n+1)
 	return nil
 }
 
@@ -176,7 +201,7 @@ func (c *client) moveNodeTx(ctx context.Context) error {
 
 // foreignKeyTx deletes a parent and then inserts a child of it, which fails, or inserts a parent
 // and two children of it with fresh keys, and gives one child a toy, in a transaction.
-func (c *client) foreignKeyTx(ctx context.Context) error {
+func (c *client) foreignKeyTx(ctx context.Context, w *fkWrite) error {
 	tx, err := c.sql.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -184,6 +209,7 @@ func (c *client) foreignKeyTx(ctx context.Context) error {
 	defer func() { _ = tx.Rollback() }()
 	parent := c.fkKey()
 	if c.rng.IntN(4) == 0 {
+		w.deletes = []int64{parent}
 		if _, err := tx.ExecContext(ctx, "DELETE FROM parents WHERE id = $1", parent); err != nil {
 			return err
 		}
@@ -198,10 +224,15 @@ func (c *client) foreignKeyTx(ctx context.Context) error {
 	}
 	c.pause(ctx)
 	child := c.value()
-	if _, err := tx.ExecContext(ctx, "INSERT INTO children (id, pid, n) VALUES ($1, $2, $3), ($4, $2, DEFAULT)", child, parent, c.rng.IntN(5), c.value()); err != nil {
+	n := c.rng.IntN(5)
+	sibling := c.value()
+	w.children = []fkChild{{id: child, pid: parent, n: int64(n)}, {id: sibling, pid: parent}}
+	if _, err := tx.ExecContext(ctx, "INSERT INTO children (id, pid, n) VALUES ($1, $2, $3), ($4, $2, DEFAULT)", child, parent, n, sibling); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, "INSERT INTO toys (id, cid) VALUES ($1, $2)", c.value(), child); err != nil {
+	toy := c.value()
+	w.children[0].toys = []int64{toy}
+	if _, err := tx.ExecContext(ctx, "INSERT INTO toys (id, cid) VALUES ($1, $2)", toy, child); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -419,6 +450,9 @@ func (c *client) auditForeignKeys(ctx context.Context, h history.Tx) {
 		c.run.anomaly(CheckerForeignKey, "client %d: %s", c.id, o)
 	}
 	c.run.checkForeignKeyRows(rows, fmt.Sprintf("client %d", c.id))
+	// The rows are checked against the writes once every write has its outcome, because a write
+	// whose outcome is not known yet may be in the snapshot.
+	c.run.fkReads = append(c.run.fkReads, fkRead{client: c.id, invoke: h.Invoke, rows: rows})
 	h.Complete = c.run.stamp()
 	h.Outcome = history.OK
 	c.record(h)
@@ -449,6 +483,26 @@ func (r *run) readFinalForeignKeys(ctx context.Context, db *sql.DB) ([]string, e
 		r.anomaly(CheckerForeignKey, "final state: %s", o)
 	}
 	r.checkForeignKeyRows(rows, "final state")
+	if err := newForeignKeyCheck(r.fkWrites).check(rows, -1); err != nil {
+		r.anomaly(CheckerDurability, "final state: %v", err)
+	}
+	var n int64
+	if err := db.QueryRowContext(ctx, "SELECT n FROM ticks WHERE id = 0").Scan(&n); err != nil {
+		return nil, err
+	}
+	if n < r.ticked {
+		r.anomaly(CheckerDurability, "final state: the counter is %d, but an acknowledged commit set it to %d", n, r.ticked)
+	}
+	// Every increment reads the counter in the snapshot of its commit, so two that were both
+	// acknowledged never set it to the same value.
+	seen := map[int64]bool{}
+	for _, v := range r.ticks {
+		if seen[v] {
+			r.anomaly(CheckerDurability, "two acknowledged commits set the counter to %d", v)
+			break
+		}
+		seen[v] = true
+	}
 	return []string{rows.String()}, nil
 }
 
@@ -477,4 +531,116 @@ func (r *run) checkConstraints() {
 	case err != nil:
 		r.anoms = append(r.anoms, &Anomaly{Checker: CheckerFinalRead, Err: fmt.Errorf("checking the constraints: %w", err)})
 	}
+}
+
+// freshKey reports whether id is outside of the pool of keys of the foreign key workload, so that
+// no statement names it but the one that inserts it.
+func (r *run) freshKey(id int64) bool {
+	return id >= int64(2*r.cfg.Keys)
+}
+
+// fkWrite of a statement or transaction of the foreign key workload, with its outcome: the
+// children with fresh keys that it inserts, and the parents that it may delete.
+type fkWrite struct {
+	invoke, complete time.Duration
+	outcome          history.Outcome
+	children         []fkChild
+	deletes          []int64
+}
+
+// fkChild is a child with a fresh key that a write inserts, with the toys with fresh keys that the
+// write gives it.
+type fkChild struct {
+	id, pid, n int64
+	toys       []int64
+}
+
+// fkRead is the rows of the foreign key workload that a reader saw in its snapshot, which it began
+// to read at invoke.
+type fkRead struct {
+	client int
+	invoke time.Duration
+	rows   fkRows
+}
+
+// checkForeignKeyReads checks the rows that every reader saw against the writes, once every write
+// has its outcome.
+func (r *run) checkForeignKeyReads() {
+	fc := newForeignKeyCheck(r.fkWrites)
+	for _, read := range r.fkReads {
+		if err := fc.check(read.rows, read.invoke); err != nil {
+			r.anomaly(CheckerRealTime, "client %d: %v", read.client, err)
+		}
+	}
+}
+
+// foreignKeyCheck checks rows of the foreign key workload against its writes. No child or toy of
+// a failed write may be there. A child that an acknowledged write inserted before the reader
+// began must be there as it was inserted, with its toys, unless some write that did not fail and
+// was not acknowledged before the insert began could have deleted its parent. Other writes are
+// ignored, so that the reader may see them or not.
+type foreignKeyCheck struct {
+	writes []fkWrite
+	// deletable says for every child of every write whether another write could have deleted its
+	// parent.
+	deletable [][]bool
+}
+
+func newForeignKeyCheck(writes []fkWrite) foreignKeyCheck {
+	fc := foreignKeyCheck{writes: writes, deletable: make([][]bool, len(writes))}
+	for i, w := range writes {
+		fc.deletable[i] = make([]bool, len(w.children))
+		for k, ch := range w.children {
+			fc.deletable[i][k] = parentDeletable(writes, i, ch.pid)
+		}
+	}
+	return fc
+}
+
+// check rows that a reader that began at invoke saw, or the final state when invoke is negative.
+func (fc foreignKeyCheck) check(rows fkRows, invoke time.Duration) error {
+	for i, w := range fc.writes {
+		for k, ch := range w.children {
+			got, ok := rows.children[ch.id]
+			if w.outcome == history.Failed {
+				if ok {
+					return fmt.Errorf("child %d is there, but the write that inserted it failed", ch.id)
+				}
+				for _, id := range ch.toys {
+					if _, ok := rows.toys[id]; ok {
+						return fmt.Errorf("toy %d is there, but the write that inserted it failed", id)
+					}
+				}
+				continue
+			}
+			if w.outcome != history.OK || invoke >= 0 && w.complete >= invoke || fc.deletable[i][k] {
+				continue
+			}
+			want := [2]sql.NullInt64{{Int64: ch.pid, Valid: true}, {Int64: ch.n, Valid: true}}
+			switch {
+			case !ok:
+				return fmt.Errorf("child %d of parent %d is missing, and no write could have deleted the parent since an acknowledged write inserted the child", ch.id, ch.pid)
+			case got != want:
+				return fmt.Errorf("child %d is %v, but an acknowledged write inserted it as %v, and no write changes it", ch.id, got, want)
+			}
+			for _, id := range ch.toys {
+				if t, ok := rows.toys[id]; !ok || t != (toy{cid: ch.id, label: "toy"}) {
+					return fmt.Errorf("toy %d of child %d is %v, but an acknowledged write inserted it, and no write could have deleted the child since", id, ch.id, t)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// parentDeletable reports whether any write but writes[i] that did not fail could have deleted
+// the parent pid, ordered after writes[i]: one that deletes it and that was not acknowledged
+// before writes[i] began.
+func parentDeletable(writes []fkWrite, i int, pid int64) bool {
+	for j, w := range writes {
+		if j != i && w.outcome != history.Failed && w.complete >= writes[i].invoke && slices.Contains(w.deletes, pid) {
+			return true
+		}
+	}
+	return false
 }

@@ -239,6 +239,19 @@ func (c *Client) Unavailable(process string, until time.Time) {
 	c.outages[process] = until
 }
 
+// ExtendUnavailable makes the store unreachable until the given time like [Client.Unavailable],
+// but never ends an outage or partition for the name earlier than it would end anyway.
+func (c *Client) ExtendUnavailable(process string, until time.Time) {
+	c.outageMu.Lock()
+	defer c.outageMu.Unlock()
+	if c.outages == nil {
+		c.outages = map[string]time.Time{}
+	}
+	if until.After(c.outages[process]) {
+		c.outages[process] = until
+	}
+}
+
 // Outages started by [Faults.OutageRate] so far.
 func (c *Client) Outages() int {
 	c.outageMu.Lock()

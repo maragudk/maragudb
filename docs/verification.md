@@ -13,7 +13,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - 36 acceptance criteria (`AC-`), 28 key invariants (`INV-`), 31 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
 - 31 mutants (`MUT-`), deliberate bugs, of which 29 are detected by the simulator's checkers within 20 seeds.
 - 29 interesting states (`STATE-`) that the simulator's fixed corpus must reach.
-- 299 declarations of coverage in the tests.
+- 300 declarations of coverage in the tests.
 
 ## Acceptance criteria
 
@@ -107,6 +107,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 > Durability and atomicity. Every acknowledged commit stays visible after any crash.
 
 - `internal/engine` `TestTx_Commit/a_commit_whose_manifest_write_lost_its_acknowledgement_is_reported_as_success_exactly_once`: a commit whose manifest write lost its acknowledgement is resolved as landed, reported once, and visible
+- `internal/history` `TestCheckBankDurability`: the bank durability checker accepts final balances that the acknowledged transfers and a set of the unknown ones explain, and rejects a lost acknowledged transfer and an applied failed one
 - `internal/history` `TestCheckDurability`: the durability checker rejects a missing acknowledged write, an applied failed write, a partially applied unknown transaction, and values in the wrong key or never written
 - `internal/history` `TestChecks_Properties/reject_a_serial_history_where_an_acknowledged_append_was_dropped_from_the_final_state`: the checkers reject every generated serial history whose final state lost one acknowledged append
 - `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus, with injected errors, latency, lost acknowledgements, outages, and crashes, finds no anomalies with any checker and exercises every fault
@@ -115,6 +116,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 > Durability and atomicity: An unacknowledged commit is either completely visible or completely invisible, never partial.
 
+- `internal/history` `TestCheckBankDurability`: the bank durability checker accepts final balances that the acknowledged transfers and a set of the unknown ones explain, and rejects a lost acknowledged transfer and an applied failed one
 - `internal/history` `TestCheckDurability`: the durability checker rejects a missing acknowledged write, an applied failed write, a partially applied unknown transaction, and values in the wrong key or never written
 - `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus, with injected errors, latency, lost acknowledgements, outages, and crashes, finds no anomalies with any checker and exercises every fault
 
@@ -894,21 +896,21 @@ Every mutant runs in every simulator configuration below, with seeds 1 to 20, un
 
 | Mutant | Detected in | First seed | Checkers |
 |---|---|---|---|
-| `MUT-COMMIT-WITHOUT-CAS` commit without CAS | 9 of 12 configurations | 1 | durability, list-append, real-time order, storage |
+| `MUT-COMMIT-WITHOUT-CAS` commit without CAS | 12 of 12 configurations | 1 | durability, list-append, real-time order, storage |
 | `MUT-GC-IGNORE-GRACE` GC ignoring the grace period | 6 of 12 configurations | 1 | final read, grace period, list-append |
 | `MUT-GC-BATCH-OBJECTS-FIRST` garbage batches deleted before their garbage | 6 of 6 configurations | 1 | storage |
 | `MUT-GC-SWEEP-SEGMENTS-ONLY` an orphan sweep that misses garbage batches | 6 of 6 configurations | 1 | storage |
 | `MUT-GC-CHAIN-FIRST-STAMP` a chain of garbage batches with the stamp of its first batch | 6 of 6 configurations | 3 | grace period |
-| `MUT-GC-DELETE-REFERENCED` GC deleting expired garbage that is referenced again | 3 of 6 configurations | 1 | final read, grace period, storage |
+| `MUT-GC-DELETE-REFERENCED` GC deleting expired garbage that is referenced again | 6 of 6 configurations | 1 | final read, grace period, list-append, storage |
 | `MUT-COMPACT-NON-ADJACENT` a merge of segments that are not adjacent | 6 of 6 configurations | 1 | bank, durability, index consistency, list-append, unique |
 | `MUT-COMPACT-DROP-TOMBSTONES` tombstones dropped in a merge that excludes the oldest segment | 4 of 4 configurations | 1 | durability, foreign key, index consistency, list-append |
-| `MUT-COMPACT-REBASE-LOSES-SEGMENT` a rebase that loses a segment added meanwhile | 6 of 6 configurations | 1 | bank, durability, final read, index consistency, list-append, real-time order, unique |
-| `MUT-COMPACT-REBASE-ON-COMPACTION` a rebase on another compaction | 2 of 6 configurations | 1 | durability, list-append |
-| `MUT-SKIP-FRESHNESS` serving the cache without a freshness check | 9 of 12 configurations | 1 | grace period, list-append, real-time order |
-| `MUT-ACK-BEFORE-CONFIRM` acking before the write is confirmed | 9 of 12 configurations | 1 | durability, real-time order, storage |
-| `MUT-COMPACTED-AHEAD` the compacted segment ahead of newer ones after a rebase | 5 of 12 configurations | 1 | durability, index consistency, list-append, real-time order |
-| `MUT-FRESH-SNAPSHOT` a fresh snapshot per statement | 8 of 8 configurations | 1 | bank, foreign key, index consistency, list-append, workload invariants |
-| `MUT-RETRY-UNKNOWN` retrying an autocommit statement after an unknown commit outcome | 2 of 8 configurations | 1 | durability, list-append |
+| `MUT-COMPACT-REBASE-LOSES-SEGMENT` a rebase that loses a segment added meanwhile | 6 of 6 configurations | 1 | durability, final read, list-append, real-time order |
+| `MUT-COMPACT-REBASE-ON-COMPACTION` a rebase on another compaction | 6 of 6 configurations | 1 | bank, durability, list-append, real-time order |
+| `MUT-SKIP-FRESHNESS` serving the cache without a freshness check | 10 of 12 configurations | 1 | grace period, list-append, real-time order |
+| `MUT-ACK-BEFORE-CONFIRM` acking before the write is confirmed | 12 of 12 configurations | 1 | durability, real-time order, storage |
+| `MUT-COMPACTED-AHEAD` the compacted segment ahead of newer ones after a rebase | 6 of 12 configurations | 1 | durability, index consistency, list-append, real-time order |
+| `MUT-FRESH-SNAPSHOT` a fresh snapshot per statement | 8 of 8 configurations | 1 | bank, durability, foreign key, index consistency, list-append, workload invariants |
+| `MUT-RETRY-UNKNOWN` retrying an autocommit statement after an unknown commit outcome | 6 of 8 configurations | 1 | durability, list-append, real-time order |
 | `MUT-INDEX-STALE-DELETE` stale index entries after an UPDATE or DELETE | 6 of 8 configurations | 1 | index consistency |
 | `MUT-UNIQUE-NO-CHECK` no unique check | 2 of 8 configurations | 1 | index consistency, unique |
 | `MUT-UNIQUE-OWN-WRITES` a unique check that misses the statement's own writes | 2 of 8 configurations | 2 | index consistency, unique |
@@ -934,16 +936,16 @@ Every mutant runs in every simulator configuration below, with seeds 1 to 20, un
 |---|---|
 | list-append through the engine, no maintainers | detected with seed 1 by durability, list-append |
 | list-append through the engine, 2 maintainers | detected with seed 1 by durability, list-append, storage |
-| bank through the engine, no maintainers | detected with seed 12 by storage |
-| bank through the engine, 2 maintainers | detected with seed 2 by storage |
+| bank through the engine, no maintainers | detected with seed 1 by durability |
+| bank through the engine, 2 maintainers | detected with seed 1 by durability |
 | list-append through SQL, no maintainers | detected with seed 1 by durability, list-append |
 | list-append through SQL, 2 maintainers | detected with seed 1 by durability, list-append |
-| bank through SQL, no maintainers | cannot detect: an unconditional manifest write drops whole concurrent commits, a dropped transfer conserves money, and the bank checker only checks totals; without maintainers, only the storage checker finds the objects of a dropped commit that GC cannot collect, in 2 of the first 100 seeds, the first at seed 80 |
-| bank through SQL, 2 maintainers | detected with seed 1 by storage |
-| unique through SQL, no maintainers | cannot detect: an unconditional manifest write drops whole concurrent commits, which leaves a consistent state in which no value repeats, the unique workload does not check that acknowledged writes survive, and in 20 seeds no dropped commit leaves the store with objects that GC cannot collect |
-| unique through SQL, 2 maintainers | cannot detect: an unconditional manifest write drops whole concurrent commits, which leaves a consistent state in which no value repeats, and the unique workload does not check that acknowledged writes survive; only the storage checker finds the objects of a dropped commit that GC cannot collect, in 11 of the first 100 seeds, the first at seed 21 |
-| foreign-key through SQL, no maintainers | detected with seed 2 by real-time order |
-| foreign-key through SQL, 2 maintainers | detected with seed 1 by real-time order |
+| bank through SQL, no maintainers | detected with seed 1 by durability |
+| bank through SQL, 2 maintainers | detected with seed 1 by durability, storage |
+| unique through SQL, no maintainers | detected with seed 1 by durability, real-time order |
+| unique through SQL, 2 maintainers | detected with seed 1 by durability, real-time order |
+| foreign-key through SQL, no maintainers | detected with seed 2 by real-time order, durability |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by real-time order, durability |
 
 Targeted tests:
 
@@ -1044,22 +1046,22 @@ Targeted tests:
 
 ### `MUT-GC-DELETE-REFERENCED`
 
-`engine.Mutations.GCDeleteReferenced` deletes the garbage of an expired chain of garbage batches also when the manifest references it otherwise, such as the output of a compaction that GC stamped as an orphan before the compaction's rebase landed.
+`engine.Mutations.GCDeleteReferenced` deletes the garbage of an expired chain of garbage batches also when the manifest references it otherwise, such as the output of a compaction that GC stamped as an orphan before the compaction's rebase landed. It runs with maintainers that stall for up to 900 ms between the segment write and the manifest write of a compaction, and with one maintainer that compacts while the other only collects garbage.
 
 | Configuration | Result |
 |---|---|
 | list-append through the engine, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| list-append through the engine, 2 maintainers | detected with seed 3 by grace period |
+| list-append through the engine, 2 maintainers | detected with seed 1 by final read, list-append, storage |
 | bank through the engine, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| bank through the engine, 2 maintainers | cannot detect: a GC pass rarely stamps the output of a compaction as an orphan between the compaction's segment write and its rebased manifest write, which the mutant needs: 3 of the first 100 seeds do, the first at seed 40; `TestMutations` of the engine makes that happen and detects the mutant |
+| bank through the engine, 2 maintainers | detected with seed 4 by storage |
 | list-append through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| list-append through SQL, 2 maintainers | cannot detect: in 20 seeds, no GC pass stamps the output of a compaction as an orphan between the compaction's segment write and its rebased manifest write, which the mutant needs; `TestMutations` of the engine makes that happen and detects the mutant |
+| list-append through SQL, 2 maintainers | detected with seed 1 by grace period, final read, list-append, storage |
 | bank through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| bank through SQL, 2 maintainers | detected with seed 14 by grace period, final read, storage |
+| bank through SQL, 2 maintainers | detected with seed 1 by grace period, final read, storage |
 | unique through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| unique through SQL, 2 maintainers | detected with seed 1 by storage |
+| unique through SQL, 2 maintainers | detected with seed 1 by grace period, final read, storage |
 | foreign-key through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| foreign-key through SQL, 2 maintainers | cannot detect: a GC pass rarely stamps the output of a compaction as an orphan between the compaction's segment write and its rebased manifest write, which the mutant needs: 5 of the first 100 seeds do, the first at seed 44; `TestMutations` of the engine makes that happen and detects the mutant |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by storage |
 
 Targeted tests:
 
@@ -1074,7 +1076,7 @@ Targeted tests:
 | list-append through the engine, no maintainers | not applicable: without maintainers nothing compacts |
 | list-append through the engine, 2 maintainers | detected with seed 1 by durability, list-append |
 | bank through the engine, no maintainers | not applicable: without maintainers nothing compacts |
-| bank through the engine, 2 maintainers | detected with seed 1 by bank |
+| bank through the engine, 2 maintainers | detected with seed 1 by bank, durability |
 | list-append through SQL, no maintainers | not applicable: without maintainers nothing compacts |
 | list-append through SQL, 2 maintainers | detected with seed 3 by durability, list-append |
 | bank through SQL, no maintainers | not applicable: without maintainers nothing compacts |
@@ -1120,15 +1122,15 @@ Targeted tests:
 | list-append through the engine, no maintainers | not applicable: without maintainers nothing compacts |
 | list-append through the engine, 2 maintainers | detected with seed 1 by durability, list-append |
 | bank through the engine, no maintainers | not applicable: without maintainers nothing compacts |
-| bank through the engine, 2 maintainers | detected with seed 6 by bank |
+| bank through the engine, 2 maintainers | detected with seed 1 by durability |
 | list-append through SQL, no maintainers | not applicable: without maintainers nothing compacts |
 | list-append through SQL, 2 maintainers | detected with seed 1 by final read, list-append |
 | bank through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| bank through SQL, 2 maintainers | detected with seed 2 by index consistency |
+| bank through SQL, 2 maintainers | detected with seed 1 by durability |
 | unique through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| unique through SQL, 2 maintainers | detected with seed 14 by unique, index consistency |
+| unique through SQL, 2 maintainers | detected with seed 1 by durability, real-time order |
 | foreign-key through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| foreign-key through SQL, 2 maintainers | detected with seed 3 by real-time order |
+| foreign-key through SQL, 2 maintainers | detected with seed 3 by real-time order, durability |
 
 Targeted tests:
 
@@ -1136,22 +1138,22 @@ Targeted tests:
 
 ### `MUT-COMPACT-REBASE-ON-COMPACTION`
 
-`engine.Mutations.CompactRebaseOnCompaction` rebases a compaction on any newer manifest with at least as many segments, also on one in which another compaction replaced segments, so that the segments of that compaction and of the commits after it are lost or put back.
+`engine.Mutations.CompactRebaseOnCompaction` rebases a compaction on any newer manifest with at least as many segments, also on one in which another compaction replaced segments, so that the segments of that compaction and of the commits after it are lost or put back. It runs with maintainers that stall for up to 500 ms between the segment write and the manifest write of a compaction.
 
 | Configuration | Result |
 |---|---|
 | list-append through the engine, no maintainers | not applicable: without maintainers nothing compacts |
-| list-append through the engine, 2 maintainers | detected with seed 1 by durability, list-append |
+| list-append through the engine, 2 maintainers | detected with seed 1 by list-append |
 | bank through the engine, no maintainers | not applicable: without maintainers nothing compacts |
-| bank through the engine, 2 maintainers | cannot detect: a rebase on another compaction loses whole commits and puts back merged segments with the same values, a lost transfer conserves money, and the bank checker only checks totals |
+| bank through the engine, 2 maintainers | detected with seed 1 by bank, durability |
 | list-append through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| list-append through SQL, 2 maintainers | detected with seed 1 by durability, list-append |
+| list-append through SQL, 2 maintainers | detected with seed 2 by durability, list-append |
 | bank through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| bank through SQL, 2 maintainers | cannot detect: a rebase on another compaction loses whole commits and puts back merged segments with the same values, a lost transfer conserves money, and the bank checker only checks totals; only the index consistency checker finds a lost commit that wrote an index entry, in 2 of the first 100 seeds, the first at seed 27 |
+| bank through SQL, 2 maintainers | detected with seed 1 by durability |
 | unique through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| unique through SQL, 2 maintainers | cannot detect: a rebase on another compaction loses whole commits and puts back merged segments with the same values, which leaves a consistent state in which no value repeats, and the unique workload does not check that acknowledged writes survive |
+| unique through SQL, 2 maintainers | detected with seed 2 by durability |
 | foreign-key through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| foreign-key through SQL, 2 maintainers | cannot detect: a rebase on another compaction loses whole commits and puts back merged segments with the same values, which mostly leaves an older consistent state; only the real-time order checker finds a lost commit that a later read missed, in 5 of the first 100 seeds, the first at seed 27 |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by real-time order, durability |
 
 Targeted tests:
 
@@ -1165,16 +1167,16 @@ Targeted tests:
 |---|---|
 | list-append through the engine, no maintainers | detected with seed 1 by list-append |
 | list-append through the engine, 2 maintainers | detected with seed 1 by list-append |
-| bank through the engine, no maintainers | cannot detect: a stale snapshot makes a transfer conflict or read an older consistent state, which conserves money |
+| bank through the engine, no maintainers | cannot detect: a transfer from a stale snapshot conflicts at commit, so that none is lost, and an audit from one reads an older state that conserves money; the bank workload checks no audit against the transfers acknowledged before it |
 | bank through the engine, 2 maintainers | detected with seed 10 by grace period |
 | list-append through SQL, no maintainers | detected with seed 1 by list-append |
 | list-append through SQL, 2 maintainers | detected with seed 1 by list-append |
-| bank through SQL, no maintainers | cannot detect: a stale snapshot makes a transfer conflict or read an older consistent state, which conserves money |
+| bank through SQL, no maintainers | cannot detect: a transfer from a stale snapshot conflicts at commit, so that none is lost, and an audit from one reads an older state that conserves money; the bank workload checks no audit against the transfers acknowledged before it |
 | bank through SQL, 2 maintainers | detected with seed 2 by grace period |
-| unique through SQL, no maintainers | cannot detect: a stale snapshot is an older consistent state in which no value repeats, and a write from it conflicts at commit; without maintainers no reader loses an object either |
-| unique through SQL, 2 maintainers | detected with seed 10 by grace period |
+| unique through SQL, no maintainers | detected with seed 1 by real-time order |
+| unique through SQL, 2 maintainers | detected with seed 2 by real-time order |
 | foreign-key through SQL, no maintainers | detected with seed 2 by real-time order |
-| foreign-key through SQL, 2 maintainers | detected with seed 10 by real-time order |
+| foreign-key through SQL, 2 maintainers | detected with seed 2 by real-time order |
 
 ### `MUT-ACK-BEFORE-CONFIRM`
 
@@ -1184,16 +1186,16 @@ Targeted tests:
 |---|---|
 | list-append through the engine, no maintainers | detected with seed 1 by durability |
 | list-append through the engine, 2 maintainers | detected with seed 1 by durability |
-| bank through the engine, no maintainers | cannot detect: an acknowledged transfer that never landed is missing as a whole, which conserves money, and without maintainers its segment is an orphan that GC collects like that of any failed commit |
-| bank through the engine, 2 maintainers | detected with seed 3 by storage |
+| bank through the engine, no maintainers | detected with seed 1 by durability |
+| bank through the engine, 2 maintainers | detected with seed 1 by durability |
 | list-append through SQL, no maintainers | detected with seed 1 by durability |
 | list-append through SQL, 2 maintainers | detected with seed 1 by durability |
-| bank through SQL, no maintainers | cannot detect: an acknowledged transfer that never landed is missing as a whole, which conserves money, and without maintainers its segment is an orphan that GC collects like that of any failed commit |
-| bank through SQL, 2 maintainers | detected with seed 1 by storage |
-| unique through SQL, no maintainers | cannot detect: an acknowledged write that never landed is missing as a whole, which leaves a consistent state, the unique workload does not check that acknowledged writes survive, and without maintainers the segment of such a write is an orphan that GC collects like any other |
-| unique through SQL, 2 maintainers | detected with seed 2 by storage |
-| foreign-key through SQL, no maintainers | detected with seed 1 by real-time order |
-| foreign-key through SQL, 2 maintainers | detected with seed 1 by real-time order |
+| bank through SQL, no maintainers | detected with seed 1 by durability |
+| bank through SQL, 2 maintainers | detected with seed 1 by durability, storage |
+| unique through SQL, no maintainers | detected with seed 1 by durability, real-time order |
+| unique through SQL, 2 maintainers | detected with seed 1 by durability, real-time order |
+| foreign-key through SQL, no maintainers | detected with seed 1 by real-time order, durability |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by real-time order, durability |
 
 Targeted tests:
 
@@ -1208,15 +1210,15 @@ Targeted tests:
 | list-append through the engine, no maintainers | cannot detect: without maintainers nothing compacts, so there is never a rebase |
 | list-append through the engine, 2 maintainers | detected with seed 1 by durability, list-append |
 | bank through the engine, no maintainers | cannot detect: without maintainers nothing compacts, so there is never a rebase |
-| bank through the engine, 2 maintainers | cannot detect: resurrected balances are a consistent older state, which conserves money, and the engine workload has no index |
+| bank through the engine, 2 maintainers | detected with seed 1 by durability |
 | list-append through SQL, no maintainers | cannot detect: without maintainers nothing compacts, so there is never a rebase |
 | list-append through SQL, 2 maintainers | detected with seed 1 by durability, list-append |
 | bank through SQL, no maintainers | cannot detect: without maintainers nothing compacts, so there is never a rebase |
-| bank through SQL, 2 maintainers | detected with seed 1 by index consistency |
+| bank through SQL, 2 maintainers | detected with seed 1 by index consistency, durability |
 | unique through SQL, no maintainers | cannot detect: without maintainers nothing compacts, so there is never a rebase |
 | unique through SQL, 2 maintainers | detected with seed 3 by index consistency |
 | foreign-key through SQL, no maintainers | cannot detect: without maintainers nothing compacts, so there is never a rebase |
-| foreign-key through SQL, 2 maintainers | detected with seed 3 by real-time order |
+| foreign-key through SQL, 2 maintainers | detected with seed 3 by real-time order, durability |
 
 Targeted tests:
 
@@ -1235,8 +1237,8 @@ Targeted tests:
 | bank through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
 | list-append through SQL, no maintainers | detected with seed 1 by list-append |
 | list-append through SQL, 2 maintainers | detected with seed 1 by list-append |
-| bank through SQL, no maintainers | detected with seed 1 by workload invariants, bank |
-| bank through SQL, 2 maintainers | detected with seed 1 by workload invariants, bank |
+| bank through SQL, no maintainers | detected with seed 1 by workload invariants, bank, durability |
+| bank through SQL, 2 maintainers | detected with seed 1 by workload invariants, bank, durability |
 | unique through SQL, no maintainers | detected with seed 1 by index consistency |
 | unique through SQL, 2 maintainers | detected with seed 1 by index consistency |
 | foreign-key through SQL, no maintainers | detected with seed 2 by foreign key |
@@ -1248,7 +1250,7 @@ Targeted tests:
 
 ### `MUT-RETRY-UNKNOWN`
 
-`exec.Mutations.RetryAfterUnknownCommit` retries an autocommit statement whose commit outcome is unknown, which can apply it twice.
+`exec.Mutations.RetryAfterUnknownCommit` retries an autocommit statement whose commit outcome is unknown, which can apply it twice. It runs with clients that are partitioned right after four in ten of their manifest writes land, so that the outcome of their commits is unknown.
 
 | Configuration | Result |
 |---|---|
@@ -1257,13 +1259,13 @@ Targeted tests:
 | bank through the engine, no maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
 | bank through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
 | list-append through SQL, no maintainers | detected with seed 1 by durability, list-append |
-| list-append through SQL, 2 maintainers | detected with seed 7 by durability, list-append |
+| list-append through SQL, 2 maintainers | detected with seed 1 by durability, list-append |
 | bank through SQL, no maintainers | cannot detect: the bank workload writes only in explicit transactions, so no autocommit statement is ever retried, and a doubled transfer conserves money anyway |
 | bank through SQL, 2 maintainers | cannot detect: the bank workload writes only in explicit transactions, so no autocommit statement is ever retried, and a doubled transfer conserves money anyway |
-| unique through SQL, no maintainers | cannot detect: a retried insert fails on its own primary key, and a retried move or delete finds its row moved or gone, so a statement applied twice leaves a consistent state |
-| unique through SQL, 2 maintainers | cannot detect: a retried insert fails on its own primary key, and a retried move or delete finds its row moved or gone, so a statement applied twice leaves a consistent state |
-| foreign-key through SQL, no maintainers | cannot detect: a retried statement is checked again against every foreign key and check, so even one applied twice, such as an increment, leaves a consistent state, and the counter is incremented only in transactions, which are never retried |
-| foreign-key through SQL, 2 maintainers | cannot detect: a retried statement is checked again against every foreign key and check, so even one applied twice, such as an increment, leaves a consistent state, and the counter is incremented only in transactions, which are never retried |
+| unique through SQL, no maintainers | detected with seed 1 by durability, real-time order |
+| unique through SQL, 2 maintainers | detected with seed 1 by durability, real-time order |
+| foreign-key through SQL, no maintainers | detected with seed 2 by durability, real-time order |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by durability |
 
 Targeted tests:
 
@@ -1514,7 +1516,7 @@ Targeted tests:
 |---|---|
 | list-append through the engine, no maintainers | detected with seed 1 by cache integrity |
 | list-append through the engine, 2 maintainers | detected with seed 2 by durability, list-append |
-| bank through the engine, no maintainers | detected with seed 2 by bank |
+| bank through the engine, no maintainers | detected with seed 2 by bank, durability |
 | bank through the engine, 2 maintainers | detected with seed 3 by cache integrity |
 | list-append through SQL, no maintainers | detected with seed 2 by workload invariants, damaged reads, list-append |
 | list-append through SQL, 2 maintainers | detected with seed 1 by durability, list-append |
@@ -1537,12 +1539,12 @@ Targeted tests:
 |---|---|
 | list-append through the engine, no maintainers | detected with seed 1 by durability, list-append |
 | list-append through the engine, 2 maintainers | detected with seed 1 by durability, list-append |
-| bank through the engine, no maintainers | detected with seed 1 by bank |
-| bank through the engine, 2 maintainers | detected with seed 1 by workload invariants, bank |
+| bank through the engine, no maintainers | detected with seed 1 by bank, durability |
+| bank through the engine, 2 maintainers | detected with seed 1 by workload invariants, bank, durability |
 | list-append through SQL, no maintainers | detected with seed 2 by durability |
 | list-append through SQL, 2 maintainers | detected with seed 1 by workload invariants, durability, list-append |
-| bank through SQL, no maintainers | detected with seed 1 by workload invariants, index consistency, bank |
-| bank through SQL, 2 maintainers | detected with seed 1 by workload invariants, index consistency, bank |
+| bank through SQL, no maintainers | detected with seed 1 by workload invariants, index consistency, bank, durability |
+| bank through SQL, 2 maintainers | detected with seed 1 by workload invariants, index consistency, bank, durability |
 | unique through SQL, no maintainers | detected with seed 1 by index consistency, unique |
 | unique through SQL, 2 maintainers | detected with seed 1 by unique, index consistency |
 | foreign-key through SQL, no maintainers | detected with seed 1 by foreign key |

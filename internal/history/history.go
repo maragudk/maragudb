@@ -7,6 +7,8 @@
 package history
 
 import (
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -124,6 +126,180 @@ func CheckBank(audits []BankAudit, total int64) error {
 		}
 	}
 	return nil
+}
+
+// ErrUndecided is returned by [CheckBankDurability] for a history whose transfers with an unknown
+// outcome have too many combinations to try.
+var ErrUndecided = errors.New("too many combinations of transfers with an unknown outcome to decide")
+
+// CheckBankDurability verifies the final balances of the bank workload against its transfers,
+// each a transaction whose appends are the amounts that it moved into accounts, negative for the
+// account it moved them from. Every balance must be initial plus the amounts of every acknowledged
+// transfer and of one set of the transfers whose outcome is unknown, the same set for every
+// account, so that a lost acknowledged transfer shows even where it conserves money. Transfers
+// with an unknown outcome that move the same amounts count as one with a multiplicity, and it
+// returns [ErrUndecided], and no [*Anomaly], when their combinations are more than
+// [maxCombinations] for each half of them.
+func CheckBankDurability(txs []Tx, initial int64, final map[string]int64) error {
+	index := map[string]int{}
+	var accounts []string
+	account := func(name string) int {
+		i, ok := index[name]
+		if !ok {
+			i = len(accounts)
+			index[name] = i
+			accounts = append(accounts, name)
+		}
+		return i
+	}
+	names := make([]string, 0, len(final))
+	for name := range final {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		account(name)
+	}
+	type delta map[int]int64
+	var acked, unknown []delta
+	for _, tx := range txs {
+		if tx.Outcome == Failed {
+			continue
+		}
+		d := delta{}
+		for _, op := range tx.Ops {
+			if op.Kind == Append {
+				d[account(op.Key)] += op.Value
+			}
+		}
+		if tx.Outcome == OK {
+			acked = append(acked, d)
+		} else {
+			unknown = append(unknown, d)
+		}
+	}
+	missing := make([]int64, len(accounts))
+	for name, i := range index {
+		missing[i] = final[name] - initial
+	}
+	for _, d := range acked {
+		for i, v := range d {
+			missing[i] -= v
+		}
+	}
+	// Transfers that move the same amounts between the same accounts are one group, of which any
+	// number up to its size may have landed, and a transfer that moves nothing does not matter.
+	groupOf := map[string]int{}
+	var groups []group
+	for _, d := range unknown {
+		v := make([]int64, len(accounts))
+		zero := true
+		for i, x := range d {
+			v[i] = x
+			zero = zero && x == 0
+		}
+		if zero {
+			continue
+		}
+		k := vectorKey(v)
+		if g, ok := groupOf[k]; ok {
+			groups[g].size++
+			continue
+		}
+		groupOf[k] = len(groups)
+		groups = append(groups, group{vector: v, size: 1})
+	}
+	found, ok := sumsTo(groups, missing)
+	if !ok {
+		return ErrUndecided
+	}
+	if found {
+		return nil
+	}
+	diff := map[string]int64{}
+	for i, name := range accounts {
+		if missing[i] != 0 {
+			diff[name] = missing[i]
+		}
+	}
+	return &Anomaly{Kind: "lost acknowledged write", Message: fmt.Sprintf("the final balances differ from those of the acknowledged transfers by %v, which no set of the %d transfers whose outcome is unknown makes up", diff, len(unknown))}
+}
+
+// maxCombinations of the groups of each half that [sumsTo] tries.
+const maxCombinations = 1 << 20
+
+// group of equal vectors, of which a sum may take any number up to size.
+type group struct {
+	vector []int64
+	size   int
+}
+
+func vectorKey(v []int64) string {
+	b := make([]byte, 0, 8*len(v))
+	for _, x := range v {
+		b = binary.LittleEndian.AppendUint64(b, uint64(x))
+	}
+	return string(b)
+}
+
+// sumsTo reports whether some choice of up to the size of each group of vectors sums to target,
+// by meeting in the middle: it keeps the sums of every choice in the first half of the groups,
+// and looks up what each choice in the second half leaves of the target. It reports false for ok
+// when a half has more than [maxCombinations] choices.
+func sumsTo(groups []group, target []int64) (found, ok bool) {
+	// The halves split the combinations rather than the groups.
+	half, left := 0, 1
+	for half < len(groups) && left*(groups[half].size+1) <= maxCombinations {
+		left *= groups[half].size + 1
+		half++
+	}
+	right := 1
+	for _, g := range groups[half:] {
+		right *= g.size + 1
+		if right > maxCombinations {
+			return false, false
+		}
+	}
+	// each calls f with the sum of every choice from gs, until f returns true.
+	each := func(gs []group, f func(sum []int64) bool) bool {
+		sum := make([]int64, len(target))
+		var visit func(i int) bool
+		visit = func(i int) bool {
+			if i == len(gs) {
+				return f(sum)
+			}
+			found := false
+			taken := 0
+			for ; taken <= gs[i].size; taken++ {
+				if visit(i + 1) {
+					found = true
+					break
+				}
+				if taken < gs[i].size {
+					for j, x := range gs[i].vector {
+						sum[j] += x
+					}
+				}
+			}
+			for j, x := range gs[i].vector {
+				sum[j] -= x * int64(min(taken, gs[i].size))
+			}
+			return found
+		}
+		return visit(0)
+	}
+	sums := map[string]bool{}
+	each(groups[:half], func(sum []int64) bool {
+		sums[vectorKey(sum)] = true
+		return false
+	})
+	rest := make([]int64, len(target))
+	return each(groups[half:], func(sum []int64) bool {
+		for j := range rest {
+			rest[j] = target[j] - sum[j]
+		}
+		return sums[vectorKey(rest)]
+	}), true
 }
 
 // CheckDurability verifies the acknowledged commits against the final state read after all

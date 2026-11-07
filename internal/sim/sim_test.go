@@ -1,6 +1,7 @@
 package sim_test
 
 import (
+	"cmp"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -16,6 +17,7 @@ import (
 	"testing"
 	"testing/synctest"
 	"time"
+	"unicode"
 
 	"maragu.dev/is"
 
@@ -223,6 +225,22 @@ func corpus() []sim.Config {
 		}
 		cfgs = append(cfgs, cfg)
 	}
+	// Maintainers that stall between the segment write and the manifest write of a compaction,
+	// half of them with one maintainer that compacts and one that only collects garbage, and
+	// clients partitioned right after some of their manifest writes land, in every workload,
+	// through the engine and through SQL.
+	for seed := uint64(900); seed < 912; seed++ {
+		cfg := sim.DefaultConfig(seed)
+		cfg.Workload = sim.Workload(seed % 4)
+		cfg.SQL = cfg.Workload >= sim.Unique || seed%8 >= 4
+		cfg.Maintainers = 2
+		cfg.CompactionStall = time.Duration(500+400*(seed%2)) * time.Millisecond
+		cfg.OneCompactor = seed%2 == 1
+		if seed%3 == 0 {
+			cfg.CommitPartitions = 0.4
+		}
+		cfgs = append(cfgs, cfg)
+	}
 	// The same through the SQL layer and the database/sql driver.
 	for seed := uint64(300); seed < 330; seed++ {
 		for _, w := range []sim.Workload{sim.ListAppend, sim.Bank} {
@@ -265,6 +283,15 @@ func failReport(t *testing.T, res sim.Result) {
 		}
 		if cfg.BlockSize != 0 {
 			replay += fmt.Sprint(" BLOCK_SIZE=", cfg.BlockSize)
+		}
+		if cfg.CompactionStall != 0 {
+			replay += fmt.Sprint(" COMPACTION_STALL=", cfg.CompactionStall)
+		}
+		if cfg.OneCompactor {
+			replay += " ONE_COMPACTOR=1"
+		}
+		if cfg.CommitPartitions != 0 {
+			replay += fmt.Sprint(" COMMIT_PARTITIONS=", cfg.CommitPartitions)
 		}
 	}
 	t.Errorf("%s\n\nconfiguration: %+v\n\nreplay with:\n  %s", res.Report(), cfg, replay)
@@ -328,6 +355,7 @@ func TestSimulator(t *testing.T) {
 		is.True(t, totals.Commits > 1000, "commits")
 		is.True(t, totals.Conflicts > 100, "conflicts")
 		is.True(t, totals.Unknown > 50, "unknown outcomes")
+		is.Equal(t, 0, totals.Undecided, "bank runs whose final balances the durability checker could not decide")
 		is.True(t, totals.LiveUnknown > 50, "unknown outcomes in processes that keep running")
 		is.True(t, totals.Outages > 200, "outages and partitions")
 		is.True(t, totals.Unavailable > 100, "operations failed by an unreachable store")
@@ -547,6 +575,17 @@ func TestSimulator(t *testing.T) {
 			cfg.BlockSize, err = strconv.Atoi(n)
 			is.NotError(t, err)
 		}
+		if d := os.Getenv("MARAGUDB_COMPACTION_STALL"); d != "" {
+			cfg.CompactionStall, err = time.ParseDuration(d)
+			is.NotError(t, err)
+		}
+		if os.Getenv("MARAGUDB_ONE_COMPACTOR") != "" {
+			cfg.OneCompactor = true
+		}
+		if p := os.Getenv("MARAGUDB_COMMIT_PARTITIONS"); p != "" {
+			cfg.CommitPartitions, err = strconv.ParseFloat(p, 64)
+			is.NotError(t, err)
+		}
 		switch os.Getenv("MARAGUDB_MAINTENANCE") {
 		case "lease":
 			cfg.Maintenance = sim.MaintenanceLease
@@ -571,6 +610,9 @@ func TestSimulator(t *testing.T) {
 					if cfg.Maintenance == sim.MaintenanceOff {
 						cfg.Maintenance = m.maintenance
 					}
+					cfg.CompactionStall = cmp.Or(cfg.CompactionStall, m.compactionStall)
+					cfg.OneCompactor = cfg.OneCompactor || m.oneCompactor
+					cfg.CommitPartitions = cmp.Or(cfg.CommitPartitions, m.commitPartitions)
 					if m.sqlMutations != (exec.Mutations{}) {
 						cfg.SQL = true
 					}
@@ -690,6 +732,11 @@ type mutant struct {
 	// maintenance runs the mutant with the clients' maintenance in this mode, when it is not
 	// [sim.MaintenanceOff].
 	maintenance sim.MaintenanceMode
+	// compactionStall, oneCompactor, and commitPartitions run the mutant with
+	// [sim.Config.CompactionStall], [sim.Config.OneCompactor], and [sim.Config.CommitPartitions].
+	compactionStall  time.Duration
+	oneCompactor     bool
+	commitPartitions float64
 	// unsimulated, for a mutant that no cell can run, is why not, and a targeted test detects it.
 	unsimulated string
 	// engineOnly, for a mutant that only the cells through the engine can run, is why the cells
@@ -750,7 +797,6 @@ func cells() []cell {
 
 // Reasons that recur in the kill matrix.
 const (
-	bankConserves     = "an unconditional manifest write drops whole concurrent commits, a dropped transfer conserves money, and the bank checker only checks totals"
 	noGC              = "without maintainers nothing is ever deleted, so no reader can lose an object"
 	noCompaction      = "without maintainers nothing compacts, so there is never a rebase"
 	sqlOnly           = "the mutant is in the SQL layer, which the engine workloads do not use"
@@ -759,7 +805,6 @@ const (
 	noUniqueIndex     = "the workload has no unique index besides the primary key"
 	noForeignKey      = "the workload has no foreign keys"
 	noCheck           = "the workload has no CHECK constraints"
-	ackConserves      = "an acknowledged transfer that never landed is missing as a whole, which conserves money, and without maintainers its segment is an orphan that GC collects like that of any failed commit"
 	noMaintainedGC    = "without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete"
 	noMaintainedMerge = "without maintainers nothing compacts"
 )
@@ -807,12 +852,7 @@ func mutants() []mutant {
 			id: "MUT-COMMIT-WITHOUT-CAS", replay: "cas", name: "commit without CAS",
 			description: "`engine.Mutations.CommitWithoutCAS` writes the manifest unconditionally, so a commit can overwrite a concurrent one.",
 			mutations:   engine.Mutations{CommitWithoutCAS: true},
-			cannot: map[cell]string{
-				{workload: sim.Unique, sql: true}:                 "an unconditional manifest write drops whole concurrent commits, which leaves a consistent state in which no value repeats, the unique workload does not check that acknowledged writes survive, and in 20 seeds no dropped commit leaves the store with objects that GC cannot collect",
-				{workload: sim.Unique, sql: true, maintainers: 2}: "an unconditional manifest write drops whole concurrent commits, which leaves a consistent state in which no value repeats, and the unique workload does not check that acknowledged writes survive; only the storage checker finds the objects of a dropped commit that GC cannot collect, in 11 of the first 100 seeds, the first at seed 21",
-				{workload: sim.Bank, sql: true}:                   bankConserves + "; without maintainers, only the storage checker finds the objects of a dropped commit that GC cannot collect, in 2 of the first 100 seeds, the first at seed 80",
-			},
-			checkers: []string{sim.CheckerListAppend, sim.CheckerStorage},
+			checkers:    []string{sim.CheckerListAppend, sim.CheckerStorage},
 		},
 		{
 			id: "MUT-GC-IGNORE-GRACE", replay: "gc", name: "GC ignoring the grace period",
@@ -844,20 +884,16 @@ func mutants() []mutant {
 		},
 		{
 			id: "MUT-GC-DELETE-REFERENCED", replay: "gc-delete-referenced", name: "GC deleting expired garbage that is referenced again",
-			description:  "`engine.Mutations.GCDeleteReferenced` deletes the garbage of an expired chain of garbage batches also when the manifest references it otherwise, such as the output of a compaction that GC stamped as an orphan before the compaction's rebase landed.",
-			mutations:    engine.Mutations{GCDeleteReferenced: true},
-			unmaintained: noMaintainedGC,
-			cannot: func() map[cell]string {
-				m := map[cell]string{}
-				for _, c := range []cell{{workload: sim.ListAppend, sql: true}} {
-					c.maintainers = 2
-					m[c] = "in 20 seeds, no GC pass stamps the output of a compaction as an orphan between the compaction's segment write and its rebased manifest write, which the mutant needs; `TestMutations` of the engine makes that happen and detects the mutant"
-				}
-				m[cell{workload: sim.Bank, maintainers: 2}] = "a GC pass rarely stamps the output of a compaction as an orphan between the compaction's segment write and its rebased manifest write, which the mutant needs: 3 of the first 100 seeds do, the first at seed 40; `TestMutations` of the engine makes that happen and detects the mutant"
-				m[cell{workload: sim.ForeignKey, sql: true, maintainers: 2}] = "a GC pass rarely stamps the output of a compaction as an orphan between the compaction's segment write and its rebased manifest write, which the mutant needs: 5 of the first 100 seeds do, the first at seed 44; `TestMutations` of the engine makes that happen and detects the mutant"
-				return m
-			}(),
-			checkers: []string{sim.CheckerStorage},
+			description: "`engine.Mutations.GCDeleteReferenced` deletes the garbage of an expired chain of garbage batches also when the manifest references it otherwise, such as the output of a compaction that GC stamped as an orphan before the compaction's rebase landed. It runs with maintainers that stall for up to 900 ms between the segment write and the manifest write of a compaction, and with one maintainer that compacts while the other only collects garbage.",
+			mutations:   engine.Mutations{GCDeleteReferenced: true},
+			// GC must stamp the output of a compaction as an orphan between the compaction's
+			// segment write and its rebased manifest write: the stall holds that window open for
+			// longer than a GC pass of the other maintainer takes, and with one compactor no other
+			// compaction makes the stalled one lose instead of rebase.
+			compactionStall: 900 * time.Millisecond,
+			oneCompactor:    true,
+			unmaintained:    noMaintainedGC,
+			checkers:        []string{sim.CheckerStorage},
 		},
 		{
 			id: "MUT-COMPACT-NON-ADJACENT", replay: "compact-non-adjacent", name: "a merge of segments that are not adjacent",
@@ -886,24 +922,21 @@ func mutants() []mutant {
 		},
 		{
 			id: "MUT-COMPACT-REBASE-ON-COMPACTION", replay: "compact-rebase-on-compaction", name: "a rebase on another compaction",
-			description:  "`engine.Mutations.CompactRebaseOnCompaction` rebases a compaction on any newer manifest with at least as many segments, also on one in which another compaction replaced segments, so that the segments of that compaction and of the commits after it are lost or put back.",
-			mutations:    engine.Mutations{CompactRebaseOnCompaction: true},
-			unmaintained: noMaintainedMerge,
-			cannot: map[cell]string{
-				{workload: sim.Bank, maintainers: 2}:                  "a rebase on another compaction loses whole commits and puts back merged segments with the same values, a lost transfer conserves money, and the bank checker only checks totals",
-				{workload: sim.Unique, sql: true, maintainers: 2}:     "a rebase on another compaction loses whole commits and puts back merged segments with the same values, which leaves a consistent state in which no value repeats, and the unique workload does not check that acknowledged writes survive",
-				{workload: sim.Bank, sql: true, maintainers: 2}:       "a rebase on another compaction loses whole commits and puts back merged segments with the same values, a lost transfer conserves money, and the bank checker only checks totals; only the index consistency checker finds a lost commit that wrote an index entry, in 2 of the first 100 seeds, the first at seed 27",
-				{workload: sim.ForeignKey, sql: true, maintainers: 2}: "a rebase on another compaction loses whole commits and puts back merged segments with the same values, which mostly leaves an older consistent state; only the real-time order checker finds a lost commit that a later read missed, in 5 of the first 100 seeds, the first at seed 27",
-			},
-			checkers: []string{sim.CheckerDurability},
+			description: "`engine.Mutations.CompactRebaseOnCompaction` rebases a compaction on any newer manifest with at least as many segments, also on one in which another compaction replaced segments, so that the segments of that compaction and of the commits after it are lost or put back. It runs with maintainers that stall for up to 500 ms between the segment write and the manifest write of a compaction.",
+			mutations:   engine.Mutations{CompactRebaseOnCompaction: true},
+			// Another compaction must land while a compaction is between its segment write and its
+			// manifest write, and commits after it: the stall holds that window open for as long as
+			// several commits and an iteration of the other maintainer take.
+			compactionStall: 500 * time.Millisecond,
+			unmaintained:    noMaintainedMerge,
+			checkers:        []string{sim.CheckerDurability},
 		},
 		{
 			id: "MUT-SKIP-FRESHNESS", replay: "freshness", name: "serving the cache without a freshness check",
 			description: "`engine.Mutations.SkipFreshnessCheck` starts transactions from the cached manifest without asking the store, so a transaction can miss commits acknowledged before it began.",
 			mutations:   engine.Mutations{SkipFreshnessCheck: true},
 			cannot: func() map[cell]string {
-				m := merge(bankCells("a stale snapshot makes a transfer conflict or read an older consistent state, which conserves money"),
-					map[cell]string{{workload: sim.Unique, sql: true}: "a stale snapshot is an older consistent state in which no value repeats, and a write from it conflicts at commit; without maintainers no reader loses an object either"})
+				m := bankCells("a transfer from a stale snapshot conflicts at commit, so that none is lost, and an audit from one reads an older state that conserves money; the bank workload checks no audit against the transfers acknowledged before it")
 				// A stale snapshot can lose an object that maintenance collected meanwhile, which the
 				// audits through SQL, which read the accounts twice, by rows and with SUM, and the
 				// readers that pause for almost a grace period run into.
@@ -917,18 +950,13 @@ func mutants() []mutant {
 			id: "MUT-ACK-BEFORE-CONFIRM", replay: "ack", name: "acking before the write is confirmed",
 			description: "`engine.Mutations.AckBeforeConfirm` reports a commit as successful without waiting for the store's answer.",
 			mutations:   engine.Mutations{AckBeforeConfirm: true},
-			cannot: map[cell]string{
-				{workload: sim.Bank}:              ackConserves,
-				{workload: sim.Bank, sql: true}:   ackConserves,
-				{workload: sim.Unique, sql: true}: "an acknowledged write that never landed is missing as a whole, which leaves a consistent state, the unique workload does not check that acknowledged writes survive, and without maintainers the segment of such a write is an orphan that GC collects like any other",
-			},
-			checkers: []string{sim.CheckerDurability, sim.CheckerStorage},
+			checkers:    []string{sim.CheckerDurability, sim.CheckerStorage},
 		},
 		{
 			id: "MUT-COMPACTED-AHEAD", replay: "compacted-ahead", name: "the compacted segment ahead of newer ones after a rebase",
 			description: "`engine.Mutations.CompactedSegmentAhead` puts the compacted segment ahead of the segments committed during the compaction when it rebases, so that old values shadow newer ones.",
 			mutations:   engine.Mutations{CompactedSegmentAhead: true},
-			cannot:      merge(noMaintainers(noCompaction), map[cell]string{{workload: sim.Bank, maintainers: 2}: "resurrected balances are a consistent older state, which conserves money, and the engine workload has no index"}),
+			cannot:      noMaintainers(noCompaction),
 			checkers:    []string{sim.CheckerListAppend},
 		},
 		{
@@ -939,11 +967,13 @@ func mutants() []mutant {
 		},
 		{
 			id: "MUT-RETRY-UNKNOWN", replay: "retry-unknown", name: "retrying an autocommit statement after an unknown commit outcome",
-			description:  "`exec.Mutations.RetryAfterUnknownCommit` retries an autocommit statement whose commit outcome is unknown, which can apply it twice.",
+			description:  "`exec.Mutations.RetryAfterUnknownCommit` retries an autocommit statement whose commit outcome is unknown, which can apply it twice. It runs with clients that are partitioned right after four in ten of their manifest writes land, so that the outcome of their commits is unknown.",
 			sqlMutations: exec.Mutations{RetryAfterUnknownCommit: true},
-			cannot: merge(bankCells(noAutocommitWrite), workloadCells(sim.Unique, "a retried insert fails on its own primary key, and a retried move or delete finds its row moved or gone, so a statement applied twice leaves a consistent state"),
-				workloadCells(sim.ForeignKey, "a retried statement is checked again against every foreign key and check, so even one applied twice, such as an increment, leaves a consistent state, and the counter is incremented only in transactions, which are never retried")),
-			checkers: []string{sim.CheckerDurability},
+			// The engine learns the outcome of most manifest writes whose answer is lost by reading
+			// the manifest again, so only a partition right after the write leaves it unknown.
+			commitPartitions: 0.4,
+			cannot:           bankCells(noAutocommitWrite),
+			checkers:         []string{sim.CheckerDurability},
 		},
 		{
 			id: "MUT-INDEX-STALE-DELETE", replay: "index-stale-delete", name: "stale index entries after an UPDATE or DELETE",
@@ -1100,6 +1130,46 @@ func (m mutant) applicable(c cell) (bool, string) {
 
 var update = flag.Bool("update", false, "write the kill matrix to "+verify.KillMatrixPath)
 
+// rateWords are the words of a reason that speak of how often a checker detects a mutant.
+var rateWords = []string{"seed", "rare", "seldom", "mostly", "often", "usually", "sometimes", "likely", "chance", "rate", "percent"}
+
+// rateWord is the first number or word in reason that speaks of how often a checker detects a
+// mutant, or "" when it has none. A reason why a configuration cannot detect a mutant states a
+// structural cause, which holds for every seed.
+func rateWord(reason string) string {
+	for _, word := range strings.FieldsFunc(strings.ToLower(reason), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	}) {
+		if strings.IndexFunc(word, unicode.IsDigit) >= 0 {
+			return word
+		}
+		for _, w := range rateWords {
+			if strings.HasPrefix(word, w) {
+				return word
+			}
+		}
+	}
+	return ""
+}
+
+func TestRateWord(t *testing.T) {
+	tests := []struct {
+		reason, want string
+	}{
+		{reason: "only the storage checker finds the objects of a dropped commit, in 2 of the first 100 seeds", want: "2"},
+		{reason: "in twenty seeds, no GC pass stamps the output", want: "seeds"},
+		{reason: "a GC pass rarely stamps the output of a compaction", want: "rarely"},
+		{reason: "which mostly leaves an older consistent state", want: "mostly"},
+		{reason: "without maintainers nothing compacts, so there is never a rebase", want: ""},
+		{reason: "the workload has no CHECK constraints", want: ""},
+	}
+	for _, test := range tests {
+		t.Run(fmt.Sprintf("finds %q in %q", test.want, test.reason), func(t *testing.T) {
+			is.Equal(t, test.want, rateWord(test.reason))
+		})
+	}
+}
+
 // killMatrixSeeds tried in every cell.
 const killMatrixSeeds = 20
 
@@ -1156,6 +1226,73 @@ func TestRun(t *testing.T) {
 				}
 			}
 		}
+	})
+}
+
+func TestRun_targetedFaults(t *testing.T) {
+	t.Run("a compaction stall holds every maintainer between the output and the manifest write of a compaction, one compactor leaves the others to collect garbage, and GC passes see the outputs before the manifest has them", func(t *testing.T) {
+		t.Parallel()
+		var cfgs []sim.Config
+		var mu sync.Mutex
+		var lines []string
+		for seed := uint64(1); seed <= 8; seed++ {
+			cfg := sim.DefaultConfig(seed)
+			cfg.Workload = sim.Bank
+			cfg.Maintainers = 2
+			cfg.CompactionStall = 900 * time.Millisecond
+			cfg.OneCompactor = true
+			cfg.Trace = func(line string) {
+				if strings.Contains(line, "maintainer") {
+					mu.Lock()
+					lines = append(lines, line)
+					mu.Unlock()
+				}
+			}
+			cfgs = append(cfgs, cfg)
+		}
+		reached := 0
+		for _, res := range runAll(cfgs) {
+			is.True(t, !res.Failed(), res.Report())
+			reached += res.Reached[reach.GCKeepsLiveGarbage]
+		}
+		stalls := 0
+		for _, line := range lines {
+			is.True(t, !strings.Contains(line, "maintainer 1: compact"), line)
+			_, after, ok := strings.Cut(line, "stalls for ")
+			if !ok {
+				continue
+			}
+			stalls++
+			d, err := time.ParseDuration(strings.Fields(after)[0])
+			is.NotError(t, err)
+			is.True(t, d >= 450*time.Millisecond && d <= 900*time.Millisecond, line)
+			is.True(t, strings.Contains(line, "maintainer 0: stalls for") && strings.Contains(line, "after writing db/seg/"), line)
+		}
+		is.True(t, stalls > 8, fmt.Sprint(stalls, " stalls"))
+		is.True(t, reached > 0, "GC keeps a live segment that an expired garbage batch lists")
+	})
+
+	t.Run("commit partitions leave the outcome of commits unknown in processes that keep running", func(t *testing.T) {
+		t.Parallel()
+		var cfgs []sim.Config
+		for seed := uint64(1); seed <= 8; seed++ {
+			cfg := sim.DefaultConfig(seed)
+			cfg.SQL = seed%2 == 0
+			cfg.CommitPartitions = 0.4
+			cfgs = append(cfgs, cfg)
+		}
+		var with, without sim.Stats
+		for _, res := range runAll(cfgs) {
+			is.True(t, !res.Failed(), res.Report())
+			with.Add(res.Stats)
+		}
+		for i := range cfgs {
+			cfgs[i].CommitPartitions = 0
+		}
+		for _, res := range runAll(cfgs) {
+			without.Add(res.Stats)
+		}
+		is.True(t, with.LiveUnknown > 3*without.LiveUnknown, fmt.Sprint(with.LiveUnknown, " unknown outcomes without a crash with partitions, ", without.LiveUnknown, " without"))
 	})
 }
 
@@ -1272,6 +1409,13 @@ func TestMutants(t *testing.T) {
 	t.Parallel()
 
 	ms := mutants()
+	for _, m := range ms {
+		for c, reason := range m.cannot {
+			if word := rateWord(reason); word != "" {
+				t.Errorf("%s, %v: the reason why the configuration cannot detect the mutant mentions %q, but it must state why no checker can see the mutant's effect there, not how often one does: %s", m.id, c, word, reason)
+			}
+		}
+	}
 	// ran holds the matrix row of every mutant whose subtest ran. The subtests run in parallel, so
 	// the whole matrix is compared once they are all done.
 	ran := make([]*verify.KillMatrixMutant, len(ms))
@@ -1345,6 +1489,9 @@ func TestMutants(t *testing.T) {
 						cfg.StoreDamage = m.storeDamage
 						cfg.BlockSize = m.blockSize
 						cfg.Maintenance = m.maintenance
+						cfg.CompactionStall = m.compactionStall
+						cfg.OneCompactor = m.oneCompactor
+						cfg.CommitPartitions = m.commitPartitions
 						res := runSim(cfg)
 						if res.Failed() {
 							r.Status, r.Seed, r.Checkers = verify.Detected, seed, res.Checkers()

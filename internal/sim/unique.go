@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -23,7 +24,10 @@ import (
 // insert one or two rows at a time, move a row from one email to another, delete a row by its
 // email, and run transactions that do several of those, all of which can violate the unique
 // email. Readers check that no snapshot has an email twice, and that lookups through the
-// indexes find exactly the rows of the table.
+// indexes find exactly the rows of the table. Every row has an id that no other row ever has,
+// and only a statement that names its email, or a transaction that found its id, changes it, so
+// that readers and the final state show the rows of acknowledged statements that nothing could
+// have changed since, and never a row of a failed statement.
 
 // UniqueTablesSQL are the statements that create the table of the unique workload.
 func UniqueTablesSQL() []string {
@@ -50,6 +54,7 @@ func (c *client) uniqueSQL(ctx context.Context) {
 	h := history.Tx{Client: c.id, Invoke: c.run.stamp()}
 	// frees is the email that the statement frees when it commits, and takes the one it takes.
 	var frees, takes string
+	var w userWrite
 	var res sql.Result
 	var err error
 	switch c.rng.IntN(6) {
@@ -61,17 +66,23 @@ func (c *client) uniqueSQL(ctx context.Context) {
 		if s, ok := e.(string); ok {
 			takes = s
 		}
-		_, err = c.sql.ExecContext(ctx, "INSERT INTO users VALUES ($1, $2, 0)", c.value(), e)
+		id := c.value()
+		w.inserts = []user{newUser(id, e)}
+		_, err = c.sql.ExecContext(ctx, "INSERT INTO users VALUES ($1, $2, 0)", id, e)
 	case 2:
-		_, err = c.sql.ExecContext(ctx, "INSERT INTO users VALUES ($1, $2, 0), ($3, $4, 0)", c.value(), c.nullableEmail(), c.value(), c.nullableEmail())
+		id1, e1, id2, e2 := c.value(), c.nullableEmail(), c.value(), c.nullableEmail()
+		w.inserts = []user{newUser(id1, e1), newUser(id2, e2)}
+		_, err = c.sql.ExecContext(ctx, "INSERT INTO users VALUES ($1, $2, 0), ($3, $4, 0)", id1, e1, id2, e2)
 	case 3:
 		frees, takes = c.email(), c.email()
+		w.changes = frees
 		res, err = c.sql.ExecContext(ctx, "UPDATE users SET email = $1, n = n + 1 WHERE email = $2", takes, frees)
 	case 4:
 		frees = c.email()
+		w.changes = frees
 		res, err = c.sql.ExecContext(ctx, "DELETE FROM users WHERE email = $1", frees)
 	default:
-		err = c.uniqueTx(ctx)
+		err = c.uniqueTx(ctx, &w)
 	}
 	if errors.Is(err, exec.ErrDuplicateKey) {
 		c.run.stats.UniqueViolations++
@@ -82,6 +93,16 @@ func (c *client) uniqueSQL(ctx context.Context) {
 		h.Err = err.Error()
 	}
 	c.record(h)
+	w.invoke, w.complete, w.outcome = h.Invoke, h.Complete, h.Outcome
+	if res != nil && h.Outcome == history.OK {
+		if n, _ := res.RowsAffected(); n == 0 {
+			// The statement found no row with the email, so it changed nothing.
+			w.changes = ""
+		}
+	}
+	if len(w.inserts) > 0 || w.changes != "" || len(w.moves) > 0 {
+		c.run.userWrites = append(c.run.userWrites, w)
+	}
 	if h.Outcome != history.OK {
 		return
 	}
@@ -101,8 +122,8 @@ func (c *client) uniqueSQL(ctx context.Context) {
 }
 
 // uniqueTx moves a row to another email, if it finds one, and inserts a row with another, in a
-// transaction.
-func (c *client) uniqueTx(ctx context.Context) error {
+// transaction, and describes what it writes in w.
+func (c *client) uniqueTx(ctx context.Context, w *userWrite) error {
 	tx, err := c.sql.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -116,11 +137,14 @@ func (c *client) uniqueTx(ctx context.Context) error {
 		return err
 	default:
 		c.pause(ctx)
+		w.moves = []int64{id}
 		if _, err := tx.ExecContext(ctx, "UPDATE users SET email = $1, n = n + 1 WHERE id = $2", c.email(), id); err != nil {
 			return err
 		}
 	}
-	if _, err := tx.ExecContext(ctx, "INSERT INTO users VALUES ($1, $2, 0)", c.value(), c.email()); err != nil {
+	id2, e := c.value(), c.email()
+	w.inserts = []user{newUser(id2, e)}
+	if _, err := tx.ExecContext(ctx, "INSERT INTO users VALUES ($1, $2, 0)", id2, e); err != nil {
 		return err
 	}
 	return tx.Commit()
@@ -144,6 +168,9 @@ func (c *client) auditUnique(ctx context.Context, h history.Tx) {
 		c.run.anomaly(CheckerUnique, "client %d: %v", c.id, err)
 		return
 	}
+	// The rows are checked against the writes once every write has its outcome, because a write
+	// whose outcome is not known yet may be in the snapshot.
+	c.run.userReads = append(c.run.userReads, userRead{client: c.id, invoke: h.Invoke, rows: rows})
 	c.pause(ctx)
 	if err := checkLookups(ctx, tx, rows, []string{c.email(), c.email()}); err != nil {
 		c.lookupError(ctx, startedAt, err)
@@ -169,6 +196,15 @@ type user struct {
 	id    int64
 	email sql.NullString
 	n     int64
+}
+
+// newUser with an email that is a string or nil.
+func newUser(id int64, email any) user {
+	u := user{id: id}
+	if e, ok := email.(string); ok {
+		u.email = sql.NullString{String: e, Valid: true}
+	}
+	return u
 }
 
 func (u user) String() string {
@@ -274,6 +310,9 @@ func (r *run) readFinalUnique(ctx context.Context, db *sql.DB) ([]string, error)
 	if err := checkUnique(rows); err != nil {
 		r.anomaly(CheckerUnique, "final state: %v", err)
 	}
+	if err := newUserCheck(r.userWrites).check(rows, -1); err != nil {
+		r.anomaly(CheckerDurability, "final state: %v", err)
+	}
 	var emails []string
 	for i := range 2 * r.cfg.Keys {
 		emails = append(emails, fmt.Sprintf("e%02d", i))
@@ -314,4 +353,96 @@ func (r *run) checkIndexes() {
 	case err != nil:
 		r.anoms = append(r.anoms, &Anomaly{Checker: CheckerFinalRead, Err: fmt.Errorf("checking the indexes: %w", err)})
 	}
+}
+
+// userWrite of a statement or transaction of the unique workload, with its outcome.
+type userWrite struct {
+	invoke, complete time.Duration
+	outcome          history.Outcome
+	// inserts are the rows that the write inserts, each with an id that no other write uses.
+	inserts []user
+	// changes is the email of the row that the write moves or deletes by its email, if any, and
+	// moves are the ids of the rows that it moves by their id.
+	changes string
+	moves   []int64
+}
+
+// userRead is the rows of the unique workload that a reader saw in its snapshot, which it began
+// to read at invoke.
+type userRead struct {
+	client int
+	invoke time.Duration
+	rows   []user
+}
+
+// checkUserReads checks the rows that every reader saw against the writes, once every write has
+// its outcome.
+func (r *run) checkUserReads() {
+	uc := newUserCheck(r.userWrites)
+	for _, read := range r.userReads {
+		if err := uc.check(read.rows, read.invoke); err != nil {
+			r.anomaly(CheckerRealTime, "client %d: %v", read.client, err)
+		}
+	}
+}
+
+// userCheck checks rows of the unique workload against its writes. No row of a failed write may
+// be there. A row that an acknowledged write inserted before the reader began must be there as it
+// was inserted, unless some write that did not fail and was not acknowledged before the insert
+// began could have changed it: one that names its email, or one that found its id. A row with a
+// NULL email is never named. Other writes are ignored, so that the reader may see them or not.
+type userCheck struct {
+	writes []userWrite
+	// changeable says for every insert of every write whether another write could have changed
+	// its row.
+	changeable [][]bool
+}
+
+func newUserCheck(writes []userWrite) userCheck {
+	uc := userCheck{writes: writes, changeable: make([][]bool, len(writes))}
+	for i, w := range writes {
+		uc.changeable[i] = make([]bool, len(w.inserts))
+		for k, u := range w.inserts {
+			uc.changeable[i][k] = changeable(writes, i, u)
+		}
+	}
+	return uc
+}
+
+// check rows that a reader that began at invoke saw, or the final state when invoke is negative.
+func (uc userCheck) check(rows []user, invoke time.Duration) error {
+	byID := map[int64]user{}
+	for _, u := range rows {
+		byID[u.id] = u
+	}
+	for i, w := range uc.writes {
+		for k, in := range w.inserts {
+			u, ok := byID[in.id]
+			switch {
+			case w.outcome == history.Failed && ok:
+				return fmt.Errorf("row %s is there, but the write that inserted it failed", u)
+			case w.outcome != history.OK || invoke >= 0 && w.complete >= invoke || uc.changeable[i][k]:
+			case !ok:
+				return fmt.Errorf("row %s is missing, and no write could have changed it since an acknowledged write inserted it", in)
+			case u != in:
+				return fmt.Errorf("row %s is %s, and no write could have changed it since an acknowledged write inserted it", in, u)
+			}
+		}
+	}
+	return nil
+}
+
+// changeable reports whether any write but writes[i] that did not fail could have changed the row
+// u that writes[i] inserted, ordered after it: a write that names the email of u or that found
+// its id, and that was not acknowledged before writes[i] began.
+func changeable(writes []userWrite, i int, u user) bool {
+	for j, w := range writes {
+		if j == i || w.outcome == history.Failed || w.complete < writes[i].invoke {
+			continue
+		}
+		if u.email.Valid && w.changes == u.email.String || slices.Contains(w.moves, u.id) {
+			return true
+		}
+	}
+	return false
 }
