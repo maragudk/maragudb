@@ -393,7 +393,7 @@ func TestUnsupported(t *testing.T) {
 	})
 
 	t.Run("UNS-SUBQUERIES other forms of subqueries and of WITH", func(t *testing.T) {
-		verify.Covers(t, "ANY, SOME, and ALL, a row on the left of IN, WITH RECURSIVE, MATERIALIZED and NOT MATERIALIZED, a query that writes in WITH, WITH in front of INSERT, UPDATE, or DELETE, a subquery in FROM without an alias, an aggregate of the columns of a query around a subquery, t.* of a table of a query around, and a subquery in the list of an IN, in GROUP BY, or in LIMIT or OFFSET are rejected, and Postgres accepts them", "UNS-SUBQUERIES")
+		verify.Covers(t, "ANY, SOME, and ALL, a row on the left of IN, WITH RECURSIVE, MATERIALIZED and NOT MATERIALIZED, a query that writes in WITH, WITH in front of INSERT, UPDATE, or DELETE, a subquery in FROM without an alias, a repeated column name in a subquery in FROM or a CTE, an aggregate of the columns of a query around a subquery, t.* of a table of a query around, and a subquery in the list of an IN, in GROUP BY, or in LIMIT or OFFSET are rejected, and Postgres accepts them", "UNS-SUBQUERIES")
 		rejects(t, create,
 			example{SQL: "SELECT i FROM dev WHERE i = ANY (SELECT j FROM dev)"},
 			example{SQL: "SELECT i FROM dev WHERE i > SOME (SELECT j FROM dev)"},
@@ -407,6 +407,8 @@ func TestUnsupported(t *testing.T) {
 			example{SQL: "WITH x AS (SELECT 1 AS i) UPDATE dev SET j = 1 WHERE i IN (SELECT i FROM x)"},
 			example{SQL: "WITH x AS (SELECT 1 AS i) DELETE FROM dev WHERE i IN (SELECT i FROM x)"},
 			example{SQL: "SELECT * FROM (SELECT 1)"},
+			example{SQL: "SELECT * FROM (SELECT 1 AS a, 2 AS a) x"},
+			example{SQL: "WITH c (a, a) AS (SELECT 1, 2) SELECT * FROM c"},
 			example{SQL: "SELECT (SELECT sum(dev.j)) FROM dev"},
 			example{SQL: "SELECT (SELECT count(*) FROM dev d WHERE d.i < sum(dev.j)) FROM dev"},
 			example{SQL: "SELECT EXISTS (SELECT dev.* FROM dev d) FROM dev"},

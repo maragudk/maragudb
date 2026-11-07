@@ -1168,6 +1168,18 @@ func TestPrepare(t *testing.T) {
 		st, err = exec.Prepare("SELECT 1 FROM t JOIN (u JOIN v ON u.a = $4) ON t.a = $2 WHERE $1 = 1")
 		is.NotError(t, err)
 		is.Equal(t, 4, st.NumParams())
+		st, err = exec.Prepare("SELECT k FROM t GROUP BY k + $2 HAVING count(*) > $1")
+		is.NotError(t, err)
+		is.Equal(t, 2, st.NumParams())
+	})
+
+	t.Run("counts the parameters of subqueries, subqueries in FROM, and CTEs", func(t *testing.T) {
+		st, err := exec.Prepare("WITH c AS (SELECT $5) SELECT (SELECT $1), EXISTS (SELECT 1 FROM u HAVING count(*) > $6) FROM (SELECT $4) x JOIN t ON t.a IN (SELECT $3) WHERE $2 = 1")
+		is.NotError(t, err)
+		is.Equal(t, 6, st.NumParams())
+		st, err = exec.Prepare("UPDATE t SET a = (SELECT b FROM u WHERE u.c = $3) WHERE EXISTS (SELECT 1 FROM v GROUP BY v.d HAVING max(v.e) > $2)")
+		is.NotError(t, err)
+		is.Equal(t, 3, st.NumParams())
 	})
 
 	t.Run("reports syntax errors", func(t *testing.T) {

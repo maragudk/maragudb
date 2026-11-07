@@ -103,6 +103,10 @@ func (b *binder) derived(ctx context.Context, sel *ast.Select, name string, name
 		if i < len(names) {
 			col.Name = names[i]
 		}
+		if _, dup := t.columnIndex(col.Name); dup {
+			// As for the names of the columns of a table, see [binder.checkColumnAliases].
+			return nil, fmt.Errorf("%w: the column name %q twice in the columns of the subquery or CTE %q is not supported, give every column its own name", ErrUnsupported, col.Name, name)
+		}
 		t.Columns = append(t.Columns, col)
 		t.PrimaryKey = append(t.PrimaryKey, i)
 	}

@@ -146,7 +146,9 @@ func (b *binder) columnRef(e *ast.ColumnRef) (*cexpr, error) {
 		if r, err := o.resolve(e); err == nil {
 			sc, _ := o.names()
 			for _, h := range hops {
-				b.run.refs[h.sub.sel] = append(b.run.refs[h.sub.sel], outerRef{scope: sc, ref: r})
+				if or := (outerRef{scope: sc, ref: r}); !slices.Contains(b.run.refs[h.sub.sel], or) {
+					b.run.refs[h.sub.sel] = append(b.run.refs[h.sub.sel], or)
+				}
 			}
 		}
 		for i, h := range hops {
@@ -266,9 +268,13 @@ func (b *binder) subquery(e *ast.Subquery) (*cexpr, error) {
 			return value.NewBool(len(rows) > 0), nil
 		}}
 	case ast.SubIn:
-		if ce, err = b.inSubquery(e, cols, innerFallible, info, evaluate); err != nil {
+		var convert bool
+		if ce, convert, err = b.inSubquery(e, cols, innerFallible, info, evaluate); err != nil {
 			return nil, err
 		}
+		// The conversion of the subquery's values to the type of the comparison is part of
+		// its evaluation, which a semi-join makes on the subquery's rows.
+		selfFallible = selfFallible || convert
 	}
 	if ce.fallible && b.pruned == 0 && b.level != nil {
 		b.level.fallible = true
@@ -334,6 +340,10 @@ func (b *binder) nullRun(orig, sel *ast.Select, outer *binder) error {
 		row[i] = value.Value{Null: true}
 	}
 	info := &subqueryInfo{sel: orig, row: row}
+	b.run.evals++
+	if b.run.evals > maxSubqueryEvals {
+		return errTooManyEvals()
+	}
 	b.run.s.snapshotReads++
 	defer func() { b.run.s.snapshotReads-- }()
 	if _, err := b.run.s.query(b.run.ctx, sel, b.inner(outer, info, false)); err != nil {
@@ -346,22 +356,22 @@ func (b *binder) nullRun(orig, sel *ast.Select, outer *binder) error {
 // equals a value of the subquery, false when the subquery has no rows or x differs from every
 // value, and NULL otherwise, as the comparison is NULL with a NULL. Postgres analyzes the
 // subquery before x, and does not evaluate x when the subquery has no rows.
-func (b *binder) inSubquery(e *ast.Subquery, cols []Column, innerFallible bool, info *subqueryInfo, evaluate func([]value.Value) ([][]value.Value, error)) (*cexpr, error) {
+func (b *binder) inSubquery(e *ast.Subquery, cols []Column, innerFallible bool, info *subqueryInfo, evaluate func([]value.Value) ([][]value.Value, error)) (*cexpr, bool, error) {
 	left, err := b.bind(e.Expr)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if len(cols) != 1 {
 		if len(cols) > 1 {
-			return nil, fmt.Errorf("%w: subquery has too many columns", ErrSyntax)
+			return nil, false, fmt.Errorf("%w: subquery has too many columns", ErrSyntax)
 		}
-		return nil, fmt.Errorf("%w: subquery has too few columns", ErrSyntax)
+		return nil, false, fmt.Errorf("%w: subquery has too few columns", ErrSyntax)
 	}
 	in := &cexpr{typ: cols[0].Type, refs: true, eval: func(row []value.Value) (value.Value, error) {
 		return row[0], nil
 	}}
 	if left, in, err = b.unify(left, in, "="); err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	not := e.Not
 	return &cexpr{typ: value.Bool, refs: left.refs || info.refsParent, fallible: innerFallible || left.fallible || in.fallible, stable: left.stable, sublink: true, aggs: left.aggs, eval: func(row []value.Value) (value.Value, error) {
@@ -394,7 +404,7 @@ func (b *binder) inSubquery(e *ast.Subquery, cols []Column, innerFallible bool, 
 			return value.NewNull(value.Bool), nil
 		}
 		return value.NewBool(not), nil
-	}}, nil
+	}}, in.fallible, nil
 }
 
 // evaluator of a subquery whose SELECT is orig, which runs sel, either orig or the form of it
@@ -416,7 +426,7 @@ func (b *binder) evaluator(orig, sel *ast.Select, outer *binder, correlated bool
 		}
 		run.evals++
 		if run.evals > maxSubqueryEvals {
-			return nil, fmt.Errorf("%w: a statement that evaluates its subqueries more than %d times is not supported, because maragudb evaluates them on every row that a plan of Postgres could evaluate them on; filter the rows more", ErrUnsupported, maxSubqueryEvals)
+			return nil, errTooManyEvals()
 		}
 		info := &subqueryInfo{sel: orig, row: row}
 		run.s.snapshotReads++
@@ -438,6 +448,12 @@ func (b *binder) evaluator(orig, sel *ast.Select, outer *binder, correlated bool
 		}
 		return r.rows, r.err
 	}
+}
+
+// errTooManyEvals is the error of a statement that evaluates its subqueries more than
+// [maxSubqueryEvals] times.
+func errTooManyEvals() error {
+	return fmt.Errorf("%w: a statement that evaluates its subqueries more than %d times is not supported, because maragudb evaluates them on every row that a plan of Postgres could evaluate them on; filter the rows more", ErrUnsupported, maxSubqueryEvals)
 }
 
 // memoKey is a text that two rows have exactly when their values are the same, also in their

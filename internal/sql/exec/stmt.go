@@ -1005,12 +1005,10 @@ func (b *binder) limit(e ast.Expr, what string) (*cexpr, error) {
 	if e == nil {
 		return nil, nil
 	}
-	if readsColumns(e) {
-		found := false
-		ast.SubqueriesOf(e, func(*ast.Select) { found = true })
-		if found {
-			return nil, fmt.Errorf("%w: a subquery in %s is not supported, write a constant or a parameter", ErrUnsupported, what)
-		}
+	found := false
+	ast.SubqueriesOf(e, func(*ast.Select) { found = true })
+	if found {
+		return nil, fmt.Errorf("%w: a subquery in %s is not supported, write a constant or a parameter", ErrUnsupported, what)
 	}
 	c, err := b.bind(e)
 	if err != nil {

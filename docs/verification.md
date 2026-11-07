@@ -634,7 +634,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 > Other forms of subqueries and of WITH.
 
-- `internal/pgdiff` `TestUnsupported/UNS-SUBQUERIES_other_forms_of_subqueries_and_of_WITH`: ANY, SOME, and ALL, a row on the left of IN, WITH RECURSIVE, MATERIALIZED and NOT MATERIALIZED, a query that writes in WITH, WITH in front of INSERT, UPDATE, or DELETE, a subquery in FROM without an alias, an aggregate of the columns of a query around a subquery, t.* of a table of a query around, and a subquery in the list of an IN, in GROUP BY, or in LIMIT or OFFSET are rejected, and Postgres accepts them
+- `internal/pgdiff` `TestUnsupported/UNS-SUBQUERIES_other_forms_of_subqueries_and_of_WITH`: ANY, SOME, and ALL, a row on the left of IN, WITH RECURSIVE, MATERIALIZED and NOT MATERIALIZED, a query that writes in WITH, WITH in front of INSERT, UPDATE, or DELETE, a subquery in FROM without an alias, a repeated column name in a subquery in FROM or a CTE, an aggregate of the columns of a query around a subquery, t.* of a table of a query around, and a subquery in the list of an IN, in GROUP BY, or in LIMIT or OFFSET are rejected, and Postgres accepts them
 
 ### `UNS-AGGREGATES`
 

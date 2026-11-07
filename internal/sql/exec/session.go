@@ -132,8 +132,19 @@ func Prepare(sql string) (*Statement, error) {
 	// The expressions of every query, those of subqueries and CTEs too.
 	query := func(q *ast.Select) {
 		ast.Selects(q, func(q *ast.Select) {
-			for _, e := range exprs(q) {
+			for _, e := range ast.SelectExprs(q) {
 				params(e)
+			}
+			var on func(e ast.TableExpr)
+			on = func(e ast.TableExpr) {
+				if j, ok := e.(*ast.Join); ok {
+					on(j.Left)
+					on(j.Right)
+					params(j.On)
+				}
+			}
+			for _, f := range q.From {
+				on(f)
 			}
 		})
 	}
