@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bufio"
 	"bytes"
+	"cmp"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
@@ -243,6 +244,27 @@ func (c *corpus) read(name string) ([]byte, error) {
 		return nil, fmt.Errorf("sqllogictest: %s in %s has SHA-256 %s, want %s; delete the directory to download the corpus again", name, c.dir, got, want)
 	}
 	return b, nil
+}
+
+// largestFirst returns the files ordered by size, largest first, and by name among files of one
+// size, with the files that cannot be read last. Workers that take the files in this order end
+// close together, because the largest files, which take longest, do not start last.
+func (c *corpus) largestFirst(files []string) []string {
+	size := map[string]int64{}
+	for _, name := range files {
+		size[name] = -1
+		if info, err := os.Stat(filepath.Join(c.dir, filepath.FromSlash(name))); err == nil {
+			size[name] = info.Size()
+		}
+	}
+	out := slices.Clone(files)
+	slices.SortStableFunc(out, func(a, b string) int {
+		if size[a] != size[b] {
+			return cmp.Compare(size[b], size[a])
+		}
+		return strings.Compare(a, b)
+	})
+	return out
 }
 
 // match the test files against comma-separated globs, where * matches within a path element

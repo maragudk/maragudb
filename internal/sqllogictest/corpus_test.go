@@ -100,6 +100,18 @@ func TestCorpus_read(t *testing.T) {
 	})
 }
 
+func TestCorpus_largestFirst(t *testing.T) {
+	t.Run("orders the files by size, largest first, and by name among files of one size, with a missing file last", func(t *testing.T) {
+		dir := t.TempDir()
+		for name, size := range map[string]int{"small.test": 1, "large.test": 30, "b.test": 20, "a.test": 20} {
+			is.NotError(t, os.WriteFile(filepath.Join(dir, name), bytes.Repeat([]byte("x"), size), 0o644))
+		}
+		c := &corpus{dir: dir}
+		got := c.largestFirst([]string{"small.test", "missing.test", "b.test", "large.test", "a.test"})
+		is.EqualSlice(t, []string{"large.test", "a.test", "b.test", "small.test", "missing.test"}, got)
+	})
+}
+
 func TestGlobMatch(t *testing.T) {
 	tests := []struct {
 		glob, name string

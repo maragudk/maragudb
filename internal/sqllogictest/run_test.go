@@ -45,7 +45,7 @@ func openMaragudb() (*sql.DB, error) {
 // runScript runs a test file given as text, and fails on harness errors.
 func runScript(t *testing.T, r *fileRunner, script string) fileReport {
 	t.Helper()
-	rep, err := r.run(t.Context(), 0, "script.test", []byte(script))
+	rep, err := r.run(t.Context(), 0, "script.test", []byte(script), nil)
 	is.NotError(t, err)
 	return rep
 }
@@ -237,23 +237,235 @@ SELECT a, b FROM t1 ORDER BY a
 		is.Equal(t, 1, rep.SortKeysOrdered)
 	})
 
+	t.Run("runs the read-only queries at the end of a file in shards on fresh databases, with the same report as in one sequence", func(t *testing.T) {
+		script := `statement ok
+CREATE TABLE t1(a INTEGER PRIMARY KEY, b INTEGER)
+
+statement ok
+INSERT INTO t1 VALUES(1, 5), (2, 0), (3, 4)
+
+statement ok
+CREATE TABLE t2(a INTEGER, b INTEGER GENERATED ALWAYS AS (a + 1) STORED)
+
+query II nosort
+SELECT a, b FROM t1 ORDER BY a
+----
+
+query I rowsort
+SELECT a / b FROM t1
+----
+
+query I rowsort
+SELECT a FROM t2
+----
+
+query I rowsort
+SELECT DISTINCT ON (a) a FROM t1
+----
+
+query I rowsort
+SELECT b FROM t1 WHERE a > 1
+----
+
+query I rowsort
+SELECT count(*) FROM t1
+----
+
+query I rowsort
+SELECT a + b FROM t1
+----
+`
+		r := newFileRunner(t)
+		var opened atomic.Int64
+		r.newMaragudb = func() (*sql.DB, error) {
+			opened.Add(1)
+			return openMaragudb()
+		}
+		want := runScript(t, r, script)
+		is.Equal(t, int64(1), opened.Load())
+		is.True(t, want.Mismatch == nil, fmt.Sprint(want.Mismatch))
+
+		r.shardQueries = 2
+		got := runScript(t, r, script)
+		is.Equal(t, int64(1+4), opened.Load(), "seven queries in shards of two")
+		is.True(t, got.Mismatch == nil, fmt.Sprint(got.Mismatch))
+		is.Equal(t, fmt.Sprintf("%+v", want), fmt.Sprintf("%+v", got))
+		is.Equal(t, 10, got.Statements)
+		is.Equal(t, 1, got.Skipped, "the query of the rejected table")
+		is.Equal(t, 2, got.Rejected, "the table and DISTINCT ON")
+		is.Equal(t, 1, got.Errors, "the division by zero")
+	})
+
+	t.Run("runs the queries at the end of a file in one sequence in a transaction", func(t *testing.T) {
+		script := `statement ok
+CREATE TABLE t1(a INTEGER PRIMARY KEY)
+
+statement ok
+BEGIN
+
+query I rowsort
+SELECT 1 / 0
+----
+
+query I rowsort
+SELECT a FROM t1
+----
+
+query I rowsort
+SELECT 2
+----
+`
+		r := newFileRunner(t)
+		r.shardQueries = 1
+		var opened atomic.Int64
+		r.newMaragudb = func() (*sql.DB, error) {
+			opened.Add(1)
+			return openMaragudb()
+		}
+		rep := runScript(t, r, script)
+		is.Equal(t, int64(1), opened.Load())
+		is.True(t, rep.Mismatch == nil, fmt.Sprint(rep.Mismatch))
+		is.Equal(t, 3, rep.Errors, "the failed query aborts the transaction for the queries after it")
+	})
+
+	t.Run("reports the difference of the earliest shard, and counts what a run in one sequence counts", func(t *testing.T) {
+		// The store of every maragudb fails every read once two segments exist, after the CREATE
+		// TABLE and the INSERT, so that every shard differs at its first query.
+		script := `statement ok
+CREATE TABLE t1(a INTEGER PRIMARY KEY)
+
+query I
+SELECT a FROM t1
+----
+
+statement ok
+INSERT INTO t1 VALUES(1)
+
+query I
+SELECT a + 1 FROM t1
+----
+
+query I
+SELECT a + 2 FROM t1
+----
+
+query I
+SELECT a + 3 FROM t1
+----
+`
+		r := newFileRunner(t)
+		var opened atomic.Int64
+		r.newMaragudb = func() (*sql.DB, error) {
+			opened.Add(1)
+			var segments atomic.Int64
+			fake := s3fake.New(s3fake.WithFaults(s3fake.Faults{Decide: func(kind s3.Kind, key string) s3fake.Outcome {
+				if kind == s3.KindPut && strings.Contains(key, "/seg/") {
+					segments.Add(1)
+				}
+				if segments.Load() >= 2 && (kind == s3.KindGet || kind == s3.KindGetConditional) {
+					return s3fake.OutcomeError
+				}
+				return s3fake.OutcomeNormal
+			}}))
+			c, err := maragudb.NewConnector(maragudb.Options{Store: s3test.NewStore(fake), Maintenance: new(false), MemoryCacheBytes: new(int64(0))}, "s3://bucket/mismatch")
+			if err != nil {
+				return nil, err
+			}
+			return sql.OpenDB(c), nil
+		}
+		want := runScript(t, r, script)
+		is.True(t, pgdiff.IsMismatch(want.Mismatch), fmt.Sprint(want.Mismatch))
+
+		r.shardQueries = 1
+		got := runScript(t, r, script)
+		is.Equal(t, int64(1+3), opened.Load(), "three queries at the end in shards of one")
+		is.True(t, pgdiff.IsMismatch(got.Mismatch), fmt.Sprint(got.Mismatch))
+		is.True(t, strings.HasPrefix(got.Mismatch.Error(), "script.test:11: SELECT a + 1 FROM t1"), got.Mismatch.Error())
+		is.Equal(t, want.Mismatch.Error(), got.Mismatch.Error())
+		is.Equal(t, 4, got.Statements, "the file ends at the mismatch")
+		is.Equal(t, fmt.Sprintf("%+v", want.Report), fmt.Sprintf("%+v", got.Report))
+	})
+
+	t.Run("bounds the shards that run at the same time by the slots", func(t *testing.T) {
+		script := "statement ok\nCREATE TABLE t1(a INTEGER PRIMARY KEY)\n"
+		for i := range 6 {
+			script += fmt.Sprintf("\nquery I\nSELECT a + %d FROM t1\n----\n", i)
+		}
+		r := newFileRunner(t)
+		r.shardQueries = 1
+		var open, most atomic.Int64
+		r.newMaragudb = func() (*sql.DB, error) {
+			n := open.Add(1)
+			for {
+				m := most.Load()
+				if n <= m || most.CompareAndSwap(m, n) {
+					break
+				}
+			}
+			// A shard opens its databases while it holds a slot, so the opens that overlap are at
+			// most the slots.
+			time.Sleep(20 * time.Millisecond)
+			open.Add(-1)
+			return openMaragudb()
+		}
+		slots := make(chan struct{}, 2)
+		rep, err := r.run(t.Context(), 0, "script.test", []byte(script), slots)
+		is.NotError(t, err)
+		is.True(t, rep.Mismatch == nil, fmt.Sprint(rep.Mismatch))
+		is.True(t, most.Load() == 2, fmt.Sprint(most.Load()))
+	})
+
 	t.Run("fails on a file that does not parse", func(t *testing.T) {
-		_, err := newFileRunner(t).run(t.Context(), 0, "bad.test", []byte("frobnicate\n"))
+		_, err := newFileRunner(t).run(t.Context(), 0, "bad.test", []byte("frobnicate\n"), nil)
 		is.True(t, err != nil && strings.Contains(err.Error(), "bad.test: line 1"), fmt.Sprint(err))
 	})
 }
 
+func TestShardStarts(t *testing.T) {
+	query := func(sql string) record { return record{kind: kindQuery, sql: sql} }
+	statement := func(sql string) record { return record{kind: kindStatement, sql: sql} }
+	create, insert, sel := statement("CREATE TABLE t1(a INTEGER)"), statement("INSERT INTO t1 VALUES(1)"), query("SELECT a FROM t1")
+
+	tests := []struct {
+		name    string
+		records []record
+		size    int
+		want    []int
+	}{
+		{name: "runs records in one sequence without a size", records: []record{create, sel, sel, sel}, size: 0, want: []int{0}},
+		{name: "runs records that end with at most size read-only queries in one sequence", records: []record{create, sel, sel, sel, insert, sel, sel}, size: 2, want: []int{0}},
+		{name: "splits the read-only queries at the end into the fewest shards of at most size, as even as can be", records: []record{create, sel, insert, sel, sel, sel, sel, sel}, size: 2, want: []int{0, 4, 6}},
+		{name: "counts only SELECTs without INTO as read-only", records: []record{create, sel, sel, query("SELECT a INTO t2 FROM t1"), sel, sel}, size: 1, want: []int{0, 5}},
+		{name: "does not count a query of VALUES as read-only", records: []record{create, sel, sel, query("VALUES (1)"), sel, sel}, size: 1, want: []int{0, 5}},
+		{name: "does not count a statement as read-only", records: []record{create, sel, sel, statement("SELECT 1"), sel, sel}, size: 1, want: []int{0, 5}},
+		{name: "runs records with a transaction in one sequence", records: []record{create, statement("BEGIN"), insert, statement("COMMIT"), sel, sel}, size: 1, want: []int{0}},
+		{name: "runs records with a savepoint in one sequence", records: []record{create, statement("savepoint s1"), sel, sel}, size: 1, want: []int{0}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			is.EqualSlice(t, test.want, shardStarts(test.records, test.size))
+		})
+	}
+}
+
 func TestFileRunner_postgres(t *testing.T) {
-	t.Run("gives each worker a connection in its own schema with sequential scans off", func(t *testing.T) {
+	t.Run("gives a connection in a fresh schema of the name with sequential scans off", func(t *testing.T) {
 		r := newFileRunner(t)
-		for worker := range 3 {
-			conn, err := r.postgres(t.Context(), worker)
+		for _, name := range []string{"sqllogictest_0", "sqllogictest_1", "sqllogictest_1_2"} {
+			conn, err := r.postgres(t.Context(), name)
+			is.NotError(t, err)
+			_, err = conn.ExecContext(t.Context(), "CREATE TABLE t (a bigint)")
+			is.NotError(t, err)
+			is.NotError(t, conn.Close())
+			conn, err = r.postgres(t.Context(), name)
 			is.NotError(t, err)
 			t.Cleanup(func() { _ = conn.Close() })
 			var schema, seqscan string
-			is.NotError(t, conn.QueryRowContext(t.Context(), "SELECT current_schema(), current_setting('enable_seqscan')").Scan(&schema, &seqscan))
-			is.Equal(t, fmt.Sprintf("sqllogictest_%d", worker), schema)
+			var tables int
+			is.NotError(t, conn.QueryRowContext(t.Context(), "SELECT current_schema(), current_setting('enable_seqscan'), (SELECT count(*) FROM pg_tables WHERE schemaname = current_schema())").Scan(&schema, &seqscan, &tables))
+			is.Equal(t, name, schema)
 			is.Equal(t, "off", seqscan)
+			is.Equal(t, 0, tables, "the schema is fresh")
 		}
 	})
 }
@@ -367,8 +579,11 @@ func TestCorpus(t *testing.T) {
 		}
 
 		start := time.Now()
+		// A worker mostly waits for Postgres, so three per CPU keep the CPUs busy, and every large
+		// file of the subset starts at once.
 		r := newFileRunner(t)
-		reports, err := r.runFiles(t.Context(), c, files, runtime.GOMAXPROCS(0))
+		r.shardQueries = 3000
+		reports, err := r.runFiles(t.Context(), c, files, 3*runtime.GOMAXPROCS(0))
 		is.NotError(t, err)
 		total := newFileReport()
 		fact := verify.Corpus{Name: name, Files: len(files)}

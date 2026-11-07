@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -72,12 +73,26 @@ type fileRunner struct {
 	pg *sql.DB
 	// newMaragudb opens a fresh, empty maragudb.
 	newMaragudb func() (*sql.DB, error)
+	// shardQueries, when positive, is the most read-only queries at the end of a file that run
+	// one after another. A file with more of them, and without transactions, splits them into
+	// shards of at most that many, which run at the same time, each on databases of its own. Zero
+	// runs every file in one sequence.
+	shardQueries int
 }
 
 // run the records of a test file, and return what they did. A difference between the
 // databases ends the file and is in the report's Mismatch; the error is for failures of the
-// harness and the databases themselves.
-func (r *fileRunner) run(ctx context.Context, worker int, name string, content []byte) (fileReport, error) {
+// harness and the databases themselves. slots, when not nil, bounds the shards that run at the
+// same time, across the files of a run.
+//
+// A read-only query outside a transaction changes nothing, so it gives the same result on any
+// databases that ran the records before it. [shardStarts] splits the read-only queries at the
+// end of a file into shards, which run at the same time: the first after the records before
+// the queries, and every other on fresh databases that first run those records again, without
+// the read-only queries among them and without counting them again. A shard ends at its first
+// difference. The report has the difference of the earliest shard, and counts what a run
+// in one sequence counts: the shards up to that one.
+func (r *fileRunner) run(ctx context.Context, worker int, name string, content []byte, slots chan struct{}) (fileReport, error) {
 	rep := newFileReport()
 	records, err := parse(bytes.NewReader(content))
 	if err != nil {
@@ -101,29 +116,168 @@ func (r *fileRunner) run(ctx context.Context, worker int, name string, content [
 	}
 	applicable = rewrite(applicable)
 
+	starts := shardStarts(applicable, r.shardQueries)
+	// setup are the records that every shard after the first runs again.
+	var setup []record
+	if len(starts) > 1 {
+		for _, rec := range applicable[:starts[1]] {
+			if !readOnly(rec) {
+				setup = append(setup, rec)
+			}
+		}
+	}
+	reports := make([]fileReport, len(starts))
+	errs := make([]error, len(starts))
+	var wg sync.WaitGroup
+	for i, start := range starts {
+		end := len(applicable)
+		if i+1 < len(starts) {
+			end = starts[i+1]
+		}
+		reports[i] = newFileReport()
+		wg.Go(func() {
+			if slots != nil {
+				select {
+				case slots <- struct{}{}:
+					defer func() { <-slots }()
+				case <-ctx.Done():
+					errs[i] = ctx.Err()
+					return
+				}
+			}
+			schema := fmt.Sprintf("sqllogictest_%d", worker)
+			if i > 0 {
+				schema = fmt.Sprintf("sqllogictest_%d_%d", worker, i)
+			}
+			d, err := r.open(ctx, schema)
+			if err != nil {
+				errs[i] = err
+				return
+			}
+			defer d.close()
+			missing := map[string]string{}
+			if i > 0 {
+				// The first shard counts these records.
+				again := newFileReport()
+				if done, err := d.exec(ctx, name, setup, missing, &again); done || err != nil {
+					reports[i].Mismatch, errs[i] = again.Mismatch, err
+					return
+				}
+			}
+			_, errs[i] = d.exec(ctx, name, applicable[start:end], missing, &reports[i])
+		})
+	}
+	wg.Wait()
+	for i := range starts {
+		rep.add(reports[i])
+		if rep.Mismatch = reports[i].Mismatch; rep.Mismatch != nil {
+			break
+		}
+	}
+	return rep, errors.Join(errs...)
+}
+
+// shardStarts returns the index of the first record of every shard of the records, in order,
+// which is [0] for records that run in one sequence. Records that end with more than size
+// read-only queries, and that have no statement that begins or ends a transaction, split those
+// queries into the fewest shards of at most size each, as even as can be. The first shard also
+// has the records before the queries.
+func shardStarts(records []record, size int) []int {
+	if size <= 0 || slices.ContainsFunc(records, transactional) {
+		return []int{0}
+	}
+	end := len(records)
+	for end > 0 && readOnly(records[end-1]) {
+		end--
+	}
+	queries := len(records) - end
+	if queries <= size {
+		return []int{0}
+	}
+	n := (queries + size - 1) / size
+	starts := []int{0}
+	for i := 1; i < n; i++ {
+		starts = append(starts, end+i*queries/n)
+	}
+	return starts
+}
+
+// readOnly reports whether the record is a query that only reads: a SELECT without INTO.
+// maragudb rejects the functions that change state, such as nextval, and a statement that it
+// rejects does not run on Postgres, so such a query changes nothing on either side.
+func readOnly(rec record) bool {
+	if rec.kind != kindQuery {
+		return false
+	}
+	toks := lex(rec.sql)
+	if words := keywords(toks); len(words) == 0 || words[0] != "SELECT" {
+		return false
+	}
+	for _, tok := range toks {
+		if tok.kind == tokWord && strings.EqualFold(tok.text, "INTO") {
+			return false
+		}
+	}
+	return true
+}
+
+// transactional reports whether the record begins or ends a transaction or works on one.
+func transactional(rec record) bool {
+	words := keywords(lex(rec.sql))
+	if len(words) == 0 {
+		return false
+	}
+	switch words[0] {
+	case "BEGIN", "START", "COMMIT", "END", "ROLLBACK", "ABORT", "SAVEPOINT", "RELEASE", "PREPARE":
+		return true
+	}
+	return false
+}
+
+// databases on which a file, or a shard of one, runs: a fresh maragudb and Postgres in a fresh
+// schema, compared by a session.
+type databases struct {
+	m       *sql.DB
+	mConn   *sql.Conn
+	pgConn  *sql.Conn
+	session *pgdiff.Session
+}
+
+// open fresh databases, with Postgres in a fresh, empty schema of the name.
+func (r *fileRunner) open(ctx context.Context, schema string) (*databases, error) {
 	m, err := r.newMaragudb()
 	if err != nil {
-		return rep, err
+		return nil, err
 	}
-	defer func() { _ = m.Close() }()
 	mConn, err := m.Conn(ctx)
 	if err != nil {
-		return rep, fmt.Errorf("maragudb: %w", err)
+		_ = m.Close()
+		return nil, fmt.Errorf("maragudb: %w", err)
 	}
-	defer func() { _ = mConn.Close() }()
-	pgConn, err := r.postgres(ctx, worker)
+	pgConn, err := r.postgres(ctx, schema)
 	if err != nil {
-		return rep, err
+		_ = mConn.Close()
+		_ = m.Close()
+		return nil, err
 	}
-	defer func() { _ = pgConn.Close() }()
-	session := pgdiff.NewSession(pgConn, mConn)
-	// The connection goes back to the pool without a transaction, also after a mismatch in the
-	// middle of one, which the session may not know is open.
-	defer func() { _, _ = pgConn.ExecContext(context.Background(), "ROLLBACK") }()
+	return &databases{m: m, mConn: mConn, pgConn: pgConn, session: pgdiff.NewSession(pgConn, mConn)}, nil
+}
 
-	// missing maps the tables and views whose creation was rejected or failed to the reason.
-	missing := map[string]string{}
-	for _, rec := range applicable {
+// close the databases. The Postgres connection goes back to the pool without a transaction,
+// also after a mismatch in the middle of one, which the session may not know is open.
+func (d *databases) close() {
+	_, _ = d.pgConn.ExecContext(context.Background(), "ROLLBACK")
+	_ = d.pgConn.Close()
+	_ = d.mConn.Close()
+	_ = d.m.Close()
+}
+
+// exec the records on the databases, and count what they did in the report. missing maps the
+// tables and views whose creation was rejected or failed to the reason, and exec updates it. A
+// difference between the databases ends the records, is in the report's Mismatch, and makes
+// done true.
+func (d *databases) exec(ctx context.Context, name string, records []record, missing map[string]string, rep *fileReport) (done bool, err error) {
+	for _, rec := range records {
 		toks := lex(rec.sql)
 		created := createdName(toks)
 		if cause := dependsOn(toks, missing, created); cause != "" {
@@ -135,13 +289,13 @@ func (r *fileRunner) run(ctx context.Context, worker int, name string, content [
 			}
 			continue
 		}
-		o, err := session.Exec(ctx, rec.sql, &rep.Report)
+		o, err := d.session.Exec(ctx, rec.sql, &rep.Report)
 		if err != nil {
 			if pgdiff.IsMismatch(err) {
 				rep.Mismatch = fmt.Errorf("%s:%d: %w", name, rec.line, err)
-				return rep, nil
+				return true, nil
 			}
-			return rep, fmt.Errorf("%s:%d: %w", name, rec.line, err)
+			return true, fmt.Errorf("%s:%d: %w", name, rec.line, err)
 		}
 		switch {
 		case !o.Executed && created != "":
@@ -155,18 +309,17 @@ func (r *fileRunner) run(ctx context.Context, worker int, name string, content [
 			rep.SetupFailed[pgReason(o.Err)]++
 		}
 	}
-	return rep, nil
+	return false, nil
 }
 
-// postgres returns a connection to Postgres in a fresh, empty schema of the worker, which is
-// the connection's search path. The connection has the settings of every connection that
+// postgres returns a connection to Postgres in a fresh, empty schema of the name, which is the
+// connection's search path. The connection has the settings of every connection that
 // [pgdiff.Postgres] gives, among them enable_seqscan=off.
-func (r *fileRunner) postgres(ctx context.Context, worker int) (*sql.Conn, error) {
+func (r *fileRunner) postgres(ctx context.Context, schema string) (*sql.Conn, error) {
 	conn, err := r.pg.Conn(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("postgres: %w", err)
 	}
-	schema := fmt.Sprintf("sqllogictest_%d", worker)
 	for _, q := range []string{"DROP SCHEMA IF EXISTS " + schema + " CASCADE", "CREATE SCHEMA " + schema, "SET search_path TO " + schema} {
 		if _, err := conn.ExecContext(ctx, q); err != nil {
 			_ = conn.Close()
@@ -299,13 +452,16 @@ func topCounts(m map[string]int, n int) string {
 	return strings.Join(parts, ", ")
 }
 
-// runFiles of the corpus on workers at the same time, and return the report of every file. It
-// stops at the first failure of the harness or the databases, but not at a mismatch, which is
-// in the file's report.
+// runFiles of the corpus on workers at the same time, largest first, and return the report of
+// every file. It stops at the first failure of the harness or the databases, but not at a
+// mismatch, which is in the file's report.
 func (r *fileRunner) runFiles(ctx context.Context, c *corpus, files []string, workers int) (map[string]fileReport, error) {
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	jobs := make(chan string)
+	// slots bound the shards that run at the same time, and so the connections to Postgres, to
+	// the number of workers.
+	slots := make(chan struct{}, workers)
 	reports := map[string]fileReport{}
 	var mu sync.Mutex
 	var firstErr error
@@ -316,7 +472,7 @@ func (r *fileRunner) runFiles(ctx context.Context, c *corpus, files []string, wo
 				content, err := c.read(name)
 				var rep fileReport
 				if err == nil {
-					rep, err = r.run(ctx, w, name, content)
+					rep, err = r.run(ctx, w, name, content, slots)
 				}
 				mu.Lock()
 				reports[name] = rep
@@ -328,7 +484,7 @@ func (r *fileRunner) runFiles(ctx context.Context, c *corpus, files []string, wo
 			}
 		})
 	}
-	for _, name := range files {
+	for _, name := range c.largestFirst(files) {
 		if ctx.Err() != nil {
 			break
 		}
