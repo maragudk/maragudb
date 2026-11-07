@@ -92,7 +92,9 @@ type window struct {
 	start, end int
 }
 
-// plan the windows that a compaction of segs merges, oldest first. They do not overlap.
+// plan the windows that a compaction of segs merges, oldest first. They do not overlap. Segments
+// are measured by their entries' bytes, without their key filters, so that the filters do not
+// move segments between tiers.
 func (t Tiers) plan(segs []segmentMeta) []window {
 	t = t.withDefaults()
 	k := len(segs)
@@ -105,17 +107,17 @@ func (t Tiers) plan(segs []segmentMeta) []window {
 	var newer int64
 	var tombstones int
 	for _, seg := range segs[1:] {
-		newer += seg.Size
+		newer += seg.dataBytes()
 		tombstones += seg.Tombstones
 	}
-	if k >= t.FanIn && (newer >= int64(t.FullRatio)*segs[0].Size || tombstones > 0 && tombstones*(t.FullRatio+1) >= t.FullRatio*segs[0].Count) {
+	if k >= t.FanIn && (newer >= int64(t.FullRatio)*segs[0].dataBytes() || tombstones > 0 && tombstones*(t.FullRatio+1) >= t.FullRatio*segs[0].Count) {
 		return []window{{0, k}}
 	}
 	// The tier of a segment counts as the highest tier of it and of every newer segment, so that
 	// tiers never rise from the oldest segment to the newest.
 	tiers := make([]int, k)
 	for i := k - 1; i >= 0; i-- {
-		tiers[i] = t.tier(segs[i].Size)
+		tiers[i] = t.tier(segs[i].dataBytes())
 		if i < k-1 {
 			tiers[i] = max(tiers[i], tiers[i+1])
 		}
@@ -133,8 +135,8 @@ func (t Tiers) plan(segs []segmentMeta) []window {
 		limit := t.limit(tiers[start] + 1)
 		for s := start; s < end; {
 			e, size := s, int64(0)
-			for e < end && (e-s < t.FanIn || segs[e].Size < limit-size) {
-				size += segs[e].Size
+			for e < end && (e-s < t.FanIn || segs[e].dataBytes() < limit-size) {
+				size += segs[e].dataBytes()
 				e++
 			}
 			if e-s < t.FanIn {
@@ -265,7 +267,7 @@ func (db *DB) compact(ctx context.Context, tiers *Tiers, progress func() error) 
 			return false, err
 		}
 		merges = append(merges, merge{members: members, out: out})
-		if tiers != nil && tiers.tier(m.Segments[members[len(members)-1]].Size) >= 2 {
+		if tiers != nil && tiers.tier(m.Segments[members[len(members)-1]].dataBytes()) >= 2 {
 			assert.Sometimes(true, "a compaction merges segments of tier 2 or higher", nil)
 			reach.Hit(ctx, reach.CompactionUpperTier)
 		}
@@ -375,6 +377,7 @@ func (db *DB) mergeSegments(ctx context.Context, startedAt time.Time, m *manifes
 		}))
 	}
 	b := newSegmentBuilder(db.blockSize)
+	b.omitFilterKeys = db.mutations.FilterOmitsKeys
 	var count, tombstones int
 	for it.Next() {
 		if err := b.add(it.Key(), it.Value(), it.tombstone); err != nil {

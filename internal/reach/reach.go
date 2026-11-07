@@ -44,6 +44,8 @@ const (
 	DiskCacheEviction        State = "STATE-DISK-CACHE-EVICTION"
 	DiskCacheRefused         State = "STATE-DISK-CACHE-REFUSED"
 	DamagedReadRefused       State = "STATE-DAMAGED-READ-REFUSED"
+	FilterSkip               State = "STATE-FILTER-SKIP"
+	FilterBlockRead          State = "STATE-FILTER-BLOCK-READ"
 )
 
 // Declared state, with what it means and the message of the Antithesis assertion that marks it.
@@ -83,6 +85,8 @@ func Declarations() []Declared {
 		{DiskCacheEviction, "a client's disk cache evicts its least recently used entries to stay within its bound", "a disk cache evicts to stay within its bound"},
 		{DiskCacheRefused, "a client's disk cache refuses a file that a crash damaged or removed, and the read goes to the store", "a disk cache refuses a damaged file"},
 		{DamagedReadRefused, "a read from the store gets damaged bytes of a block, the manifest, or a garbage batch, and fails with ErrCorrupt instead of serving or caching them", "a read of damaged bytes from the store fails with ErrCorrupt"},
+		{FilterSkip, "a point lookup skips a segment whose key range holds the key, because the segment's key filter does not hold it", "a point lookup skips a segment whose filter does not hold the key"},
+		{FilterBlockRead, "a point lookup with neither the root block nor the filter block of a segment in a cache reads both in one range read, and checks each", "a point lookup reads a filter block with its root block"},
 	}
 }
 

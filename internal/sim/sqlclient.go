@@ -55,7 +55,7 @@ func (r *run) openSQL(ctx context.Context, opts engine.Options) (*sql.DB, *engin
 // seedSQL creates the tables, and the accounts, with a fault-free client before the clients start.
 func (r *run) seedSQL() {
 	r.goTask("seed", func(ctx context.Context) {
-		db, _, err := r.openSQL(ctx, engine.Options{Client: r.fake.WithoutFaults(), Now: r.sched.Now, Sleep: r.sched.Sleep, Rand: rand.New(rand.NewPCG(r.cfg.Seed, 0x5eed))})
+		db, _, err := r.openSQL(ctx, engine.Options{Client: r.fake.WithoutFaults(), Now: r.sched.Now, Sleep: r.sched.Sleep, BlockSize: r.blockSize(), Rand: rand.New(rand.NewPCG(r.cfg.Seed, 0x5eed))})
 		if err != nil {
 			panic(err)
 		}

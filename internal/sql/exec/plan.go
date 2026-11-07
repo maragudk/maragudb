@@ -1076,6 +1076,10 @@ type access struct {
 	// start and end bound a range of row keys otherwise, or of the entries of index.
 	start, end []byte
 	index      *index
+	// entry means that the range of index holds at most one key, start: index is unique, and
+	// equalities with values that are not NULL fix all of its columns, so that only the entry
+	// with exactly those values can be in the range, which a point read finds.
+	entry bool
 	// union of accesses, whose rows are read once each.
 	union []access
 	// ordered reads the rows in the order of the index's entries instead of key order.
@@ -1168,7 +1172,11 @@ func (t *table) span(sc scan, f filter) span {
 		sp.ranged = hasLo || hasHi
 		return sp
 	}
+	// Every column of the index is fixed by an equality with a value that is not NULL. The entry of
+	// a unique index for such values is its key without a suffix, and the encodings are
+	// self-delimiting, so no other key of the index begins with it.
 	sp.start, sp.end = prefix, append(slices.Clone(prefix), 0xFF)
+	sp.entry = !sc.pk && sc.index.Unique
 	return sp
 }
 

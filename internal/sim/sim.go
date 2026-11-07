@@ -146,6 +146,11 @@ type Config struct {
 	// objects in the store stay whole. Without it, no read is damaged, and the earlier
 	// configurations keep their histories.
 	StoreDamage bool
+	// BlockSize of the segment blocks that the processes write, when it is not zero, instead of
+	// the default of 16 KiB. With blocks far smaller than the default, the segments of a run have
+	// trees of several levels and filter blocks, which the default blocks never give a database
+	// of a run.
+	BlockSize int
 	// Trace receives one line per event when non-nil.
 	Trace func(string)
 }
@@ -587,6 +592,7 @@ func (r *run) engineOptions(id int, rng *rand.Rand, disk cache.Cache) engine.Opt
 		Sleep:         r.sched.Sleep,
 		Rand:          rand.New(rand.NewPCG(rng.Uint64(), rng.Uint64())),
 		Mutations:     r.cfg.Mutations,
+		BlockSize:     r.blockSize(),
 	}
 	switch id % 3 {
 	case 1:
@@ -596,6 +602,14 @@ func (r *run) engineOptions(id int, rng *rand.Rand, disk cache.Cache) engine.Opt
 		opts.MemoryCacheBytes = new(int64)
 	}
 	return opts
+}
+
+// blockSize of the segments that the processes write, or nil for the default.
+func (r *run) blockSize() *int {
+	if r.cfg.BlockSize == 0 {
+		return nil
+	}
+	return &r.cfg.BlockSize
 }
 
 // open an engine for a process.
@@ -622,7 +636,7 @@ func (r *run) maintenanceOptions(id int) (engine.MaintenanceOptions, bool) {
 func (r *run) seedBank() {
 	r.total = int64(r.cfg.Keys) * initialBalance
 	r.goTask("seed", func(ctx context.Context) {
-		db, err := engine.Open(ctx, engine.Options{Client: r.fake.WithoutFaults(), Prefix: "db", Now: r.sched.Now, Sleep: r.sched.Sleep, Rand: rand.New(rand.NewPCG(r.cfg.Seed, 0x5eed))})
+		db, err := engine.Open(ctx, engine.Options{Client: r.fake.WithoutFaults(), Prefix: "db", Now: r.sched.Now, Sleep: r.sched.Sleep, BlockSize: r.blockSize(), Rand: rand.New(rand.NewPCG(r.cfg.Seed, 0x5eed))})
 		if err != nil {
 			panic(err)
 		}

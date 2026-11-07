@@ -11,8 +11,10 @@ import (
 
 // A segment is one immutable object holding a sorted run of entries as a B+tree of blocks.
 //
-// Object layout: data blocks in key order, then index blocks bottom-up, then the root block.
-// The root's location is recorded in the manifest, so a lookup needs no footer read.
+// Object layout: data blocks in key order, then index blocks bottom-up, then the root block, and
+// then, in some segments, the block of the segment's key filter, which filter.go describes. The
+// root's location is recorded in the manifest, and so is the filter's, so a lookup needs no
+// footer read.
 //
 // Block layout: kind byte, uvarint count, then entries, then a checksum.
 //   - data entry: uvarint key length, key, flags byte (bit 0: tombstone), and unless a tombstone,
@@ -83,10 +85,26 @@ type segmentBuilder struct {
 	lastKey    []byte
 	minKey     []byte
 	maxKey     []byte
+	// hashes of the keys, for the key filter.
+	hashes []uint64
+	// omitFilterKeys leaves every other key out of the filter, for [Mutations.FilterOmitsKeys].
+	omitFilterKeys bool
 }
 
 func newSegmentBuilder(blockSize int) *segmentBuilder {
 	return &segmentBuilder{blockSize: blockSize}
+}
+
+// inlineFilterBytes is the size up to which the key filter is kept in the manifest: a sixteenth
+// of a block, 1 KiB at the default block size, about 800 keys.
+func (b *segmentBuilder) inlineFilterBytes() int {
+	return b.blockSize / 16
+}
+
+// maxFilterBlockBytes is the size up to which the key filter is a block of the segment: four
+// blocks, 64 KiB at the default block size, about 52,000 keys.
+func (b *segmentBuilder) maxFilterBlockBytes() int {
+	return 4 * b.blockSize
 }
 
 func (b *segmentBuilder) add(key, value []byte, tombstone bool) error {
@@ -108,6 +126,9 @@ func (b *segmentBuilder) add(key, value []byte, tombstone bool) error {
 		b.block.WriteByte(0)
 		b.block.Write(binary.AppendUvarint(nil, uint64(len(value))))
 		b.block.Write(value)
+	}
+	if !b.omitFilterKeys || b.count%2 == 0 {
+		b.hashes = append(b.hashes, keyHash(key))
 	}
 	b.blockN++
 	b.count++
@@ -177,6 +198,16 @@ func (b *segmentBuilder) finish(objectKey string) ([]byte, segmentMeta, error) {
 		flush()
 		level = next
 	}
+	root := level[0].ref
+	var inline keyFilter
+	var filterRef *blockRef
+	switch filter := buildFilter(b.hashes); {
+	case len(filter) <= b.inlineFilterBytes():
+		inline = filter
+	case len(b.leaves) > 1 && len(filter)+minBlockBytes <= b.maxFilterBlockBytes():
+		ref := b.writeBlock(blockKindFilter, 1, filter)
+		filterRef = &ref
+	}
 	out := b.buf.Bytes()
 	for _, ref := range b.blocks {
 		block := out[ref.Offset : ref.Offset+ref.Length]
@@ -184,13 +215,15 @@ func (b *segmentBuilder) finish(objectKey string) ([]byte, segmentMeta, error) {
 		binary.BigEndian.PutUint32(block[end:], blockChecksum(objectKey, ref.Offset, block[:end]))
 	}
 	meta := segmentMeta{
-		Key:        objectKey,
-		Size:       int64(b.buf.Len()),
-		Root:       level[0].ref,
-		MinKey:     b.minKey,
-		MaxKey:     b.maxKey,
-		Count:      b.count,
-		Tombstones: b.tombstones,
+		Key:         objectKey,
+		Size:        int64(b.buf.Len()),
+		Root:        root,
+		MinKey:      b.minKey,
+		MaxKey:      b.maxKey,
+		Count:       b.count,
+		Tombstones:  b.tombstones,
+		Filter:      inline,
+		FilterBlock: filterRef,
 	}
 	return out, meta, nil
 }

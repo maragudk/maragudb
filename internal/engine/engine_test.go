@@ -3,9 +3,11 @@ package engine_test
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"log/slog"
 	"math/rand/v2"
 	"strconv"
@@ -1566,6 +1568,290 @@ func TestDB_Damage(t *testing.T) {
 	})
 }
 
+// filterSegment as the manifest in the store lists it.
+type filterSegment struct {
+	Key         string     `json:"key"`
+	Root        blockSpan  `json:"root"`
+	Filter      []byte     `json:"filter"`
+	FilterBlock *blockSpan `json:"filterBlock"`
+}
+
+type blockSpan struct {
+	Offset int64 `json:"o"`
+	Length int64 `json:"l"`
+}
+
+// cacheKey of the block at s of the object at key, as the engine's caches key it.
+func (s blockSpan) cacheKey(key string) string {
+	return fmt.Sprintf("%s@%d+%d", key, s.Offset, s.Length)
+}
+
+// filterSegments that the manifest in the store lists, oldest first.
+func filterSegments(t *testing.T, w *world) []filterSegment {
+	t.Helper()
+	var m struct {
+		Segments []filterSegment `json:"segments"`
+	}
+	is.NotError(t, json.Unmarshal(manifestJSON(t, w), &m))
+	return m.Segments
+}
+
+// withoutFilters rewrites the manifest in the store without the key filters of its segments, as
+// a version of maragudb without filters writes it, and seals it again.
+func withoutFilters(t *testing.T, w *world) {
+	t.Helper()
+	var m map[string]any
+	is.NotError(t, json.Unmarshal(manifestJSON(t, w), &m))
+	for _, seg := range m["segments"].([]any) {
+		delete(seg.(map[string]any), "filter")
+		delete(seg.(map[string]any), "filterBlock")
+	}
+	body, err := json.Marshal(m)
+	is.NotError(t, err)
+	sealed := binary.BigEndian.AppendUint32([]byte("mdbm"), crc32.Update(crc32.Update(0, crc32.MakeTable(crc32.Castagnoli), []byte("db/manifest")), crc32.MakeTable(crc32.Castagnoli), body))
+	_, err = w.fake.Put(t.Context(), "db/manifest", append(sealed, body...), s3.PutOptions{})
+	is.NotError(t, err)
+}
+
+func TestDB_KeyFilters(t *testing.T) {
+	t.Parallel()
+
+	blockSize := 256
+	// load the segments of a database with key filters of both kinds, and return what it holds.
+	// The oldest segment holds key-0000 to key-0399; three newer ones of five keys each keep their
+	// filters in the manifest; and the newest, of 60 keys, keeps a filter block after its root.
+	// Every newer segment holds key-0000 and key-0399, so that the key range of each spans every
+	// key, and only a filter can tell that a key is not in it.
+	load := func(t *testing.T, db *engine.DB) map[string]string {
+		t.Helper()
+		want := map[string]string{}
+		commit := func(c int, ids ...int) {
+			var kv []string
+			for _, i := range ids {
+				k, v := fmt.Sprintf("key-%04d", i), fmt.Sprintf("v%d-%d", c, i)
+				kv = append(kv, k, v)
+				want[k] = v
+			}
+			put(t, db, kv...)
+		}
+		var ids []int
+		for i := range 400 {
+			ids = append(ids, i)
+		}
+		commit(0, ids...)
+		for c := 1; c <= 3; c++ {
+			commit(c, 0, 399, 7*c+1, 7*c+101, 7*c+201)
+		}
+		ids = []int{0, 399}
+		for i := range 58 {
+			ids = append(ids, 6*i+3)
+		}
+		commit(4, ids...)
+		return want
+	}
+	opts := func(o engine.Options) engine.Options {
+		o.BlockSize = &blockSize
+		return o
+	}
+	// onlyOldest is a key of the oldest segment alone, which no filter of a newer one holds.
+	const onlyOldest = "key-0002"
+
+	t.Run("segments keep small filters in the manifest and larger ones as a block after the root", func(t *testing.T) {
+		w := newWorld(t)
+		load(t, w.open(1, opts(engine.Options{})))
+		segs := filterSegments(t, w)
+		is.Equal(t, 5, len(segs))
+		for i, seg := range segs {
+			inline := i >= 1 && i <= 3
+			is.Equal(t, inline, seg.Filter != nil, fmt.Sprint("segment ", i))
+			is.Equal(t, !inline, seg.FilterBlock != nil, fmt.Sprint("segment ", i))
+			if seg.FilterBlock != nil {
+				is.Equal(t, seg.Root.Offset+seg.Root.Length, seg.FilterBlock.Offset)
+			}
+		}
+	})
+
+	t.Run("a cold point lookup makes no GET for a segment whose filter in the manifest does not hold the key, and one for a segment whose filter block does not", func(t *testing.T) {
+		verify.Covers(t, "a cold point lookup of a key of the oldest segment alone makes the GETs of a descent of the oldest segment, one GET for the root and filter blocks of a newer segment whose filter block does not hold the key, and none for three newer segments whose filters in the manifest do not hold it; without the filters, it descends into every segment", "AC-5.3")
+		// The descent of the oldest segment, with nothing else in the database.
+		w := newWorld(t)
+		db := w.open(1, opts(engine.Options{}))
+		var kv []string
+		for i := range 400 {
+			kv = append(kv, fmt.Sprintf("key-%04d", i), fmt.Sprintf("v0-%d", i))
+		}
+		put(t, db, kv...)
+		cold := w.open(2, opts(engine.Options{MemoryCacheBytes: new(int64)}))
+		before := cold.Stats().S3
+		get(t, cold, onlyOldest)
+		descent := cold.Stats().S3.Sub(before).Get
+		is.True(t, descent >= 2, "the oldest segment has several levels")
+
+		w = newWorld(t)
+		load(t, w.open(1, opts(engine.Options{})))
+		cold = w.open(2, opts(engine.Options{MemoryCacheBytes: new(int64)}))
+		before = cold.Stats().S3
+		v, ok := get(t, cold, onlyOldest)
+		is.True(t, ok)
+		is.Equal(t, "v0-2", v)
+		is.Equal(t, descent+1, cold.Stats().S3.Sub(before).Get)
+
+		withoutFilters(t, w)
+		cold = w.open(3, opts(engine.Options{MemoryCacheBytes: new(int64)}))
+		before = cold.Stats().S3
+		v, ok = get(t, cold, onlyOldest)
+		is.True(t, ok)
+		is.Equal(t, "v0-2", v)
+		is.True(t, cold.Stats().S3.Sub(before).Get >= descent+2+3, "without filters, every segment is read")
+	})
+
+	t.Run("every key reads its newest value and absent keys read as absent, cold, warm, and through segments without filters", func(t *testing.T) {
+		verify.Covers(t, "point lookups of every key of a database whose segments have filters in the manifest and filter blocks find the newest value, with a cold cache, a warm one, and after the filters are removed from the manifest as an older version writes it", "INV-CACHE-LOSS")
+		w := newWorld(t)
+		want := load(t, w.open(1, opts(engine.Options{})))
+		check := func(db *engine.DB) {
+			t.Helper()
+			for k, v := range want {
+				got, ok := get(t, db, k)
+				is.True(t, ok, k)
+				is.Equal(t, v, got, k)
+			}
+			for _, k := range []string{"", "a", "key-0400", "key-00025", "zz"} {
+				_, ok := get(t, db, k)
+				is.True(t, !ok, k)
+			}
+		}
+		check(w.open(2, opts(engine.Options{MemoryCacheBytes: new(int64)})))
+		warm := w.open(3, opts(engine.Options{}))
+		check(warm)
+		check(warm)
+		withoutFilters(t, w)
+		check(w.open(4, opts(engine.Options{MemoryCacheBytes: new(int64)})))
+		check(w.open(5, opts(engine.Options{})))
+	})
+
+	t.Run("a warm cache adds no GET for filters, and the disk cache holds filter blocks as it holds other blocks", func(t *testing.T) {
+		verify.Covers(t, "a point lookup with a warm memory cache makes only the freshness read, and one with a warm disk cache reads the filter blocks from it, so that a segment whose filter does not hold the key costs no GET", "AC-5.2", "INV-DISK-CACHE-BOUND")
+		w := newWorld(t)
+		load(t, w.open(1, opts(engine.Options{})))
+		db := w.open(2, opts(engine.Options{}))
+		get(t, db, onlyOldest)
+		before := db.Stats().S3
+		get(t, db, onlyOldest)
+		is.Equal(t, s3.Counts{GetConditional: 1}, db.Stats().S3.Sub(before))
+
+		disk := cache.NewMemory(0)
+		cold := w.open(3, opts(engine.Options{MemoryCacheBytes: new(int64), DiskCache: disk}))
+		get(t, cold, onlyOldest)
+		segs := filterSegments(t, w)
+		for _, seg := range []filterSegment{segs[0], segs[4]} {
+			b, ok := disk.Get(seg.FilterBlock.cacheKey(seg.Key))
+			is.True(t, ok, "the filter block is in the disk cache")
+			is.Equal(t, seg.FilterBlock.Length, int64(len(b)))
+		}
+		fresh := w.open(4, opts(engine.Options{MemoryCacheBytes: new(int64), DiskCache: disk}))
+		before = fresh.Stats().S3
+		v, _ := get(t, fresh, onlyOldest)
+		is.Equal(t, "v0-2", v)
+		is.Equal(t, int64(0), fresh.Stats().S3.Sub(before).Get, "every block the lookup needs is in the disk cache")
+		is.True(t, fresh.Stats().DiskCacheHits >= 2)
+	})
+
+	t.Run("filter blocks count toward the memory cache's budget", func(t *testing.T) {
+		verify.Covers(t, "with a memory cache one byte too small for the root and filter blocks of a segment, the root block evicts the filter block, and with one byte more, both stay", "INV-STATS")
+		w := newWorld(t)
+		var kv []string
+		for i := range 400 {
+			kv = append(kv, fmt.Sprintf("key-%04d", i), fmt.Sprint(i))
+		}
+		put(t, w.open(1, opts(engine.Options{})), kv...)
+		seg := filterSegments(t, w)[0]
+		for _, extra := range []int64{-1, 0} {
+			budget := seg.Root.Length + seg.FilterBlock.Length + extra
+			db := w.open(3, opts(engine.Options{MemoryCacheBytes: &budget}))
+			// A key that the segment does not hold reads the root and filter blocks in one GET,
+			// and stops at the filter.
+			before := db.Stats().S3
+			_, ok := get(t, db, "key-0002x")
+			is.True(t, !ok)
+			is.Equal(t, int64(1), db.Stats().S3.Sub(before).Get)
+			// When both blocks fit, the filter stops the lookup of the key again without a GET.
+			// When they do not, the root block evicted the filter block, which the lookup reads
+			// again.
+			before = db.Stats().S3
+			_, ok = get(t, db, "key-0002x")
+			is.True(t, !ok)
+			want := int64(0)
+			if extra < 0 {
+				want = 1
+			}
+			is.Equal(t, want, db.Stats().S3.Sub(before).Get, fmt.Sprint("a budget of ", budget, " bytes"))
+		}
+	})
+
+	t.Run("a lookup reads a filter block alone when a scan put the root block in the cache without it, and keeps it", func(t *testing.T) {
+		verify.Covers(t, "after a scan cached the root block of a segment but not its filter block, a cold lookup of a key that the segment does not hold makes one GET, for the filter block, and the next one none", "AC-5.3")
+		w := newWorld(t)
+		var kv []string
+		for i := range 400 {
+			kv = append(kv, fmt.Sprintf("key-%04d", i), fmt.Sprint(i))
+		}
+		put(t, w.open(1, opts(engine.Options{})), kv...)
+		db := w.open(2, opts(engine.Options{}))
+		tx, err := db.BeginReadOnly(t.Context())
+		is.NotError(t, err)
+		equalMap(t, map[string]string{"key-0100": "100"}, scan(t, tx, "key-0100", "key-01000"))
+		is.NotError(t, tx.Rollback())
+		for _, want := range []int64{1, 0} {
+			before := db.Stats().S3
+			_, ok := get(t, db, "key-0002x")
+			is.True(t, !ok)
+			is.Equal(t, want, db.Stats().S3.Sub(before).Get)
+		}
+		v, _ := get(t, db, "key-0002")
+		is.Equal(t, "2", v)
+	})
+
+	t.Run("a filter block that the store damaged fails the lookup with ErrCorrupt and is not cached, and one damaged in a cache is read from the store", func(t *testing.T) {
+		verify.Covers(t, "a point lookup whose read of a filter block and its root block gets damaged filter bytes from the store fails with ErrCorrupt and caches neither, and a filter block that the disk cache returns damaged is refused, counted, and read from the store", "INV-DAMAGE-DETECTED")
+		w := newWorld(t)
+		load(t, w.open(1, opts(engine.Options{})))
+		newest := filterSegments(t, w)[4]
+		w.damage = func(key string, body []byte) []byte {
+			if key == newest.Key && int64(len(body)) == newest.Root.Length+newest.FilterBlock.Length {
+				// The last byte of the filter's bits, before the checksum.
+				body[len(body)-5] ^= 0x10
+			}
+			return body
+		}
+		disk := cache.NewMemory(0)
+		db := w.open(2, opts(engine.Options{DiskCache: disk}))
+		tx, err := db.BeginReadOnly(t.Context())
+		is.NotError(t, err)
+		_, _, err = tx.Get(t.Context(), []byte(onlyOldest))
+		is.Error(t, engine.ErrCorrupt, err)
+		is.True(t, strings.Contains(err.Error(), "fails its checksum"), err.Error())
+		_, cached := disk.Get(newest.FilterBlock.cacheKey(newest.Key))
+		is.True(t, !cached, "the damaged filter block is not in the disk cache")
+		w.damage = nil
+		v, _ := get(t, db, onlyOldest)
+		is.Equal(t, "v0-2", v)
+
+		damaged := &damagedCache{Cache: cache.NewMemory(0)}
+		db = w.open(3, opts(engine.Options{DiskCache: damaged, MemoryCacheBytes: new(int64)}))
+		get(t, db, onlyOldest)
+		damaged.damaged = true
+		before := db.Stats()
+		for k, want := range map[string]string{onlyOldest: "v0-2", "key-0003": "v4-3"} {
+			v, ok := get(t, db, k)
+			is.True(t, ok)
+			is.Equal(t, want, v)
+		}
+		is.True(t, db.Stats().DiskCacheRefused > before.DiskCacheRefused)
+		is.Equal(t, before.DiskCacheHits, db.Stats().DiskCacheHits)
+	})
+}
+
 func TestDB_Stats(t *testing.T) {
 	t.Parallel()
 
@@ -1727,6 +2013,42 @@ func TestMutations(t *testing.T) {
 		w.damage = nil
 		v, _ = get(t, db, "a")
 		is.Equal(t, "7", v)
+	})
+
+	t.Run("FilterOmitsKeys makes a point lookup skip the segment with the newest value of a key it left out", func(t *testing.T) {
+		verify.Covers(t, "with the mutant, the filter of a segment leaves out its second key, and a point lookup of that key reads the value of an older segment", "MUT-FILTER-OMITS-KEYS")
+		w := newWorld(t)
+		db := w.open(1, engine.Options{Mutations: engine.Mutations{FilterOmitsKeys: true}})
+		put(t, db, "a", "1")
+		put(t, db, "0", "x", "a", "2")
+		v, _ := get(t, db, "a")
+		is.Equal(t, "1", v)
+	})
+
+	t.Run("FilterUnchecked trusts a filter block whose bytes the store damaged, and keeps trusting it from the cache", func(t *testing.T) {
+		verify.Covers(t, "with the mutant, a filter block whose bits the store cleared is trusted, so that a point lookup misses the key, and the memory cache serves the damaged filter after the store returns whole bytes", "MUT-FILTER-UNCHECKED")
+		blockSize := 256
+		w := newWorld(t)
+		var kv []string
+		for i := range 400 {
+			kv = append(kv, fmt.Sprintf("key-%04d", i), fmt.Sprint(i))
+		}
+		put(t, w.open(1, engine.Options{BlockSize: &blockSize}), kv...)
+		seg := filterSegments(t, w)[0]
+		db := w.open(2, engine.Options{BlockSize: &blockSize, Mutations: engine.Mutations{FilterUnchecked: true}})
+		w.damage = func(key string, body []byte) []byte {
+			if key == seg.Key && int64(len(body)) == seg.Root.Length+seg.FilterBlock.Length {
+				// The filter's bits, after the kind, the count, and the probes, and before the
+				// checksum.
+				clear(body[seg.Root.Length+3 : len(body)-4])
+			}
+			return body
+		}
+		_, ok := get(t, db, "key-0002")
+		is.True(t, !ok, "the damaged filter holds no key")
+		w.damage = nil
+		_, ok = get(t, db, "key-0002")
+		is.True(t, !ok, "the cache serves the damaged filter")
 	})
 
 	t.Run("CommitWithoutCAS lets a stale commit overwrite a newer one", func(t *testing.T) {

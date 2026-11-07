@@ -992,6 +992,13 @@ func segments(t *testing.T, db *sql.DB, n, rowBytes int) int {
 	return s.Segments
 }
 
+// tieredBudget is the most GETs that a cold read after many commits with the merges of the tiers
+// may make, when the same read of the same data, fully compacted, makes compacted GETs: one and a
+// half times as many, or two more, whichever is more.
+func tieredBudget(compacted int64) int64 {
+	return max(compacted*3/2, compacted+2)
+}
+
 func TestRequestBudgets(t *testing.T) {
 	t.Parallel()
 
@@ -1046,6 +1053,7 @@ func TestRequestBudgets(t *testing.T) {
 			w := newWorld(t)
 			db := w.open(maragudb.Options{})
 			load(t, db, n)
+			var tiered int64
 			for phase, state := range []string{"tiered", "compacted"} {
 				if state == "compacted" {
 					is.NotError(t, maragudb.Compact(t.Context(), db))
@@ -1071,6 +1079,11 @@ func TestRequestBudgets(t *testing.T) {
 				verify.CheckBudget(t, "SQL autocommit INSERT, cold, "+state+": PUTs", n, d.Put+d.PutConditional, 2)
 				verify.CheckBudget(t, "SQL autocommit INSERT, cold, "+state+": GETs", n, d.Get, limit)
 				is.Equal(t, maragudb.Requests{Get: d.Get, GetConditional: 1, Put: 1, PutConditional: 1}, d)
+				if state == "tiered" {
+					tiered = d.Get
+				} else {
+					verify.CheckBudget(t, "SQL autocommit INSERT, cold, tiered against compacted: GETs", n, tiered, tieredBudget(d.Get))
+				}
 			}
 		}
 	})
@@ -1092,11 +1105,12 @@ func TestRequestBudgets(t *testing.T) {
 	})
 
 	t.Run("a SELECT by primary key with a cold cache makes a logarithmic number of GETs", func(t *testing.T) {
-		verify.Covers(t, "a SELECT by primary key with a cold cache makes at most one GET per tree level of every segment for the table definition and the row, after many commits with the merges of the tiers, which leave fewer than four segments per tier, and one GET per tree level after a compaction of every segment", "AC-5.3")
+		verify.Covers(t, "a SELECT by primary key with a cold cache makes at most one GET per tree level of every segment for the table definition and the row, after many commits with the merges of the tiers, which leave fewer than four segments per tier, and one GET per tree level after a compaction of every segment; after the many commits, at most one and a half times the GETs of the compacted database, or two more, at every size up to 100,000 rows", "AC-5.3")
 		for _, n := range sizes {
 			w := newWorld(t)
 			db := w.open(maragudb.Options{})
 			load(t, db, n)
+			var tiered int64
 			for _, state := range []string{"tiered", "compacted"} {
 				if state == "compacted" {
 					is.NotError(t, maragudb.Compact(t.Context(), db))
@@ -1112,6 +1126,11 @@ func TestRequestBudgets(t *testing.T) {
 				verify.CheckBudget(t, "SQL SELECT by key, cold, "+state+": GETs", n, d.Get, limit)
 				is.Equal(t, int64(1), d.GetConditional, "one freshness check")
 				is.Equal(t, int64(0), d.Put+d.PutConditional+d.List+d.Delete)
+				if state == "tiered" {
+					tiered = d.Get
+				} else {
+					verify.CheckBudget(t, "SQL SELECT by key, cold, tiered against compacted: GETs", n, tiered, tieredBudget(d.Get))
+				}
 			}
 		}
 	})
@@ -1171,9 +1190,10 @@ func TestRequestBudgets_Indexes(t *testing.T) {
 	loaded := loadedWorlds(t, load)
 
 	t.Run("a point lookup through a unique index with a cold cache makes a logarithmic number of GETs", func(t *testing.T) {
-		verify.Covers(t, "a SELECT by a unique secondary index with a cold cache makes a logarithmic number of GETs: one descent of the tree of every segment each for the table definition, the index entry, and the row, after many commits with the merges of the tiers, which leave fewer than four segments per tier, and after a compaction of every segment", "AC-5.5")
+		verify.Covers(t, "a SELECT by a unique secondary index with a cold cache makes a logarithmic number of GETs: one descent of the tree of every segment each for the table definition, the index entry, and the row, after many commits with the merges of the tiers, which leave fewer than four segments per tier, and after a compaction of every segment; after the many commits, at most one and a half times the GETs of the compacted database, or two more, at every size up to 100,000 rows", "AC-5.5")
 		for _, n := range sizes {
 			w := loaded(t, n)
+			var tiered int64
 			for _, state := range []string{"tiered", "compacted"} {
 				if state == "compacted" {
 					is.NotError(t, maragudb.Compact(t.Context(), w.open(maragudb.Options{})))
@@ -1189,6 +1209,11 @@ func TestRequestBudgets_Indexes(t *testing.T) {
 				verify.CheckBudget(t, "SQL SELECT by unique index, cold, "+state+": GETs", n, d.Get, limit)
 				is.Equal(t, int64(1), d.GetConditional, "one freshness check")
 				is.Equal(t, int64(0), d.Put+d.PutConditional+d.List+d.Delete)
+				if state == "tiered" {
+					tiered = d.Get
+				} else {
+					verify.CheckBudget(t, "SQL SELECT by unique index, cold, tiered against compacted: GETs", n, tiered, tieredBudget(d.Get))
+				}
 			}
 		}
 	})
@@ -1265,11 +1290,12 @@ func TestRequestBudgets_ForeignKeys(t *testing.T) {
 	}
 
 	t.Run("an insert of a row with a foreign key adds no request with a warm cache, and a logarithmic number of GETs with a cold one", func(t *testing.T) {
-		verify.Covers(t, "an autocommit INSERT of a row that references a parent makes one conditional GET and two PUTs with a warm cache at every database size, and with a cold cache one descent of the tree of every segment each for the table definitions, the duplicate key check, and the lookup of the parent, after many commits with the merges of the tiers, and after a compaction of every segment", "AC-5.7", "AC-5.1")
+		verify.Covers(t, "an autocommit INSERT of a row that references a parent makes one conditional GET and two PUTs with a warm cache at every database size, and with a cold cache one descent of the tree of every segment each for the table definitions, the duplicate key check, and the lookup of the parent, after many commits with the merges of the tiers, and after a compaction of every segment; after the many commits, at most one and a half times the GETs of the compacted database, or two more, at every size up to 100,000 rows", "AC-5.7", "AC-5.1")
 		for _, n := range sizes {
 			w := newWorld(t)
 			db := w.open(maragudb.Options{})
 			load(t, db, n)
+			var tiered int64
 			for phase, state := range []string{"tiered", "compacted"} {
 				if state == "compacted" {
 					is.NotError(t, maragudb.Compact(t.Context(), db))
@@ -1292,6 +1318,11 @@ func TestRequestBudgets_ForeignKeys(t *testing.T) {
 				t.Logf("n=%d %s cold insert of a child: %+v, limit %d", n, state, d, limit)
 				verify.CheckBudget(t, "SQL autocommit INSERT with a foreign key, cold, "+state+": GETs", n, d.Get, limit)
 				is.Equal(t, maragudb.Requests{Get: d.Get, GetConditional: 1, Put: 1, PutConditional: 1}, d)
+				if state == "tiered" {
+					tiered = d.Get
+				} else {
+					verify.CheckBudget(t, "SQL autocommit INSERT with a foreign key, cold, tiered against compacted: GETs", n, tiered, tieredBudget(d.Get))
+				}
 			}
 		}
 	})
@@ -1301,7 +1332,7 @@ func TestRequestBudgets_Joins(t *testing.T) {
 	t.Parallel()
 
 	t.Run("a join from one parent row to its children through an index on their foreign key makes a logarithmic number of GETs per row with a cold cache", func(t *testing.T) {
-		verify.Covers(t, "a SELECT that joins one parent row to its children with ON c.pid = p.id, through an index on c (pid), makes with a cold cache one descent of the tree of every segment for each table definition, for the parent, for the index entries, and for each child, at every database size, after many commits with the merges of the tiers, which leave fewer than four segments per tier, and after a compaction of every segment", "AC-5.8")
+		verify.Covers(t, "a SELECT that joins one parent row to its children with ON c.pid = p.id, through an index on c (pid), makes with a cold cache one descent of the tree of every segment for each table definition, for the parent, for the index entries, and for each child, at every database size, after many commits with the merges of the tiers, which leave fewer than four segments per tier, and after a compaction of every segment; after the many commits, at most one and a half times the GETs of the compacted database, or two more, at every size up to 100,000 rows", "AC-5.8")
 		const children = 3
 		for _, n := range []int{100, 1_000, 10_000, 100_000} {
 			w := newWorld(t)
@@ -1349,36 +1380,59 @@ func TestRequestBudgets_Joins(t *testing.T) {
 				}
 				return "DELETE FROM c WHERE id = $1", []any{2*n + i - 1}
 			})
+			// coldGets of a query on a process with a cold cache, which must return rows rows.
+			coldGets := func(rows int, query string, args ...any) maragudb.Requests {
+				t.Helper()
+				cold := w.open(maragudb.Options{MemoryCacheBytes: new(int64)})
+				s, err := maragudb.Stats(t.Context(), cold)
+				is.NotError(t, err)
+				res, err := cold.QueryContext(t.Context(), query, args...)
+				is.NotError(t, err)
+				found := 0
+				for res.Next() {
+					found++
+				}
+				is.NotError(t, res.Err())
+				is.NotError(t, res.Close())
+				is.Equal(t, rows, found, query)
+				after, err := maragudb.Stats(t.Context(), cold)
+				is.NotError(t, err)
+				return after.Requests.Sub(s.Requests)
+			}
+			var tiered int64
 			for _, state := range []string{"tiered", "compacted"} {
 				if state == "compacted" {
 					is.NotError(t, maragudb.Compact(t.Context(), db))
 				}
-				cold := w.open(maragudb.Options{MemoryCacheBytes: new(int64)})
 				// Blocks of 16 KiB hold at least 64 rows or entries, so a descent of the tree of a
 				// segment is at most 1 + log64(n) GETs.
 				depth := int64(1)
 				for m := 2 * n; m > 1; m = (m + 63) / 64 {
 					depth++
 				}
+				segs := int64(segments(t, w.open(maragudb.Options{MemoryCacheBytes: new(int64)}), 2*n, 100))
 				// The two table definitions, the parent, the index entries, and each child.
-				limit := int64(segments(t, cold, 2*n, 100)) * depth * (2 + 1 + 1 + children)
-				s, err := maragudb.Stats(t.Context(), cold)
-				is.NotError(t, err)
-				rows, err := cold.QueryContext(t.Context(), "SELECT p.name, c.id FROM p JOIN c ON c.pid = p.id WHERE p.id = $1", n/2+1)
-				is.NotError(t, err)
-				found := 0
-				for rows.Next() {
-					found++
-				}
-				is.NotError(t, rows.Err())
-				is.NotError(t, rows.Close())
-				is.Equal(t, children, found)
-				after, err := maragudb.Stats(t.Context(), cold)
-				is.NotError(t, err)
-				d := after.Requests.Sub(s.Requests)
+				limit := segs * depth * (2 + 1 + 1 + children)
+				d := coldGets(children, "SELECT p.name, c.id FROM p JOIN c ON c.pid = p.id WHERE p.id = $1", n/2+1)
 				t.Logf("n=%d %s cold join of a parent to its %d children: %+v, limit %d", n, state, children, d, limit)
 				verify.CheckBudget(t, "SQL SELECT that joins a parent to its children through an index, cold, "+state+": GETs", n, d.Get, limit)
 				is.Equal(t, maragudb.Requests{Get: d.Get, GetConditional: 1}, d)
+				if state == "tiered" {
+					tiered = d.Get
+				} else {
+					verify.CheckBudget(t, "SQL SELECT that joins a parent to its children through an index, cold, tiered against compacted: GETs", n, tiered, tieredBudget(d.Get))
+				}
+
+				// The rows of a non-unique index entry, and a range of rows, are not what key filters
+				// help with, so they are measured here, against the bound of a descent of every
+				// segment for the table definition, the entries, and each row.
+				d = coldGets(children, "SELECT id FROM c WHERE pid = $1", n/2+1)
+				t.Logf("n=%d %s cold lookup of the %d children through a non-unique index: %+v", n, state, children, d)
+				verify.CheckBudget(t, "SQL SELECT by a non-unique index, cold, "+state+": GETs", n, d.Get, segs*depth*(1+1+children))
+				rangeRows := min(100, n/2)
+				d = coldGets(rangeRows, "SELECT id, name FROM p WHERE id >= $1 AND id < $2", n/4, n/4+rangeRows)
+				t.Logf("n=%d %s cold range scan of %d rows: %+v", n, state, rangeRows, d)
+				verify.CheckBudget(t, "SQL SELECT of a range of keys, cold, "+state+": GETs", n, d.Get, segs*(depth+int64(rangeRows)/64+1)+depth)
 			}
 		}
 	})

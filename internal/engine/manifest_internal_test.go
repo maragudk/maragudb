@@ -33,7 +33,7 @@ func TestManifest(t *testing.T) {
 					keys[0], keys[1] = keys[1], keys[0]
 				}
 				count := hegel.Draw(ht, hegel.Integers(0, 1<<30))
-				m.Segments = append(m.Segments, segmentMeta{
+				seg := segmentMeta{
 					Key:        hegel.Draw(ht, hegel.Text().MinSize(1).MaxSize(16)),
 					Size:       size,
 					Root:       blockRef{Offset: hegel.Draw(ht, hegel.Integers[int64](0, size-length)), Length: length},
@@ -41,7 +41,17 @@ func TestManifest(t *testing.T) {
 					MaxKey:     keys[1],
 					Count:      count,
 					Tombstones: hegel.Draw(ht, hegel.Integers(0, count)),
-				})
+				}
+				// A filter in the manifest, a filter block after the root, or neither.
+				switch end := seg.Root.Offset + seg.Root.Length; hegel.Draw(ht, hegel.Integers(0, 2)) {
+				case 1:
+					seg.Filter = append(keyFilter{byte(hegel.Draw(ht, hegel.Integers(1, 32)))}, hegel.Draw(ht, hegel.Binary(1, 32))...)
+				case 2:
+					if size-end >= minBlockBytes {
+						seg.FilterBlock = &blockRef{Offset: end, Length: hegel.Draw(ht, hegel.Integers[int64](minBlockBytes, size-end))}
+					}
+				}
+				m.Segments = append(m.Segments, seg)
 			}
 			n = hegel.Draw(ht, hegel.Integers(0, 5))
 			for range n {
@@ -151,6 +161,15 @@ func TestManifest(t *testing.T) {
 			`{"version":3,"seq":1,"segments":[{"key":"s","size":40,"root":{"o":0,"l":5},"count":1}]}`,
 			`{"version":3,"seq":1,"segments":[{"key":"s","size":40,"root":{"o":0,"l":40},"count":1,"tombstones":2}]}`,
 			`{"version":3,"seq":1,"segments":[{"key":"s","size":40,"root":{"o":0,"l":40},"minKey":"Yg==","maxKey":"YQ==","count":1}]}`,
+			// A filter without bits, one without probes, and one in both places.
+			`{"version":3,"seq":1,"segments":[{"key":"s","size":40,"root":{"o":0,"l":40},"count":1,"filter":"Bw=="}]}`,
+			`{"version":3,"seq":1,"segments":[{"key":"s","size":40,"root":{"o":0,"l":40},"count":1,"filter":"AP8="}]}`,
+			`{"version":3,"seq":1,"segments":[{"key":"s","size":40,"root":{"o":0,"l":20},"count":1,"filter":"B/8=","filterBlock":{"o":20,"l":20}}]}`,
+			// A filter block that is not right after the root, that is too short, or that ends
+			// beyond the object.
+			`{"version":3,"seq":1,"segments":[{"key":"s","size":40,"root":{"o":0,"l":20},"count":1,"filterBlock":{"o":21,"l":19}}]}`,
+			`{"version":3,"seq":1,"segments":[{"key":"s","size":40,"root":{"o":0,"l":20},"count":1,"filterBlock":{"o":20,"l":5}}]}`,
+			`{"version":3,"seq":1,"segments":[{"key":"s","size":40,"root":{"o":0,"l":20},"count":1,"filterBlock":{"o":20,"l":21}}]}`,
 			`{"version":3,"seq":1,"batches":[{"key":"b","objects":-1}]}`,
 			`{"version":3,"seq":1,"commits":[{"seq":2,"id":"c"}]}`,
 			`{"version":3,"seq":3,"commits":[{"seq":2,"id":"c"},{"seq":2,"id":"d"}]}`,

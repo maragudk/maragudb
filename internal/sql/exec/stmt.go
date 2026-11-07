@@ -395,20 +395,19 @@ func (s *Session) scanRows(ctx context.Context, t *table, a access, f filter, fn
 	}
 	if a.index == nil && a.union == nil || a.ordered {
 		// A range of rows, or of the entries of an index, in order.
-		it := s.kv.scan(ctx, a.start, a.end)
-		for it.Next() {
+		stopped := false
+		err := s.scanAccess(ctx, a, func(key, val []byte) (bool, error) {
 			var more bool
 			var err error
 			if a.index == nil {
-				more, err = visit(it.Key(), it.Value())
+				more, err = visit(key, val)
 			} else {
-				more, err = fetch(t.rowKeyOf(it.Value()), true)
+				more, err = fetch(t.rowKeyOf(val), true)
 			}
-			if err != nil || !more {
-				return err
-			}
-		}
-		if err := it.Err(); err != nil {
+			stopped = !more
+			return more, err
+		})
+		if err != nil || stopped {
 			return err
 		}
 		return orderDependent
@@ -423,6 +422,27 @@ func (s *Session) scanRows(ctx context.Context, t *table, a access, f filter, fn
 		}
 	}
 	return orderDependent
+}
+
+// scanAccess calls fn with the keys in the range of a and their values in order, from the
+// transaction without the statement's own writes, until fn returns false or fails. The range of
+// an access to one entry of a unique index is read with a point read of that entry.
+func (s *Session) scanAccess(ctx context.Context, a access, fn func(key, val []byte) (bool, error)) error {
+	if a.entry {
+		val, ok, err := s.kv.tx.Get(ctx, a.start)
+		if err != nil || !ok {
+			return err
+		}
+		_, err = fn(a.start, val)
+		return err
+	}
+	it := s.kv.scan(ctx, a.start, a.end)
+	for it.Next() {
+		if more, err := fn(it.Key(), it.Value()); err != nil || !more {
+			return err
+		}
+	}
+	return it.Err()
 }
 
 // rowKey of a row that an access reads, and whether an index entry points to it.
@@ -447,16 +467,15 @@ func (s *Session) rowKeys(ctx context.Context, t *table, a access) ([]rowKey, er
 		case a.point != nil:
 			fromIndex[string(a.point)] = false
 		default:
-			it := s.kv.scan(ctx, a.start, a.end)
-			for it.Next() {
-				key := string(it.Key())
+			return s.scanAccess(ctx, a, func(k, val []byte) (bool, error) {
+				key := string(k)
 				if a.index != nil {
-					key = string(t.rowKeyOf(it.Value()))
+					key = string(t.rowKeyOf(val))
 				}
 				prev, seen := fromIndex[key]
 				fromIndex[key] = a.index != nil && (!seen || prev)
-			}
-			return it.Err()
+				return true, nil
+			})
 		}
 		return nil
 	}

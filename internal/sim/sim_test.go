@@ -205,6 +205,24 @@ func corpus() []sim.Config {
 		}
 		cfgs = append(cfgs, cfg)
 	}
+	// Blocks of 128 and 256 bytes, so that segments have trees of several levels and key filters
+	// in blocks of their own, and with 256 bytes also in the manifest, in every workload, through
+	// the engine and through SQL, some with damaged reads from the store, damaged disk caches, or
+	// heavier faults.
+	for seed := uint64(800); seed < 816; seed++ {
+		cfg := sim.DefaultConfig(seed)
+		cfg.Workload = sim.Workload(seed % 4)
+		cfg.SQL = cfg.Workload >= sim.Unique || seed%8 >= 4
+		cfg.BlockSize = 128 << (seed / 8 % 2)
+		cfg.StoreDamage = seed%3 == 1
+		cfg.DiskFaults = seed%4 == 3
+		if seed%3 == 0 {
+			cfg.Clients = 10
+			cfg.CrashRate = 0.03
+			cfg.Maintainers = 2
+		}
+		cfgs = append(cfgs, cfg)
+	}
 	// The same through the SQL layer and the database/sql driver.
 	for seed := uint64(300); seed < 330; seed++ {
 		for _, w := range []sim.Workload{sim.ListAppend, sim.Bank} {
@@ -245,6 +263,9 @@ func failReport(t *testing.T, res sim.Result) {
 		if cfg.StoreDamage {
 			replay += " STORE_DAMAGE=1"
 		}
+		if cfg.BlockSize != 0 {
+			replay += fmt.Sprint(" BLOCK_SIZE=", cfg.BlockSize)
+		}
 	}
 	t.Errorf("%s\n\nconfiguration: %+v\n\nreplay with:\n  %s", res.Report(), cfg, replay)
 }
@@ -283,12 +304,13 @@ func TestSimulator(t *testing.T) {
 		verify.Covers(t, "the fixed corpus, with the foreign key workload under the same faults, finds no reference to a missing row and no row that violates a CHECK in any snapshot a reader saw, and after every run through SQL every foreign key and CHECK of the store holds", "INV-FK", "INV-CHECK")
 		verify.Covers(t, "the fixed corpus, with disk caches small enough to evict and files that crashes and the disk damage, finds no anomalies, and after every operation of every client the files of its disk cache are within the bound and all counted", "INV-DISK-CACHE-BOUND", "INV-CACHE-LOSS")
 		verify.Covers(t, "the fixed corpus, with reads whose bodies the store damages in every workload, through the engine and SQL, finds no anomalies: no wrong data, no cache that returns bytes that fail their check, every failure for damage an ErrCorrupt of an operation whose read the store damaged, and every failure through the engine of a known kind", "INV-DAMAGE-DETECTED")
-		verify.Covers(t, "the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, unique and foreign key violations that only a concurrent commit causes, disk caches that evict and refuse damaged files, and damaged reads from the store refused with ErrCorrupt",
+		verify.Covers(t, "the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, unique and foreign key violations that only a concurrent commit causes, disk caches that evict and refuse damaged files, damaged reads from the store refused with ErrCorrupt, and point lookups that skip segments by their key filters and read filter blocks with root blocks",
 			"AC-1.3", "AC-1.4", "STATE-LOST-ACK-LANDED", "STATE-LOST-ACK-CONFLICT", "STATE-LIVE-UNKNOWN", "STATE-AUTOCOMMIT-RETRY",
 			"STATE-COMPACTION-REBASE", "STATE-COMPACTION-PARTIAL-REBASE", "STATE-COMPACTION-KEEPS-TOMBSTONE", "STATE-COMPACTION-UPPER-TIER", "STATE-COMPACTION-WINDOWS", "STATE-GC-REBASE", "STATE-GC-KEEPS-LIVE-GARBAGE", "STATE-GC-BATCH-REWRITTEN", "STATE-GC-CHAIN-DROPPED", "STATE-LEASE-TAKEOVER", "STATE-LEASE-OVERLAP",
 			"STATE-SNAPSHOT-EXPIRED-REFUSED", "STATE-BLOCK-READ-RETRY-SUCCEEDED", "STATE-CRASH-MID-COMMIT-RECOVERED",
 			"STATE-CRASH-MID-COMPACTION", "STATE-CRASH-MID-GC", "STATE-UNIQUE-AFTER-CONFLICT", "STATE-UNIQUE-VALUE-REUSED",
-			"STATE-FK-AFTER-CONFLICT", "STATE-FK-CASCADE-TABLES", "STATE-DISK-CACHE-EVICTION", "STATE-DISK-CACHE-REFUSED", "STATE-DAMAGED-READ-REFUSED")
+			"STATE-FK-AFTER-CONFLICT", "STATE-FK-CASCADE-TABLES", "STATE-DISK-CACHE-EVICTION", "STATE-DISK-CACHE-REFUSED", "STATE-DAMAGED-READ-REFUSED",
+			"STATE-FILTER-SKIP", "STATE-FILTER-BLOCK-READ")
 		t.Parallel()
 		c := corpusResults()
 		for _, res := range c.failed {
@@ -521,6 +543,10 @@ func TestSimulator(t *testing.T) {
 		if os.Getenv("MARAGUDB_STORE_DAMAGE") != "" {
 			cfg.StoreDamage = true
 		}
+		if n := os.Getenv("MARAGUDB_BLOCK_SIZE"); n != "" {
+			cfg.BlockSize, err = strconv.Atoi(n)
+			is.NotError(t, err)
+		}
 		switch os.Getenv("MARAGUDB_MAINTENANCE") {
 		case "lease":
 			cfg.Maintenance = sim.MaintenanceLease
@@ -539,6 +565,9 @@ func TestSimulator(t *testing.T) {
 					cfg.DiskMutations = m.diskMutations
 					cfg.DiskFaults = cfg.DiskFaults || m.diskMutations != (cache.DiskMutations{})
 					cfg.StoreDamage = cfg.StoreDamage || m.storeDamage
+					if m.blockSize != 0 {
+						cfg.BlockSize = m.blockSize
+					}
 					if cfg.Maintenance == sim.MaintenanceOff {
 						cfg.Maintenance = m.maintenance
 					}
@@ -597,6 +626,9 @@ func TestSimulator(t *testing.T) {
 			cfg.GracePeriod = time.Duration(50+rng.IntN(3000)) * time.Millisecond
 			cfg.DiskFaults = rng.IntN(2) == 0
 			cfg.StoreDamage = rng.IntN(2) == 0
+			if rng.IntN(4) == 0 {
+				cfg.BlockSize = 64 + rng.IntN(448)
+			}
 			res := runSim(cfg)
 			runs++
 			batch.add(res)
@@ -653,6 +685,8 @@ type mutant struct {
 	diskMutations cache.DiskMutations
 	// storeDamage runs the mutant with [sim.Config.StoreDamage].
 	storeDamage bool
+	// blockSize runs the mutant with [sim.Config.BlockSize].
+	blockSize int
 	// maintenance runs the mutant with the clients' maintenance in this mode, when it is not
 	// [sim.MaintenanceOff].
 	maintenance sim.MaintenanceMode
@@ -773,8 +807,12 @@ func mutants() []mutant {
 			id: "MUT-COMMIT-WITHOUT-CAS", replay: "cas", name: "commit without CAS",
 			description: "`engine.Mutations.CommitWithoutCAS` writes the manifest unconditionally, so a commit can overwrite a concurrent one.",
 			mutations:   engine.Mutations{CommitWithoutCAS: true},
-			cannot:      map[cell]string{{workload: sim.Unique, sql: true}: "an unconditional manifest write drops whole concurrent commits, which leaves a consistent state in which no value repeats, the unique workload does not check that acknowledged writes survive, and in 20 seeds no dropped commit leaves the store with objects that GC cannot collect"},
-			checkers:    []string{sim.CheckerListAppend, sim.CheckerStorage},
+			cannot: map[cell]string{
+				{workload: sim.Unique, sql: true}:                 "an unconditional manifest write drops whole concurrent commits, which leaves a consistent state in which no value repeats, the unique workload does not check that acknowledged writes survive, and in 20 seeds no dropped commit leaves the store with objects that GC cannot collect",
+				{workload: sim.Unique, sql: true, maintainers: 2}: "an unconditional manifest write drops whole concurrent commits, which leaves a consistent state in which no value repeats, and the unique workload does not check that acknowledged writes survive; only the storage checker finds the objects of a dropped commit that GC cannot collect, in 11 of the first 100 seeds, the first at seed 21",
+				{workload: sim.Bank, sql: true}:                   bankConserves + "; without maintainers, only the storage checker finds the objects of a dropped commit that GC cannot collect, in 2 of the first 100 seeds, the first at seed 80",
+			},
+			checkers: []string{sim.CheckerListAppend, sim.CheckerStorage},
 		},
 		{
 			id: "MUT-GC-IGNORE-GRACE", replay: "gc", name: "GC ignoring the grace period",
@@ -811,10 +849,12 @@ func mutants() []mutant {
 			unmaintained: noMaintainedGC,
 			cannot: func() map[cell]string {
 				m := map[cell]string{}
-				for _, c := range []cell{{workload: sim.ListAppend}, {workload: sim.ListAppend, sql: true}, {workload: sim.Bank, sql: true}} {
+				for _, c := range []cell{{workload: sim.ListAppend, sql: true}} {
 					c.maintainers = 2
 					m[c] = "in 20 seeds, no GC pass stamps the output of a compaction as an orphan between the compaction's segment write and its rebased manifest write, which the mutant needs; `TestMutations` of the engine makes that happen and detects the mutant"
 				}
+				m[cell{workload: sim.Bank, maintainers: 2}] = "a GC pass rarely stamps the output of a compaction as an orphan between the compaction's segment write and its rebased manifest write, which the mutant needs: 3 of the first 100 seeds do, the first at seed 40; `TestMutations` of the engine makes that happen and detects the mutant"
+				m[cell{workload: sim.ForeignKey, sql: true, maintainers: 2}] = "a GC pass rarely stamps the output of a compaction as an orphan between the compaction's segment write and its rebased manifest write, which the mutant needs: 5 of the first 100 seeds do, the first at seed 44; `TestMutations` of the engine makes that happen and detects the mutant"
 				return m
 			}(),
 			checkers: []string{sim.CheckerStorage},
@@ -835,9 +875,6 @@ func mutants() []mutant {
 				{workload: sim.Bank, maintainers: 2}:                  "the bank workload through the engine never deletes a key, so no merge meets a tombstone",
 				{workload: sim.ListAppend, sql: true, maintainers: 2}: "the list-append workload through SQL never deletes a row, and its tables have no index besides the primary key, so no merge meets a tombstone",
 			},
-			cannot: map[cell]string{
-				{workload: sim.ForeignKey, sql: true, maintainers: 2}: "a row that the workload deleted comes back together with the rows that its delete cascaded to, which is an older consistent state, unless a later commit changed a row that they reference; 2 of the first 100 seeds reach that, the first at seed 71",
-			},
 			checkers: []string{sim.CheckerListAppend},
 		},
 		{
@@ -853,8 +890,10 @@ func mutants() []mutant {
 			mutations:    engine.Mutations{CompactRebaseOnCompaction: true},
 			unmaintained: noMaintainedMerge,
 			cannot: map[cell]string{
-				{workload: sim.Bank, maintainers: 2}:              "a rebase on another compaction loses whole commits and puts back merged segments with the same values, a lost transfer conserves money, and the bank checker only checks totals",
-				{workload: sim.Unique, sql: true, maintainers: 2}: "a rebase on another compaction loses whole commits and puts back merged segments with the same values, which leaves a consistent state in which no value repeats, and the unique workload does not check that acknowledged writes survive",
+				{workload: sim.Bank, maintainers: 2}:                  "a rebase on another compaction loses whole commits and puts back merged segments with the same values, a lost transfer conserves money, and the bank checker only checks totals",
+				{workload: sim.Unique, sql: true, maintainers: 2}:     "a rebase on another compaction loses whole commits and puts back merged segments with the same values, which leaves a consistent state in which no value repeats, and the unique workload does not check that acknowledged writes survive",
+				{workload: sim.Bank, sql: true, maintainers: 2}:       "a rebase on another compaction loses whole commits and puts back merged segments with the same values, a lost transfer conserves money, and the bank checker only checks totals; only the index consistency checker finds a lost commit that wrote an index entry, in 2 of the first 100 seeds, the first at seed 27",
+				{workload: sim.ForeignKey, sql: true, maintainers: 2}: "a rebase on another compaction loses whole commits and puts back merged segments with the same values, which mostly leaves an older consistent state; only the real-time order checker finds a lost commit that a later read missed, in 5 of the first 100 seeds, the first at seed 27",
 			},
 			checkers: []string{sim.CheckerDurability},
 		},
@@ -896,7 +935,6 @@ func mutants() []mutant {
 			id: "MUT-FRESH-SNAPSHOT", replay: "fresh-snapshot", name: "a fresh snapshot per statement",
 			description:  "`exec.Mutations.FreshSnapshotPerStatement` starts every statement of an explicit transaction that has not written yet from the latest commit, so an audit can straddle a transfer and a reader can see two states.",
 			sqlMutations: exec.Mutations{FreshSnapshotPerStatement: true},
-			cannot:       map[cell]string{{workload: sim.ForeignKey, sql: true, maintainers: 2}: "the mutant shows in the foreign key workload only when a reader's statements straddle a commit that changes what they read, which 8 of the first 100 seeds with two maintainers reach, the first at seed 31; the cell without maintainers detects it"},
 			checkers:     []string{sim.CheckerBank, sim.CheckerListAppend},
 		},
 		{
@@ -997,6 +1035,28 @@ func mutants() []mutant {
 			mutations:   engine.Mutations{SegmentUnchecked: true},
 			storeDamage: true,
 			checkers:    []string{sim.CheckerCache},
+		},
+		{
+			id: "MUT-FILTER-OMITS-KEYS", replay: "filter-omits-keys", name: "key filters that leave out keys",
+			description: "`engine.Mutations.FilterOmitsKeys` leaves every other key of a segment out of its key filter, so that a point lookup of such a key skips the segment that holds its newest value and reads an older value, or none.",
+			mutations:   engine.Mutations{FilterOmitsKeys: true},
+		},
+		{
+			id: "MUT-FILTER-UNCHECKED", replay: "filter-unchecked", name: "filter blocks read without their checksum",
+			description: "`engine.Mutations.FilterUnchecked` decodes the filter blocks of segments without checking their checksums, and caches what the store returns before decoding it, so that a filter block whose bytes the store damaged is trusted, or cached and trusted later. It runs with damaged reads from the store and with blocks of 128 bytes, so that segments have filter blocks.",
+			mutations:   engine.Mutations{FilterUnchecked: true},
+			storeDamage: true,
+			blockSize:   128,
+			unreached: func() map[cell]string {
+				m := map[cell]string{}
+				for _, c := range cells() {
+					if c.workload == sim.Bank && !c.sql {
+						m[c] = "the bank workload through the engine keeps four accounts, whose segments fit in one block even of 128 bytes, so no segment has a filter block"
+					}
+				}
+				return m
+			}(),
+			checkers: []string{sim.CheckerCache},
 		},
 		{
 			id: "MUT-DISK-CACHE-UNCOUNTED", replay: "disk-cache-uncounted", name: "a disk cache that does not count the files of an earlier process",
@@ -1153,10 +1213,35 @@ func TestRun_maintenancePanics(t *testing.T) {
 				}
 			}
 		}
+		// Whether a run's steps draw a panic, back off, and resume before the run ends is up to its
+		// seed, so a configuration whose run shows none of the three tries other seeds, up to four
+		// in all. Every run must pass its checkers.
 		results := make([]sim.Result, len(cfgs))
 		var wg sync.WaitGroup
 		for i, cfg := range cfgs {
-			wg.Go(func() { results[i] = runSim(cfg) })
+			// shows counts how many of the three a run shows.
+			shows := func(s sim.Stats) int {
+				n := 0
+				for _, ok := range []bool{s.MaintenancePanics > 0, s.MaintenanceBackoffs > 0, s.MaintenanceResumed > 0} {
+					if ok {
+						n++
+					}
+				}
+				return n
+			}
+			wg.Go(func() {
+				for try := range uint64(4) {
+					c := cfg
+					c.Seed += try * 1000
+					res := runSim(c)
+					if try == 0 || res.Failed() || shows(res.Stats) > shows(results[i].Stats) {
+						results[i] = res
+					}
+					if results[i].Failed() || shows(results[i].Stats) == 3 {
+						return
+					}
+				}
+			})
 		}
 		wg.Wait()
 		// A maintainer resumes when it changes the database again after a panic, before the run
@@ -1258,6 +1343,7 @@ func TestMutants(t *testing.T) {
 						cfg.DiskMutations = m.diskMutations
 						cfg.DiskFaults = m.diskMutations != (cache.DiskMutations{})
 						cfg.StoreDamage = m.storeDamage
+						cfg.BlockSize = m.blockSize
 						cfg.Maintenance = m.maintenance
 						res := runSim(cfg)
 						if res.Failed() {

@@ -124,6 +124,12 @@ type Mutations struct {
 	// SegmentUnchecked decodes the blocks of segments without checking their checksums, and
 	// caches the blocks it reads from the store before decoding them.
 	SegmentUnchecked bool
+	// FilterOmitsKeys leaves every other key of a segment out of its key filter, so that a point
+	// lookup skips a segment that holds its key and reads an older value, or none.
+	FilterOmitsKeys bool
+	// FilterUnchecked decodes the filter blocks of segments without checking their checksums, and
+	// caches the filter blocks it reads from the store before decoding them.
+	FilterUnchecked bool
 	// MaintenancePanics makes one in three [Maintainer] steps that get to work panic with
 	// [ErrInjectedPanic], at one of the first eight calls of the step's progress hook, which the
 	// random source picks: before a block read or the segment write of a merge, before the

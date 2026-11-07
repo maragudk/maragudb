@@ -37,13 +37,14 @@
           "seed": 1,
           "checkers": [
             "durability",
-            "list-append"
+            "list-append",
+            "storage"
           ]
         },
         {
           "cell": "bank through the engine, no maintainers",
           "status": "detected",
-          "seed": 7,
+          "seed": 12,
           "checkers": [
             "storage"
           ]
@@ -51,7 +52,7 @@
         {
           "cell": "bank through the engine, 2 maintainers",
           "status": "detected",
-          "seed": 3,
+          "seed": 2,
           "checkers": [
             "storage"
           ]
@@ -76,16 +77,13 @@
         },
         {
           "cell": "bank through SQL, no maintainers",
-          "status": "detected",
-          "seed": 2,
-          "checkers": [
-            "storage"
-          ]
+          "status": "undetected",
+          "reason": "an unconditional manifest write drops whole concurrent commits, a dropped transfer conserves money, and the bank checker only checks totals; without maintainers, only the storage checker finds the objects of a dropped commit that GC cannot collect, in 2 of the first 100 seeds, the first at seed 80"
         },
         {
           "cell": "bank through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
             "storage"
           ]
@@ -97,16 +95,13 @@
         },
         {
           "cell": "unique through SQL, 2 maintainers",
-          "status": "detected",
-          "seed": 14,
-          "checkers": [
-            "storage"
-          ]
+          "status": "undetected",
+          "reason": "an unconditional manifest write drops whole concurrent commits, which leaves a consistent state in which no value repeats, and the unique workload does not check that acknowledged writes survive; only the storage checker finds the objects of a dropped commit that GC cannot collect, in 11 of the first 100 seeds, the first at seed 21"
         },
         {
           "cell": "foreign-key through SQL, no maintainers",
           "status": "detected",
-          "seed": 1,
+          "seed": 2,
           "checkers": [
             "real-time order"
           ]
@@ -114,10 +109,9 @@
         {
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
-            "real-time order",
-            "storage"
+            "real-time order"
           ]
         }
       ]
@@ -164,7 +158,7 @@
         {
           "cell": "list-append through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 1,
+          "seed": 2,
           "checkers": [
             "grace period"
           ]
@@ -177,7 +171,7 @@
         {
           "cell": "bank through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
             "grace period"
           ]
@@ -190,10 +184,9 @@
         {
           "cell": "unique through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 4,
+          "seed": 1,
           "checkers": [
-            "grace period",
-            "final read"
+            "grace period"
           ]
         },
         {
@@ -204,9 +197,10 @@
         {
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 1,
+          "seed": 2,
           "checkers": [
-            "grace period"
+            "grace period",
+            "final read"
           ]
         }
       ]
@@ -238,7 +232,7 @@
         {
           "cell": "bank through the engine, 2 maintainers",
           "status": "detected",
-          "seed": 1,
+          "seed": 2,
           "checkers": [
             "storage"
           ]
@@ -264,7 +258,7 @@
         {
           "cell": "bank through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
             "storage"
           ]
@@ -277,7 +271,7 @@
         {
           "cell": "unique through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
             "storage"
           ]
@@ -290,7 +284,7 @@
         {
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 1,
+          "seed": 2,
           "checkers": [
             "storage"
           ]
@@ -397,7 +391,7 @@
         {
           "cell": "list-append through the engine, 2 maintainers",
           "status": "detected",
-          "seed": 8,
+          "seed": 17,
           "checkers": [
             "grace period"
           ]
@@ -410,7 +404,7 @@
         {
           "cell": "bank through the engine, 2 maintainers",
           "status": "detected",
-          "seed": 11,
+          "seed": 4,
           "checkers": [
             "grace period"
           ]
@@ -423,7 +417,7 @@
         {
           "cell": "list-append through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 12,
+          "seed": 5,
           "checkers": [
             "grace period"
           ]
@@ -449,7 +443,7 @@
         {
           "cell": "unique through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 16,
+          "seed": 19,
           "checkers": [
             "grace period"
           ]
@@ -462,7 +456,7 @@
         {
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 12,
+          "seed": 6,
           "checkers": [
             "grace period"
           ]
@@ -482,8 +476,11 @@
         },
         {
           "cell": "list-append through the engine, 2 maintainers",
-          "status": "undetected",
-          "reason": "in 20 seeds, no GC pass stamps the output of a compaction as an orphan between the compaction's segment write and its rebased manifest write, which the mutant needs; `TestMutations` of the engine makes that happen and detects the mutant"
+          "status": "detected",
+          "seed": 3,
+          "checkers": [
+            "grace period"
+          ]
         },
         {
           "cell": "bank through the engine, no maintainers",
@@ -492,12 +489,8 @@
         },
         {
           "cell": "bank through the engine, 2 maintainers",
-          "status": "detected",
-          "seed": 14,
-          "checkers": [
-            "final read",
-            "storage"
-          ]
+          "status": "undetected",
+          "reason": "a GC pass rarely stamps the output of a compaction as an orphan between the compaction's segment write and its rebased manifest write, which the mutant needs: 3 of the first 100 seeds do, the first at seed 40; `TestMutations` of the engine makes that happen and detects the mutant"
         },
         {
           "cell": "list-append through SQL, no maintainers",
@@ -516,8 +509,13 @@
         },
         {
           "cell": "bank through SQL, 2 maintainers",
-          "status": "undetected",
-          "reason": "in 20 seeds, no GC pass stamps the output of a compaction as an orphan between the compaction's segment write and its rebased manifest write, which the mutant needs; `TestMutations` of the engine makes that happen and detects the mutant"
+          "status": "detected",
+          "seed": 14,
+          "checkers": [
+            "grace period",
+            "final read",
+            "storage"
+          ]
         },
         {
           "cell": "unique through SQL, no maintainers",
@@ -527,7 +525,7 @@
         {
           "cell": "unique through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 8,
+          "seed": 1,
           "checkers": [
             "storage"
           ]
@@ -539,11 +537,8 @@
         },
         {
           "cell": "foreign-key through SQL, 2 maintainers",
-          "status": "detected",
-          "seed": 11,
-          "checkers": [
-            "storage"
-          ]
+          "status": "undetected",
+          "reason": "a GC pass rarely stamps the output of a compaction as an orphan between the compaction's segment write and its rebased manifest write, which the mutant needs: 5 of the first 100 seeds do, the first at seed 44; `TestMutations` of the engine makes that happen and detects the mutant"
         }
       ]
     },
@@ -602,10 +597,9 @@
         {
           "cell": "bank through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
-            "index consistency",
-            "bank"
+            "index consistency"
           ]
         },
         {
@@ -618,8 +612,8 @@
           "status": "detected",
           "seed": 2,
           "checkers": [
-            "index consistency",
-            "unique"
+            "unique",
+            "index consistency"
           ]
         },
         {
@@ -651,7 +645,7 @@
         {
           "cell": "list-append through the engine, 2 maintainers",
           "status": "detected",
-          "seed": 3,
+          "seed": 10,
           "checkers": [
             "durability",
             "list-append"
@@ -685,7 +679,7 @@
         {
           "cell": "bank through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 4,
+          "seed": 2,
           "checkers": [
             "index consistency"
           ]
@@ -698,7 +692,7 @@
         {
           "cell": "unique through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
             "index consistency"
           ]
@@ -710,8 +704,11 @@
         },
         {
           "cell": "foreign-key through SQL, 2 maintainers",
-          "status": "undetected",
-          "reason": "a row that the workload deleted comes back together with the rows that its delete cascaded to, which is an older consistent state, unless a later commit changed a row that they reference; 2 of the first 100 seeds reach that, the first at seed 71"
+          "status": "detected",
+          "seed": 3,
+          "checkers": [
+            "foreign key"
+          ]
         }
       ]
     },
@@ -743,7 +740,7 @@
         {
           "cell": "bank through the engine, 2 maintainers",
           "status": "detected",
-          "seed": 1,
+          "seed": 6,
           "checkers": [
             "bank"
           ]
@@ -783,7 +780,7 @@
         {
           "cell": "unique through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 4,
+          "seed": 14,
           "checkers": [
             "unique",
             "index consistency"
@@ -797,9 +794,9 @@
         {
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 1,
+          "seed": 3,
           "checkers": [
-            "foreign key"
+            "real-time order"
           ]
         }
       ]
@@ -818,7 +815,7 @@
         {
           "cell": "list-append through the engine, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
             "durability",
             "list-append"
@@ -842,9 +839,9 @@
         {
           "cell": "list-append through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
-            "final read",
+            "durability",
             "list-append"
           ]
         },
@@ -855,12 +852,8 @@
         },
         {
           "cell": "bank through SQL, 2 maintainers",
-          "status": "detected",
-          "seed": 12,
-          "checkers": [
-            "index consistency",
-            "bank"
-          ]
+          "status": "undetected",
+          "reason": "a rebase on another compaction loses whole commits and puts back merged segments with the same values, a lost transfer conserves money, and the bank checker only checks totals; only the index consistency checker finds a lost commit that wrote an index entry, in 2 of the first 100 seeds, the first at seed 27"
         },
         {
           "cell": "unique through SQL, no maintainers",
@@ -879,11 +872,8 @@
         },
         {
           "cell": "foreign-key through SQL, 2 maintainers",
-          "status": "detected",
-          "seed": 3,
-          "checkers": [
-            "real-time order"
-          ]
+          "status": "undetected",
+          "reason": "a rebase on another compaction loses whole commits and puts back merged segments with the same values, which mostly leaves an older consistent state; only the real-time order checker finds a lost commit that a later read missed, in 5 of the first 100 seeds, the first at seed 27"
         }
       ]
     },
@@ -917,7 +907,7 @@
         {
           "cell": "bank through the engine, 2 maintainers",
           "status": "detected",
-          "seed": 11,
+          "seed": 10,
           "checkers": [
             "grace period"
           ]
@@ -946,7 +936,7 @@
         {
           "cell": "bank through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 12,
+          "seed": 2,
           "checkers": [
             "grace period"
           ]
@@ -959,7 +949,7 @@
         {
           "cell": "unique through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 4,
+          "seed": 10,
           "checkers": [
             "grace period"
           ]
@@ -975,7 +965,7 @@
         {
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 10,
           "checkers": [
             "real-time order"
           ]
@@ -1001,8 +991,7 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
-            "durability",
-            "storage"
+            "durability"
           ]
         },
         {
@@ -1013,7 +1002,7 @@
         {
           "cell": "bank through the engine, 2 maintainers",
           "status": "detected",
-          "seed": 8,
+          "seed": 3,
           "checkers": [
             "storage"
           ]
@@ -1031,8 +1020,7 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
-            "durability",
-            "storage"
+            "durability"
           ]
         },
         {
@@ -1043,7 +1031,7 @@
         {
           "cell": "bank through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
             "storage"
           ]
@@ -1056,7 +1044,7 @@
         {
           "cell": "unique through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 15,
+          "seed": 2,
           "checkers": [
             "storage"
           ]
@@ -1064,7 +1052,7 @@
         {
           "cell": "foreign-key through SQL, no maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
             "real-time order"
           ]
@@ -1072,10 +1060,9 @@
         {
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
-            "real-time order",
-            "storage"
+            "real-time order"
           ]
         }
       ]
@@ -1132,7 +1119,7 @@
         {
           "cell": "bank through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
             "index consistency"
           ]
@@ -1158,7 +1145,7 @@
         {
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 4,
+          "seed": 3,
           "checkers": [
             "real-time order"
           ]
@@ -1202,7 +1189,7 @@
         {
           "cell": "list-append through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
             "list-append"
           ]
@@ -1244,15 +1231,18 @@
         {
           "cell": "foreign-key through SQL, no maintainers",
           "status": "detected",
-          "seed": 14,
+          "seed": 2,
           "checkers": [
             "foreign key"
           ]
         },
         {
           "cell": "foreign-key through SQL, 2 maintainers",
-          "status": "undetected",
-          "reason": "the mutant shows in the foreign key workload only when a reader's statements straddle a commit that changes what they read, which 8 of the first 100 seeds with two maintainers reach, the first at seed 31; the cell without maintainers detects it"
+          "status": "detected",
+          "seed": 16,
+          "checkers": [
+            "foreign key"
+          ]
         }
       ]
     },
@@ -1294,7 +1284,7 @@
         {
           "cell": "list-append through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 8,
+          "seed": 7,
           "checkers": [
             "durability",
             "list-append"
@@ -1395,7 +1385,7 @@
         {
           "cell": "unique through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
             "index consistency"
           ]
@@ -1552,7 +1542,7 @@
         {
           "cell": "unique through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 3,
+          "seed": 2,
           "checkers": [
             "unique",
             "index consistency"
@@ -1703,7 +1693,7 @@
         {
           "cell": "foreign-key through SQL, no maintainers",
           "status": "detected",
-          "seed": 1,
+          "seed": 2,
           "checkers": [
             "foreign key"
           ]
@@ -1711,7 +1701,7 @@
         {
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 1,
+          "seed": 2,
           "checkers": [
             "foreign key"
           ]
@@ -1851,7 +1841,7 @@
         {
           "cell": "foreign-key through SQL, no maintainers",
           "status": "detected",
-          "seed": 5,
+          "seed": 6,
           "checkers": [
             "check constraint"
           ]
@@ -1859,7 +1849,7 @@
         {
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 6,
+          "seed": 20,
           "checkers": [
             "check constraint"
           ]
@@ -1895,7 +1885,7 @@
         {
           "cell": "list-append through SQL, no maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 3,
           "checkers": [
             "durability",
             "list-append"
@@ -1904,9 +1894,10 @@
         {
           "cell": "list-append through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 4,
           "checkers": [
-            "durability"
+            "durability",
+            "list-append"
           ]
         },
         {
@@ -2034,7 +2025,7 @@
         {
           "cell": "bank through the engine, no maintainers",
           "status": "detected",
-          "seed": 1,
+          "seed": 2,
           "checkers": [
             "cache integrity"
           ]
@@ -2042,7 +2033,7 @@
         {
           "cell": "bank through the engine, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
             "cache integrity"
           ]
@@ -2066,7 +2057,7 @@
         {
           "cell": "bank through SQL, no maintainers",
           "status": "detected",
-          "seed": 1,
+          "seed": 2,
           "checkers": [
             "cache integrity"
           ]
@@ -2082,7 +2073,7 @@
         {
           "cell": "unique through SQL, no maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
             "cache integrity"
           ]
@@ -2090,7 +2081,7 @@
         {
           "cell": "unique through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
             "cache integrity"
           ]
@@ -2200,7 +2191,8 @@
           "status": "detected",
           "seed": 2,
           "checkers": [
-            "cache integrity"
+            "durability",
+            "list-append"
           ]
         },
         {
@@ -2225,6 +2217,7 @@
           "seed": 2,
           "checkers": [
             "workload invariants",
+            "damaged reads",
             "list-append"
           ]
         },
@@ -2233,6 +2226,7 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "durability",
             "list-append"
           ]
         },
@@ -2241,31 +2235,32 @@
           "status": "detected",
           "seed": 2,
           "checkers": [
+            "workload invariants",
             "cache integrity"
           ]
         },
         {
           "cell": "bank through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
-            "bank"
+            "damaged reads"
           ]
         },
         {
           "cell": "unique through SQL, no maintainers",
           "status": "detected",
-          "seed": 3,
+          "seed": 2,
           "checkers": [
-            "cache integrity"
+            "cache integrity",
+            "index consistency"
           ]
         },
         {
           "cell": "unique through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
-            "unique",
             "index consistency"
           ]
         },
@@ -2281,6 +2276,220 @@
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
           "seed": 2,
+          "checkers": [
+            "cache integrity"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "MUT-FILTER-OMITS-KEYS",
+      "name": "key filters that leave out keys",
+      "replay": "filter-omits-keys",
+      "description": "`engine.Mutations.FilterOmitsKeys` leaves every other key of a segment out of its key filter, so that a point lookup of such a key skips the segment that holds its newest value and reads an older value, or none.",
+      "results": [
+        {
+          "cell": "list-append through the engine, no maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "durability",
+            "list-append"
+          ]
+        },
+        {
+          "cell": "list-append through the engine, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "durability",
+            "list-append"
+          ]
+        },
+        {
+          "cell": "bank through the engine, no maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "bank"
+          ]
+        },
+        {
+          "cell": "bank through the engine, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "workload invariants",
+            "bank"
+          ]
+        },
+        {
+          "cell": "list-append through SQL, no maintainers",
+          "status": "detected",
+          "seed": 2,
+          "checkers": [
+            "durability"
+          ]
+        },
+        {
+          "cell": "list-append through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "workload invariants",
+            "durability",
+            "list-append"
+          ]
+        },
+        {
+          "cell": "bank through SQL, no maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "workload invariants",
+            "index consistency",
+            "bank"
+          ]
+        },
+        {
+          "cell": "bank through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "workload invariants",
+            "index consistency",
+            "bank"
+          ]
+        },
+        {
+          "cell": "unique through SQL, no maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "index consistency",
+            "unique"
+          ]
+        },
+        {
+          "cell": "unique through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "unique",
+            "index consistency"
+          ]
+        },
+        {
+          "cell": "foreign-key through SQL, no maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "foreign key"
+          ]
+        },
+        {
+          "cell": "foreign-key through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "foreign key",
+            "final read"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "MUT-FILTER-UNCHECKED",
+      "name": "filter blocks read without their checksum",
+      "replay": "filter-unchecked",
+      "description": "`engine.Mutations.FilterUnchecked` decodes the filter blocks of segments without checking their checksums, and caches what the store returns before decoding it, so that a filter block whose bytes the store damaged is trusted, or cached and trusted later. It runs with damaged reads from the store and with blocks of 128 bytes, so that segments have filter blocks.",
+      "results": [
+        {
+          "cell": "list-append through the engine, no maintainers",
+          "status": "detected",
+          "seed": 20,
+          "checkers": [
+            "cache integrity"
+          ]
+        },
+        {
+          "cell": "list-append through the engine, 2 maintainers",
+          "status": "detected",
+          "seed": 3,
+          "checkers": [
+            "cache integrity"
+          ]
+        },
+        {
+          "cell": "bank through the engine, no maintainers",
+          "status": "not applicable",
+          "reason": "the bank workload through the engine keeps four accounts, whose segments fit in one block even of 128 bytes, so no segment has a filter block"
+        },
+        {
+          "cell": "bank through the engine, 2 maintainers",
+          "status": "not applicable",
+          "reason": "the bank workload through the engine keeps four accounts, whose segments fit in one block even of 128 bytes, so no segment has a filter block"
+        },
+        {
+          "cell": "list-append through SQL, no maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "cache integrity"
+          ]
+        },
+        {
+          "cell": "list-append through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 10,
+          "checkers": [
+            "cache integrity"
+          ]
+        },
+        {
+          "cell": "bank through SQL, no maintainers",
+          "status": "detected",
+          "seed": 3,
+          "checkers": [
+            "cache integrity"
+          ]
+        },
+        {
+          "cell": "bank through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 7,
+          "checkers": [
+            "cache integrity"
+          ]
+        },
+        {
+          "cell": "unique through SQL, no maintainers",
+          "status": "detected",
+          "seed": 2,
+          "checkers": [
+            "cache integrity"
+          ]
+        },
+        {
+          "cell": "unique through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "cache integrity"
+          ]
+        },
+        {
+          "cell": "foreign-key through SQL, no maintainers",
+          "status": "detected",
+          "seed": 12,
+          "checkers": [
+            "cache integrity"
+          ]
+        },
+        {
+          "cell": "foreign-key through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
           "checkers": [
             "cache integrity"
           ]
@@ -2312,7 +2521,7 @@
         {
           "cell": "bank through the engine, no maintainers",
           "status": "detected",
-          "seed": 1,
+          "seed": 2,
           "checkers": [
             "disk cache bound"
           ]
@@ -2320,7 +2529,7 @@
         {
           "cell": "bank through the engine, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
             "disk cache bound"
           ]
@@ -2360,7 +2569,7 @@
         {
           "cell": "unique through SQL, no maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
             "disk cache bound"
           ]
@@ -2368,7 +2577,7 @@
         {
           "cell": "unique through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
             "disk cache bound"
           ]
@@ -2416,7 +2625,7 @@
         {
           "cell": "bank through the engine, no maintainers",
           "status": "detected",
-          "seed": 1,
+          "seed": 2,
           "checkers": [
             "panic"
           ]
@@ -2424,7 +2633,7 @@
         {
           "cell": "bank through the engine, 2 maintainers",
           "status": "detected",
-          "seed": 1,
+          "seed": 2,
           "checkers": [
             "panic"
           ]
@@ -2472,7 +2681,7 @@
         {
           "cell": "unique through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 1,
+          "seed": 2,
           "checkers": [
             "panic"
           ]
@@ -2480,7 +2689,7 @@
         {
           "cell": "foreign-key through SQL, no maintainers",
           "status": "detected",
-          "seed": 3,
+          "seed": 1,
           "checkers": [
             "panic"
           ]
@@ -2488,7 +2697,7 @@
         {
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
             "panic"
           ]

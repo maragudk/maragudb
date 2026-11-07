@@ -192,6 +192,70 @@ func TestSegment(t *testing.T) {
 		}
 	})
 
+	t.Run("a segment keeps its key filter in the manifest when it is small, as a block after the root when its tree has levels, and not at all otherwise", func(t *testing.T) {
+		entriesOf := func(n, valueBytes int) []entry {
+			var entries []entry
+			for i := range n {
+				e := entry{key: fmt.Appendf(nil, "k%05d", i), tombstone: i%9 == 4}
+				if !e.tombstone {
+					e.value = bytes.Repeat([]byte("v"), valueBytes)
+				}
+				entries = append(entries, e)
+			}
+			return entries
+		}
+		// holdsAll checks that the filter of the segment holds every key, through the decoder.
+		holdsAll := func(t *testing.T, body []byte, meta segmentMeta, entries []entry) {
+			t.Helper()
+			f := meta.Filter
+			if meta.FilterBlock != nil {
+				var err error
+				f, err = decodeFilterBlock(testSegmentKey, *meta.FilterBlock, body[meta.FilterBlock.Offset:meta.FilterBlock.Offset+meta.FilterBlock.Length])
+				is.NotError(t, err)
+			}
+			for _, e := range entries {
+				is.True(t, f.mayContain(e.key), string(e.key))
+			}
+		}
+
+		// 4 keys, a filter of 9 bytes, within a sixteenth of a block of 256 bytes.
+		entries := entriesOf(4, 4)
+		body, meta := build(t, 256, entries)
+		is.Equal(t, 9, len(meta.Filter))
+		is.True(t, meta.FilterBlock == nil)
+		is.Equal(t, int64(len(body)), meta.Root.Offset+meta.Root.Length, "the object ends with the root block")
+		holdsAll(t, body, meta, entries)
+
+		// 100 keys of a tree of several levels, a filter of 126 bytes, after the root block.
+		entries = entriesOf(100, 4)
+		body, meta = build(t, 256, entries)
+		is.True(t, meta.Filter == nil)
+		is.True(t, meta.FilterBlock != nil)
+		is.Equal(t, meta.Root.Offset+meta.Root.Length, meta.FilterBlock.Offset)
+		is.Equal(t, int64(len(body)), meta.FilterBlock.Offset+meta.FilterBlock.Length, "the object ends with the filter block")
+		is.Equal(t, int64(126+minBlockBytes), meta.FilterBlock.Length)
+		is.Equal(t, meta.Size, int64(len(body)))
+		is.Equal(t, meta.Size-meta.FilterBlock.Length, meta.dataBytes())
+		holdsAll(t, body, meta, entries)
+		lookup := memoryFetcher(body, nil)
+		for _, e := range entries {
+			got, ok, err := segmentLookup(meta.Root, e.key, lookup)
+			is.NotError(t, err)
+			is.True(t, ok && equalEntries([]entry{got}, []entry{e}))
+		}
+		is.True(t, equalEntries(entries, collect(newSegmentIterator(meta.Root, nil, lookup))), "a scan never reads the filter block")
+
+		// 900 keys, whose filter of 1,126 bytes is more than four blocks of 256 bytes.
+		_, meta = build(t, 256, entriesOf(900, 4))
+		is.True(t, meta.Filter == nil && meta.FilterBlock == nil)
+
+		// 2,000 keys in one block of 32 KiB, whose filter of 2,501 bytes is more than a sixteenth
+		// of the block, and a block of its own would save no request.
+		_, meta = build(t, 32<<10, entriesOf(2000, 0))
+		is.Equal(t, int64(0), meta.Root.Offset, "the segment is one block")
+		is.True(t, meta.Filter == nil && meta.FilterBlock == nil)
+	})
+
 	t.Run("rejects keys out of order and duplicates", func(t *testing.T) {
 		b := newSegmentBuilder(64)
 		is.NotError(t, b.add([]byte("b"), []byte("1"), false))
@@ -275,7 +339,7 @@ func TestSegment(t *testing.T) {
 		for i := range 40 {
 			entries = append(entries, entry{key: fmt.Appendf(nil, "key-%03d", i), value: fmt.Appendf(nil, "value-%d", i), tombstone: i%7 == 3})
 		}
-		body, _ := build(t, 128, entries)
+		body, meta := build(t, 128, entries)
 		other, _ := buildAt(t, "db/seg/0000000000000002-other", 128, entries)
 		is.True(t, bytes.Equal(body[:10], other[:10]), "the two segments hold the same entries")
 		b := newSegmentBuilder(128)
@@ -286,31 +350,40 @@ func TestSegment(t *testing.T) {
 		is.NotError(t, err)
 		refs := b.blocks
 		is.True(t, len(refs) > 4, "the segment has several levels of blocks")
+		is.True(t, meta.FilterBlock != nil, "the segment has a filter block")
+		// decode the block at ref, the filter block with its own decoder.
+		decode := func(ref blockRef, b []byte) error {
+			if ref == *meta.FilterBlock {
+				_, err := decodeFilterBlock(testSegmentKey, ref, b)
+				return err
+			}
+			_, err := decodeBlock(testSegmentKey, ref, b)
+			return err
+		}
 		for _, ref := range refs {
 			block := body[ref.Offset : ref.Offset+ref.Length]
-			_, err := decodeBlock(testSegmentKey, ref, block)
-			is.NotError(t, err)
+			is.NotError(t, decode(ref, block))
 			for i := range block {
 				for bit := range 8 {
 					damaged := bytes.Clone(block)
 					damaged[i] ^= 1 << bit
-					_, err := decodeBlock(testSegmentKey, ref, damaged)
-					is.Error(t, ErrCorrupt, err, fmt.Sprintf("block %+v with bit %d of byte %d flipped", ref, bit, i))
+					is.Error(t, ErrCorrupt, decode(ref, damaged), fmt.Sprintf("block %+v with bit %d of byte %d flipped", ref, bit, i))
 				}
 			}
 			for n := range len(block) {
-				_, err := decodeBlock(testSegmentKey, ref, block[:n])
-				is.Error(t, ErrCorrupt, err, fmt.Sprintf("block %+v cut to %d bytes", ref, n))
+				is.Error(t, ErrCorrupt, decode(ref, block[:n]), fmt.Sprintf("block %+v cut to %d bytes", ref, n))
 			}
-			_, err = decodeBlock(testSegmentKey, ref, other[ref.Offset:ref.Offset+ref.Length])
-			is.Error(t, ErrCorrupt, err, "the same block of another segment")
+			is.Error(t, ErrCorrupt, decode(ref, other[ref.Offset:ref.Offset+ref.Length]), "the same block of another segment")
 			for _, at := range refs {
 				if at != ref && at.Length == ref.Length {
-					_, err := decodeBlock(testSegmentKey, at, block)
-					is.Error(t, ErrCorrupt, err, "a block of the segment at another offset")
+					is.Error(t, ErrCorrupt, decode(at, block), "a block of the segment at another offset")
 				}
 			}
 		}
+		_, err = decodeBlock(testSegmentKey, *meta.FilterBlock, body[meta.FilterBlock.Offset:meta.FilterBlock.Offset+meta.FilterBlock.Length])
+		is.Error(t, ErrCorrupt, err, "the filter block read as a block of the tree")
+		_, err = decodeFilterBlock(testSegmentKey, meta.Root, body[meta.Root.Offset:meta.Root.Offset+meta.Root.Length])
+		is.Error(t, ErrCorrupt, err, "the root block read as a filter block")
 	})
 }
 

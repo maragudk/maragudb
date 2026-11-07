@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/antithesishq/antithesis-sdk-go/assert"
+
+	"maragu.dev/maragudb/internal/reach"
 )
 
 // Tx is a transaction over a snapshot of the database. It is not safe for concurrent use.
@@ -72,12 +74,22 @@ func (tx *Tx) Get(ctx context.Context, key []byte) ([]byte, bool, error) {
 		}
 		return e.value, true, nil
 	}
+	h := keyHash(key)
 	for i := len(tx.m.Segments) - 1; i >= 0; i-- {
 		seg := tx.m.Segments[i]
 		if bytes.Compare(key, seg.MinKey) < 0 || bytes.Compare(key, seg.MaxKey) > 0 {
 			continue
 		}
-		e, ok, err := segmentLookup(seg.Root, key, tx.db.fetcher(ctx, tx.startedAt, seg))
+		fetch, err := tx.db.lookupFetcher(ctx, tx.startedAt, seg, h)
+		if err != nil {
+			return nil, false, err
+		}
+		if fetch == nil {
+			assert.Sometimes(true, "a point lookup skips a segment whose filter does not hold the key", nil)
+			reach.Hit(ctx, reach.FilterSkip)
+			continue
+		}
+		e, ok, err := segmentLookup(seg.Root, key, fetch)
 		if err != nil {
 			return nil, false, err
 		}
@@ -179,6 +191,7 @@ func (tx *Tx) Commit(ctx context.Context) error {
 	}
 	sort.Strings(keys)
 	b := newSegmentBuilder(tx.db.blockSize)
+	b.omitFilterKeys = tx.db.mutations.FilterOmitsKeys
 	for _, k := range keys {
 		e := tx.writes[k]
 		if err := b.add(e.key, e.value, e.tombstone); err != nil {
@@ -194,12 +207,19 @@ func (tx *Tx) Commit(ctx context.Context) error {
 	if err := db.putObject(ctx, meta.Key, body); err != nil {
 		return err
 	}
-	root := bytes.Clone(body[meta.Root.Offset : meta.Root.Offset+meta.Root.Length])
-	if db.mem != nil {
-		db.mem.Put(blockCacheKey(meta.Key, meta.Root), root)
+	// The root block, and the filter block that a lookup reads with it, go to the caches.
+	prime := []blockRef{meta.Root}
+	if meta.FilterBlock != nil {
+		prime = append(prime, *meta.FilterBlock)
 	}
-	if db.disk != nil {
-		db.disk.Put(blockCacheKey(meta.Key, meta.Root), root)
+	for _, ref := range prime {
+		block := bytes.Clone(body[ref.Offset : ref.Offset+ref.Length])
+		if db.mem != nil {
+			db.mem.Put(blockCacheKey(meta.Key, ref), block)
+		}
+		if db.disk != nil {
+			db.disk.Put(blockCacheKey(meta.Key, ref), block)
+		}
 	}
 
 	next := tx.m.next(id, db.now())

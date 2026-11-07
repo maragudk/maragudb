@@ -11,9 +11,9 @@ Each entry names the test's package, the test's name, and what the test asserts,
 ## At a glance
 
 - 36 acceptance criteria (`AC-`), 28 key invariants (`INV-`), 31 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
-- 29 mutants (`MUT-`), deliberate bugs, of which 27 are detected by the simulator's checkers within 20 seeds.
-- 27 interesting states (`STATE-`) that the simulator's fixed corpus must reach.
-- 291 declarations of coverage in the tests.
+- 31 mutants (`MUT-`), deliberate bugs, of which 29 are detected by the simulator's checkers within 20 seeds.
+- 29 interesting states (`STATE-`) that the simulator's fixed corpus must reach.
+- 299 declarations of coverage in the tests.
 
 ## Acceptance criteria
 
@@ -43,7 +43,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/s3fake` `TestClient_Faults/a_lost_ack_hides_a_precondition_failure_too`: a lost acknowledgement also hides a precondition failure, so the client cannot tell what happened
 - `internal/s3fake` `TestClient_Faults/lost_acks_are_applied_but_reported_as_errors`: a lost acknowledgement applies the write and still reports an error
 - `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus, with injected errors, latency, lost acknowledgements, outages, and crashes, finds no anomalies with any checker and exercises every fault
-- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, unique and foreign key violations that only a concurrent commit causes, disk caches that evict and refuse damaged files, and damaged reads from the store refused with ErrCorrupt
+- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, unique and foreign key violations that only a concurrent commit causes, disk caches that evict and refuse damaged files, damaged reads from the store refused with ErrCorrupt, and point lookups that skip segments by their key filters and read filter blocks with root blocks
 
 ### `AC-1.4`
 
@@ -52,7 +52,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/s3fake` `TestClient_Faults/a_crashed_process_cannot_make_further_requests`: a crashed process fails every later request, and other processes are unaffected
 - `internal/s3fake` `TestClient_Faults/crashes_happen_both_before_and_after_apply`: over 50 seeds, crashes happen both before and after the write is applied
 - `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus, with injected errors, latency, lost acknowledgements, outages, and crashes, finds no anomalies with any checker and exercises every fault
-- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, unique and foreign key violations that only a concurrent commit causes, disk caches that evict and refuse damaged files, and damaged reads from the store refused with ErrCorrupt
+- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, unique and foreign key violations that only a concurrent commit causes, disk caches that evict and refuse damaged files, damaged reads from the store refused with ErrCorrupt, and point lookups that skip segments by their key filters and read filter blocks with root blocks
 
 ### `AC-1.5`
 
@@ -180,24 +180,27 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 - `.` `TestMaintenance/keeps_the_commit_and_warm-read_budgets_in_steady_state`: with background maintenance, an INSERT and a warm SELECT keep their request budgets
 - `.` `TestRequestBudgets/an_autocommit_INSERT_makes_one_conditional_GET_and_two_PUTs_regardless_of_database_size`: an autocommit INSERT makes one conditional GET and two PUTs at every database size, after many commits with the merges of the tiers, and after a compaction of every segment
-- `.` `TestRequestBudgets_ForeignKeys/an_insert_of_a_row_with_a_foreign_key_adds_no_request_with_a_warm_cache,_and_a_logarithmic_number_of_GETs_with_a_cold_one`: an autocommit INSERT of a row that references a parent makes one conditional GET and two PUTs with a warm cache at every database size, and with a cold cache one descent of the tree of every segment each for the table definitions, the duplicate key check, and the lookup of the parent, after many commits with the merges of the tiers, and after a compaction of every segment
+- `.` `TestRequestBudgets_ForeignKeys/an_insert_of_a_row_with_a_foreign_key_adds_no_request_with_a_warm_cache,_and_a_logarithmic_number_of_GETs_with_a_cold_one`: an autocommit INSERT of a row that references a parent makes one conditional GET and two PUTs with a warm cache at every database size, and with a cold cache one descent of the tree of every segment each for the table definitions, the duplicate key check, and the lookup of the parent, after many commits with the merges of the tiers, and after a compaction of every segment; after the many commits, at most one and a half times the GETs of the compacted database, or two more, at every size up to 100,000 rows
 - `.` `TestRequestBudgets_Indexes/a_commit_that_changes_indexed_columns_makes_one_conditional_GET_and_two_PUTs_regardless_of_database_size`: an autocommit UPDATE that changes the columns of two indexes, and so deletes and writes entries of both, makes one conditional GET and two PUTs at every database size
 - `internal/engine` `TestRequestBudgets/a_commit_uses_two_PUTs_and_one_GET_regardless_of_database_size`: a commit makes one conditional GET, one PUT, and one conditional PUT at 100 to 100,000 keys
 
 ### `AC-5.2`
 
-> S3 request budgets: A transaction with a warm cache uses one conditional GET (or HEAD) for the freshness check, plus nothing else for cached data.
+> S3 request budgets: A transaction with a warm cache uses one conditional GET (or HEAD) for the freshness check, plus nothing else for cached data, also for the key filters of segments.
 
 - `.` `TestMaintenance/keeps_the_commit_and_warm-read_budgets_in_steady_state`: with background maintenance, an INSERT and a warm SELECT keep their request budgets
 - `.` `TestRequestBudgets/a_SELECT_by_primary_key_with_a_warm_cache_makes_exactly_one_conditional_GET`: a SELECT by primary key with a warm cache makes exactly one conditional GET
+- `internal/engine` `TestDB_KeyFilters/a_warm_cache_adds_no_GET_for_filters,_and_the_disk_cache_holds_filter_blocks_as_it_holds_other_blocks`: a point lookup with a warm memory cache makes only the freshness read, and one with a warm disk cache reads the filter blocks from it, so that a segment whose filter does not hold the key costs no GET
 - `internal/engine` `TestRequestBudgets/a_transaction_with_a_warm_cache_uses_one_conditional_GET_and_nothing_else`: a read-only transaction with a warm cache makes exactly one conditional GET at 100 to 10,000 keys
 
 ### `AC-5.3`
 
-> S3 request budgets: A point lookup with a cold cache uses at most one GET per tree level of each live segment, so O(log n) GETs per segment, and compaction keeps O(log n) live segments.
+> S3 request budgets: A point lookup with a cold cache uses at most one GET per tree level of each live segment, so O(log n) GETs per segment, and compaction keeps O(log n) live segments. A live segment whose key filter shows that it does not hold the key costs at most one GET, and none when the manifest holds the filter. The lookup stays within the tiered bound.
 
-- `.` `TestRequestBudgets/a_SELECT_by_primary_key_with_a_cold_cache_makes_a_logarithmic_number_of_GETs`: a SELECT by primary key with a cold cache makes at most one GET per tree level of every segment for the table definition and the row, after many commits with the merges of the tiers, which leave fewer than four segments per tier, and one GET per tree level after a compaction of every segment
+- `.` `TestRequestBudgets/a_SELECT_by_primary_key_with_a_cold_cache_makes_a_logarithmic_number_of_GETs`: a SELECT by primary key with a cold cache makes at most one GET per tree level of every segment for the table definition and the row, after many commits with the merges of the tiers, which leave fewer than four segments per tier, and one GET per tree level after a compaction of every segment; after the many commits, at most one and a half times the GETs of the compacted database, or two more, at every size up to 100,000 rows
 - `.` `TestRequestBudgets/an_autocommit_INSERT_makes_one_conditional_GET_and_two_PUTs_regardless_of_database_size`: an autocommit INSERT with a cold cache makes at most one GET per tree level of every segment for the table definition and the duplicate key check, after many commits with the merges of the tiers, which leave fewer than four segments per tier, and after a compaction of every segment
+- `internal/engine` `TestDB_KeyFilters/a_cold_point_lookup_makes_no_GET_for_a_segment_whose_filter_in_the_manifest_does_not_hold_the_key,_and_one_for_a_segment_whose_filter_block_does_not`: a cold point lookup of a key of the oldest segment alone makes the GETs of a descent of the oldest segment, one GET for the root and filter blocks of a newer segment whose filter block does not hold the key, and none for three newer segments whose filters in the manifest do not hold it; without the filters, it descends into every segment
+- `internal/engine` `TestDB_KeyFilters/a_lookup_reads_a_filter_block_alone_when_a_scan_put_the_root_block_in_the_cache_without_it,_and_keeps_it`: after a scan cached the root block of a segment but not its filter block, a cold lookup of a key that the segment does not hold makes one GET, for the filter block, and the next one none
 - `internal/engine` `TestMaintainer_Compaction/reads_and_writes_a_number_of_bytes_per_committed_byte_that_grows_with_the_logarithm_of_the_size,_while_it_grows_a_database_tenfold`: growing an empty database by commits of ten new keys, an update, and a delete each, with maintenance after every commit, from 300 commits to 3,000, makes compaction read and write at most two bytes more per committed byte for every fourfold of the size, plus two, and leaves fewer than four segments in each tier after every maintenance step
 - `internal/engine` `TestMaintainer_Compaction/reads_and_writes_about_as_many_bytes_per_committed_byte_for_the_same_commits_on_a_database_ten_times_as_large`: 1,000 commits on databases of 2,000 and 20,000 keys, with a maintenance step after every commit, leave fewer than four segments in each tier, where a segment counts in the highest tier of itself and the newer segments
 - `internal/engine` `TestRequestBudgets/a_point_lookup_with_a_cold_cache_uses_a_logarithmic_number_of_GETs`: a cold point lookup makes one freshness check and at most one GET per tree level, 1 + log16(n), at 100 to 100,000 keys
@@ -206,9 +209,9 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 ### `AC-5.5`
 
-> S3 request budgets: A point lookup through a secondary index with a cold cache uses that budget for the index entry and again for the row.
+> S3 request budgets: A point lookup through a secondary index with a cold cache uses that budget for the index entry and again for the row. A lookup through a unique index stays within the tiered bound.
 
-- `.` `TestRequestBudgets_Indexes/a_point_lookup_through_a_unique_index_with_a_cold_cache_makes_a_logarithmic_number_of_GETs`: a SELECT by a unique secondary index with a cold cache makes a logarithmic number of GETs: one descent of the tree of every segment each for the table definition, the index entry, and the row, after many commits with the merges of the tiers, which leave fewer than four segments per tier, and after a compaction of every segment
+- `.` `TestRequestBudgets_Indexes/a_point_lookup_through_a_unique_index_with_a_cold_cache_makes_a_logarithmic_number_of_GETs`: a SELECT by a unique secondary index with a cold cache makes a logarithmic number of GETs: one descent of the tree of every segment each for the table definition, the index entry, and the row, after many commits with the merges of the tiers, which leave fewer than four segments per tier, and after a compaction of every segment; after the many commits, at most one and a half times the GETs of the compacted database, or two more, at every size up to 100,000 rows
 
 ### `AC-5.6`
 
@@ -218,15 +221,15 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 ### `AC-5.7`
 
-> S3 request budgets: An insert of a row with a foreign key with a warm cache uses no request beyond those of any other commit, and with a cold cache the budget of a point lookup for the referenced row.
+> S3 request budgets: An insert of a row with a foreign key with a warm cache uses no request beyond those of any other commit, and with a cold cache the budget of a point lookup for the referenced row, within the tiered bound.
 
-- `.` `TestRequestBudgets_ForeignKeys/an_insert_of_a_row_with_a_foreign_key_adds_no_request_with_a_warm_cache,_and_a_logarithmic_number_of_GETs_with_a_cold_one`: an autocommit INSERT of a row that references a parent makes one conditional GET and two PUTs with a warm cache at every database size, and with a cold cache one descent of the tree of every segment each for the table definitions, the duplicate key check, and the lookup of the parent, after many commits with the merges of the tiers, and after a compaction of every segment
+- `.` `TestRequestBudgets_ForeignKeys/an_insert_of_a_row_with_a_foreign_key_adds_no_request_with_a_warm_cache,_and_a_logarithmic_number_of_GETs_with_a_cold_one`: an autocommit INSERT of a row that references a parent makes one conditional GET and two PUTs with a warm cache at every database size, and with a cold cache one descent of the tree of every segment each for the table definitions, the duplicate key check, and the lookup of the parent, after many commits with the merges of the tiers, and after a compaction of every segment; after the many commits, at most one and a half times the GETs of the compacted database, or two more, at every size up to 100,000 rows
 
 ### `AC-5.8`
 
-> S3 request budgets: A join from one row of a table to the rows that reference it, through an index on the referencing columns, with a cold cache uses the budget of a point lookup for each row it reads.
+> S3 request budgets: A join from one row of a table to the rows that reference it, through an index on the referencing columns, with a cold cache uses the budget of a point lookup for each row it reads, within the tiered bound.
 
-- `.` `TestRequestBudgets_Joins/a_join_from_one_parent_row_to_its_children_through_an_index_on_their_foreign_key_makes_a_logarithmic_number_of_GETs_per_row_with_a_cold_cache`: a SELECT that joins one parent row to its children with ON c.pid = p.id, through an index on c (pid), makes with a cold cache one descent of the tree of every segment for each table definition, for the parent, for the index entries, and for each child, at every database size, after many commits with the merges of the tiers, which leave fewer than four segments per tier, and after a compaction of every segment
+- `.` `TestRequestBudgets_Joins/a_join_from_one_parent_row_to_its_children_through_an_index_on_their_foreign_key_makes_a_logarithmic_number_of_GETs_per_row_with_a_cold_cache`: a SELECT that joins one parent row to its children with ON c.pid = p.id, through an index on c (pid), makes with a cold cache one descent of the tree of every segment for each table definition, for the parent, for the index entries, and for each child, at every database size, after many commits with the merges of the tiers, which leave fewer than four segments per tier, and after a compaction of every segment; after the many commits, at most one and a half times the GETs of the compacted database, or two more, at every size up to 100,000 rows
 
 ### `AC-5.4`
 
@@ -358,6 +361,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/cache` `TestDisk/refuses_every_damaged_file_and_removes_it`: a disk cache file that is empty, truncated at any length, corrupt in any byte, of another key, or of the format without a header is a miss, and leaves the cache
 - `internal/cache` `TestDisk/serves_a_read_that_an_eviction_overlaps_whole_or_not_at_all`: an eviction of an entry in the middle of its read gives the whole value on a file system that keeps removed files readable, and a miss on one that cuts the read short, never the bytes it cut
 - `internal/engine` `TestDB_Damage/damaged_bytes_from_the_memory_or_the_disk_cache_are_a_miss,_counted,_and_read_from_the_store`: a block or manifest that a cache returns damaged is refused, counted, and read from the store, which serves the right value
+- `internal/engine` `TestDB_KeyFilters/every_key_reads_its_newest_value_and_absent_keys_read_as_absent,_cold,_warm,_and_through_segments_without_filters`: point lookups of every key of a database whose segments have filters in the manifest and filter blocks find the newest value, with a cold cache, a warm one, and after the filters are removed from the manifest as an older version writes it
 - `internal/engine` `TestDB_Stats/a_stale_disk-cached_manifest_is_refreshed_on_open`: a stale manifest in the disk cache is replaced by the store's newer one on open
 - `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus, with injected errors, latency, lost acknowledgements, outages, and crashes, finds no anomalies with any checker and exercises every fault
 - `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus, with disk caches small enough to evict and files that crashes and the disk damage, finds no anomalies, and after every operation of every client the files of its disk cache are within the bound and all counted
@@ -375,16 +379,18 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/cache` `TestDisk/keeps_its_files_within_the_bound_in_a_directory_of_the_operating_system`: the realistic workload on a disk cache directory of the operating system, with restarts that close and open it again, keeps its files within the bound after every operation
 - `internal/cache` `TestDisk/never_serves_bytes_that_the_latest_Put_of_a_key_did_not_put,_never_holds_more_than_the_bound,_and_counts_every_file,_through_damage,_restarts,_and_evictions_and_replacements_in_the_middle_of_reads`: random operations, damaged and cut files, restarts with leftover temporary files, and evictions and replacements in the middle of reads never make a disk cache serve other bytes than the latest Put of the key, and its files never exceed the bound and are all counted
 - `internal/cache` `TestOpenDir/refuses_a_directory_that_another_process_has_open_until_that_process_ends,_also_by_a_crash,_and_shares_one_within_a_process`: a second process that opens a disk cache directory fails with ErrInUse while the first has it open, and opens it once the first closed it or crashed; within one process, the opens of a directory share one cache
+- `internal/engine` `TestDB_KeyFilters/a_warm_cache_adds_no_GET_for_filters,_and_the_disk_cache_holds_filter_blocks_as_it_holds_other_blocks`: a point lookup with a warm memory cache makes only the freshness read, and one with a warm disk cache reads the filter blocks from it, so that a segment whose filter does not hold the key costs no GET
 - `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus, with disk caches small enough to evict and files that crashes and the disk damage, finds no anomalies, and after every operation of every client the files of its disk cache are within the bound and all counted
 
 ### `INV-DAMAGE-DETECTED`
 
-> Damaged bytes in an object in the store, whether a block of a segment, the manifest, a garbage batch, or a definition in the catalog, give a clear error that wraps ErrCorrupt, and damaged bytes in a cache are never served, but read from the store instead. Damaged bytes never give a panic, a hang, or wrong data.
+> Damaged bytes in an object in the store, whether a block of a segment, including the block of its key filter, the manifest, a garbage batch, or a definition in the catalog, give a clear error that wraps ErrCorrupt, and damaged bytes in a cache are never served, but read from the store instead. Damaged bytes never give a panic, a hang, or wrong data.
 
 - `internal/engine` `TestDB_Damage/a_GC_pass_that_reads_a_damaged_garbage_batch_fails_with_ErrCorrupt,_and_a_later_one_succeeds`: a GC pass whose read of a garbage batch gets damaged bytes fails with ErrCorrupt and deletes nothing, and a later pass collects the garbage
 - `internal/engine` `TestDB_Damage/a_block_read_from_the_store_with_damaged_bytes_fails_with_ErrCorrupt,_is_cached_nowhere,_and_a_later_read_of_whole_bytes_succeeds`: a read of a block whose bytes the store damaged fails with ErrCorrupt and caches nothing, and the next read of whole bytes succeeds
 - `internal/engine` `TestDB_Damage/a_manifest_read_from_the_store_with_damaged_bytes_fails_the_transaction_with_ErrCorrupt,_and_a_later_one_succeeds`: a transaction whose freshness read gets a manifest that the store damaged fails with ErrCorrupt, and keeps the manifest it had
 - `internal/engine` `TestDB_Damage/damaged_bytes_from_the_memory_or_the_disk_cache_are_a_miss,_counted,_and_read_from_the_store`: a block or manifest that a cache returns damaged is refused, counted, and read from the store, which serves the right value
+- `internal/engine` `TestDB_KeyFilters/a_filter_block_that_the_store_damaged_fails_the_lookup_with_ErrCorrupt_and_is_not_cached,_and_one_damaged_in_a_cache_is_read_from_the_store`: a point lookup whose read of a filter block and its root block gets damaged filter bytes from the store fails with ErrCorrupt and caches neither, and a filter block that the disk cache returns damaged is refused, counted, and read from the store
 - `internal/engine` `TestGarbageBatch/fails_with_ErrCorrupt_when_a_bit_of_the_batch_flips,_when_it_is_cut_short,_or_when_it_is_read_from_another_key`: every bit flip and every truncation of a garbage batch, and a garbage batch read from another key, fail with ErrCorrupt
 - `internal/engine` `TestManifest/fails_with_ErrCorrupt_when_a_bit_of_the_manifest_flips,_when_it_is_cut_short,_or_when_it_is_read_from_another_key`: every bit flip and every truncation of a manifest, and a manifest read from another key, fail with ErrCorrupt
 - `internal/engine` `TestOpen/fails_with_ErrUnsupportedManifest_on_a_manifest_of_version_1,_which_listed_stamped_garbage_itself`: a database whose manifest has an encoding without checksums fails to open with an error that names the versions, and is left as it is
@@ -438,6 +444,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 > API: A small native API exposes Stats(), with S3 request counts by kind and cache hits and misses, and also exposes cache options.
 
 - `.` `TestStats/counts_requests_and_cache_hits_across_connections`: Stats reports request counts by kind and cache hits across connections
+- `internal/engine` `TestDB_KeyFilters/filter_blocks_count_toward_the_memory_cache's_budget`: with a memory cache one byte too small for the root and filter blocks of a segment, the root block evicts the filter block, and with one byte more, both stay
 - `internal/engine` `TestDB_Stats/counts_cache_hits_and_misses_per_tier`: Stats counts memory and disk cache hits and misses
 
 ### `INV-PANIC-RECOVERED`
@@ -887,33 +894,35 @@ Every mutant runs in every simulator configuration below, with seeds 1 to 20, un
 
 | Mutant | Detected in | First seed | Checkers |
 |---|---|---|---|
-| `MUT-COMMIT-WITHOUT-CAS` commit without CAS | 11 of 12 configurations | 1 | durability, list-append, real-time order, storage |
+| `MUT-COMMIT-WITHOUT-CAS` commit without CAS | 9 of 12 configurations | 1 | durability, list-append, real-time order, storage |
 | `MUT-GC-IGNORE-GRACE` GC ignoring the grace period | 6 of 12 configurations | 1 | final read, grace period, list-append |
 | `MUT-GC-BATCH-OBJECTS-FIRST` garbage batches deleted before their garbage | 6 of 6 configurations | 1 | storage |
 | `MUT-GC-SWEEP-SEGMENTS-ONLY` an orphan sweep that misses garbage batches | 6 of 6 configurations | 1 | storage |
 | `MUT-GC-CHAIN-FIRST-STAMP` a chain of garbage batches with the stamp of its first batch | 6 of 6 configurations | 3 | grace period |
-| `MUT-GC-DELETE-REFERENCED` GC deleting expired garbage that is referenced again | 3 of 6 configurations | 8 | final read, storage |
+| `MUT-GC-DELETE-REFERENCED` GC deleting expired garbage that is referenced again | 3 of 6 configurations | 1 | final read, grace period, storage |
 | `MUT-COMPACT-NON-ADJACENT` a merge of segments that are not adjacent | 6 of 6 configurations | 1 | bank, durability, index consistency, list-append, unique |
-| `MUT-COMPACT-DROP-TOMBSTONES` tombstones dropped in a merge that excludes the oldest segment | 3 of 4 configurations | 2 | durability, index consistency, list-append |
-| `MUT-COMPACT-REBASE-LOSES-SEGMENT` a rebase that loses a segment added meanwhile | 6 of 6 configurations | 1 | bank, durability, final read, foreign key, index consistency, list-append, unique |
-| `MUT-COMPACT-REBASE-ON-COMPACTION` a rebase on another compaction | 4 of 6 configurations | 2 | bank, durability, final read, index consistency, list-append, real-time order |
+| `MUT-COMPACT-DROP-TOMBSTONES` tombstones dropped in a merge that excludes the oldest segment | 4 of 4 configurations | 1 | durability, foreign key, index consistency, list-append |
+| `MUT-COMPACT-REBASE-LOSES-SEGMENT` a rebase that loses a segment added meanwhile | 6 of 6 configurations | 1 | bank, durability, final read, index consistency, list-append, real-time order, unique |
+| `MUT-COMPACT-REBASE-ON-COMPACTION` a rebase on another compaction | 2 of 6 configurations | 1 | durability, list-append |
 | `MUT-SKIP-FRESHNESS` serving the cache without a freshness check | 9 of 12 configurations | 1 | grace period, list-append, real-time order |
 | `MUT-ACK-BEFORE-CONFIRM` acking before the write is confirmed | 9 of 12 configurations | 1 | durability, real-time order, storage |
 | `MUT-COMPACTED-AHEAD` the compacted segment ahead of newer ones after a rebase | 5 of 12 configurations | 1 | durability, index consistency, list-append, real-time order |
-| `MUT-FRESH-SNAPSHOT` a fresh snapshot per statement | 7 of 8 configurations | 1 | bank, foreign key, index consistency, list-append, workload invariants |
+| `MUT-FRESH-SNAPSHOT` a fresh snapshot per statement | 8 of 8 configurations | 1 | bank, foreign key, index consistency, list-append, workload invariants |
 | `MUT-RETRY-UNKNOWN` retrying an autocommit statement after an unknown commit outcome | 2 of 8 configurations | 1 | durability, list-append |
 | `MUT-INDEX-STALE-DELETE` stale index entries after an UPDATE or DELETE | 6 of 8 configurations | 1 | index consistency |
 | `MUT-UNIQUE-NO-CHECK` no unique check | 2 of 8 configurations | 1 | index consistency, unique |
-| `MUT-UNIQUE-OWN-WRITES` a unique check that misses the statement's own writes | 2 of 8 configurations | 3 | index consistency, unique |
+| `MUT-UNIQUE-OWN-WRITES` a unique check that misses the statement's own writes | 2 of 8 configurations | 2 | index consistency, unique |
 | `MUT-FK-NO-CHILD-CHECK` no check of a referencing row | 2 of 8 configurations | 1 | foreign key |
-| `MUT-FK-NO-PARENT-CHECK` no check or action on the referencing rows | 2 of 8 configurations | 1 | foreign key |
+| `MUT-FK-NO-PARENT-CHECK` no check or action on the referencing rows | 2 of 8 configurations | 2 | foreign key |
 | `MUT-FK-OWN-WRITES` foreign key lookups that miss the statement's own writes | 2 of 8 configurations | 1 | foreign key |
-| `MUT-CHECK-SKIP-UPDATE` CHECK on INSERT only | 2 of 8 configurations | 5 | check constraint |
-| `MUT-SUBQUERY-STALE-READS` subquery reads that a retry does not repeat | 2 of 2 configurations | 2 | durability, list-append |
+| `MUT-CHECK-SKIP-UPDATE` CHECK on INSERT only | 2 of 8 configurations | 6 | check constraint |
+| `MUT-SUBQUERY-STALE-READS` subquery reads that a retry does not repeat | 2 of 2 configurations | 3 | durability, list-append |
 | `MUT-UPDATE-SEES-OWN-WRITES` an UPDATE that revisits the rows it wrote | 0 of 8 configurations | none |  |
 | `MUT-DISK-CACHE-UNVERIFIED` a disk cache that serves damaged files | 12 of 12 configurations | 1 | cache integrity |
 | `MUT-DISK-CACHE-SERVE-CUT-READ` a disk cache that serves a read that an eviction cut short | 0 of 0 configurations | none |  |
-| `MUT-SEGMENT-UNCHECKED` blocks of segments read without their checksum | 12 of 12 configurations | 1 | bank, cache integrity, index consistency, list-append, unique, workload invariants |
+| `MUT-SEGMENT-UNCHECKED` blocks of segments read without their checksum | 12 of 12 configurations | 1 | bank, cache integrity, damaged reads, durability, index consistency, list-append, workload invariants |
+| `MUT-FILTER-OMITS-KEYS` key filters that leave out keys | 12 of 12 configurations | 1 | bank, durability, final read, foreign key, index consistency, list-append, unique, workload invariants |
+| `MUT-FILTER-UNCHECKED` filter blocks read without their checksum | 10 of 10 configurations | 1 | cache integrity |
 | `MUT-DISK-CACHE-UNCOUNTED` a disk cache that does not count the files of an earlier process | 12 of 12 configurations | 1 | disk cache bound |
 | `MUT-MAINTENANCE-UNRECOVERED` a maintenance step that does not recover a panic | 12 of 12 configurations | 1 | panic |
 
@@ -924,17 +933,17 @@ Every mutant runs in every simulator configuration below, with seeds 1 to 20, un
 | Configuration | Result |
 |---|---|
 | list-append through the engine, no maintainers | detected with seed 1 by durability, list-append |
-| list-append through the engine, 2 maintainers | detected with seed 1 by durability, list-append |
-| bank through the engine, no maintainers | detected with seed 7 by storage |
-| bank through the engine, 2 maintainers | detected with seed 3 by storage |
+| list-append through the engine, 2 maintainers | detected with seed 1 by durability, list-append, storage |
+| bank through the engine, no maintainers | detected with seed 12 by storage |
+| bank through the engine, 2 maintainers | detected with seed 2 by storage |
 | list-append through SQL, no maintainers | detected with seed 1 by durability, list-append |
 | list-append through SQL, 2 maintainers | detected with seed 1 by durability, list-append |
-| bank through SQL, no maintainers | detected with seed 2 by storage |
-| bank through SQL, 2 maintainers | detected with seed 2 by storage |
+| bank through SQL, no maintainers | cannot detect: an unconditional manifest write drops whole concurrent commits, a dropped transfer conserves money, and the bank checker only checks totals; without maintainers, only the storage checker finds the objects of a dropped commit that GC cannot collect, in 2 of the first 100 seeds, the first at seed 80 |
+| bank through SQL, 2 maintainers | detected with seed 1 by storage |
 | unique through SQL, no maintainers | cannot detect: an unconditional manifest write drops whole concurrent commits, which leaves a consistent state in which no value repeats, the unique workload does not check that acknowledged writes survive, and in 20 seeds no dropped commit leaves the store with objects that GC cannot collect |
-| unique through SQL, 2 maintainers | detected with seed 14 by storage |
-| foreign-key through SQL, no maintainers | detected with seed 1 by real-time order |
-| foreign-key through SQL, 2 maintainers | detected with seed 2 by real-time order, storage |
+| unique through SQL, 2 maintainers | cannot detect: an unconditional manifest write drops whole concurrent commits, which leaves a consistent state in which no value repeats, and the unique workload does not check that acknowledged writes survive; only the storage checker finds the objects of a dropped commit that GC cannot collect, in 11 of the first 100 seeds, the first at seed 21 |
+| foreign-key through SQL, no maintainers | detected with seed 2 by real-time order |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by real-time order |
 
 Targeted tests:
 
@@ -952,13 +961,13 @@ Targeted tests:
 | bank through the engine, no maintainers | cannot detect: without maintainers nothing is ever deleted, so no reader can lose an object |
 | bank through the engine, 2 maintainers | detected with seed 1 by grace period |
 | list-append through SQL, no maintainers | cannot detect: without maintainers nothing is ever deleted, so no reader can lose an object |
-| list-append through SQL, 2 maintainers | detected with seed 1 by grace period |
+| list-append through SQL, 2 maintainers | detected with seed 2 by grace period |
 | bank through SQL, no maintainers | cannot detect: without maintainers nothing is ever deleted, so no reader can lose an object |
-| bank through SQL, 2 maintainers | detected with seed 2 by grace period |
+| bank through SQL, 2 maintainers | detected with seed 1 by grace period |
 | unique through SQL, no maintainers | cannot detect: without maintainers nothing is ever deleted, so no reader can lose an object |
-| unique through SQL, 2 maintainers | detected with seed 4 by grace period, final read |
+| unique through SQL, 2 maintainers | detected with seed 1 by grace period |
 | foreign-key through SQL, no maintainers | cannot detect: without maintainers nothing is ever deleted, so no reader can lose an object |
-| foreign-key through SQL, 2 maintainers | detected with seed 1 by grace period |
+| foreign-key through SQL, 2 maintainers | detected with seed 2 by grace period, final read |
 
 Targeted tests:
 
@@ -973,15 +982,15 @@ Targeted tests:
 | list-append through the engine, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
 | list-append through the engine, 2 maintainers | detected with seed 2 by storage |
 | bank through the engine, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| bank through the engine, 2 maintainers | detected with seed 1 by storage |
+| bank through the engine, 2 maintainers | detected with seed 2 by storage |
 | list-append through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
 | list-append through SQL, 2 maintainers | detected with seed 1 by storage |
 | bank through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| bank through SQL, 2 maintainers | detected with seed 2 by storage |
+| bank through SQL, 2 maintainers | detected with seed 1 by storage |
 | unique through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| unique through SQL, 2 maintainers | detected with seed 2 by storage |
+| unique through SQL, 2 maintainers | detected with seed 1 by storage |
 | foreign-key through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| foreign-key through SQL, 2 maintainers | detected with seed 1 by storage |
+| foreign-key through SQL, 2 maintainers | detected with seed 2 by storage |
 
 Targeted tests:
 
@@ -1017,17 +1026,17 @@ Targeted tests:
 | Configuration | Result |
 |---|---|
 | list-append through the engine, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| list-append through the engine, 2 maintainers | detected with seed 8 by grace period |
+| list-append through the engine, 2 maintainers | detected with seed 17 by grace period |
 | bank through the engine, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| bank through the engine, 2 maintainers | detected with seed 11 by grace period |
+| bank through the engine, 2 maintainers | detected with seed 4 by grace period |
 | list-append through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| list-append through SQL, 2 maintainers | detected with seed 12 by grace period |
+| list-append through SQL, 2 maintainers | detected with seed 5 by grace period |
 | bank through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
 | bank through SQL, 2 maintainers | detected with seed 3 by grace period |
 | unique through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| unique through SQL, 2 maintainers | detected with seed 16 by grace period |
+| unique through SQL, 2 maintainers | detected with seed 19 by grace period |
 | foreign-key through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| foreign-key through SQL, 2 maintainers | detected with seed 12 by grace period |
+| foreign-key through SQL, 2 maintainers | detected with seed 6 by grace period |
 
 Targeted tests:
 
@@ -1040,17 +1049,17 @@ Targeted tests:
 | Configuration | Result |
 |---|---|
 | list-append through the engine, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| list-append through the engine, 2 maintainers | cannot detect: in 20 seeds, no GC pass stamps the output of a compaction as an orphan between the compaction's segment write and its rebased manifest write, which the mutant needs; `TestMutations` of the engine makes that happen and detects the mutant |
+| list-append through the engine, 2 maintainers | detected with seed 3 by grace period |
 | bank through the engine, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| bank through the engine, 2 maintainers | detected with seed 14 by final read, storage |
+| bank through the engine, 2 maintainers | cannot detect: a GC pass rarely stamps the output of a compaction as an orphan between the compaction's segment write and its rebased manifest write, which the mutant needs: 3 of the first 100 seeds do, the first at seed 40; `TestMutations` of the engine makes that happen and detects the mutant |
 | list-append through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
 | list-append through SQL, 2 maintainers | cannot detect: in 20 seeds, no GC pass stamps the output of a compaction as an orphan between the compaction's segment write and its rebased manifest write, which the mutant needs; `TestMutations` of the engine makes that happen and detects the mutant |
 | bank through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| bank through SQL, 2 maintainers | cannot detect: in 20 seeds, no GC pass stamps the output of a compaction as an orphan between the compaction's segment write and its rebased manifest write, which the mutant needs; `TestMutations` of the engine makes that happen and detects the mutant |
+| bank through SQL, 2 maintainers | detected with seed 14 by grace period, final read, storage |
 | unique through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| unique through SQL, 2 maintainers | detected with seed 8 by storage |
+| unique through SQL, 2 maintainers | detected with seed 1 by storage |
 | foreign-key through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| foreign-key through SQL, 2 maintainers | detected with seed 11 by storage |
+| foreign-key through SQL, 2 maintainers | cannot detect: a GC pass rarely stamps the output of a compaction as an orphan between the compaction's segment write and its rebased manifest write, which the mutant needs: 5 of the first 100 seeds do, the first at seed 44; `TestMutations` of the engine makes that happen and detects the mutant |
 
 Targeted tests:
 
@@ -1069,9 +1078,9 @@ Targeted tests:
 | list-append through SQL, no maintainers | not applicable: without maintainers nothing compacts |
 | list-append through SQL, 2 maintainers | detected with seed 3 by durability, list-append |
 | bank through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| bank through SQL, 2 maintainers | detected with seed 2 by index consistency, bank |
+| bank through SQL, 2 maintainers | detected with seed 1 by index consistency |
 | unique through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| unique through SQL, 2 maintainers | detected with seed 2 by index consistency, unique |
+| unique through SQL, 2 maintainers | detected with seed 2 by unique, index consistency |
 | foreign-key through SQL, no maintainers | not applicable: without maintainers nothing compacts |
 | foreign-key through SQL, 2 maintainers | detected with seed 1 by index consistency |
 
@@ -1086,17 +1095,17 @@ Targeted tests:
 | Configuration | Result |
 |---|---|
 | list-append through the engine, no maintainers | not applicable: without maintainers nothing compacts |
-| list-append through the engine, 2 maintainers | detected with seed 3 by durability, list-append |
+| list-append through the engine, 2 maintainers | detected with seed 10 by durability, list-append |
 | bank through the engine, no maintainers | not applicable: without maintainers nothing compacts |
 | bank through the engine, 2 maintainers | not applicable: the bank workload through the engine never deletes a key, so no merge meets a tombstone |
 | list-append through SQL, no maintainers | not applicable: without maintainers nothing compacts |
 | list-append through SQL, 2 maintainers | not applicable: the list-append workload through SQL never deletes a row, and its tables have no index besides the primary key, so no merge meets a tombstone |
 | bank through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| bank through SQL, 2 maintainers | detected with seed 4 by index consistency |
+| bank through SQL, 2 maintainers | detected with seed 2 by index consistency |
 | unique through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| unique through SQL, 2 maintainers | detected with seed 2 by index consistency |
+| unique through SQL, 2 maintainers | detected with seed 1 by index consistency |
 | foreign-key through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| foreign-key through SQL, 2 maintainers | cannot detect: a row that the workload deleted comes back together with the rows that its delete cascaded to, which is an older consistent state, unless a later commit changed a row that they reference; 2 of the first 100 seeds reach that, the first at seed 71 |
+| foreign-key through SQL, 2 maintainers | detected with seed 3 by foreign key |
 
 Targeted tests:
 
@@ -1111,15 +1120,15 @@ Targeted tests:
 | list-append through the engine, no maintainers | not applicable: without maintainers nothing compacts |
 | list-append through the engine, 2 maintainers | detected with seed 1 by durability, list-append |
 | bank through the engine, no maintainers | not applicable: without maintainers nothing compacts |
-| bank through the engine, 2 maintainers | detected with seed 1 by bank |
+| bank through the engine, 2 maintainers | detected with seed 6 by bank |
 | list-append through SQL, no maintainers | not applicable: without maintainers nothing compacts |
 | list-append through SQL, 2 maintainers | detected with seed 1 by final read, list-append |
 | bank through SQL, no maintainers | not applicable: without maintainers nothing compacts |
 | bank through SQL, 2 maintainers | detected with seed 2 by index consistency |
 | unique through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| unique through SQL, 2 maintainers | detected with seed 4 by unique, index consistency |
+| unique through SQL, 2 maintainers | detected with seed 14 by unique, index consistency |
 | foreign-key through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| foreign-key through SQL, 2 maintainers | detected with seed 1 by foreign key |
+| foreign-key through SQL, 2 maintainers | detected with seed 3 by real-time order |
 
 Targeted tests:
 
@@ -1132,17 +1141,17 @@ Targeted tests:
 | Configuration | Result |
 |---|---|
 | list-append through the engine, no maintainers | not applicable: without maintainers nothing compacts |
-| list-append through the engine, 2 maintainers | detected with seed 2 by durability, list-append |
+| list-append through the engine, 2 maintainers | detected with seed 1 by durability, list-append |
 | bank through the engine, no maintainers | not applicable: without maintainers nothing compacts |
 | bank through the engine, 2 maintainers | cannot detect: a rebase on another compaction loses whole commits and puts back merged segments with the same values, a lost transfer conserves money, and the bank checker only checks totals |
 | list-append through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| list-append through SQL, 2 maintainers | detected with seed 2 by final read, list-append |
+| list-append through SQL, 2 maintainers | detected with seed 1 by durability, list-append |
 | bank through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| bank through SQL, 2 maintainers | detected with seed 12 by index consistency, bank |
+| bank through SQL, 2 maintainers | cannot detect: a rebase on another compaction loses whole commits and puts back merged segments with the same values, a lost transfer conserves money, and the bank checker only checks totals; only the index consistency checker finds a lost commit that wrote an index entry, in 2 of the first 100 seeds, the first at seed 27 |
 | unique through SQL, no maintainers | not applicable: without maintainers nothing compacts |
 | unique through SQL, 2 maintainers | cannot detect: a rebase on another compaction loses whole commits and puts back merged segments with the same values, which leaves a consistent state in which no value repeats, and the unique workload does not check that acknowledged writes survive |
 | foreign-key through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| foreign-key through SQL, 2 maintainers | detected with seed 3 by real-time order |
+| foreign-key through SQL, 2 maintainers | cannot detect: a rebase on another compaction loses whole commits and puts back merged segments with the same values, which mostly leaves an older consistent state; only the real-time order checker finds a lost commit that a later read missed, in 5 of the first 100 seeds, the first at seed 27 |
 
 Targeted tests:
 
@@ -1157,15 +1166,15 @@ Targeted tests:
 | list-append through the engine, no maintainers | detected with seed 1 by list-append |
 | list-append through the engine, 2 maintainers | detected with seed 1 by list-append |
 | bank through the engine, no maintainers | cannot detect: a stale snapshot makes a transfer conflict or read an older consistent state, which conserves money |
-| bank through the engine, 2 maintainers | detected with seed 11 by grace period |
+| bank through the engine, 2 maintainers | detected with seed 10 by grace period |
 | list-append through SQL, no maintainers | detected with seed 1 by list-append |
 | list-append through SQL, 2 maintainers | detected with seed 1 by list-append |
 | bank through SQL, no maintainers | cannot detect: a stale snapshot makes a transfer conflict or read an older consistent state, which conserves money |
-| bank through SQL, 2 maintainers | detected with seed 12 by grace period |
+| bank through SQL, 2 maintainers | detected with seed 2 by grace period |
 | unique through SQL, no maintainers | cannot detect: a stale snapshot is an older consistent state in which no value repeats, and a write from it conflicts at commit; without maintainers no reader loses an object either |
-| unique through SQL, 2 maintainers | detected with seed 4 by grace period |
+| unique through SQL, 2 maintainers | detected with seed 10 by grace period |
 | foreign-key through SQL, no maintainers | detected with seed 2 by real-time order |
-| foreign-key through SQL, 2 maintainers | detected with seed 2 by real-time order |
+| foreign-key through SQL, 2 maintainers | detected with seed 10 by real-time order |
 
 ### `MUT-ACK-BEFORE-CONFIRM`
 
@@ -1174,17 +1183,17 @@ Targeted tests:
 | Configuration | Result |
 |---|---|
 | list-append through the engine, no maintainers | detected with seed 1 by durability |
-| list-append through the engine, 2 maintainers | detected with seed 1 by durability, storage |
+| list-append through the engine, 2 maintainers | detected with seed 1 by durability |
 | bank through the engine, no maintainers | cannot detect: an acknowledged transfer that never landed is missing as a whole, which conserves money, and without maintainers its segment is an orphan that GC collects like that of any failed commit |
-| bank through the engine, 2 maintainers | detected with seed 8 by storage |
+| bank through the engine, 2 maintainers | detected with seed 3 by storage |
 | list-append through SQL, no maintainers | detected with seed 1 by durability |
-| list-append through SQL, 2 maintainers | detected with seed 1 by durability, storage |
+| list-append through SQL, 2 maintainers | detected with seed 1 by durability |
 | bank through SQL, no maintainers | cannot detect: an acknowledged transfer that never landed is missing as a whole, which conserves money, and without maintainers its segment is an orphan that GC collects like that of any failed commit |
-| bank through SQL, 2 maintainers | detected with seed 2 by storage |
+| bank through SQL, 2 maintainers | detected with seed 1 by storage |
 | unique through SQL, no maintainers | cannot detect: an acknowledged write that never landed is missing as a whole, which leaves a consistent state, the unique workload does not check that acknowledged writes survive, and without maintainers the segment of such a write is an orphan that GC collects like any other |
-| unique through SQL, 2 maintainers | detected with seed 15 by storage |
-| foreign-key through SQL, no maintainers | detected with seed 2 by real-time order |
-| foreign-key through SQL, 2 maintainers | detected with seed 2 by real-time order, storage |
+| unique through SQL, 2 maintainers | detected with seed 2 by storage |
+| foreign-key through SQL, no maintainers | detected with seed 1 by real-time order |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by real-time order |
 
 Targeted tests:
 
@@ -1203,11 +1212,11 @@ Targeted tests:
 | list-append through SQL, no maintainers | cannot detect: without maintainers nothing compacts, so there is never a rebase |
 | list-append through SQL, 2 maintainers | detected with seed 1 by durability, list-append |
 | bank through SQL, no maintainers | cannot detect: without maintainers nothing compacts, so there is never a rebase |
-| bank through SQL, 2 maintainers | detected with seed 2 by index consistency |
+| bank through SQL, 2 maintainers | detected with seed 1 by index consistency |
 | unique through SQL, no maintainers | cannot detect: without maintainers nothing compacts, so there is never a rebase |
 | unique through SQL, 2 maintainers | detected with seed 3 by index consistency |
 | foreign-key through SQL, no maintainers | cannot detect: without maintainers nothing compacts, so there is never a rebase |
-| foreign-key through SQL, 2 maintainers | detected with seed 4 by real-time order |
+| foreign-key through SQL, 2 maintainers | detected with seed 3 by real-time order |
 
 Targeted tests:
 
@@ -1225,13 +1234,13 @@ Targeted tests:
 | bank through the engine, no maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
 | bank through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
 | list-append through SQL, no maintainers | detected with seed 1 by list-append |
-| list-append through SQL, 2 maintainers | detected with seed 2 by list-append |
+| list-append through SQL, 2 maintainers | detected with seed 1 by list-append |
 | bank through SQL, no maintainers | detected with seed 1 by workload invariants, bank |
 | bank through SQL, 2 maintainers | detected with seed 1 by workload invariants, bank |
 | unique through SQL, no maintainers | detected with seed 1 by index consistency |
 | unique through SQL, 2 maintainers | detected with seed 1 by index consistency |
-| foreign-key through SQL, no maintainers | detected with seed 14 by foreign key |
-| foreign-key through SQL, 2 maintainers | cannot detect: the mutant shows in the foreign key workload only when a reader's statements straddle a commit that changes what they read, which 8 of the first 100 seeds with two maintainers reach, the first at seed 31; the cell without maintainers detects it |
+| foreign-key through SQL, no maintainers | detected with seed 2 by foreign key |
+| foreign-key through SQL, 2 maintainers | detected with seed 16 by foreign key |
 
 Targeted tests:
 
@@ -1248,7 +1257,7 @@ Targeted tests:
 | bank through the engine, no maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
 | bank through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
 | list-append through SQL, no maintainers | detected with seed 1 by durability, list-append |
-| list-append through SQL, 2 maintainers | detected with seed 8 by durability, list-append |
+| list-append through SQL, 2 maintainers | detected with seed 7 by durability, list-append |
 | bank through SQL, no maintainers | cannot detect: the bank workload writes only in explicit transactions, so no autocommit statement is ever retried, and a doubled transfer conserves money anyway |
 | bank through SQL, 2 maintainers | cannot detect: the bank workload writes only in explicit transactions, so no autocommit statement is ever retried, and a doubled transfer conserves money anyway |
 | unique through SQL, no maintainers | cannot detect: a retried insert fails on its own primary key, and a retried move or delete finds its row moved or gone, so a statement applied twice leaves a consistent state |
@@ -1275,7 +1284,7 @@ Targeted tests:
 | bank through SQL, no maintainers | detected with seed 1 by index consistency |
 | bank through SQL, 2 maintainers | detected with seed 1 by index consistency |
 | unique through SQL, no maintainers | detected with seed 1 by index consistency |
-| unique through SQL, 2 maintainers | detected with seed 2 by index consistency |
+| unique through SQL, 2 maintainers | detected with seed 1 by index consistency |
 | foreign-key through SQL, no maintainers | detected with seed 1 by index consistency |
 | foreign-key through SQL, 2 maintainers | detected with seed 2 by index consistency |
 
@@ -1321,7 +1330,7 @@ Targeted tests:
 | bank through SQL, no maintainers | cannot detect: the workload has no unique index besides the primary key |
 | bank through SQL, 2 maintainers | cannot detect: the workload has no unique index besides the primary key |
 | unique through SQL, no maintainers | detected with seed 5 by unique, index consistency |
-| unique through SQL, 2 maintainers | detected with seed 3 by unique, index consistency |
+| unique through SQL, 2 maintainers | detected with seed 2 by unique, index consistency |
 | foreign-key through SQL, no maintainers | cannot detect: the workload has no unique index besides the primary key |
 | foreign-key through SQL, 2 maintainers | cannot detect: the workload has no unique index besides the primary key |
 
@@ -1364,8 +1373,8 @@ Targeted tests:
 | bank through SQL, 2 maintainers | cannot detect: the workload has no foreign keys |
 | unique through SQL, no maintainers | cannot detect: the workload has no foreign keys |
 | unique through SQL, 2 maintainers | cannot detect: the workload has no foreign keys |
-| foreign-key through SQL, no maintainers | detected with seed 1 by foreign key |
-| foreign-key through SQL, 2 maintainers | detected with seed 1 by foreign key |
+| foreign-key through SQL, no maintainers | detected with seed 2 by foreign key |
+| foreign-key through SQL, 2 maintainers | detected with seed 2 by foreign key |
 
 ### `MUT-FK-OWN-WRITES`
 
@@ -1402,8 +1411,8 @@ Targeted tests:
 | bank through SQL, 2 maintainers | cannot detect: the workload has no CHECK constraints |
 | unique through SQL, no maintainers | cannot detect: the workload has no CHECK constraints |
 | unique through SQL, 2 maintainers | cannot detect: the workload has no CHECK constraints |
-| foreign-key through SQL, no maintainers | detected with seed 5 by check constraint |
-| foreign-key through SQL, 2 maintainers | detected with seed 6 by check constraint |
+| foreign-key through SQL, no maintainers | detected with seed 6 by check constraint |
+| foreign-key through SQL, 2 maintainers | detected with seed 20 by check constraint |
 
 ### `MUT-SUBQUERY-STALE-READS`
 
@@ -1415,8 +1424,8 @@ Targeted tests:
 | list-append through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
 | bank through the engine, no maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
 | bank through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
-| list-append through SQL, no maintainers | detected with seed 2 by durability, list-append |
-| list-append through SQL, 2 maintainers | detected with seed 2 by durability |
+| list-append through SQL, no maintainers | detected with seed 3 by durability, list-append |
+| list-append through SQL, 2 maintainers | detected with seed 4 by durability, list-append |
 | bank through SQL, no maintainers | not applicable: only the list-append workload writes with a subquery, an append to a packed list that reads the list in a subquery |
 | bank through SQL, 2 maintainers | not applicable: only the list-append workload writes with a subquery, an append to a packed list that reads the list in a subquery |
 | unique through SQL, no maintainers | not applicable: only the list-append workload writes with a subquery, an append to a packed list that reads the list in a subquery |
@@ -1459,14 +1468,14 @@ Targeted tests:
 |---|---|
 | list-append through the engine, no maintainers | detected with seed 1 by cache integrity |
 | list-append through the engine, 2 maintainers | detected with seed 2 by cache integrity |
-| bank through the engine, no maintainers | detected with seed 1 by cache integrity |
-| bank through the engine, 2 maintainers | detected with seed 2 by cache integrity |
+| bank through the engine, no maintainers | detected with seed 2 by cache integrity |
+| bank through the engine, 2 maintainers | detected with seed 1 by cache integrity |
 | list-append through SQL, no maintainers | detected with seed 2 by cache integrity |
 | list-append through SQL, 2 maintainers | detected with seed 1 by cache integrity |
-| bank through SQL, no maintainers | detected with seed 1 by cache integrity |
+| bank through SQL, no maintainers | detected with seed 2 by cache integrity |
 | bank through SQL, 2 maintainers | detected with seed 1 by cache integrity |
-| unique through SQL, no maintainers | detected with seed 2 by cache integrity |
-| unique through SQL, 2 maintainers | detected with seed 2 by cache integrity |
+| unique through SQL, no maintainers | detected with seed 1 by cache integrity |
+| unique through SQL, 2 maintainers | detected with seed 1 by cache integrity |
 | foreign-key through SQL, no maintainers | detected with seed 1 by cache integrity |
 | foreign-key through SQL, 2 maintainers | detected with seed 1 by cache integrity |
 
@@ -1504,21 +1513,67 @@ Targeted tests:
 | Configuration | Result |
 |---|---|
 | list-append through the engine, no maintainers | detected with seed 1 by cache integrity |
-| list-append through the engine, 2 maintainers | detected with seed 2 by cache integrity |
+| list-append through the engine, 2 maintainers | detected with seed 2 by durability, list-append |
 | bank through the engine, no maintainers | detected with seed 2 by bank |
 | bank through the engine, 2 maintainers | detected with seed 3 by cache integrity |
-| list-append through SQL, no maintainers | detected with seed 2 by workload invariants, list-append |
-| list-append through SQL, 2 maintainers | detected with seed 1 by list-append |
-| bank through SQL, no maintainers | detected with seed 2 by cache integrity |
-| bank through SQL, 2 maintainers | detected with seed 2 by bank |
-| unique through SQL, no maintainers | detected with seed 3 by cache integrity |
-| unique through SQL, 2 maintainers | detected with seed 2 by unique, index consistency |
+| list-append through SQL, no maintainers | detected with seed 2 by workload invariants, damaged reads, list-append |
+| list-append through SQL, 2 maintainers | detected with seed 1 by durability, list-append |
+| bank through SQL, no maintainers | detected with seed 2 by workload invariants, cache integrity |
+| bank through SQL, 2 maintainers | detected with seed 1 by damaged reads |
+| unique through SQL, no maintainers | detected with seed 2 by cache integrity, index consistency |
+| unique through SQL, 2 maintainers | detected with seed 1 by index consistency |
 | foreign-key through SQL, no maintainers | detected with seed 1 by cache integrity |
 | foreign-key through SQL, 2 maintainers | detected with seed 2 by cache integrity |
 
 Targeted tests:
 
 - `internal/engine` `TestMutations/SegmentUnchecked_serves_a_block_whose_bytes_the_store_damaged,_and_keeps_serving_it_from_the_cache`: with the mutant, a block whose value the store damaged is served as a wrong value, and served again from the memory cache after the store returns whole bytes
+
+### `MUT-FILTER-OMITS-KEYS`
+
+`engine.Mutations.FilterOmitsKeys` leaves every other key of a segment out of its key filter, so that a point lookup of such a key skips the segment that holds its newest value and reads an older value, or none.
+
+| Configuration | Result |
+|---|---|
+| list-append through the engine, no maintainers | detected with seed 1 by durability, list-append |
+| list-append through the engine, 2 maintainers | detected with seed 1 by durability, list-append |
+| bank through the engine, no maintainers | detected with seed 1 by bank |
+| bank through the engine, 2 maintainers | detected with seed 1 by workload invariants, bank |
+| list-append through SQL, no maintainers | detected with seed 2 by durability |
+| list-append through SQL, 2 maintainers | detected with seed 1 by workload invariants, durability, list-append |
+| bank through SQL, no maintainers | detected with seed 1 by workload invariants, index consistency, bank |
+| bank through SQL, 2 maintainers | detected with seed 1 by workload invariants, index consistency, bank |
+| unique through SQL, no maintainers | detected with seed 1 by index consistency, unique |
+| unique through SQL, 2 maintainers | detected with seed 1 by unique, index consistency |
+| foreign-key through SQL, no maintainers | detected with seed 1 by foreign key |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by foreign key, final read |
+
+Targeted tests:
+
+- `internal/engine` `TestMutations/FilterOmitsKeys_makes_a_point_lookup_skip_the_segment_with_the_newest_value_of_a_key_it_left_out`: with the mutant, the filter of a segment leaves out its second key, and a point lookup of that key reads the value of an older segment
+
+### `MUT-FILTER-UNCHECKED`
+
+`engine.Mutations.FilterUnchecked` decodes the filter blocks of segments without checking their checksums, and caches what the store returns before decoding it, so that a filter block whose bytes the store damaged is trusted, or cached and trusted later. It runs with damaged reads from the store and with blocks of 128 bytes, so that segments have filter blocks.
+
+| Configuration | Result |
+|---|---|
+| list-append through the engine, no maintainers | detected with seed 20 by cache integrity |
+| list-append through the engine, 2 maintainers | detected with seed 3 by cache integrity |
+| bank through the engine, no maintainers | not applicable: the bank workload through the engine keeps four accounts, whose segments fit in one block even of 128 bytes, so no segment has a filter block |
+| bank through the engine, 2 maintainers | not applicable: the bank workload through the engine keeps four accounts, whose segments fit in one block even of 128 bytes, so no segment has a filter block |
+| list-append through SQL, no maintainers | detected with seed 1 by cache integrity |
+| list-append through SQL, 2 maintainers | detected with seed 10 by cache integrity |
+| bank through SQL, no maintainers | detected with seed 3 by cache integrity |
+| bank through SQL, 2 maintainers | detected with seed 7 by cache integrity |
+| unique through SQL, no maintainers | detected with seed 2 by cache integrity |
+| unique through SQL, 2 maintainers | detected with seed 1 by cache integrity |
+| foreign-key through SQL, no maintainers | detected with seed 12 by cache integrity |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by cache integrity |
+
+Targeted tests:
+
+- `internal/engine` `TestMutations/FilterUnchecked_trusts_a_filter_block_whose_bytes_the_store_damaged,_and_keeps_trusting_it_from_the_cache`: with the mutant, a filter block whose bits the store cleared is trusted, so that a point lookup misses the key, and the memory cache serves the damaged filter after the store returns whole bytes
 
 ### `MUT-DISK-CACHE-UNCOUNTED`
 
@@ -1528,14 +1583,14 @@ Targeted tests:
 |---|---|
 | list-append through the engine, no maintainers | detected with seed 1 by disk cache bound |
 | list-append through the engine, 2 maintainers | detected with seed 1 by disk cache bound |
-| bank through the engine, no maintainers | detected with seed 1 by disk cache bound |
-| bank through the engine, 2 maintainers | detected with seed 2 by disk cache bound |
+| bank through the engine, no maintainers | detected with seed 2 by disk cache bound |
+| bank through the engine, 2 maintainers | detected with seed 1 by disk cache bound |
 | list-append through SQL, no maintainers | detected with seed 2 by disk cache bound |
 | list-append through SQL, 2 maintainers | detected with seed 1 by disk cache bound |
 | bank through SQL, no maintainers | detected with seed 1 by disk cache bound |
 | bank through SQL, 2 maintainers | detected with seed 1 by disk cache bound |
-| unique through SQL, no maintainers | detected with seed 2 by disk cache bound |
-| unique through SQL, 2 maintainers | detected with seed 2 by disk cache bound |
+| unique through SQL, no maintainers | detected with seed 1 by disk cache bound |
+| unique through SQL, 2 maintainers | detected with seed 1 by disk cache bound |
 | foreign-key through SQL, no maintainers | detected with seed 1 by disk cache bound |
 | foreign-key through SQL, 2 maintainers | detected with seed 1 by disk cache bound |
 
@@ -1551,16 +1606,16 @@ Targeted tests:
 |---|---|
 | list-append through the engine, no maintainers | detected with seed 1 by panic |
 | list-append through the engine, 2 maintainers | detected with seed 1 by panic |
-| bank through the engine, no maintainers | detected with seed 1 by panic |
-| bank through the engine, 2 maintainers | detected with seed 1 by panic |
+| bank through the engine, no maintainers | detected with seed 2 by panic |
+| bank through the engine, 2 maintainers | detected with seed 2 by panic |
 | list-append through SQL, no maintainers | detected with seed 1 by panic |
 | list-append through SQL, 2 maintainers | detected with seed 1 by panic |
 | bank through SQL, no maintainers | detected with seed 1 by panic |
 | bank through SQL, 2 maintainers | detected with seed 1 by panic |
 | unique through SQL, no maintainers | detected with seed 1 by panic |
-| unique through SQL, 2 maintainers | detected with seed 1 by panic |
-| foreign-key through SQL, no maintainers | detected with seed 3 by panic |
-| foreign-key through SQL, 2 maintainers | detected with seed 2 by panic |
+| unique through SQL, 2 maintainers | detected with seed 2 by panic |
+| foreign-key through SQL, no maintainers | detected with seed 1 by panic |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by panic |
 
 ## Reached states
 
@@ -1595,7 +1650,9 @@ The fixed simulator corpus must reach every state at least once, or its test fai
 | `STATE-DISK-CACHE-EVICTION` | a client's disk cache evicts its least recently used entries to stay within its bound | "a disk cache evicts to stay within its bound" |
 | `STATE-DISK-CACHE-REFUSED` | a client's disk cache refuses a file that a crash damaged or removed, and the read goes to the store | "a disk cache refuses a damaged file" |
 | `STATE-DAMAGED-READ-REFUSED` | a read from the store gets damaged bytes of a block, the manifest, or a garbage batch, and fails with ErrCorrupt instead of serving or caching them | "a read of damaged bytes from the store fails with ErrCorrupt" |
+| `STATE-FILTER-SKIP` | a point lookup skips a segment whose key range holds the key, because the segment's key filter does not hold it | "a point lookup skips a segment whose filter does not hold the key" |
+| `STATE-FILTER-BLOCK-READ` | a point lookup with neither the root block nor the filter block of a segment in a cache reads both in one range read, and checks each | "a point lookup reads a filter block with its root block" |
 
 Verified by:
 
-- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, unique and foreign key violations that only a concurrent commit causes, disk caches that evict and refuse damaged files, and damaged reads from the store refused with ErrCorrupt
+- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, unique and foreign key violations that only a concurrent commit causes, disk caches that evict and refuse damaged files, damaged reads from the store refused with ErrCorrupt, and point lookups that skip segments by their key filters and read filter blocks with root blocks

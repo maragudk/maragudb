@@ -80,6 +80,19 @@ type segmentMeta struct {
 	// Tombstones among the Count entries. Manifests written before it was recorded lack it, and
 	// read as none, which only delays a merge of the whole database.
 	Tombstones int `json:"tombstones,omitempty"`
+	// Filter is the segment's key filter when it is small enough for the manifest, and
+	// FilterBlock locates it otherwise, right after the root block, when the segment has one.
+	// Segments written before filters existed have neither, and a lookup reads them as before.
+	Filter      keyFilter `json:"filter,omitempty"`
+	FilterBlock *blockRef `json:"filterBlock,omitempty"`
+}
+
+// dataBytes of the segment: its size without its filter block.
+func (s segmentMeta) dataBytes() int64 {
+	if s.FilterBlock == nil {
+		return s.Size
+	}
+	return s.Size - s.FilterBlock.Length
 }
 
 // batchRef references a chain of garbage batch objects: the newest one, which names the one
@@ -192,10 +205,15 @@ func decodeManifest(key string, b []byte) (*manifest, error) {
 }
 
 // validate what the engine relies on in a decoded manifest: that every segment's root block lies
-// within its object, that counts and sizes are not negative, and that the commit records are in
+// within its object, and its filter block right after the root block, that a filter in the
+// manifest has the structure of one, that counts and sizes are not negative, and that the commit records are in
 // order and end at most at the manifest's sequence number.
 func (m *manifest) validate() error {
 	for i, seg := range m.Segments {
+		var filterErr error
+		if seg.Filter != nil {
+			filterErr = seg.Filter.validate()
+		}
 		switch {
 		case seg.Key == "":
 			return fmt.Errorf("segment %d has no key", i)
@@ -205,6 +223,12 @@ func (m *manifest) validate() error {
 			return fmt.Errorf("the root block %d+%d of segment %q is not within its %d bytes", seg.Root.Offset, seg.Root.Length, seg.Key, seg.Size)
 		case bytes.Compare(seg.MinKey, seg.MaxKey) > 0:
 			return fmt.Errorf("segment %q has a smallest key after its largest", seg.Key)
+		case seg.Filter != nil && seg.FilterBlock != nil:
+			return fmt.Errorf("segment %q has a filter in the manifest and a filter block", seg.Key)
+		case filterErr != nil:
+			return fmt.Errorf("segment %q: %w", seg.Key, filterErr)
+		case seg.FilterBlock != nil && (seg.FilterBlock.Offset != seg.Root.Offset+seg.Root.Length || seg.FilterBlock.Length < minBlockBytes || seg.FilterBlock.Length > seg.Size-seg.FilterBlock.Offset):
+			return fmt.Errorf("the filter block %d+%d of segment %q is not right after its root block %d+%d within its %d bytes", seg.FilterBlock.Offset, seg.FilterBlock.Length, seg.Key, seg.Root.Offset, seg.Root.Length, seg.Size)
 		}
 	}
 	for i, ref := range m.Batches {

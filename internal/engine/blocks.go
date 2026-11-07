@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -23,19 +24,45 @@ func blockCacheKey(objectKey string, ref blockRef) string {
 // gives an error that wraps [ErrCorrupt].
 func (db *DB) readBlock(ctx context.Context, snapshotAt time.Time, objectKey string, ref blockRef) (*decodedBlock, error) {
 	ck := blockCacheKey(objectKey, ref)
+	if d, ok := db.cachedBlock(ck, objectKey, ref); ok {
+		return d, nil
+	}
+	body, err := db.readRange(ctx, snapshotAt, objectKey, ref)
+	if err != nil {
+		return nil, err
+	}
+	return db.storedBlock(ctx, ck, objectKey, ref, body)
+}
+
+// cachedBlock of a segment at the cache key ck, from the memory cache or the disk cache, checked.
+// It is false when neither cache has the block whole.
+func (db *DB) cachedBlock(ck, objectKey string, ref blockRef) (*decodedBlock, bool) {
+	return cachedEntry(db, ck, func(b []byte) (*decodedBlock, error) { return db.decodeBlock(objectKey, ref, b) })
+}
+
+// storedBlock checks and decodes the bytes of a block that the store returned, and caches them
+// at ck when they pass.
+func (db *DB) storedBlock(ctx context.Context, ck, objectKey string, ref blockRef, body []byte) (*decodedBlock, error) {
+	return storedEntry(ctx, db, ck, body, db.mutations.SegmentUnchecked, func(b []byte) (*decodedBlock, error) { return db.decodeBlock(objectKey, ref, b) })
+}
+
+// cachedEntry at the cache key ck, from the memory cache or the disk cache, which decode checks
+// and decodes. It is false when neither cache has the entry whole. The decoded entry is kept with
+// the bytes in the memory cache, so that a hit does not decode them again; readers share it and
+// never change it.
+func cachedEntry[T any](db *DB, ck string, decode func([]byte) (T, error)) (T, bool) {
+	var none T
 	if db.mem != nil {
-		// The decoded block is kept with the cached bytes, so that a hit does not decode them
-		// again. Readers share it and never change it.
 		if b, parsed, ok := db.mem.GetParsed(ck); ok {
-			if d, ok := parsed.(*decodedBlock); ok {
+			if v, ok := parsed.(T); ok {
 				db.memHits.Add(1)
-				return d, nil
+				return v, true
 			}
-			d, err := db.decodeBlock(objectKey, ref, b)
+			v, err := decode(b)
 			if err == nil {
 				db.memHits.Add(1)
-				db.mem.SetParsed(ck, b, d)
-				return d, nil
+				db.mem.SetParsed(ck, b, v)
+				return v, true
 			}
 			db.cacheRefused(&db.memRefused, "memory", ck, err)
 		}
@@ -43,19 +70,43 @@ func (db *DB) readBlock(ctx context.Context, snapshotAt time.Time, objectKey str
 	}
 	if db.disk != nil {
 		if b, ok := db.disk.Get(ck); ok {
-			d, err := db.decodeBlock(objectKey, ref, b)
+			v, err := decode(b)
 			if err == nil {
 				db.diskHits.Add(1)
 				if db.mem != nil {
 					db.mem.Put(ck, b)
-					db.mem.SetParsed(ck, b, d)
+					db.mem.SetParsed(ck, b, v)
 				}
-				return d, nil
+				return v, true
 			}
 			db.cacheRefused(&db.diskRefused, "disk", ck, err)
 		}
 		db.diskMisses.Add(1)
 	}
+	return none, false
+}
+
+// storedEntry checks and decodes with decode the bytes that the store returned, and caches them at
+// ck when they pass. With unchecked, for the mutations that skip a check, it caches them before it
+// decodes them.
+func storedEntry[T any](ctx context.Context, db *DB, ck string, body []byte, unchecked bool, decode func([]byte) (T, error)) (T, error) {
+	if unchecked {
+		db.cacheBytes(ck, body, nil)
+	}
+	v, err := decode(body)
+	if err != nil {
+		db.corruptRead(ctx, err)
+		return v, err
+	}
+	if !unchecked {
+		db.cacheBytes(ck, body, v)
+	}
+	return v, nil
+}
+
+// readRange of the object at objectKey from the store. A missing object means that GC deleted the
+// objects of the snapshot taken at snapshotAt, which gives [ErrSnapshotExpired].
+func (db *DB) readRange(ctx context.Context, snapshotAt time.Time, objectKey string, ref blockRef) ([]byte, error) {
 	res, err := db.getBlock(ctx, objectKey, ref)
 	if err != nil {
 		if errors.Is(err, s3.ErrNotFound) {
@@ -67,18 +118,104 @@ func (db *DB) readBlock(ctx context.Context, snapshotAt time.Time, objectKey str
 		}
 		return nil, fmt.Errorf("engine: reading block of %q: %w", objectKey, err)
 	}
-	if db.mutations.SegmentUnchecked {
-		db.cacheBlock(ck, res.Body, nil)
+	return res.Body, nil
+}
+
+// lookupFetcher for a point lookup in seg of the key whose hash is h, or nil when the segment's
+// key filter shows that the segment does not hold the key. A filter block that no cache has is
+// read together with the root block when no cache has that either, and the fetcher then serves
+// that root block without reading it again.
+func (db *DB) lookupFetcher(ctx context.Context, snapshotAt time.Time, seg segmentMeta, h uint64) (blockFetcher, error) {
+	if seg.FilterBlock == nil {
+		if !seg.Filter.mayContainHash(h) {
+			return nil, nil
+		}
+		return db.fetcher(ctx, snapshotAt, seg), nil
 	}
-	d, err := db.decodeBlock(objectKey, ref, res.Body)
+	f, root, err := db.readFilter(ctx, snapshotAt, seg)
+	switch {
+	case err != nil:
+		return nil, err
+	case !f.mayContainHash(h):
+		return nil, nil
+	}
+	fetch := db.fetcher(ctx, snapshotAt, seg)
+	if root == nil {
+		return fetch, nil
+	}
+	return func(ref blockRef) (*decodedBlock, error) {
+		if ref == seg.Root {
+			return root, nil
+		}
+		return fetch(ref)
+	}, nil
+}
+
+// readFilter reads the filter block of seg from the caches, or else from the store: alone when a
+// cache has the root block, and otherwise in one range read with the root block. It returns the
+// root block when it has it. A filter block is read alone even though a lookup of a key that the
+// segment holds then makes one GET more than without the filter, because the filter stays in the
+// cache, and saves every later lookup of a key that the segment does not hold its descent.
+func (db *DB) readFilter(ctx context.Context, snapshotAt time.Time, seg segmentMeta) (keyFilter, *decodedBlock, error) {
+	ref := *seg.FilterBlock
+	fk := blockCacheKey(seg.Key, ref)
+	if f, ok := db.cachedFilter(fk, seg.Key, ref); ok {
+		return f, nil, nil
+	}
+	rk := blockCacheKey(seg.Key, seg.Root)
+	if root, ok := db.cachedBlock(rk, seg.Key, seg.Root); ok {
+		body, err := db.readRange(ctx, snapshotAt, seg.Key, ref)
+		if err != nil {
+			return nil, nil, err
+		}
+		f, err := db.storedFilter(ctx, fk, seg.Key, ref, body)
+		if err != nil {
+			return nil, nil, err
+		}
+		return f, root, nil
+	}
+	both := blockRef{Offset: seg.Root.Offset, Length: seg.Root.Length + ref.Length}
+	body, err := db.readRange(ctx, snapshotAt, seg.Key, both)
 	if err != nil {
-		db.corruptRead(ctx, err)
+		return nil, nil, err
+	}
+	// Each block gets its own copy, so that a cached block does not pin the other.
+	n := min(len(body), int(seg.Root.Length))
+	f, err := db.storedFilter(ctx, fk, seg.Key, ref, bytes.Clone(body[n:]))
+	if err != nil {
+		return nil, nil, err
+	}
+	root, err := db.storedBlock(ctx, rk, seg.Key, seg.Root, bytes.Clone(body[:n]))
+	if err != nil {
+		return nil, nil, err
+	}
+	assert.Sometimes(true, "a point lookup reads a filter block with its root block", nil)
+	reach.Hit(ctx, reach.FilterBlockRead)
+	return f, root, nil
+}
+
+// cachedFilter of a segment at the cache key ck, from the memory cache or the disk cache, checked.
+// It is false when neither cache has the filter whole.
+func (db *DB) cachedFilter(ck, objectKey string, ref blockRef) (keyFilter, bool) {
+	return cachedEntry(db, ck, func(b []byte) (keyFilter, error) { return db.decodeFilter(objectKey, ref, b) })
+}
+
+// storedFilter checks and decodes the bytes of a filter block that the store returned, and caches
+// them at ck when they pass.
+func (db *DB) storedFilter(ctx context.Context, ck, objectKey string, ref blockRef, body []byte) (keyFilter, error) {
+	return storedEntry(ctx, db, ck, body, db.mutations.FilterUnchecked, func(b []byte) (keyFilter, error) { return db.decodeFilter(objectKey, ref, b) })
+}
+
+// decodeFilter block of a segment, checking it unless [Mutations.FilterUnchecked] is set.
+func (db *DB) decodeFilter(objectKey string, ref blockRef, b []byte) (keyFilter, error) {
+	if !db.mutations.FilterUnchecked {
+		return decodeFilterBlock(objectKey, ref, b)
+	}
+	body, err := blockBody(objectKey, ref, b)
+	if err != nil {
 		return nil, err
 	}
-	if !db.mutations.SegmentUnchecked {
-		db.cacheBlock(ck, res.Body, d)
-	}
-	return d, nil
+	return parseFilterBlock(objectKey, ref, body)
 }
 
 // decodeBlock of a segment, checking it unless [Mutations.SegmentUnchecked] is set.
@@ -93,13 +230,13 @@ func (db *DB) decodeBlock(objectKey string, ref blockRef, b []byte) (*decodedBlo
 	return parseBlock(objectKey, ref, body)
 }
 
-// cacheBlock read from the store in the caches, with its decoded form d in the memory cache
-// unless it is nil.
-func (db *DB) cacheBlock(ck string, b []byte, d *decodedBlock) {
+// cacheBytes read from the store in the caches, with their decoded form parsed in the memory
+// cache unless it is nil.
+func (db *DB) cacheBytes(ck string, b []byte, parsed any) {
 	if db.mem != nil {
 		db.mem.Put(ck, b)
-		if d != nil {
-			db.mem.SetParsed(ck, b, d)
+		if parsed != nil {
+			db.mem.SetParsed(ck, b, parsed)
 		}
 	}
 	if db.disk != nil {
