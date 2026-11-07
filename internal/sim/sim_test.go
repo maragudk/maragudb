@@ -113,10 +113,12 @@ var corpusResults = sync.OnceValue(func() corpusSummary {
 // corpus of fixed seeds and configurations run in `make test`.
 func corpus() []sim.Config {
 	var cfgs []sim.Config
+	// Some configurations of every group get damaged reads from the store.
 	for seed := uint64(1); seed <= 40; seed++ {
 		for _, w := range []sim.Workload{sim.ListAppend, sim.Bank} {
 			cfg := sim.DefaultConfig(seed)
 			cfg.Workload = w
+			cfg.StoreDamage = seed%8 == 0
 			cfgs = append(cfgs, cfg)
 		}
 	}
@@ -159,6 +161,7 @@ func corpus() []sim.Config {
 		cfg.Workload = sim.Unique
 		cfg.SQL = true
 		cfg.Maintenance = sim.MaintenanceMode(seed % 4)
+		cfg.StoreDamage = seed%6 == 1
 		if seed%3 == 0 {
 			cfg.Clients = 10
 			cfg.ErrorRate = 0.15
@@ -176,6 +179,7 @@ func corpus() []sim.Config {
 		cfg.Workload = sim.ForeignKey
 		cfg.SQL = true
 		cfg.Maintenance = sim.MaintenanceMode(seed % 4)
+		cfg.StoreDamage = seed%6 == 1
 		if seed%3 == 0 {
 			cfg.Clients = 10
 			cfg.ErrorRate = 0.15
@@ -193,6 +197,7 @@ func corpus() []sim.Config {
 		cfg.Workload = sim.Workload(seed % 4)
 		cfg.SQL = cfg.Workload >= sim.Unique || seed%8 >= 4
 		cfg.DiskFaults = true
+		cfg.StoreDamage = seed%3 == 1
 		if seed%3 == 0 {
 			cfg.Clients = 10
 			cfg.CrashRate = 0.03
@@ -206,6 +211,7 @@ func corpus() []sim.Config {
 			cfg := sim.DefaultConfig(seed)
 			cfg.Workload = w
 			cfg.SQL = true
+			cfg.StoreDamage = seed%6 == 1
 			if seed%3 == 0 {
 				cfg.Clients = 10
 				cfg.ErrorRate = 0.15
@@ -235,6 +241,9 @@ func failReport(t *testing.T, res sim.Result) {
 		replay += fmt.Sprintf(" MAINTAINERS=%d MAINTENANCE=%s", cfg.Maintainers, maintenanceName(cfg.Maintenance))
 		if cfg.DiskFaults {
 			replay += " DISK_FAULTS=1"
+		}
+		if cfg.StoreDamage {
+			replay += " STORE_DAMAGE=1"
 		}
 	}
 	t.Errorf("%s\n\nconfiguration: %+v\n\nreplay with:\n  %s", res.Report(), cfg, replay)
@@ -273,12 +282,13 @@ func TestSimulator(t *testing.T) {
 		verify.Covers(t, "the fixed corpus, with the unique workload under the same faults, finds no two rows with the same unique value in any snapshot a reader saw or in the final state, and after every run through SQL every index of the store matches its table, and lookups through the indexes find the rows of the table", "INV-UNIQUE", "INV-INDEX-CONSISTENT")
 		verify.Covers(t, "the fixed corpus, with the foreign key workload under the same faults, finds no reference to a missing row and no row that violates a CHECK in any snapshot a reader saw, and after every run through SQL every foreign key and CHECK of the store holds", "INV-FK", "INV-CHECK")
 		verify.Covers(t, "the fixed corpus, with disk caches small enough to evict and files that crashes and the disk damage, finds no anomalies, and after every operation of every client the files of its disk cache are within the bound and all counted", "INV-DISK-CACHE-BOUND", "INV-CACHE-LOSS")
-		verify.Covers(t, "the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, unique and foreign key violations that only a concurrent commit causes, and disk caches that evict and refuse damaged files",
+		verify.Covers(t, "the fixed corpus, with reads whose bodies the store damages in every workload, through the engine and SQL, finds no anomalies: no wrong data, no cache that returns bytes that fail their check, every failure for damage an ErrCorrupt of an operation whose read the store damaged, and every failure through the engine of a known kind", "INV-DAMAGE-DETECTED")
+		verify.Covers(t, "the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, unique and foreign key violations that only a concurrent commit causes, disk caches that evict and refuse damaged files, and damaged reads from the store refused with ErrCorrupt",
 			"AC-1.3", "AC-1.4", "STATE-LOST-ACK-LANDED", "STATE-LOST-ACK-CONFLICT", "STATE-LIVE-UNKNOWN", "STATE-AUTOCOMMIT-RETRY",
 			"STATE-COMPACTION-REBASE", "STATE-COMPACTION-PARTIAL-REBASE", "STATE-COMPACTION-KEEPS-TOMBSTONE", "STATE-COMPACTION-UPPER-TIER", "STATE-COMPACTION-WINDOWS", "STATE-GC-REBASE", "STATE-GC-KEEPS-LIVE-GARBAGE", "STATE-GC-BATCH-REWRITTEN", "STATE-GC-CHAIN-DROPPED", "STATE-LEASE-TAKEOVER", "STATE-LEASE-OVERLAP",
 			"STATE-SNAPSHOT-EXPIRED-REFUSED", "STATE-BLOCK-READ-RETRY-SUCCEEDED", "STATE-CRASH-MID-COMMIT-RECOVERED",
 			"STATE-CRASH-MID-COMPACTION", "STATE-CRASH-MID-GC", "STATE-UNIQUE-AFTER-CONFLICT", "STATE-UNIQUE-VALUE-REUSED",
-			"STATE-FK-AFTER-CONFLICT", "STATE-FK-CASCADE-TABLES", "STATE-DISK-CACHE-EVICTION", "STATE-DISK-CACHE-REFUSED")
+			"STATE-FK-AFTER-CONFLICT", "STATE-FK-CASCADE-TABLES", "STATE-DISK-CACHE-EVICTION", "STATE-DISK-CACHE-REFUSED", "STATE-DAMAGED-READ-REFUSED")
 		t.Parallel()
 		c := corpusResults()
 		for _, res := range c.failed {
@@ -508,6 +518,9 @@ func TestSimulator(t *testing.T) {
 		if os.Getenv("MARAGUDB_DISK_FAULTS") != "" {
 			cfg.DiskFaults = true
 		}
+		if os.Getenv("MARAGUDB_STORE_DAMAGE") != "" {
+			cfg.StoreDamage = true
+		}
 		switch os.Getenv("MARAGUDB_MAINTENANCE") {
 		case "lease":
 			cfg.Maintenance = sim.MaintenanceLease
@@ -525,6 +538,7 @@ func TestSimulator(t *testing.T) {
 					cfg.SQLMutations = m.sqlMutations
 					cfg.DiskMutations = m.diskMutations
 					cfg.DiskFaults = cfg.DiskFaults || m.diskMutations != (cache.DiskMutations{})
+					cfg.StoreDamage = cfg.StoreDamage || m.storeDamage
 					if m.sqlMutations != (exec.Mutations{}) {
 						cfg.SQL = true
 					}
@@ -579,6 +593,7 @@ func TestSimulator(t *testing.T) {
 			cfg.OutageTimeout = time.Duration(rng.IntN(200)) * time.Millisecond
 			cfg.GracePeriod = time.Duration(50+rng.IntN(3000)) * time.Millisecond
 			cfg.DiskFaults = rng.IntN(2) == 0
+			cfg.StoreDamage = rng.IntN(2) == 0
 			res := runSim(cfg)
 			runs++
 			batch.add(res)
@@ -633,6 +648,8 @@ type mutant struct {
 	sqlMutations                  exec.Mutations
 	// diskMutations break the disk cache, and run with [sim.Config.DiskFaults].
 	diskMutations cache.DiskMutations
+	// storeDamage runs the mutant with [sim.Config.StoreDamage].
+	storeDamage bool
 	// unsimulated, for a mutant that no cell can run, is why not, and a targeted test detects it.
 	unsimulated string
 	// engineOnly, for a mutant that only the cells through the engine can run, is why the cells
@@ -957,16 +974,22 @@ func mutants() []mutant {
 		},
 		{
 			id: "MUT-DISK-CACHE-UNVERIFIED", replay: "disk-cache-unverified", name: "a disk cache that serves damaged files",
-			description:   "`cache.DiskMutations.Unverified` serves the bytes of a disk cache file without checking its header, key, length, and checksum, so that a file that a crash truncated, corrupted, or filled with another entry's content is served.",
+			description:   "`cache.DiskMutations.Unverified` serves the bytes of a disk cache file without checking its header, key, length, and checksum, so that a file that a crash truncated, corrupted, or filled with another entry's content is served. The engine checks every block and manifest it reads, so it refuses them, and the cache integrity checker finds that the cache returned them.",
 			diskMutations: cache.DiskMutations{Unverified: true},
-			engineOnly:    "a damaged table definition that the mutant serves can make the SQL layer fail an index lookup with a panic, which ends the simulation instead of a checker; the cells through the engine, which have no table definitions, and `TestDisk` of the cache detect the mutant",
-			checkers:      []string{sim.CheckerListAppend, sim.CheckerBank},
+			checkers:      []string{sim.CheckerCache},
 		},
 		{
 			id: "MUT-DISK-CACHE-SERVE-CUT-READ", replay: "disk-cache-serve-cut-read", name: "a disk cache that serves a read that an eviction cut short",
 			description:   "`cache.DiskMutations.ServeCutReads` serves a disk cache file that is shorter than its header says as it is, as a read that an eviction or a replacement cut short leaves on a file system that does not keep a removed file readable.",
 			diskMutations: cache.DiskMutations{ServeCutReads: true},
 			unsimulated:   "a disk cache read in the simulator never overlaps an eviction, because the scheduler runs one task at a time and a read of the disk cache does not yield, and a block or manifest cut short fails to decode in the engine anyway; `TestDisk` of the cache overlaps reads with evictions and detects the mutant",
+		},
+		{
+			id: "MUT-SEGMENT-UNCHECKED", replay: "segment-unchecked", name: "blocks of segments read without their checksum",
+			description: "`engine.Mutations.SegmentUnchecked` decodes the blocks of segments without checking their checksums, and caches what the store returns before decoding it, so that a block whose bytes the store damaged is served, or cached and served later. It runs with damaged reads from the store.",
+			mutations:   engine.Mutations{SegmentUnchecked: true},
+			storeDamage: true,
+			checkers:    []string{sim.CheckerCache},
 		},
 		{
 			id: "MUT-DISK-CACHE-UNCOUNTED", replay: "disk-cache-uncounted", name: "a disk cache that does not count the files of an earlier process",
@@ -1051,6 +1074,37 @@ func TestRun(t *testing.T) {
 	})
 }
 
+func TestRun_panic(t *testing.T) {
+	t.Run("a panic in the SQL layer fails the run at once with the panic's value and stack, instead of hanging it in database/sql", func(t *testing.T) {
+		verify.Covers(t, "a panic in the SQL layer under database/sql fails a simulation run within seconds, with the panic's value and the stack where it happened, instead of hanging it", "INV-DAMAGE-DETECTED")
+		t.Parallel()
+		// With seed 4, the bank workload panics in an audit, whose deferred rollback waits forever
+		// for database/sql to release the connection unless the driver recovers the panic, and the
+		// list-append workload panics in an autocommit statement.
+		for _, w := range []sim.Workload{sim.Bank, sim.ListAppend} {
+			cfg := sim.DefaultConfig(4)
+			cfg.Workload = w
+			cfg.SQL = true
+			cfg.Maintainers = 2
+			cfg.Maintenance = sim.MaintenanceLease
+			cfg.SQLMutations = exec.Mutations{PanicInScan: true}
+			done := make(chan sim.Result, 1)
+			go func() { done <- runSim(cfg) }()
+			var res sim.Result
+			select {
+			case res = <-done:
+			case <-time.After(time.Minute):
+				t.Fatalf("%v: the run hangs after a panic", cfg.Name())
+			}
+			is.True(t, res.Failed(), cfg.Name())
+			is.EqualSlice(t, []string{sim.CheckerPanic}, res.Checkers())
+			msg := res.Anomalies[len(res.Anomalies)-1].Error()
+			is.True(t, strings.Contains(msg, `exec: a scan of "`), msg)
+			is.True(t, strings.Contains(msg, "exec.(*Session).scanRows"), msg)
+		}
+	})
+}
+
 func TestMutants(t *testing.T) {
 	verify.Covers(t, "every mutant is detected by a checker in at least one simulator configuration, every configuration that cannot detect a mutant says why, and the kill matrix matches its golden file", "AC-2")
 	t.Parallel()
@@ -1121,6 +1175,7 @@ func TestMutants(t *testing.T) {
 						cfg.SQLMutations = m.sqlMutations
 						cfg.DiskMutations = m.diskMutations
 						cfg.DiskFaults = m.diskMutations != (cache.DiskMutations{})
+						cfg.StoreDamage = m.storeDamage
 						res := runSim(cfg)
 						if res.Failed() {
 							r.Status, r.Seed, r.Checkers = verify.Detected, seed, res.Checkers()
@@ -1141,7 +1196,7 @@ func TestMutants(t *testing.T) {
 					caught[name] = true
 				}
 				if r.Status == verify.Detected && c.maintainers == 0 && !slices.ContainsFunc(r.Checkers, func(name string) bool {
-					return name == sim.CheckerListAppend || name == sim.CheckerDurability || name == sim.CheckerBank || name == sim.CheckerUnique || name == sim.CheckerIndex || name == sim.CheckerForeignKey || name == sim.CheckerCheck || name == sim.CheckerRealTime || name == sim.CheckerStorage || name == sim.CheckerDiskCache
+					return name == sim.CheckerListAppend || name == sim.CheckerDurability || name == sim.CheckerBank || name == sim.CheckerUnique || name == sim.CheckerIndex || name == sim.CheckerForeignKey || name == sim.CheckerCheck || name == sim.CheckerRealTime || name == sim.CheckerStorage || name == sim.CheckerDiskCache || name == sim.CheckerCache || name == sim.CheckerDamage
 				}) {
 					t.Errorf("%v: without maintainers, a history or invariant checker must find the mutant, but only %v did", c, r.Checkers)
 				}

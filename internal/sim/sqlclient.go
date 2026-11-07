@@ -32,7 +32,7 @@ import (
 // the engine behind it. The driver's own maintenance loop stays off, because its timing would
 // not be deterministic; the clients drive maintenance steps themselves.
 func (r *run) openSQL(ctx context.Context, opts engine.Options) (*sql.DB, *engine.DB, error) {
-	d := sqldriver.New(sqldriver.Options{Engine: opts, Exec: exec.Options{Mutations: r.cfg.SQLMutations}, Maintenance: sqldriver.MaintenanceOptions{Disabled: true}})
+	d := sqldriver.New(sqldriver.Options{Engine: opts, Exec: exec.Options{Mutations: r.cfg.SQLMutations}, Maintenance: sqldriver.MaintenanceOptions{Disabled: true}, OnPanic: r.recovered})
 	c, err := sqldriver.NewConnector(d, "s3://sim/db")
 	if err != nil {
 		return nil, nil, err
@@ -191,6 +191,7 @@ func (c *client) outcomeSQL(ctx context.Context, err error) history.Outcome {
 // readErrorSQL is like [client.readError] for a transaction begun at startedAt.
 func (c *client) readErrorSQL(ctx context.Context, startedAt time.Time, err error) {
 	c.run.stats.FailedReads++
+	c.checkError(err)
 	if errors.Is(err, engine.ErrSnapshotExpired) {
 		age := c.run.sched.Now().Sub(startedAt)
 		assert.Sometimes(age >= c.run.cfg.GracePeriod, "a reader older than the grace period is told so", nil)
@@ -390,6 +391,7 @@ func (c *client) listAppendSQL(ctx context.Context) {
 			}
 			if err != nil {
 				c.run.trace("client %d: insert: %v", c.id, err)
+				c.checkError(err)
 				_ = tx.Rollback()
 				h.Complete = c.run.stamp()
 				h.Outcome = history.Failed
@@ -541,6 +543,7 @@ func (c *client) bankSQL(ctx context.Context) {
 		res, err := tx.ExecContext(ctx, query, arg, step.id)
 		if err != nil {
 			c.run.trace("client %d: update: %v", c.id, err)
+			c.checkError(err)
 			_ = tx.Rollback()
 			return
 		}

@@ -3,6 +3,8 @@ package sqldriver_test
 import (
 	"database/sql"
 	"database/sql/driver"
+	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -12,6 +14,7 @@ import (
 
 	"maragu.dev/maragudb/internal/engine"
 	"maragu.dev/maragudb/internal/s3fake"
+	"maragu.dev/maragudb/internal/sql/exec"
 	"maragu.dev/maragudb/internal/sqldriver"
 	"maragu.dev/maragudb/internal/verify"
 )
@@ -236,5 +239,75 @@ func TestConn(t *testing.T) {
 		is.Equal(t, any("18446744073709551615"), sum)
 		is.Equal(t, any("2.0000000000000000"), avg)
 		is.Equal(t, int64(3), count)
+	})
+}
+
+func TestOptions_OnPanic(t *testing.T) {
+	t.Run("turns a panic in a statement into the error OnPanic returns, discards the connection, and lets the transaction roll back", func(t *testing.T) {
+		verify.Covers(t, "with OnPanic, a panic in a statement of a transaction becomes an error, the transaction rolls back at once, and the next statement runs on a new connection", "INV-DAMAGE-DETECTED")
+		var panics []string
+		d := sqldriver.New(sqldriver.Options{
+			Engine:      engine.Options{Client: s3fake.New()},
+			Maintenance: sqldriver.MaintenanceOptions{Disabled: true},
+			Exec:        exec.Options{Mutations: exec.Mutations{PanicInScan: true}},
+			OnPanic: func(value any, stack []byte) error {
+				panics = append(panics, fmt.Sprint(value))
+				is.True(t, strings.Contains(string(stack), "scanRows"), string(stack))
+				return errors.New("recovered")
+			},
+		})
+		c, err := sqldriver.NewConnector(d, "s3://bucket/db")
+		is.NotError(t, err)
+		db := sql.OpenDB(c)
+		defer func() { _ = db.Close() }()
+		db.SetMaxOpenConns(1)
+		_, err = db.ExecContext(t.Context(), "CREATE TABLE t (id bigint PRIMARY KEY, v bigint)")
+		is.NotError(t, err)
+		_, err = db.ExecContext(t.Context(), "INSERT INTO t VALUES (1, 2)")
+		is.NotError(t, err)
+		tx, err := db.BeginTx(t.Context(), nil)
+		is.NotError(t, err)
+		var v int64
+		err = tx.QueryRowContext(t.Context(), "SELECT v FROM t WHERE v = 2").Scan(&v)
+		is.Equal(t, "recovered", fmt.Sprint(err))
+		is.EqualSlice(t, []string{`exec: a scan of "t" panics`}, panics)
+		done := make(chan error, 1)
+		go func() { done <- tx.Rollback() }()
+		select {
+		case err := <-done:
+			is.True(t, err == nil || errors.Is(err, driver.ErrBadConn), fmt.Sprint(err))
+		case <-time.After(10 * time.Second):
+			t.Fatal("the rollback hangs")
+		}
+		_, err = db.ExecContext(t.Context(), "INSERT INTO t VALUES (2, 3)")
+		is.NotError(t, err, "a new connection runs the next statement")
+	})
+	t.Run("rolls back a transaction whose statement panicked, also when it is committed", func(t *testing.T) {
+		d := sqldriver.New(sqldriver.Options{
+			Engine:      engine.Options{Client: s3fake.New()},
+			Maintenance: sqldriver.MaintenanceOptions{Disabled: true},
+			Exec:        exec.Options{Mutations: exec.Mutations{PanicInScan: true}},
+			OnPanic: func(value any, stack []byte) error {
+				return errors.New("recovered")
+			},
+		})
+		c, err := sqldriver.NewConnector(d, "s3://bucket/db")
+		is.NotError(t, err)
+		db := sql.OpenDB(c)
+		defer func() { _ = db.Close() }()
+		db.SetMaxOpenConns(1)
+		_, err = db.ExecContext(t.Context(), "CREATE TABLE t (id bigint PRIMARY KEY, v bigint)")
+		is.NotError(t, err)
+		tx, err := db.BeginTx(t.Context(), nil)
+		is.NotError(t, err)
+		_, err = tx.ExecContext(t.Context(), "INSERT INTO t VALUES (1, 2)")
+		is.NotError(t, err)
+		var v int64
+		err = tx.QueryRowContext(t.Context(), "SELECT v FROM t WHERE v = 2").Scan(&v)
+		is.Equal(t, "recovered", fmt.Sprint(err))
+		is.True(t, tx.Commit() != nil, "the commit fails")
+		var id int64
+		err = db.QueryRowContext(t.Context(), "SELECT id FROM t WHERE id = 1").Scan(&id)
+		is.Error(t, sql.ErrNoRows, err, "the insert of the transaction was rolled back")
 	})
 }

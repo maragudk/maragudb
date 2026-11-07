@@ -38,17 +38,18 @@ verification:
 # WORKLOAD=foreign-key, the last two of which run through SQL, API=sql, CORPUS=1 to use the
 # corpus configuration of that seed, workload, and API, MAINTAINERS=<n> (default 2),
 # MAINTENANCE=lease|none|overlap, DISK_FAULTS=1 for small disk caches whose files are damaged,
-# and MUTATION=<name>, where the names are in the kill matrix in
+# STORE_DAMAGE=1 for reads whose bodies the store damages, and MUTATION=<name>, where the names
+# are in the kill matrix in
 # docs/verification.md: cas, gc, gc-batch-objects-first, gc-sweep-segments-only,
 # gc-chain-first-stamp, gc-delete-referenced, compact-non-adjacent, compact-drop-tombstones,
 # compact-rebase-loses-segment, compact-rebase-on-compaction, freshness, ack, compacted-ahead,
 # fresh-snapshot, retry-unknown, index-stale-delete, unique-no-check, unique-own-writes,
 # fk-no-child-check, fk-no-parent-check, fk-own-writes, check-skip-update, subquery-stale-reads,
-# update-sees-own-writes, disk-cache-unverified, disk-cache-serve-cut-read, and
-# disk-cache-uncounted.
+# update-sees-own-writes, disk-cache-unverified, disk-cache-serve-cut-read, disk-cache-uncounted,
+# and segment-unchecked.
 .PHONY: replay
 replay:
-	MARAGUDB_SEED=$(SEED) MARAGUDB_WORKLOAD=$(WORKLOAD) MARAGUDB_API=$(API) MARAGUDB_CORPUS=$(CORPUS) MARAGUDB_MAINTAINERS=$(MAINTAINERS) MARAGUDB_MAINTENANCE=$(MAINTENANCE) MARAGUDB_DISK_FAULTS=$(DISK_FAULTS) MARAGUDB_MUTATION=$(MUTATION) go test ./internal/sim -run 'TestSimulator/replay' -count 1 -v
+	MARAGUDB_SEED=$(SEED) MARAGUDB_WORKLOAD=$(WORKLOAD) MARAGUDB_API=$(API) MARAGUDB_CORPUS=$(CORPUS) MARAGUDB_MAINTAINERS=$(MAINTAINERS) MARAGUDB_MAINTENANCE=$(MAINTENANCE) MARAGUDB_DISK_FAULTS=$(DISK_FAULTS) MARAGUDB_STORE_DAMAGE=$(STORE_DAMAGE) MARAGUDB_MUTATION=$(MUTATION) go test ./internal/sim -run 'TestSimulator/replay' -count 1 -v
 
 # Run the simulator with random seeds and configurations for SOAK_DURATION (default 5m), and
 # then the full sqllogictest corpus.

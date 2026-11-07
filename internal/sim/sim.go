@@ -141,6 +141,11 @@ type Config struct {
 	DiskFaults bool
 	// DiskMutations to break the clients' disk caches with.
 	DiskMutations cache.DiskMutations
+	// StoreDamage makes the store damage the body of one in fifty of the reads of the clients and
+	// the maintainers, with a flipped bit, a cut, or another object's bytes at the same range. The
+	// objects in the store stay whole. Without it, no read is damaged, and the earlier
+	// configurations keep their histories.
+	StoreDamage bool
 	// Trace receives one line per event when non-nil.
 	Trace func(string)
 }
@@ -286,6 +291,17 @@ const (
 	// CheckerDiskCache finds a client whose disk cache holds files that take more bytes than its
 	// bound, or more than it counts, after any of its operations.
 	CheckerDiskCache = "disk cache bound"
+	// CheckerCache finds a client whose memory or disk cache returned a block or a manifest that
+	// failed the engine's check: the cache did not keep what it was given, or the engine gave it
+	// bytes that it had not checked.
+	CheckerCache = "cache integrity"
+	// CheckerDamage finds an operation of a client that failed with [engine.ErrCorrupt] although
+	// the store damaged none of the reads of the operation, which means damaged bytes got past a
+	// check earlier, and an operation through the engine that failed with an error of no kind
+	// that the engine or the store gives, such as a block that did not decode.
+	CheckerDamage = "damaged reads"
+	// CheckerPanic is a panic in a task of the run, whose value and stack it reports.
+	CheckerPanic = "panic"
 )
 
 // Anomaly found in a run, with the checker that found it.
@@ -356,6 +372,25 @@ type run struct {
 	// ticked is the highest value of the counter of the foreign key workload that an
 	// acknowledged commit wrote.
 	ticked int64
+	// panicked is the first panic that the SQL driver recovered, with the stack where it
+	// happened, which the task that made the call panics with again once the call returned.
+	panicked *sched.TaskPanic
+}
+
+// recovered records a panic that the SQL driver recovered, and returns the error that the call
+// returns instead, so that database/sql unwinds without leaving its locks held.
+func (r *run) recovered(value any, stack []byte) error {
+	if r.panicked == nil {
+		r.panicked = &sched.TaskPanic{Value: value, Stack: stack}
+	}
+	return fmt.Errorf("sim: the call panicked: %v", value)
+}
+
+// repanic with the panic that the SQL driver recovered, if any, so that the run fails with it.
+func (r *run) repanic() {
+	if r.panicked != nil {
+		panic(r.panicked)
+	}
 }
 
 // goTask starts a scheduled task whose context counts the states it reaches.
@@ -377,9 +412,36 @@ func (r *run) stamp() time.Duration {
 
 const initialBalance = 100
 
-// Run a simulation.
-func Run(cfg Config) Result {
+// damageRate of the reads of the run's store.
+func damageRate(cfg Config) float64 {
+	if cfg.StoreDamage {
+		return 0.02
+	}
+	return 0
+}
+
+// Run a simulation. A panic in a task of the run ends it at once, with the panic as the
+// anomaly of [CheckerPanic].
+func Run(cfg Config) (res Result) {
 	r := &run{cfg: cfg}
+	defer func() {
+		p := recover()
+		if p == nil {
+			return
+		}
+		tp, ok := p.(*sched.TaskPanic)
+		if !ok {
+			panic(p)
+		}
+		if inner, ok := tp.Value.(*sched.TaskPanic); ok {
+			// A panic that the SQL driver recovered, which the task panicked with again.
+			inner.Task = tp.Task
+			tp = inner
+		}
+		err := error(tp)
+		r.trace("ANOMALY %v", err)
+		res = Result{Config: cfg, History: r.txs, Audits: r.audits, Stats: r.stats, Reached: r.reached.Counts(), Anomalies: append(r.anoms, &Anomaly{Checker: CheckerPanic, Err: err})}
+	}()
 	r.sched = sched.New(time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC))
 	r.rng = rand.New(rand.NewPCG(cfg.Seed, 0x5ca1ab1e))
 	r.fake = s3fake.New(s3fake.WithClock(r.sched), s3fake.WithFaults(s3fake.Faults{
@@ -391,6 +453,7 @@ func Run(cfg Config) Result {
 		OutageRate:    cfg.OutageRate,
 		MaxOutage:     cfg.MaxOutage,
 		OutageTimeout: cfg.OutageTimeout,
+		DamageRate:    damageRate(cfg),
 	}))
 	if cfg.Trace != nil {
 		r.fake.Log = func(line string) {
@@ -427,7 +490,7 @@ func Run(cfg Config) Result {
 	r.stats.Elapsed = r.sched.Elapsed()
 	r.stats.Outages = r.fake.Outages()
 
-	res := Result{Config: cfg, History: r.txs, Audits: r.audits, Stats: r.stats, Reached: r.reached.Counts()}
+	res = Result{Config: cfg, History: r.txs, Audits: r.audits, Stats: r.stats, Reached: r.reached.Counts()}
 	var final map[string][]int64
 	var balances map[string]int64
 	var err error
@@ -711,6 +774,13 @@ type client struct {
 	db        *engine.DB
 	// sql is the database/sql handle when the run goes through SQL.
 	sql *sql.DB
+	// engine is the engine of the current process, through SQL or not, and refused the blocks and
+	// manifests that its caches returned and that failed their check, when last looked at.
+	engine  *engine.DB
+	refused int64
+	// damagedAt is the number of the client's reads that the store had damaged when its current
+	// operation began.
+	damagedAt int
 	// maint is the client's maintainer in the maintenance modes.
 	maint *engine.Maintainer
 	next  int64
@@ -741,16 +811,20 @@ func (c *client) loop(ctx context.Context) {
 			}
 			if err != nil {
 				c.run.trace("client %d: open: %v", c.id, err)
+				c.run.repanic()
 				c.afterCrash()
 				c.run.sched.Sleep(ctx, time.Duration(c.rng.Int64N(int64(10*time.Millisecond))))
 				i--
 				continue
 			}
+			c.engine, c.refused = db, 0
+			c.checkCache()
 			if opts, ok := c.run.maintenanceOptions(c.id); ok {
 				c.maint = db.NewMaintainer(opts)
 			}
 		}
 		pctx := s3fake.WithProcess(ctx, c.proc)
+		c.damagedAt = c.run.fake.Damaged(c.proc.Name)
 		switch {
 		case c.run.cfg.Workload == Unique:
 			c.uniqueSQL(pctx)
@@ -765,14 +839,18 @@ func (c *client) loop(ctx context.Context) {
 		default:
 			c.bankTx(pctx)
 		}
+		c.run.repanic()
 		c.checkDisk(ctx)
+		c.checkCache()
 		if names := c.files.Names(); c.run.cfg.DiskFaults && len(names) > 0 && c.diskRng.IntN(8) == 0 {
 			c.damageFile(names[c.diskRng.IntN(len(names))])
 		}
 		c.afterCrash()
 		if c.maint != nil && c.rng.IntN(3) == 0 {
 			c.step(pctx)
+			c.run.repanic()
 			c.checkDisk(ctx)
+			c.checkCache()
 			c.afterCrash()
 		}
 		c.run.sched.Sleep(ctx, time.Duration(c.rng.Int64N(int64(5*time.Millisecond))))
@@ -815,6 +893,7 @@ func (c *client) afterCrash() {
 		c.run.trace("client %d: crashed at %s, restarting", c.id, step)
 		c.run.stats.Crashes++
 		c.db = nil
+		c.engine = nil
 		c.maint = nil
 		c.closeSQL()
 		c.proc = nil
@@ -861,6 +940,43 @@ func (c *client) checkDisk(ctx context.Context) {
 		reach.Hit(ctx, reach.DiskCacheRefused)
 	}
 	c.diskStats = s
+}
+
+// checkCache checks that the caches of the client's engine returned no block or manifest that
+// failed its check since it was last looked at.
+func (c *client) checkCache() {
+	if c.engine == nil {
+		return
+	}
+	s := c.engine.Stats()
+	if refused := s.MemoryCacheRefused + s.DiskCacheRefused; refused > c.refused {
+		c.run.anomaly(CheckerCache, "client %d: its caches returned %d blocks or manifests that failed their check, %d from memory and %d from disk", c.id, refused-c.refused, s.MemoryCacheRefused, s.DiskCacheRefused)
+		c.refused = refused
+	}
+}
+
+// checkError of an operation of the client: an [engine.ErrCorrupt] needs a read of the operation
+// that the store damaged, and through the engine, every error must be of a kind that the engine
+// or the store gives.
+func (c *client) checkError(err error) {
+	if err == nil {
+		return
+	}
+	if errors.Is(err, engine.ErrCorrupt) {
+		if c.run.fake.Damaged(c.proc.Name) == c.damagedAt {
+			c.run.anomaly(CheckerDamage, "client %d: an operation fails with %v, but the store damaged none of its reads", c.id, err)
+		}
+		return
+	}
+	if c.run.cfg.SQL {
+		return
+	}
+	for _, known := range []error{engine.ErrConflict, engine.ErrCommitUnknown, engine.ErrSnapshotExpired, s3fake.ErrInjected, s3fake.ErrUnavailable, s3fake.ErrCrashed} {
+		if errors.Is(err, known) {
+			return
+		}
+	}
+	c.run.anomaly(CheckerDamage, "client %d: an operation fails with an error of no kind that the engine or the store gives: %v", c.id, err)
 }
 
 // damageDisk as a crash can: a third of the files of the disk cache are damaged, and the write in
@@ -931,6 +1047,7 @@ func (c *client) value() int64 {
 // transaction is younger than the grace period.
 func (c *client) readError(ctx context.Context, tx *engine.Tx, err error) {
 	c.run.stats.FailedReads++
+	c.checkError(err)
 	if errors.Is(err, engine.ErrSnapshotExpired) {
 		age := c.run.sched.Now().Sub(tx.StartedAt())
 		assert.Sometimes(age >= c.run.cfg.GracePeriod, "a reader older than the grace period is told so", nil)
@@ -952,6 +1069,7 @@ func (c *client) record(tx history.Tx) {
 // outcome of a commit. Only [engine.ErrCommitUnknown] is ambiguous; every other error means
 // the transaction was not applied.
 func (c *client) outcome(ctx context.Context, err error) history.Outcome {
+	c.checkError(err)
 	if errors.Is(err, s3fake.ErrUnavailable) {
 		c.run.stats.Unavailable++
 	}
@@ -1010,6 +1128,7 @@ func (c *client) listAppendTx(ctx context.Context) {
 	}
 	if err != nil {
 		c.run.trace("client %d: begin: %v", c.id, err)
+		c.checkError(err)
 		return
 	}
 	for _, p := range plans {
@@ -1082,6 +1201,7 @@ func (c *client) bankTx(ctx context.Context) {
 	if c.rng.IntN(3) == 0 {
 		tx, err := c.db.BeginReadOnly(ctx)
 		if err != nil {
+			c.checkError(err)
 			return
 		}
 		balances := map[string]int64{}
@@ -1113,6 +1233,7 @@ func (c *client) bankTx(ctx context.Context) {
 	amount := int64(1 + c.rng.IntN(initialBalance/2))
 	tx, err := c.db.Begin(ctx)
 	if err != nil {
+		c.checkError(err)
 		return
 	}
 	read := func(key string) (int64, bool) {
@@ -1210,6 +1331,7 @@ func (m *maintainer) loop(ctx context.Context) {
 			}
 		}
 		n, err := m.db.GC(pctx)
+		m.run.repanic()
 		if crashed, _ := m.proc.Crashed(); crashed {
 			assert.Sometimes(true, "a process crashes during a GC pass", nil)
 			reach.Hit(ctx, reach.CrashMidGC)

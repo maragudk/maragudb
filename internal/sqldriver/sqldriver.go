@@ -17,6 +17,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"reflect"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -48,6 +49,14 @@ type Options struct {
 	// Maintenance in the background for every database.
 	Maintenance MaintenanceOptions
 	Logger      *slog.Logger
+	// OnPanic, when set, recovers a panic in a call into a connection, a statement, or a
+	// transaction, and the call returns the error that OnPanic returns for the panic's value and
+	// stack. The connection is broken afterwards: its transaction cannot commit, and database/sql
+	// discards it. The panic may have left the engine with locks held or state half changed, so
+	// OnPanic is for a caller that ends soon after, such as a test that fails on the panic.
+	// Without OnPanic, a panic goes on to the caller, through database/sql, which can leave its
+	// locks held.
+	OnPanic func(value any, stack []byte) error
 }
 
 // MaintenanceOptions for the background loop that compacts and garbage collects a database.
@@ -212,7 +221,7 @@ func (c *Connector) Connect(ctx context.Context) (driver.Conn, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Conn{db: db, session: exec.NewSession(db, c.d.opts.Exec)}, nil
+	return &Conn{db: db, session: exec.NewSession(db, c.d.opts.Exec), onPanic: c.d.opts.OnPanic}, nil
 }
 
 // Driver of the connector.
@@ -262,6 +271,21 @@ type Conn struct {
 	// owner is the connector to close with the connection, when the connection was opened
 	// without one.
 	owner *Connector
+	// onPanic is [Options.OnPanic], and broken is set once it recovered a panic.
+	onPanic func(value any, stack []byte) error
+	broken  bool
+}
+
+// recoverPanic, deferred in every call into the session, recovers a panic when [Options.OnPanic]
+// is set, sets err to what OnPanic returns, and breaks the connection.
+func (c *Conn) recoverPanic(err *error) {
+	if c.onPanic == nil {
+		return
+	}
+	if p := recover(); p != nil {
+		c.broken = true
+		*err = c.onPanic(p, debug.Stack())
+	}
 }
 
 // DB is the storage engine the connection belongs to.
@@ -275,7 +299,8 @@ func (c *Conn) Prepare(query string) (driver.Stmt, error) {
 }
 
 // PrepareContext parses the statement.
-func (c *Conn) PrepareContext(_ context.Context, query string) (driver.Stmt, error) {
+func (c *Conn) PrepareContext(_ context.Context, query string) (_ driver.Stmt, err error) {
+	defer c.recoverPanic(&err)
 	st, err := c.session.Prepare(query)
 	if err != nil {
 		return nil, err
@@ -284,8 +309,8 @@ func (c *Conn) PrepareContext(_ context.Context, query string) (driver.Stmt, err
 }
 
 // Close the connection.
-func (c *Conn) Close() error {
-	var err error
+func (c *Conn) Close() (err error) {
+	defer c.recoverPanic(&err)
 	if c.session.InTx() {
 		err = c.session.Rollback()
 	}
@@ -304,7 +329,11 @@ func (c *Conn) Begin() (driver.Tx, error) {
 
 // BeginTx begins a transaction. Read-only transactions never conflict. The isolation level must
 // be the default or serializable, which is the only level there is.
-func (c *Conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, error) {
+func (c *Conn) BeginTx(ctx context.Context, opts driver.TxOptions) (_ driver.Tx, err error) {
+	defer c.recoverPanic(&err)
+	if c.broken {
+		return nil, driver.ErrBadConn
+	}
 	switch sql.IsolationLevel(opts.Isolation) {
 	case sql.LevelDefault, sql.LevelSerializable:
 	default:
@@ -317,7 +346,8 @@ func (c *Conn) BeginTx(ctx context.Context, opts driver.TxOptions) (driver.Tx, e
 }
 
 // ExecContext runs a statement without preparing it separately.
-func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (_ driver.Result, err error) {
+	defer c.recoverPanic(&err)
 	st, err := c.session.Prepare(query)
 	if err != nil {
 		return nil, err
@@ -326,7 +356,8 @@ func (c *Conn) ExecContext(ctx context.Context, query string, args []driver.Name
 }
 
 // QueryContext runs a query without preparing it separately.
-func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (_ driver.Rows, err error) {
+	defer c.recoverPanic(&err)
 	st, err := c.session.Prepare(query)
 	if err != nil {
 		return nil, err
@@ -334,7 +365,11 @@ func (c *Conn) QueryContext(ctx context.Context, query string, args []driver.Nam
 	return c.query(ctx, st, args)
 }
 
-func (c *Conn) exec(ctx context.Context, st *exec.Statement, args []driver.NamedValue) (driver.Result, error) {
+func (c *Conn) exec(ctx context.Context, st *exec.Statement, args []driver.NamedValue) (_ driver.Result, err error) {
+	defer c.recoverPanic(&err)
+	if c.broken {
+		return nil, driver.ErrBadConn
+	}
 	params, err := toValues(st, args)
 	if err != nil {
 		return nil, err
@@ -346,7 +381,11 @@ func (c *Conn) exec(ctx context.Context, st *exec.Statement, args []driver.Named
 	return Result{affected: res.RowsAffected}, nil
 }
 
-func (c *Conn) query(ctx context.Context, st *exec.Statement, args []driver.NamedValue) (driver.Rows, error) {
+func (c *Conn) query(ctx context.Context, st *exec.Statement, args []driver.NamedValue) (_ driver.Rows, err error) {
+	defer c.recoverPanic(&err)
+	if c.broken {
+		return nil, driver.ErrBadConn
+	}
 	params, err := toValues(st, args)
 	if err != nil {
 		return nil, err
@@ -389,7 +428,8 @@ func (c *Conn) CheckNamedValue(nv *driver.NamedValue) error {
 }
 
 // Ping checks that the database is reachable.
-func (c *Conn) Ping(ctx context.Context) error {
+func (c *Conn) Ping(ctx context.Context) (err error) {
+	defer c.recoverPanic(&err)
 	tx, err := c.db.BeginReadOnly(ctx)
 	if err != nil {
 		return err
@@ -398,7 +438,11 @@ func (c *Conn) Ping(ctx context.Context) error {
 }
 
 // ResetSession rolls back a transaction left open with a SQL BEGIN and discards the connection.
-func (c *Conn) ResetSession(context.Context) error {
+func (c *Conn) ResetSession(context.Context) (err error) {
+	defer c.recoverPanic(&err)
+	if c.broken {
+		return driver.ErrBadConn
+	}
 	if c.session.InTx() {
 		_ = c.session.Rollback()
 		return driver.ErrBadConn
@@ -406,9 +450,10 @@ func (c *Conn) ResetSession(context.Context) error {
 	return nil
 }
 
-// IsValid reports whether the connection can be reused.
+// IsValid reports whether the connection can be reused, which it cannot once it recovered a
+// panic.
 func (c *Conn) IsValid() bool {
-	return true
+	return !c.broken
 }
 
 func toValues(st *exec.Statement, args []driver.NamedValue) ([]value.Value, error) {
@@ -504,12 +549,19 @@ type Tx struct {
 
 // Commit the transaction. It returns [engine.ErrConflict] when the transaction lost to a
 // concurrent commit.
-func (t *Tx) Commit() error {
+func (t *Tx) Commit() (err error) {
+	defer t.conn.recoverPanic(&err)
+	if t.conn.broken {
+		// A statement of the transaction panicked, so it rolls back instead.
+		_ = t.conn.session.Rollback()
+		return driver.ErrBadConn
+	}
 	return t.conn.session.Commit(t.ctx)
 }
 
 // Rollback the transaction.
-func (t *Tx) Rollback() error {
+func (t *Tx) Rollback() (err error) {
+	defer t.conn.recoverPanic(&err)
 	return t.conn.session.Rollback()
 }
 

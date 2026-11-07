@@ -3,6 +3,7 @@ package sched_test
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -74,6 +75,34 @@ func TestScheduler(t *testing.T) {
 		is.Equal(t, time.Second, s.Elapsed())
 	})
 
+	t.Run("a task that panics makes Run panic at once with the value and the task's stack, and resumes no other task", func(t *testing.T) {
+		verify.Covers(t, "a panic in a scheduled task makes Run panic at once with the panic's value and the stack of the task, instead of hanging", "INV-DAMAGE-DETECTED")
+		s := sched.New(time.Unix(0, 0))
+		var trace []string
+		s.Go("sleeper", func(ctx context.Context) {
+			trace = append(trace, "sleeper")
+			s.Sleep(ctx, time.Second)
+			trace = append(trace, "sleeper again")
+		})
+		s.Go("panicker", func(ctx context.Context) {
+			s.Sleep(ctx, time.Millisecond)
+			panicInTask()
+		})
+		var p any
+		func() {
+			defer func() { p = recover() }()
+			s.Run()
+		}()
+		tp, ok := p.(*sched.TaskPanic)
+		is.True(t, ok, fmt.Sprint(p))
+		is.Equal(t, "panicker", tp.Task)
+		is.Equal(t, "boom", fmt.Sprint(tp.Value))
+		is.True(t, strings.Contains(string(tp.Stack), "panicInTask"), string(tp.Stack))
+		is.True(t, strings.Contains(tp.Error(), "task panicker panicked: boom"), tp.Error())
+		is.EqualSlice(t, []string{"sleeper"}, trace)
+		is.Equal(t, time.Millisecond, s.Elapsed())
+	})
+
 	t.Run("panics when sleeping outside a task", func(t *testing.T) {
 		s := sched.New(time.Unix(0, 0))
 		defer func() {
@@ -82,4 +111,9 @@ func TestScheduler(t *testing.T) {
 		}()
 		s.Sleep(t.Context(), time.Second)
 	})
+}
+
+// panicInTask panics, so that a test can find it on the stack of the panic.
+func panicInTask() {
+	panic("boom")
 }

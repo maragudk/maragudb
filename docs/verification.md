@@ -10,10 +10,10 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 ## At a glance
 
-- 36 acceptance criteria (`AC-`), 25 key invariants (`INV-`), 31 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
-- 27 mutants (`MUT-`), deliberate bugs, of which 25 are detected by the simulator's checkers within 20 seeds.
-- 26 interesting states (`STATE-`) that the simulator's fixed corpus must reach.
-- 251 declarations of coverage in the tests.
+- 36 acceptance criteria (`AC-`), 26 key invariants (`INV-`), 31 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
+- 28 mutants (`MUT-`), deliberate bugs, of which 26 are detected by the simulator's checkers within 20 seeds.
+- 27 interesting states (`STATE-`) that the simulator's fixed corpus must reach.
+- 267 declarations of coverage in the tests.
 
 ## Acceptance criteria
 
@@ -43,7 +43,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/s3fake` `TestClient_Faults/a_lost_ack_hides_a_precondition_failure_too`: a lost acknowledgement also hides a precondition failure, so the client cannot tell what happened
 - `internal/s3fake` `TestClient_Faults/lost_acks_are_applied_but_reported_as_errors`: a lost acknowledgement applies the write and still reports an error
 - `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus, with injected errors, latency, lost acknowledgements, outages, and crashes, finds no anomalies with any checker and exercises every fault
-- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, unique and foreign key violations that only a concurrent commit causes, and disk caches that evict and refuse damaged files
+- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, unique and foreign key violations that only a concurrent commit causes, disk caches that evict and refuse damaged files, and damaged reads from the store refused with ErrCorrupt
 
 ### `AC-1.4`
 
@@ -52,7 +52,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/s3fake` `TestClient_Faults/a_crashed_process_cannot_make_further_requests`: a crashed process fails every later request, and other processes are unaffected
 - `internal/s3fake` `TestClient_Faults/crashes_happen_both_before_and_after_apply`: over 50 seeds, crashes happen both before and after the write is applied
 - `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus, with injected errors, latency, lost acknowledgements, outages, and crashes, finds no anomalies with any checker and exercises every fault
-- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, unique and foreign key violations that only a concurrent commit causes, and disk caches that evict and refuse damaged files
+- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, unique and foreign key violations that only a concurrent commit causes, disk caches that evict and refuse damaged files, and damaged reads from the store refused with ErrCorrupt
 
 ### `AC-1.5`
 
@@ -355,6 +355,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/cache` `TestDisk/never_serves_bytes_that_the_latest_Put_of_a_key_did_not_put,_never_holds_more_than_the_bound,_and_counts_every_file,_through_damage,_restarts,_and_evictions_and_replacements_in_the_middle_of_reads`: random operations, damaged and cut files, restarts with leftover temporary files, and evictions and replacements in the middle of reads never make a disk cache serve other bytes than the latest Put of the key, and its files never exceed the bound and are all counted
 - `internal/cache` `TestDisk/refuses_every_damaged_file_and_removes_it`: a disk cache file that is empty, truncated at any length, corrupt in any byte, of another key, or of the format without a header is a miss, and leaves the cache
 - `internal/cache` `TestDisk/serves_a_read_that_an_eviction_overlaps_whole_or_not_at_all`: an eviction of an entry in the middle of its read gives the whole value on a file system that keeps removed files readable, and a miss on one that cuts the read short, never the bytes it cut
+- `internal/engine` `TestDB_Damage/damaged_bytes_from_the_memory_or_the_disk_cache_are_a_miss,_counted,_and_read_from_the_store`: a block or manifest that a cache returns damaged is refused, counted, and read from the store, which serves the right value
 - `internal/engine` `TestDB_Stats/a_stale_disk-cached_manifest_is_refreshed_on_open`: a stale manifest in the disk cache is replaced by the store's newer one on open
 - `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus, with injected errors, latency, lost acknowledgements, outages, and crashes, finds no anomalies with any checker and exercises every fault
 - `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus, with disk caches small enough to evict and files that crashes and the disk damage, finds no anomalies, and after every operation of every client the files of its disk cache are within the bound and all counted
@@ -373,6 +374,26 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/cache` `TestDisk/never_serves_bytes_that_the_latest_Put_of_a_key_did_not_put,_never_holds_more_than_the_bound,_and_counts_every_file,_through_damage,_restarts,_and_evictions_and_replacements_in_the_middle_of_reads`: random operations, damaged and cut files, restarts with leftover temporary files, and evictions and replacements in the middle of reads never make a disk cache serve other bytes than the latest Put of the key, and its files never exceed the bound and are all counted
 - `internal/cache` `TestOpenDir/refuses_a_directory_that_another_process_has_open_until_that_process_ends,_also_by_a_crash,_and_shares_one_within_a_process`: a second process that opens a disk cache directory fails with ErrInUse while the first has it open, and opens it once the first closed it or crashed; within one process, the opens of a directory share one cache
 - `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus, with disk caches small enough to evict and files that crashes and the disk damage, finds no anomalies, and after every operation of every client the files of its disk cache are within the bound and all counted
+
+### `INV-DAMAGE-DETECTED`
+
+> Damaged bytes in an object in the store, whether a block of a segment, the manifest, a garbage batch, or a definition in the catalog, give a clear error that wraps ErrCorrupt, and damaged bytes in a cache are never served, but read from the store instead. Damaged bytes never give a panic, a hang, or wrong data.
+
+- `internal/engine` `TestDB_Damage/a_GC_pass_that_reads_a_damaged_garbage_batch_fails_with_ErrCorrupt,_and_a_later_one_succeeds`: a GC pass whose read of a garbage batch gets damaged bytes fails with ErrCorrupt and deletes nothing, and a later pass collects the garbage
+- `internal/engine` `TestDB_Damage/a_block_read_from_the_store_with_damaged_bytes_fails_with_ErrCorrupt,_is_cached_nowhere,_and_a_later_read_of_whole_bytes_succeeds`: a read of a block whose bytes the store damaged fails with ErrCorrupt and caches nothing, and the next read of whole bytes succeeds
+- `internal/engine` `TestDB_Damage/a_manifest_read_from_the_store_with_damaged_bytes_fails_the_transaction_with_ErrCorrupt,_and_a_later_one_succeeds`: a transaction whose freshness read gets a manifest that the store damaged fails with ErrCorrupt, and keeps the manifest it had
+- `internal/engine` `TestDB_Damage/damaged_bytes_from_the_memory_or_the_disk_cache_are_a_miss,_counted,_and_read_from_the_store`: a block or manifest that a cache returns damaged is refused, counted, and read from the store, which serves the right value
+- `internal/engine` `TestGarbageBatch/fails_with_ErrCorrupt_when_a_bit_of_the_batch_flips,_when_it_is_cut_short,_or_when_it_is_read_from_another_key`: every bit flip and every truncation of a garbage batch, and a garbage batch read from another key, fail with ErrCorrupt
+- `internal/engine` `TestManifest/fails_with_ErrCorrupt_when_a_bit_of_the_manifest_flips,_when_it_is_cut_short,_or_when_it_is_read_from_another_key`: every bit flip and every truncation of a manifest, and a manifest read from another key, fail with ErrCorrupt
+- `internal/engine` `TestOpen/fails_with_ErrUnsupportedManifest_on_a_manifest_of_version_1,_which_listed_stamped_garbage_itself`: a database whose manifest has an encoding without checksums fails to open with an error that names the versions, and is left as it is
+- `internal/engine` `TestSegment/every_block_fails_with_ErrCorrupt_when_a_bit_of_it_flips,_when_it_is_cut_short,_or_when_its_bytes_come_from_another_object_or_another_offset`: every bit flip and every truncation of every block of a segment, and a block read from another segment or another offset, fail with ErrCorrupt
+- `internal/s3fake` `TestClient_DamageRate/damages_the_bodies_of_reads_with_flipped_bits,_cuts,_and_the_bytes_of_other_objects_at_the_same_range,_leaves_the_objects_whole,_and_counts_the_damage_by_process`: the fake store damages the bodies of reads at a rate, with a flipped bit, a cut, or another object's bytes at the same range, while the objects stay whole
+- `internal/sched` `TestScheduler/a_task_that_panics_makes_Run_panic_at_once_with_the_value_and_the_task's_stack,_and_resumes_no_other_task`: a panic in a scheduled task makes Run panic at once with the panic's value and the stack of the task, instead of hanging
+- `internal/sim` `TestRun_panic/a_panic_in_the_SQL_layer_fails_the_run_at_once_with_the_panic's_value_and_stack,_instead_of_hanging_it_in_database/sql`: a panic in the SQL layer under database/sql fails a simulation run within seconds, with the panic's value and the stack where it happened, instead of hanging it
+- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus, with reads whose bodies the store damages in every workload, through the engine and SQL, finds no anomalies: no wrong data, no cache that returns bytes that fail their check, every failure for damage an ErrCorrupt of an operation whose read the store damaged, and every failure through the engine of a known kind
+- `internal/sql/exec` `TestCatalog/a_table_definition_that_does_not_hold_up_fails_every_statement_that_reads_it_with_ErrCorrupt,_and_never_panics`: a table definition that does not decode, names another table, has an index without columns, or a column reference, foreign key, or type out of range fails the statements that read it with ErrCorrupt, and never panics
+- `internal/sql/value` `TestEncodeRow/rejects_values_that_no_write_stores:_text_that_is_not_UTF-8,_and_times_finer_than_a_microsecond`: a row of text that is not UTF-8, or of a time finer than a microsecond, fails to decode with ErrCorruptRow
+- `internal/sqldriver` `TestOptions_OnPanic/turns_a_panic_in_a_statement_into_the_error_OnPanic_returns,_discards_the_connection,_and_lets_the_transaction_roll_back`: with OnPanic, a panic in a statement of a transaction becomes an error, the transaction rolls back at once, and the next statement runs on a new connection
 
 ### `INV-REGISTER`
 
@@ -850,8 +871,9 @@ Every mutant runs in every simulator configuration below, with seeds 1 to 20, un
 | `MUT-CHECK-SKIP-UPDATE` CHECK on INSERT only | 2 of 8 configurations | 5 | check constraint |
 | `MUT-SUBQUERY-STALE-READS` subquery reads that a retry does not repeat | 2 of 2 configurations | 2 | durability, list-append |
 | `MUT-UPDATE-SEES-OWN-WRITES` an UPDATE that revisits the rows it wrote | 0 of 8 configurations | none |  |
-| `MUT-DISK-CACHE-UNVERIFIED` a disk cache that serves damaged files | 4 of 4 configurations | 2 | bank, list-append, workload invariants |
+| `MUT-DISK-CACHE-UNVERIFIED` a disk cache that serves damaged files | 12 of 12 configurations | 1 | cache integrity |
 | `MUT-DISK-CACHE-SERVE-CUT-READ` a disk cache that serves a read that an eviction cut short | 0 of 0 configurations | none |  |
+| `MUT-SEGMENT-UNCHECKED` blocks of segments read without their checksum | 12 of 12 configurations | 1 | bank, cache integrity, index consistency, list-append, unique, workload invariants |
 | `MUT-DISK-CACHE-UNCOUNTED` a disk cache that does not count the files of an earlier process | 12 of 12 configurations | 1 | disk cache bound |
 
 ### `MUT-COMMIT-WITHOUT-CAS`
@@ -908,7 +930,7 @@ Targeted tests:
 | Configuration | Result |
 |---|---|
 | list-append through the engine, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| list-append through the engine, 2 maintainers | detected with seed 1 by storage |
+| list-append through the engine, 2 maintainers | detected with seed 2 by storage |
 | bank through the engine, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
 | bank through the engine, 2 maintainers | detected with seed 1 by storage |
 | list-append through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
@@ -1004,7 +1026,7 @@ Targeted tests:
 | bank through the engine, no maintainers | not applicable: without maintainers nothing compacts |
 | bank through the engine, 2 maintainers | detected with seed 1 by bank |
 | list-append through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| list-append through SQL, 2 maintainers | detected with seed 2 by durability, list-append |
+| list-append through SQL, 2 maintainers | detected with seed 3 by durability, list-append |
 | bank through SQL, no maintainers | not applicable: without maintainers nothing compacts |
 | bank through SQL, 2 maintainers | detected with seed 2 by index consistency, bank |
 | unique through SQL, no maintainers | not applicable: without maintainers nothing compacts |
@@ -1119,7 +1141,7 @@ Targeted tests:
 | bank through SQL, no maintainers | cannot detect: an acknowledged transfer that never landed is missing as a whole, which conserves money, and without maintainers its segment is an orphan that GC collects like that of any failed commit |
 | bank through SQL, 2 maintainers | detected with seed 2 by storage |
 | unique through SQL, no maintainers | cannot detect: an acknowledged write that never landed is missing as a whole, which leaves a consistent state, the unique workload does not check that acknowledged writes survive, and without maintainers the segment of such a write is an orphan that GC collects like any other |
-| unique through SQL, 2 maintainers | detected with seed 3 by storage |
+| unique through SQL, 2 maintainers | detected with seed 15 by storage |
 | foreign-key through SQL, no maintainers | detected with seed 2 by real-time order |
 | foreign-key through SQL, 2 maintainers | detected with seed 2 by real-time order, storage |
 
@@ -1390,22 +1412,22 @@ Targeted tests:
 
 ### `MUT-DISK-CACHE-UNVERIFIED`
 
-`cache.DiskMutations.Unverified` serves the bytes of a disk cache file without checking its header, key, length, and checksum, so that a file that a crash truncated, corrupted, or filled with another entry's content is served.
+`cache.DiskMutations.Unverified` serves the bytes of a disk cache file without checking its header, key, length, and checksum, so that a file that a crash truncated, corrupted, or filled with another entry's content is served. The engine checks every block and manifest it reads, so it refuses them, and the cache integrity checker finds that the cache returned them.
 
 | Configuration | Result |
 |---|---|
-| list-append through the engine, no maintainers | detected with seed 2 by workload invariants, list-append |
-| list-append through the engine, 2 maintainers | detected with seed 3 by list-append |
-| bank through the engine, no maintainers | detected with seed 2 by bank |
-| bank through the engine, 2 maintainers | detected with seed 2 by workload invariants |
-| list-append through SQL, no maintainers | not applicable: a damaged table definition that the mutant serves can make the SQL layer fail an index lookup with a panic, which ends the simulation instead of a checker; the cells through the engine, which have no table definitions, and `TestDisk` of the cache detect the mutant |
-| list-append through SQL, 2 maintainers | not applicable: a damaged table definition that the mutant serves can make the SQL layer fail an index lookup with a panic, which ends the simulation instead of a checker; the cells through the engine, which have no table definitions, and `TestDisk` of the cache detect the mutant |
-| bank through SQL, no maintainers | not applicable: a damaged table definition that the mutant serves can make the SQL layer fail an index lookup with a panic, which ends the simulation instead of a checker; the cells through the engine, which have no table definitions, and `TestDisk` of the cache detect the mutant |
-| bank through SQL, 2 maintainers | not applicable: a damaged table definition that the mutant serves can make the SQL layer fail an index lookup with a panic, which ends the simulation instead of a checker; the cells through the engine, which have no table definitions, and `TestDisk` of the cache detect the mutant |
-| unique through SQL, no maintainers | not applicable: a damaged table definition that the mutant serves can make the SQL layer fail an index lookup with a panic, which ends the simulation instead of a checker; the cells through the engine, which have no table definitions, and `TestDisk` of the cache detect the mutant |
-| unique through SQL, 2 maintainers | not applicable: a damaged table definition that the mutant serves can make the SQL layer fail an index lookup with a panic, which ends the simulation instead of a checker; the cells through the engine, which have no table definitions, and `TestDisk` of the cache detect the mutant |
-| foreign-key through SQL, no maintainers | not applicable: a damaged table definition that the mutant serves can make the SQL layer fail an index lookup with a panic, which ends the simulation instead of a checker; the cells through the engine, which have no table definitions, and `TestDisk` of the cache detect the mutant |
-| foreign-key through SQL, 2 maintainers | not applicable: a damaged table definition that the mutant serves can make the SQL layer fail an index lookup with a panic, which ends the simulation instead of a checker; the cells through the engine, which have no table definitions, and `TestDisk` of the cache detect the mutant |
+| list-append through the engine, no maintainers | detected with seed 1 by cache integrity |
+| list-append through the engine, 2 maintainers | detected with seed 2 by cache integrity |
+| bank through the engine, no maintainers | detected with seed 1 by cache integrity |
+| bank through the engine, 2 maintainers | detected with seed 2 by cache integrity |
+| list-append through SQL, no maintainers | detected with seed 2 by cache integrity |
+| list-append through SQL, 2 maintainers | detected with seed 1 by cache integrity |
+| bank through SQL, no maintainers | detected with seed 1 by cache integrity |
+| bank through SQL, 2 maintainers | detected with seed 1 by cache integrity |
+| unique through SQL, no maintainers | detected with seed 2 by cache integrity |
+| unique through SQL, 2 maintainers | detected with seed 2 by cache integrity |
+| foreign-key through SQL, no maintainers | detected with seed 1 by cache integrity |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by cache integrity |
 
 Targeted tests:
 
@@ -1433,6 +1455,29 @@ Targeted tests:
 Targeted tests:
 
 - `internal/cache` `TestDisk/with_the_mutant_that_serves_cut_reads,_the_random_operations_serve_bytes_that_were_not_put`: with the mutant, the random operations on a disk cache find a Get that serves a read that an eviction or a replacement cut short
+
+### `MUT-SEGMENT-UNCHECKED`
+
+`engine.Mutations.SegmentUnchecked` decodes the blocks of segments without checking their checksums, and caches what the store returns before decoding it, so that a block whose bytes the store damaged is served, or cached and served later. It runs with damaged reads from the store.
+
+| Configuration | Result |
+|---|---|
+| list-append through the engine, no maintainers | detected with seed 1 by cache integrity |
+| list-append through the engine, 2 maintainers | detected with seed 2 by cache integrity |
+| bank through the engine, no maintainers | detected with seed 2 by bank |
+| bank through the engine, 2 maintainers | detected with seed 3 by cache integrity |
+| list-append through SQL, no maintainers | detected with seed 2 by workload invariants, list-append |
+| list-append through SQL, 2 maintainers | detected with seed 1 by list-append |
+| bank through SQL, no maintainers | detected with seed 2 by cache integrity |
+| bank through SQL, 2 maintainers | detected with seed 2 by bank |
+| unique through SQL, no maintainers | detected with seed 3 by cache integrity |
+| unique through SQL, 2 maintainers | detected with seed 2 by unique, index consistency |
+| foreign-key through SQL, no maintainers | detected with seed 1 by cache integrity |
+| foreign-key through SQL, 2 maintainers | detected with seed 2 by cache integrity |
+
+Targeted tests:
+
+- `internal/engine` `TestMutations/SegmentUnchecked_serves_a_block_whose_bytes_the_store_damaged,_and_keeps_serving_it_from_the_cache`: with the mutant, a block whose value the store damaged is served as a wrong value, and served again from the memory cache after the store returns whole bytes
 
 ### `MUT-DISK-CACHE-UNCOUNTED`
 
@@ -1489,7 +1534,8 @@ The fixed simulator corpus must reach every state at least once, or its test fai
 | `STATE-FK-CASCADE-TABLES` | one statement's ON DELETE CASCADE actions delete rows in more than one table | "a cascade deletes rows in more than one table" |
 | `STATE-DISK-CACHE-EVICTION` | a client's disk cache evicts its least recently used entries to stay within its bound | "a disk cache evicts to stay within its bound" |
 | `STATE-DISK-CACHE-REFUSED` | a client's disk cache refuses a file that a crash damaged or removed, and the read goes to the store | "a disk cache refuses a damaged file" |
+| `STATE-DAMAGED-READ-REFUSED` | a read from the store gets damaged bytes of a block, the manifest, or a garbage batch, and fails with ErrCorrupt instead of serving or caching them | "a read of damaged bytes from the store fails with ErrCorrupt" |
 
 Verified by:
 
-- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, unique and foreign key violations that only a concurrent commit causes, and disk caches that evict and refuse damaged files
+- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, unique and foreign key violations that only a concurrent commit causes, disk caches that evict and refuse damaged files, and damaged reads from the store refused with ErrCorrupt

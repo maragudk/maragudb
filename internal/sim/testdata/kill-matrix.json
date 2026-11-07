@@ -224,7 +224,7 @@
         {
           "cell": "list-append through the engine, 2 maintainers",
           "status": "detected",
-          "seed": 1,
+          "seed": 2,
           "checkers": [
             "storage"
           ]
@@ -587,7 +587,7 @@
         {
           "cell": "list-append through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 3,
           "checkers": [
             "durability",
             "list-append"
@@ -1055,7 +1055,7 @@
         {
           "cell": "unique through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 3,
+          "seed": 15,
           "checkers": [
             "storage"
           ]
@@ -2012,31 +2012,30 @@
       "id": "MUT-DISK-CACHE-UNVERIFIED",
       "name": "a disk cache that serves damaged files",
       "replay": "disk-cache-unverified",
-      "description": "`cache.DiskMutations.Unverified` serves the bytes of a disk cache file without checking its header, key, length, and checksum, so that a file that a crash truncated, corrupted, or filled with another entry's content is served.",
+      "description": "`cache.DiskMutations.Unverified` serves the bytes of a disk cache file without checking its header, key, length, and checksum, so that a file that a crash truncated, corrupted, or filled with another entry's content is served. The engine checks every block and manifest it reads, so it refuses them, and the cache integrity checker finds that the cache returned them.",
       "results": [
         {
           "cell": "list-append through the engine, no maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
-            "workload invariants",
-            "list-append"
+            "cache integrity"
           ]
         },
         {
           "cell": "list-append through the engine, 2 maintainers",
           "status": "detected",
-          "seed": 3,
+          "seed": 2,
           "checkers": [
-            "list-append"
+            "cache integrity"
           ]
         },
         {
           "cell": "bank through the engine, no maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
-            "bank"
+            "cache integrity"
           ]
         },
         {
@@ -2044,48 +2043,72 @@
           "status": "detected",
           "seed": 2,
           "checkers": [
-            "workload invariants"
+            "cache integrity"
           ]
         },
         {
           "cell": "list-append through SQL, no maintainers",
-          "status": "not applicable",
-          "reason": "a damaged table definition that the mutant serves can make the SQL layer fail an index lookup with a panic, which ends the simulation instead of a checker; the cells through the engine, which have no table definitions, and `TestDisk` of the cache detect the mutant"
+          "status": "detected",
+          "seed": 2,
+          "checkers": [
+            "cache integrity"
+          ]
         },
         {
           "cell": "list-append through SQL, 2 maintainers",
-          "status": "not applicable",
-          "reason": "a damaged table definition that the mutant serves can make the SQL layer fail an index lookup with a panic, which ends the simulation instead of a checker; the cells through the engine, which have no table definitions, and `TestDisk` of the cache detect the mutant"
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "cache integrity"
+          ]
         },
         {
           "cell": "bank through SQL, no maintainers",
-          "status": "not applicable",
-          "reason": "a damaged table definition that the mutant serves can make the SQL layer fail an index lookup with a panic, which ends the simulation instead of a checker; the cells through the engine, which have no table definitions, and `TestDisk` of the cache detect the mutant"
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "cache integrity"
+          ]
         },
         {
           "cell": "bank through SQL, 2 maintainers",
-          "status": "not applicable",
-          "reason": "a damaged table definition that the mutant serves can make the SQL layer fail an index lookup with a panic, which ends the simulation instead of a checker; the cells through the engine, which have no table definitions, and `TestDisk` of the cache detect the mutant"
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "cache integrity"
+          ]
         },
         {
           "cell": "unique through SQL, no maintainers",
-          "status": "not applicable",
-          "reason": "a damaged table definition that the mutant serves can make the SQL layer fail an index lookup with a panic, which ends the simulation instead of a checker; the cells through the engine, which have no table definitions, and `TestDisk` of the cache detect the mutant"
+          "status": "detected",
+          "seed": 2,
+          "checkers": [
+            "cache integrity"
+          ]
         },
         {
           "cell": "unique through SQL, 2 maintainers",
-          "status": "not applicable",
-          "reason": "a damaged table definition that the mutant serves can make the SQL layer fail an index lookup with a panic, which ends the simulation instead of a checker; the cells through the engine, which have no table definitions, and `TestDisk` of the cache detect the mutant"
+          "status": "detected",
+          "seed": 2,
+          "checkers": [
+            "cache integrity"
+          ]
         },
         {
           "cell": "foreign-key through SQL, no maintainers",
-          "status": "not applicable",
-          "reason": "a damaged table definition that the mutant serves can make the SQL layer fail an index lookup with a panic, which ends the simulation instead of a checker; the cells through the engine, which have no table definitions, and `TestDisk` of the cache detect the mutant"
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "cache integrity"
+          ]
         },
         {
           "cell": "foreign-key through SQL, 2 maintainers",
-          "status": "not applicable",
-          "reason": "a damaged table definition that the mutant serves can make the SQL layer fail an index lookup with a panic, which ends the simulation instead of a checker; the cells through the engine, which have no table definitions, and `TestDisk` of the cache detect the mutant"
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "cache integrity"
+          ]
         }
       ]
     },
@@ -2154,6 +2177,112 @@
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "not applicable",
           "reason": "a disk cache read in the simulator never overlaps an eviction, because the scheduler runs one task at a time and a read of the disk cache does not yield, and a block or manifest cut short fails to decode in the engine anyway; `TestDisk` of the cache overlaps reads with evictions and detects the mutant"
+        }
+      ]
+    },
+    {
+      "id": "MUT-SEGMENT-UNCHECKED",
+      "name": "blocks of segments read without their checksum",
+      "replay": "segment-unchecked",
+      "description": "`engine.Mutations.SegmentUnchecked` decodes the blocks of segments without checking their checksums, and caches what the store returns before decoding it, so that a block whose bytes the store damaged is served, or cached and served later. It runs with damaged reads from the store.",
+      "results": [
+        {
+          "cell": "list-append through the engine, no maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "cache integrity"
+          ]
+        },
+        {
+          "cell": "list-append through the engine, 2 maintainers",
+          "status": "detected",
+          "seed": 2,
+          "checkers": [
+            "cache integrity"
+          ]
+        },
+        {
+          "cell": "bank through the engine, no maintainers",
+          "status": "detected",
+          "seed": 2,
+          "checkers": [
+            "bank"
+          ]
+        },
+        {
+          "cell": "bank through the engine, 2 maintainers",
+          "status": "detected",
+          "seed": 3,
+          "checkers": [
+            "cache integrity"
+          ]
+        },
+        {
+          "cell": "list-append through SQL, no maintainers",
+          "status": "detected",
+          "seed": 2,
+          "checkers": [
+            "workload invariants",
+            "list-append"
+          ]
+        },
+        {
+          "cell": "list-append through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "list-append"
+          ]
+        },
+        {
+          "cell": "bank through SQL, no maintainers",
+          "status": "detected",
+          "seed": 2,
+          "checkers": [
+            "cache integrity"
+          ]
+        },
+        {
+          "cell": "bank through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 2,
+          "checkers": [
+            "bank"
+          ]
+        },
+        {
+          "cell": "unique through SQL, no maintainers",
+          "status": "detected",
+          "seed": 3,
+          "checkers": [
+            "cache integrity"
+          ]
+        },
+        {
+          "cell": "unique through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 2,
+          "checkers": [
+            "unique",
+            "index consistency"
+          ]
+        },
+        {
+          "cell": "foreign-key through SQL, no maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "cache integrity"
+          ]
+        },
+        {
+          "cell": "foreign-key through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 2,
+          "checkers": [
+            "cache integrity"
+          ]
         }
       ]
     },

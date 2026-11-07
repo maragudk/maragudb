@@ -4,14 +4,34 @@
 // [Scheduler.Sleep], which parks it until its virtual wake-up time. The scheduler then resumes
 // the task with the earliest wake-up time (ties broken in creation order). Given the same
 // sequence of calls, the interleaving is identical on every run.
+//
+// A task that panics stops the scheduler: [Scheduler.Run] resumes no other task and panics with a
+// [*TaskPanic], which has the panic's value and the stack of the task where it happened. The
+// other tasks stay parked for good, because ending them would unwind code that may hold locks.
 package sched
 
 import (
 	"container/heap"
 	"context"
+	"fmt"
+	"runtime/debug"
 	"sync"
 	"time"
 )
+
+// TaskPanic is the value that [Scheduler.Run] panics with when a task panicked.
+type TaskPanic struct {
+	// Task is the name of the task that panicked.
+	Task string
+	// Value is what the task panicked with.
+	Value any
+	// Stack of the task's goroutine where it panicked.
+	Stack []byte
+}
+
+func (p *TaskPanic) Error() string {
+	return fmt.Sprintf("task %s panicked: %v\n%s", p.Task, p.Value, p.Stack)
+}
 
 type ctxKey struct{}
 
@@ -23,6 +43,8 @@ type Scheduler struct {
 	seq    uint64
 	queue  waiters
 	parked chan struct{}
+	// panicked is the panic of a task, once one panicked.
+	panicked *TaskPanic
 }
 
 type task struct {
@@ -70,8 +92,15 @@ func (s *Scheduler) Go(name string, f func(ctx context.Context)) {
 	ctx := context.WithValue(context.Background(), ctxKey{}, t)
 	go func() {
 		<-t.wake
+		defer func() {
+			if p := recover(); p != nil {
+				s.mu.Lock()
+				s.panicked = &TaskPanic{Task: name, Value: p, Stack: debug.Stack()}
+				s.mu.Unlock()
+			}
+			s.parked <- struct{}{}
+		}()
 		f(ctx)
-		s.parked <- struct{}{}
 	}()
 }
 
@@ -80,10 +109,15 @@ func (s *Scheduler) enqueueLocked(t *task, at time.Duration) {
 	heap.Push(&s.queue, waiter{at: at, seq: s.seq, task: t})
 }
 
-// Run tasks until all of them have finished.
+// Run tasks until all of them have finished. When a task panics, Run panics with a [*TaskPanic]
+// at once, and so does every later call. A task that blocks without sleeping blocks Run too.
 func (s *Scheduler) Run() {
 	for {
 		s.mu.Lock()
+		if p := s.panicked; p != nil {
+			s.mu.Unlock()
+			panic(p)
+		}
 		if s.queue.Len() == 0 {
 			s.mu.Unlock()
 			return
