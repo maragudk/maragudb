@@ -618,6 +618,9 @@ type mutant struct {
 	// unmaintained, for a mutant of code that only runs with maintainers, is why the cells without
 	// them do not apply.
 	unmaintained string
+	// unreached are the cells that never run the code the mutant breaks, with the reason, so that
+	// they do not apply.
+	unreached map[cell]string
 }
 
 // cell of the kill matrix: a workload, through an API, with a number of maintainers.
@@ -772,9 +775,11 @@ func mutants() []mutant {
 			description:  "`engine.Mutations.CompactDropTombstones` drops tombstones in every merge, also in one that excludes the oldest segment, so that a value that an older segment holds shows again after its delete.",
 			mutations:    engine.Mutations{CompactDropTombstones: true},
 			unmaintained: noMaintainedMerge,
-			cannot: map[cell]string{
+			unreached: map[cell]string{
 				{workload: sim.Bank, maintainers: 2}:                  "the bank workload through the engine never deletes a key, so no merge meets a tombstone",
 				{workload: sim.ListAppend, sql: true, maintainers: 2}: "the list-append workload through SQL never deletes a row, and its tables have no index besides the primary key, so no merge meets a tombstone",
+			},
+			cannot: map[cell]string{
 				{workload: sim.ForeignKey, sql: true, maintainers: 2}: "a row that the workload deleted comes back together with the rows that its delete cascaded to, which is an older consistent state, unless a later commit changed a row that they reference; 2 of the first 100 seeds reach that, the first at seed 71",
 			},
 			checkers: []string{sim.CheckerListAppend},
@@ -932,6 +937,9 @@ func (m mutant) applicable(c cell) (bool, string) {
 	}
 	if m.unmaintained != "" && c.maintainers == 0 {
 		return false, m.unmaintained
+	}
+	if reason, ok := m.unreached[c]; ok {
+		return false, reason
 	}
 	return true, ""
 }

@@ -663,7 +663,7 @@
         },
         {
           "cell": "bank through the engine, 2 maintainers",
-          "status": "undetected",
+          "status": "not applicable",
           "reason": "the bank workload through the engine never deletes a key, so no merge meets a tombstone"
         },
         {
@@ -673,7 +673,7 @@
         },
         {
           "cell": "list-append through SQL, 2 maintainers",
-          "status": "undetected",
+          "status": "not applicable",
           "reason": "the list-append workload through SQL never deletes a row, and its tables have no index besides the primary key, so no merge meets a tombstone"
         },
         {

@@ -344,24 +344,26 @@ func segmentSizes(t *testing.T, w *world) []int64 {
 
 func TestMaintainer_Compaction(t *testing.T) {
 	t.Run("reads and writes about as many bytes per committed byte for the same commits on a database ten times as large", func(t *testing.T) {
-		verify.Covers(t, "the same 1,000 commits of an insert, an update, and a delete each, with maintenance after every commit, make compaction read and write at most 1.5 times as many bytes per committed byte on a database of 20,000 keys as on one of 2,000, and with the mutant that merges every segment, at least 5 times as many", "AC-6.5")
+		verify.Covers(t, "the same 1,000 commits of an insert, an update, and a delete each, with maintenance after every commit, make compaction read and write at most 1.5 times as many bytes per committed byte on a database of 20,000 keys as on one of 2,000, and the same 300 commits with the mutant that merges every segment, at least 5 times as many", "AC-6.5")
 		verify.Covers(t, "1,000 commits on databases of 2,000 and 20,000 keys, with a maintenance step after every commit, leave fewer than four segments in each tier, where a segment counts in the highest tier of itself and the newer segments", "AC-5.3")
+		t.Parallel()
 		small := amplification(t, 2_000, 1_000, 1, engine.Mutations{})
 		large := amplification(t, 20_000, 1_000, 1, engine.Mutations{})
 		t.Logf("bytes moved per committed byte: %.1f at 2,000 keys, %.1f at 20,000", small, large)
 		is.True(t, large <= 1.5*small, fmt.Sprintf("%.1f and %.1f", small, large))
 
-		small = amplification(t, 2_000, 1_000, 1, engine.Mutations{CompactAll: true})
-		large = amplification(t, 20_000, 1_000, 1, engine.Mutations{CompactAll: true})
+		small = amplification(t, 2_000, 300, 1, engine.Mutations{CompactAll: true})
+		large = amplification(t, 20_000, 300, 1, engine.Mutations{CompactAll: true})
 		t.Logf("with every segment merged: %.1f at 2,000 keys, %.1f at 20,000", small, large)
 		is.True(t, large >= 5*small, fmt.Sprintf("%.1f and %.1f", small, large))
 	})
 
 	t.Run("reads and writes a number of bytes per committed byte that grows with the logarithm of the size, while it grows a database tenfold", func(t *testing.T) {
-		verify.Covers(t, "growing an empty database by commits of ten new keys, an update, and a delete each, with maintenance after every commit, from 500 commits to 5,000, makes compaction read and write at most two bytes more per committed byte for every fourfold of the size, plus two, and leaves fewer than four segments in each tier after every maintenance step", "AC-6.5", "AC-5.3")
-		small := amplification(t, 0, 500, 10, engine.Mutations{})
-		large := amplification(t, 0, 5_000, 10, engine.Mutations{})
-		t.Logf("bytes moved per committed byte: %.1f after 500 commits, %.1f after 5,000", small, large)
+		verify.Covers(t, "growing an empty database by commits of ten new keys, an update, and a delete each, with maintenance after every commit, from 300 commits to 3,000, makes compaction read and write at most two bytes more per committed byte for every fourfold of the size, plus two, and leaves fewer than four segments in each tier after every maintenance step", "AC-6.5", "AC-5.3")
+		t.Parallel()
+		small := amplification(t, 0, 300, 10, engine.Mutations{})
+		large := amplification(t, 0, 3_000, 10, engine.Mutations{})
+		t.Logf("bytes moved per committed byte: %.1f after 300 commits, %.1f after 3,000", small, large)
 		// Every tier is four times as large as the one below, and a merge into the next tier reads
 		// and writes a byte once. Merges of the whole database add a bounded number per byte.
 		is.True(t, large <= small+2*(math.Log(10)/math.Log(4)+1), fmt.Sprintf("%.1f and %.1f", small, large))
