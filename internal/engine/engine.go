@@ -41,6 +41,10 @@ var (
 	// ErrUnsupportedManifest is returned for a manifest in an encoding that this version does not
 	// read, such as one written by an earlier version.
 	ErrUnsupportedManifest = errors.New("engine: unsupported manifest version")
+	// ErrCorrupt is returned when an object in the store has damaged bytes: a block of a segment,
+	// the manifest, or a garbage batch that fails its checksum or does not decode, or a value
+	// that a layer above decodes from them and finds invalid. Damaged bytes are never served.
+	ErrCorrupt = errors.New("engine: corrupt data")
 )
 
 // Options for [Open].
@@ -117,6 +121,9 @@ type Mutations struct {
 	// CompactAll merges every segment whenever there are at least [Tiers.FanIn] segments, instead
 	// of the segments that the tiers make due, as compaction did before tiers.
 	CompactAll bool
+	// SegmentUnchecked decodes the blocks of segments without checking their checksums, and
+	// caches the blocks it reads from the store before decoding them.
+	SegmentUnchecked bool
 }
 
 // Stats about store requests and cache effectiveness.
@@ -126,6 +133,10 @@ type Stats struct {
 	MemoryCacheMisses int64
 	DiskCacheHits     int64
 	DiskCacheMisses   int64
+	// MemoryCacheRefused and DiskCacheRefused count the blocks and manifests that a cache returned
+	// and that failed their check, which a cache that keeps what it was given never returns. Such a
+	// read goes to the store instead.
+	MemoryCacheRefused, DiskCacheRefused int64
 	// Seq is the latest known commit sequence number.
 	Seq uint64
 	// Segments currently referenced by the latest known manifest.
@@ -174,6 +185,7 @@ type DB struct {
 	batches map[string]*garbageBatch
 
 	memHits, memMisses, diskHits, diskMisses                    atomic.Int64
+	memRefused, diskRefused                                     atomic.Int64
 	compactionsStarted, compactions, compactionRebases, deleted atomic.Int64
 	maintenanceRuns, leaseAcquisitions, leaseLosses             atomic.Int64
 	committedBytes, compactionBytesRead, compactionBytesWritten atomic.Int64
@@ -266,6 +278,8 @@ func (db *DB) Stats() Stats {
 		MemoryCacheMisses:  db.memMisses.Load(),
 		DiskCacheHits:      db.diskHits.Load(),
 		DiskCacheMisses:    db.diskMisses.Load(),
+		MemoryCacheRefused: db.memRefused.Load(),
+		DiskCacheRefused:   db.diskRefused.Load(),
 		CompactionsStarted: db.compactionsStarted.Load(),
 		Compactions:        db.compactions.Load(),
 		CompactionRebases:  db.compactionRebases.Load(),
@@ -325,33 +339,41 @@ func (db *DB) setManifest(m *manifest, etag string, fromStore bool) {
 	db.etag = etag
 	db.manifestMu.Unlock()
 	if db.disk != nil {
-		if b, err := encodeManifest(m); err == nil {
+		if b, err := encodeManifest(db.manifestKey(), m); err == nil {
 			cached, _ := json.Marshal(diskManifest{ETag: etag, Body: b})
-			db.disk.Put(db.manifestKey(), cached)
+			db.disk.Put(db.diskManifestKey(), cached)
 		}
 	}
 }
 
-// diskManifest is the disk cache's record of the last seen manifest.
+// diskManifestKey of the disk cache's record of the last seen manifest. It names the version of
+// the manifest, so that the record of an earlier version is never read.
+func (db *DB) diskManifestKey() string {
+	return fmt.Sprintf("%s@v%d", db.manifestKey(), manifestVersion)
+}
+
+// diskManifest is the disk cache's record of the last seen manifest, with the bytes of its object.
 type diskManifest struct {
-	ETag string          `json:"etag"`
-	Body json.RawMessage `json:"body"`
+	ETag string `json:"etag"`
+	Body []byte `json:"body"`
 }
 
 func (db *DB) loadManifestFromDisk() {
 	if db.disk == nil {
 		return
 	}
-	b, ok := db.disk.Get(db.manifestKey())
+	b, ok := db.disk.Get(db.diskManifestKey())
 	if !ok {
 		return
 	}
 	var dm diskManifest
-	if err := json.Unmarshal(b, &dm); err != nil {
-		return
+	err := json.Unmarshal(b, &dm)
+	var m *manifest
+	if err == nil {
+		m, err = decodeManifest(db.manifestKey(), dm.Body)
 	}
-	m, err := decodeManifest(dm.Body)
 	if err != nil {
+		db.cacheRefused(&db.diskRefused, "disk", db.diskManifestKey(), err)
 		return
 	}
 	db.manifestMu.Lock()
@@ -371,8 +393,11 @@ func (db *DB) refreshManifest(ctx context.Context) (*manifest, string, error) {
 		}
 		return nil, "", err
 	}
-	m, err := decodeManifest(res.Body)
+	m, err := decodeManifest(db.manifestKey(), res.Body)
 	if err != nil {
+		if errors.Is(err, ErrCorrupt) {
+			db.corruptRead(ctx, err)
+		}
 		return nil, "", err
 	}
 	db.setManifest(m, res.ETag, true)
@@ -391,7 +416,7 @@ func (db *DB) currentManifest(ctx context.Context) (*manifest, string, error) {
 
 func (db *DB) createManifest(ctx context.Context) error {
 	m := &manifest{Version: manifestVersion, UpdatedAt: db.now()}
-	b, err := encodeManifest(m)
+	b, err := encodeManifest(db.manifestKey(), m)
 	if err != nil {
 		return err
 	}
@@ -416,7 +441,7 @@ func (db *DB) createManifest(ctx context.Context) error {
 // number, and it is retried with the same body while the manifest is unchanged. The same
 // commit ID is reused on every attempt, so a commit can never be applied twice.
 func (db *DB) casManifest(ctx context.Context, baseEtag string, next *manifest) (string, error) {
-	body, err := encodeManifest(next)
+	body, err := encodeManifest(db.manifestKey(), next)
 	if err != nil {
 		return "", err
 	}
@@ -495,8 +520,11 @@ func (db *DB) readManifest(ctx context.Context) (*manifest, string, error) {
 	if err != nil {
 		return nil, "", err
 	}
-	m, err := decodeManifest(res.Body)
+	m, err := decodeManifest(db.manifestKey(), res.Body)
 	if err != nil {
+		if errors.Is(err, ErrCorrupt) {
+			db.corruptRead(ctx, err)
+		}
 		return nil, "", err
 	}
 	return m, res.ETag, nil

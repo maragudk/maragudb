@@ -35,6 +35,8 @@ type world struct {
 	fake  *s3fake.Client
 	// decide scripts request outcomes once set.
 	decide func(kind s3.Kind, key string) s3fake.Outcome
+	// damage scripts the bodies of reads once set.
+	damage func(key string, body []byte) []byte
 }
 
 func newWorld(t *testing.T) *world {
@@ -45,6 +47,11 @@ func newWorld(t *testing.T) *world {
 			return s3fake.OutcomeNormal
 		}
 		return w.decide(kind, key)
+	}, Damage: func(key string, body []byte) []byte {
+		if w.damage == nil {
+			return body
+		}
+		return w.damage(key, body)
 	}}))
 	return w
 }
@@ -108,6 +115,15 @@ func equalMap(t *testing.T, want, got map[string]string) {
 	is.Equal(t, fmt.Sprint(want), fmt.Sprint(got))
 }
 
+// manifestJSON of the manifest in the store, without its seal of a magic number and a checksum.
+func manifestJSON(t *testing.T, w *world) []byte {
+	t.Helper()
+	body, ok := w.fake.Body("db/manifest")
+	is.True(t, ok)
+	is.True(t, len(body) > 8 && string(body[:4]) == "mdbm", "the manifest is sealed")
+	return body[8:]
+}
+
 // garbageChain as the manifest in the store references it.
 type garbageChain struct {
 	Key       string    `json:"key"`
@@ -118,8 +134,7 @@ type garbageChain struct {
 // garbageChains that the manifest in the store references.
 func garbageChains(t *testing.T, w *world) []garbageChain {
 	t.Helper()
-	body, ok := w.fake.Body("db/manifest")
-	is.True(t, ok)
+	body := manifestJSON(t, w)
 	var m struct {
 		Batches []garbageChain `json:"batches"`
 	}
@@ -173,13 +188,14 @@ func TestOpen(t *testing.T) {
 
 	t.Run("fails with ErrUnsupportedManifest on a manifest of version 1, which listed stamped garbage itself", func(t *testing.T) {
 		verify.Covers(t, "a database whose manifest has the encoding of version 1 fails to open with an error that names the versions, and is left as it is", "AC-6.4")
+		verify.Covers(t, "a database whose manifest has an encoding without checksums fails to open with an error that names the versions, and is left as it is", "INV-DAMAGE-DETECTED")
 		w := newWorld(t)
 		v1 := `{"version":1,"seq":3,"commitID":"c3","segments":[],"garbage":[{"key":"db/seg/0000000000000001-a","unreferencedAt":"2026-01-01T00:00:00Z"}],"commits":[{"seq":3,"id":"c3"}],"updatedAt":"2026-01-01T00:00:00Z"}`
 		_, err := w.fake.Put(t.Context(), "db/manifest", []byte(v1), s3.PutOptions{})
 		is.NotError(t, err)
 		_, err = engine.Open(t.Context(), engine.Options{Client: w.fake, Prefix: "db", Now: w.clock.Now})
 		is.Error(t, engine.ErrUnsupportedManifest, err)
-		is.True(t, strings.Contains(err.Error(), "the manifest has version 1, and this version of maragudb reads only version 2"), err.Error())
+		is.True(t, strings.Contains(err.Error(), "the manifest has version 1, and this version of maragudb reads only version 3"), err.Error())
 		body, ok := w.fake.Body("db/manifest")
 		is.True(t, ok)
 		is.Equal(t, v1, string(body))
@@ -716,13 +732,12 @@ func putOldest(t *testing.T, db *engine.DB) {
 
 // smallTiers put a segment of one key and a value of 20 bytes in tier 1, and one with a shorter
 // value or a tombstone in tier 0, and never merge the whole database.
-var smallTiers = engine.Tiers{FanIn: 2, BaseBytes: 16, FullRatio: 100}
+var smallTiers = engine.Tiers{FanIn: 2, BaseBytes: 18, FullRatio: 100}
 
 // segmentKeys of the live segments that the manifest in the store lists, oldest first.
 func segmentKeys(t *testing.T, w *world) []string {
 	t.Helper()
-	body, ok := w.fake.Body("db/manifest")
-	is.True(t, ok)
+	body := manifestJSON(t, w)
 	var m struct {
 		Segments []struct {
 			Key string `json:"key"`
@@ -1385,6 +1400,156 @@ func TestDB_ReadRetries(t *testing.T) {
 	})
 }
 
+// damagedCache flips a bit of every value it returns while damaged is set.
+type damagedCache struct {
+	cache.Cache
+	damaged bool
+}
+
+func (c *damagedCache) Get(key string) ([]byte, bool) {
+	v, ok := c.Cache.Get(key)
+	if ok && c.damaged && len(v) > 0 {
+		v = bytes.Clone(v)
+		v[len(v)/2] ^= 4
+	}
+	return v, ok
+}
+
+func TestDB_Damage(t *testing.T) {
+	flip := func(key string, body []byte) []byte {
+		body[len(body)/2] ^= 1
+		return body
+	}
+
+	t.Run("a block read from the store with damaged bytes fails with ErrCorrupt, is cached nowhere, and a later read of whole bytes succeeds", func(t *testing.T) {
+		verify.Covers(t, "a read of a block whose bytes the store damaged fails with ErrCorrupt and caches nothing, and the next read of whole bytes succeeds", "INV-DAMAGE-DETECTED")
+		w := newWorld(t)
+		put(t, w.open(1, engine.Options{}), "a", "1")
+		disk := cache.NewMemory(0)
+		db := w.open(2, engine.Options{DiskCache: disk})
+		w.damage = func(key string, body []byte) []byte {
+			if strings.HasPrefix(key, "db/seg/") {
+				return flip(key, body)
+			}
+			return body
+		}
+		tx, err := db.BeginReadOnly(t.Context())
+		is.NotError(t, err)
+		_, _, err = tx.Get(t.Context(), []byte("a"))
+		is.Error(t, engine.ErrCorrupt, err)
+		is.True(t, strings.Contains(err.Error(), "fails its checksum"), err.Error())
+		is.Equal(t, 1, disk.Len(), "only the manifest is in the disk cache")
+		w.damage = nil
+		v, ok := get(t, db, "a")
+		is.True(t, ok)
+		is.Equal(t, "1", v)
+		is.Equal(t, 2, disk.Len())
+	})
+
+	t.Run("a manifest read from the store with damaged bytes fails the transaction with ErrCorrupt, and a later one succeeds", func(t *testing.T) {
+		verify.Covers(t, "a transaction whose freshness read gets a manifest that the store damaged fails with ErrCorrupt, and keeps the manifest it had", "INV-DAMAGE-DETECTED")
+		w := newWorld(t)
+		writer := w.open(1, engine.Options{})
+		put(t, writer, "a", "1")
+		db := w.open(2, engine.Options{})
+		put(t, writer, "a", "2")
+		w.damage = func(key string, body []byte) []byte {
+			if key == "db/manifest" {
+				return flip(key, body)
+			}
+			return body
+		}
+		_, err := db.BeginReadOnly(t.Context())
+		is.Error(t, engine.ErrCorrupt, err)
+		w.damage = nil
+		v, _ := get(t, db, "a")
+		is.Equal(t, "2", v)
+	})
+
+	t.Run("a database whose manifest in the store is damaged fails to open with ErrCorrupt and is left as it is", func(t *testing.T) {
+		w := newWorld(t)
+		put(t, w.open(1, engine.Options{}), "a", "1")
+		body, _ := w.fake.Body("db/manifest")
+		_, err := w.fake.Put(t.Context(), "db/manifest", flip("", bytes.Clone(body)), s3.PutOptions{})
+		is.NotError(t, err)
+		_, err = engine.Open(t.Context(), engine.Options{Client: w.fake, Prefix: "db", Now: w.clock.Now})
+		is.Error(t, engine.ErrCorrupt, err)
+		after, _ := w.fake.Body("db/manifest")
+		is.True(t, !bytes.Equal(body, after) && len(body) == len(after), "the damaged manifest is still there")
+	})
+
+	t.Run("a GC pass that reads a damaged garbage batch fails with ErrCorrupt, and a later one succeeds", func(t *testing.T) {
+		verify.Covers(t, "a GC pass whose read of a garbage batch gets damaged bytes fails with ErrCorrupt and deletes nothing, and a later pass collects the garbage", "INV-DAMAGE-DETECTED")
+		w := newWorld(t)
+		db := w.open(1, engine.Options{})
+		put(t, db, "a", "1")
+		put(t, db, "a", "2")
+		is.NotError(t, db.Compact(t.Context()))
+		_, err := db.GC(t.Context())
+		is.NotError(t, err)
+		is.True(t, len(keysWith(w, "db/gc/")) == 1, "the stamped garbage is in a batch")
+		w.clock.Sleep(t.Context(), 2*time.Hour)
+		fresh := w.open(2, engine.Options{})
+		w.damage = func(key string, body []byte) []byte {
+			if strings.HasPrefix(key, "db/gc/") {
+				return flip(key, body)
+			}
+			return body
+		}
+		n, err := fresh.GC(t.Context())
+		is.Error(t, engine.ErrCorrupt, err)
+		is.Equal(t, 0, n)
+		w.damage = nil
+		n, err = fresh.GC(t.Context())
+		is.NotError(t, err)
+		is.True(t, n >= 2, fmt.Sprint(n))
+	})
+
+	t.Run("damaged bytes from the memory or the disk cache are a miss, counted, and read from the store", func(t *testing.T) {
+		verify.Covers(t, "a block or manifest that a cache returns damaged is refused, counted, and read from the store, which serves the right value", "INV-DAMAGE-DETECTED", "INV-CACHE-LOSS")
+		w := newWorld(t)
+		disk := &damagedCache{Cache: cache.NewMemory(0)}
+		db := w.open(1, engine.Options{DiskCache: disk, MemoryCacheBytes: new(int64)})
+		put(t, db, "a", "1")
+		disk.damaged = true
+		before := db.Stats().S3.Get
+		v, ok := get(t, db, "a")
+		is.True(t, ok)
+		is.Equal(t, "1", v)
+		s := db.Stats()
+		is.Equal(t, int64(1), s.DiskCacheRefused)
+		is.Equal(t, int64(0), s.DiskCacheHits)
+		is.Equal(t, before+1, s.S3.Get, "the block came from the store")
+
+		// A process that starts on a damaged record of the manifest reads it from the store.
+		db2 := w.open(2, engine.Options{DiskCache: disk})
+		is.Equal(t, int64(1), db2.Stats().DiskCacheRefused)
+		v, _ = get(t, db2, "a")
+		is.Equal(t, "1", v)
+
+		mem := w.open(3, engine.Options{})
+		put(t, mem, "b", "2")
+		v, _ = get(t, mem, "b")
+		is.Equal(t, "2", v)
+		is.Equal(t, int64(0), mem.Stats().MemoryCacheRefused)
+	})
+
+	t.Run("checksums add no requests: a warm read makes only the freshness read, and a cold point lookup one GET per level", func(t *testing.T) {
+		w := newWorld(t)
+		db := w.open(1, engine.Options{})
+		put(t, db, "a", "1")
+		before := db.Stats().S3
+		get(t, db, "a")
+		d := db.Stats().S3.Sub(before)
+		is.Equal(t, int64(1), d.Get+d.GetConditional, "the freshness read only")
+		cold := w.open(2, engine.Options{MemoryCacheBytes: new(int64)})
+		before = cold.Stats().S3
+		get(t, cold, "a")
+		d = cold.Stats().S3.Sub(before)
+		is.Equal(t, int64(2), d.Get+d.GetConditional, "the freshness read and the root block of the one segment")
+	})
+}
+
 func TestDB_Stats(t *testing.T) {
 	t.Run("counts cache hits and misses per tier", func(t *testing.T) {
 		verify.Covers(t, "Stats counts memory and disk cache hits and misses", "INV-STATS")
@@ -1522,6 +1687,26 @@ func TestRequestBudgets(t *testing.T) {
 }
 
 func TestMutations(t *testing.T) {
+	t.Run("SegmentUnchecked serves a block whose bytes the store damaged, and keeps serving it from the cache", func(t *testing.T) {
+		verify.Covers(t, "with the mutant, a block whose value the store damaged is served as a wrong value, and served again from the memory cache after the store returns whole bytes", "MUT-SEGMENT-UNCHECKED")
+		w := newWorld(t)
+		put(t, w.open(1, engine.Options{}), "a", "1")
+		db := w.open(2, engine.Options{Mutations: engine.Mutations{SegmentUnchecked: true}})
+		w.damage = func(key string, body []byte) []byte {
+			if strings.HasPrefix(key, "db/seg/") {
+				// The value is the byte before the flags and the length of the value, and the
+				// checksum after it.
+				body[len(body)-5] = '7'
+			}
+			return body
+		}
+		v, _ := get(t, db, "a")
+		is.Equal(t, "7", v)
+		w.damage = nil
+		v, _ = get(t, db, "a")
+		is.Equal(t, "7", v)
+	})
+
 	t.Run("CommitWithoutCAS lets a stale commit overwrite a newer one", func(t *testing.T) {
 		verify.Covers(t, "with the mutant, a stale commit overwrites another process's newer commit", "MUT-COMMIT-WITHOUT-CAS")
 		w := newWorld(t)

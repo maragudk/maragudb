@@ -189,7 +189,7 @@ func TestDB(t *testing.T) {
 		if err == nil {
 			_ = rows.Close()
 		}
-		is.True(t, err != nil && strings.Contains(err.Error(), "the manifest has version 1, and this version of maragudb reads only version 2"), fmt.Sprint(err))
+		is.True(t, err != nil && strings.Contains(err.Error(), "the manifest has version 1, and this version of maragudb reads only version 3"), fmt.Sprint(err))
 	})
 
 	t.Run("round trips every type through parameters and Scan", func(t *testing.T) {
@@ -680,7 +680,8 @@ func TestMaintenance(t *testing.T) {
 				var m struct {
 					Segments json.RawMessage `json:"segments"`
 				}
-				is.NotError(t, json.Unmarshal(body, &m))
+				// The JSON of the manifest follows a magic number and a checksum of 8 bytes.
+				is.NotError(t, json.Unmarshal(body[8:], &m))
 				var segs []json.RawMessage
 				is.NotError(t, json.Unmarshal(m.Segments, &segs))
 				most = max(most, len(body))

@@ -3,6 +3,7 @@ package engine
 import (
 	"bytes"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"sort"
 	"testing"
@@ -31,27 +32,46 @@ func drawEntries(ht *hegel.T, minSize, maxSize int) []entry {
 	return entries
 }
 
-// memoryFetcher serves blocks from a segment held in memory and counts fetches.
+// testSegmentKey is the object key of the segments that the tests build.
+const testSegmentKey = "db/seg/0000000000000001-test"
+
+// memoryFetcher serves blocks from a segment held in memory at [testSegmentKey], checking them,
+// and counts fetches.
 func memoryFetcher(body []byte, fetches *int) blockFetcher {
 	return func(ref blockRef) (*decodedBlock, error) {
 		if fetches != nil {
 			*fetches++
 		}
-		if ref.Offset < 0 || ref.Offset+ref.Length > int64(len(body)) {
-			return nil, fmt.Errorf("ref %+v out of range for %d bytes", ref, len(body))
+		b, err := rangeOf(body, ref)
+		if err != nil {
+			return nil, err
 		}
-		return decodeBlock(body[ref.Offset : ref.Offset+ref.Length])
+		return decodeBlock(testSegmentKey, ref, b)
 	}
 }
 
+// rangeOf body that ref locates, as a range read of the store returns it.
+func rangeOf(body []byte, ref blockRef) ([]byte, error) {
+	if ref.Offset < 0 || ref.Length <= 0 || ref.Offset >= int64(len(body)) {
+		return nil, fmt.Errorf("ref %+v out of range for %d bytes", ref, len(body))
+	}
+	return body[ref.Offset:min(ref.Offset+ref.Length, int64(len(body)))], nil
+}
+
 func build(t testing.TB, blockSize int, entries []entry) ([]byte, segmentMeta) {
+	t.Helper()
+	return buildAt(t, testSegmentKey, blockSize, entries)
+}
+
+func buildAt(t testing.TB, key string, blockSize int, entries []entry) ([]byte, segmentMeta) {
 	t.Helper()
 	b := newSegmentBuilder(blockSize)
 	for _, e := range entries {
 		is.NotError(t, b.add(e.key, e.value, e.tombstone))
 	}
-	body, meta, err := b.finish()
+	body, meta, err := b.finish(key)
 	is.NotError(t, err)
+	is.Equal(t, key, meta.Key)
 	return body, meta
 }
 
@@ -178,7 +198,7 @@ func TestSegment(t *testing.T) {
 	})
 
 	t.Run("rejects an empty segment", func(t *testing.T) {
-		_, _, err := newSegmentBuilder(64).finish()
+		_, _, err := newSegmentBuilder(64).finish(testSegmentKey)
 		is.True(t, err != nil)
 	})
 
@@ -189,19 +209,55 @@ func TestSegment(t *testing.T) {
 		b.Write(binary.AppendUvarint(nil, 0))
 		b.Write(binary.AppendUvarint(nil, 0))
 		b.Write(binary.AppendUvarint(nil, 0))
-		body := b.Bytes()
+		body := sealBlock(testSegmentKey, 0, b.Bytes())
 		root := blockRef{Offset: 0, Length: int64(len(body))}
 		_, _, err := segmentLookup(root, []byte("k"), memoryFetcher(body, nil))
-		is.True(t, err != nil)
+		is.Error(t, ErrCorrupt, err)
 		it := newSegmentIterator(root, nil, memoryFetcher(body, nil))
 		is.True(t, !it.Valid())
-		is.True(t, it.Err() != nil)
+		is.Error(t, ErrCorrupt, it.Err())
+	})
+
+	t.Run("a walk through index blocks that share their children reads every data block once and fails instead of repeating", func(t *testing.T) {
+		// Two data blocks, then two index blocks that both point at both of them, and a root that
+		// points at both index blocks, so that a walk would read each data block twice.
+		var obj []byte
+		block := func(body []byte) blockRef {
+			ref := blockRef{Offset: int64(len(obj))}
+			obj = append(obj, sealBlock(testSegmentKey, ref.Offset, body)...)
+			ref.Length = int64(len(obj)) - ref.Offset
+			return ref
+		}
+		data := func(key string) []byte {
+			b := []byte{blockKindData, 1}
+			b = binary.AppendUvarint(b, uint64(len(key)))
+			b = append(b, key...)
+			return append(b, 0, 1, 'v')
+		}
+		index := func(keys []string, refs []blockRef) []byte {
+			b := []byte{blockKindIndex, byte(len(keys))}
+			for i, k := range keys {
+				b = binary.AppendUvarint(b, uint64(len(k)))
+				b = append(b, k...)
+				b = binary.AppendUvarint(b, uint64(refs[i].Offset))
+				b = binary.AppendUvarint(b, uint64(refs[i].Length))
+			}
+			return b
+		}
+		a, c := block(data("a")), block(data("c"))
+		x := block(index([]string{"a", "c"}, []blockRef{a, c}))
+		y := block(index([]string{"e", "g"}, []blockRef{a, c}))
+		root := block(index([]string{"a", "e"}, []blockRef{x, y}))
+		it := newSegmentIterator(root, nil, memoryFetcher(obj, nil))
+		got := collect(it)
+		is.Equal(t, 2, len(got))
+		is.Error(t, ErrCorrupt, it.Err())
 	})
 
 	t.Run("decoding arbitrary bytes never panics or allocates beyond the input", func(t *testing.T) {
 		hegel.Test(t, func(ht *hegel.T) {
 			b := hegel.Draw(ht, hegel.Binary(0, 64))
-			d, err := decodeBlock(b)
+			d, err := parseBlockBody(blockRef{Offset: 1 << 20, Length: int64(len(b))}, b)
 			if err != nil {
 				return
 			}
@@ -209,6 +265,144 @@ func TestSegment(t *testing.T) {
 				ht.Fatalf("decoded %d entries from %d bytes", len(d.entries)+len(d.index), len(b))
 			}
 		}, hegel.WithTestCases(2000))
+	})
+
+	t.Run("every block fails with ErrCorrupt when a bit of it flips, when it is cut short, or when its bytes come from another object or another offset", func(t *testing.T) {
+		verify.Covers(t, "every bit flip and every truncation of every block of a segment, and a block read from another segment or another offset, fail with ErrCorrupt", "INV-DAMAGE-DETECTED")
+		var entries []entry
+		for i := range 40 {
+			entries = append(entries, entry{key: fmt.Appendf(nil, "key-%03d", i), value: fmt.Appendf(nil, "value-%d", i), tombstone: i%7 == 3})
+		}
+		body, _ := build(t, 128, entries)
+		other, _ := buildAt(t, "db/seg/0000000000000002-other", 128, entries)
+		is.True(t, bytes.Equal(body[:10], other[:10]), "the two segments hold the same entries")
+		b := newSegmentBuilder(128)
+		for _, e := range entries {
+			is.NotError(t, b.add(e.key, e.value, e.tombstone))
+		}
+		_, _, err := b.finish(testSegmentKey)
+		is.NotError(t, err)
+		refs := b.blocks
+		is.True(t, len(refs) > 4, "the segment has several levels of blocks")
+		for _, ref := range refs {
+			block := body[ref.Offset : ref.Offset+ref.Length]
+			_, err := decodeBlock(testSegmentKey, ref, block)
+			is.NotError(t, err)
+			for i := range block {
+				for bit := range 8 {
+					damaged := bytes.Clone(block)
+					damaged[i] ^= 1 << bit
+					_, err := decodeBlock(testSegmentKey, ref, damaged)
+					is.Error(t, ErrCorrupt, err, fmt.Sprintf("block %+v with bit %d of byte %d flipped", ref, bit, i))
+				}
+			}
+			for n := range len(block) {
+				_, err := decodeBlock(testSegmentKey, ref, block[:n])
+				is.Error(t, ErrCorrupt, err, fmt.Sprintf("block %+v cut to %d bytes", ref, n))
+			}
+			_, err = decodeBlock(testSegmentKey, ref, other[ref.Offset:ref.Offset+ref.Length])
+			is.Error(t, ErrCorrupt, err, "the same block of another segment")
+			for _, at := range refs {
+				if at != ref && at.Length == ref.Length {
+					_, err := decodeBlock(testSegmentKey, at, block)
+					is.Error(t, ErrCorrupt, err, "a block of the segment at another offset")
+				}
+			}
+		}
+	})
+}
+
+// sealBlock appends the checksum of the block at offset of the object at key to body.
+func sealBlock(key string, offset int64, body []byte) []byte {
+	return binary.BigEndian.AppendUint32(bytes.Clone(body), blockChecksum(key, offset, body))
+}
+
+// FuzzSegment walks a segment of arbitrary bytes with a point lookup and a scan, which never
+// panic, loop, or read a data block twice, and fail with [ErrCorrupt] when they fail. Half of the
+// inputs get valid checksums, so that the fuzzer reaches the decoding behind them.
+func FuzzSegment(f *testing.F) {
+	var entries []entry
+	for i := range 30 {
+		entries = append(entries, entry{key: fmt.Appendf(nil, "k%02d", i), value: fmt.Appendf(nil, "v%d", i), tombstone: i%5 == 2})
+	}
+	for _, blockSize := range []int{1, 40, 200} {
+		body, meta := build(f, blockSize, entries)
+		f.Add(body, meta.Root.Offset, meta.Root.Length, []byte("k07"), false)
+		f.Add(body, meta.Root.Offset, meta.Root.Length, []byte(""), true)
+	}
+	f.Add([]byte{1, 1, 0, 0, 6, 0, 0, 0, 0}, int64(0), int64(9), []byte("k"), true)
+	f.Fuzz(func(t *testing.T, body []byte, rootOffset, rootLength int64, key []byte, reseal bool) {
+		// reseal gives every block that the walk reads a valid checksum.
+		fetch := func(ref blockRef) (*decodedBlock, error) {
+			b, err := rangeOf(body, ref)
+			if err != nil {
+				return nil, fmt.Errorf("%w: %w", ErrCorrupt, err)
+			}
+			if reseal && len(b) >= minBlockBytes {
+				b = sealBlock(testSegmentKey, ref.Offset, b[:len(b)-blockChecksumBytes])
+			}
+			return decodeBlock(testSegmentKey, ref, b)
+		}
+		root := blockRef{Offset: rootOffset, Length: rootLength}
+		if _, _, err := segmentLookup(root, key, fetch); err != nil && !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("lookup: %v", err)
+		}
+		fetches := 0
+		it := newSegmentIterator(root, key, func(ref blockRef) (*decodedBlock, error) {
+			fetches++
+			return fetch(ref)
+		})
+		var last []byte
+		for n := 0; it.Valid(); n++ {
+			if n > 0 && bytes.Compare(it.Entry().key, last) <= 0 {
+				t.Fatalf("the scan yields %q after %q", it.Entry().key, last)
+			}
+			last = it.Entry().key
+			it.Next()
+		}
+		if err := it.Err(); err != nil && !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("scan: %v", err)
+		}
+		// Every data block is read at most once, and each read of an index block leads to a read
+		// of a data block or to the end of the walk, along a path of at most maxTreeDepth blocks.
+		if bound := (len(body)/minBlockBytes + 1) * maxTreeDepth; fetches > bound {
+			t.Fatalf("the scan read %d blocks of %d bytes", fetches, len(body))
+		}
+	})
+}
+
+// FuzzBlock decodes arbitrary bytes as a block, which never panics, fails with [ErrCorrupt] when
+// it fails, and yields entries in key order.
+func FuzzBlock(f *testing.F) {
+	body, _ := build(f, 64, []entry{{key: []byte("a"), value: []byte("1")}, {key: []byte("b"), tombstone: true}, {key: []byte("c"), value: []byte("3")}})
+	f.Add(body, int64(0), true)
+	f.Add(body, int64(len(body)), false)
+	f.Add([]byte{blockKindIndex, 2, 1, 'a', 0, 6, 1, 'b', 6, 6}, int64(100), false)
+	f.Fuzz(func(t *testing.T, b []byte, offset int64, checksum bool) {
+		ref := blockRef{Offset: offset, Length: int64(len(b))}
+		var d *decodedBlock
+		var err error
+		if checksum {
+			d, err = decodeBlock(testSegmentKey, ref, b)
+		} else {
+			d, err = parseBlock(testSegmentKey, ref, b)
+		}
+		if err != nil {
+			if !errors.Is(err, ErrCorrupt) {
+				t.Fatalf("error %v does not wrap ErrCorrupt", err)
+			}
+			return
+		}
+		for i := 1; i < len(d.entries); i++ {
+			if bytes.Compare(d.entries[i-1].key, d.entries[i].key) >= 0 {
+				t.Fatalf("entries out of order")
+			}
+		}
+		for i, x := range d.index {
+			if x.ref.Offset < 0 || x.ref.Offset+x.ref.Length > offset || i > 0 && x.ref.Offset < d.index[i-1].ref.Offset+d.index[i-1].ref.Length {
+				t.Fatalf("child %+v of index entry %d of the block at %d", x.ref, i, offset)
+			}
+		}
 	})
 }
 

@@ -70,6 +70,12 @@ var (
 	// ErrSnapshotExpired is returned by a transaction older than the GC grace period, and by
 	// [Compact] and [GC] when they took longer than half of it.
 	ErrSnapshotExpired = engine.ErrSnapshotExpired
+	// ErrCorrupt is returned when an object in the store has damaged bytes: a block of a
+	// segment, the manifest, or a garbage batch that fails its checksum or does not decode, or a
+	// table definition or row that does not decode or does not hold up. The damaged data is never
+	// served. Damaged bytes in the memory or the disk cache are not served either, and the read
+	// goes to the store instead.
+	ErrCorrupt = engine.ErrCorrupt
 	// ErrUnsupported is a statement that Postgres accepts and maragudb does not, such as one
 	// that uses a feature maragudb does not have, or one whose result in Postgres would depend
 	// on its query plan or on the physical order of rows. Its message says what is unsupported

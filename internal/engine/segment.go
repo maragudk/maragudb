@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"sort"
 )
 
@@ -13,16 +14,41 @@ import (
 // Object layout: data blocks in key order, then index blocks bottom-up, then the root block.
 // The root's location is recorded in the manifest, so a lookup needs no footer read.
 //
-// Block layout: kind byte, uvarint count, then entries.
+// Block layout: kind byte, uvarint count, then entries, then a checksum.
 //   - data entry: uvarint key length, key, flags byte (bit 0: tombstone), and unless a tombstone,
 //     uvarint value length, value
 //   - index entry: uvarint first key length, first key, uvarint offset, uvarint length
+//   - checksum: four big-endian bytes, the CRC-32C of the segment's object key, of the block's
+//     offset in the object as eight big-endian bytes, and of the block's bytes before the
+//     checksum. A block read from the wrong object or the wrong offset fails it too, so a read
+//     of one block checks it without reading the rest of the object.
 //
-// An index entry covers the keys from its first key up to the next entry's first key.
+// Every block has at least one entry, and the keys of a block are strictly increasing. An index
+// entry covers the keys from its first key up to the next entry's first key, and its block lies
+// after the block of the entry before it and before the index block itself.
+//
+// The manifest's version is the version of this format too: a manifest of version 3 references
+// only segments whose blocks have checksums.
 const (
 	blockKindData  = 0
 	blockKindIndex = 1
+	// blockChecksumBytes is the size of the checksum at the end of every block.
+	blockChecksumBytes = 4
+	// minBlockBytes is the size of the smallest block: a kind, a count, and the checksum.
+	minBlockBytes = 2 + blockChecksumBytes
 )
+
+var castagnoli = crc32.MakeTable(crc32.Castagnoli)
+
+// blockChecksum of the block at offset in the object at objectKey, whose bytes before the
+// checksum are body.
+func blockChecksum(objectKey string, offset int64, body []byte) uint32 {
+	var off [8]byte
+	binary.BigEndian.PutUint64(off[:], uint64(offset))
+	crc := crc32.Update(0, castagnoli, []byte(objectKey))
+	crc = crc32.Update(crc, castagnoli, off[:])
+	return crc32.Update(crc, castagnoli, body)
+}
 
 // blockRef locates a block in its object.
 type blockRef struct {
@@ -100,18 +126,22 @@ func (b *segmentBuilder) flushBlock() {
 	b.blockN = 0
 }
 
+// writeBlock with room for its checksum, which [segmentBuilder.finish] fills in once the object
+// key is known.
 func (b *segmentBuilder) writeBlock(kind byte, n int, body []byte) blockRef {
 	offset := int64(b.buf.Len())
 	b.buf.WriteByte(kind)
 	b.buf.Write(binary.AppendUvarint(nil, uint64(n)))
 	b.buf.Write(body)
+	b.buf.Write(make([]byte, blockChecksumBytes))
 	ref := blockRef{Offset: offset, Length: int64(b.buf.Len()) - offset}
 	b.blocks = append(b.blocks, ref)
 	return ref
 }
 
-// finish the segment and return its bytes and metadata. The metadata has no key yet.
-func (b *segmentBuilder) finish() ([]byte, segmentMeta, error) {
+// finish the segment for the object at objectKey and return its bytes and metadata, with Key
+// set to objectKey.
+func (b *segmentBuilder) finish(objectKey string) ([]byte, segmentMeta, error) {
 	if b.count == 0 {
 		return nil, segmentMeta{}, errors.New("engine: empty segment")
 	}
@@ -147,7 +177,14 @@ func (b *segmentBuilder) finish() ([]byte, segmentMeta, error) {
 		flush()
 		level = next
 	}
+	out := b.buf.Bytes()
+	for _, ref := range b.blocks {
+		block := out[ref.Offset : ref.Offset+ref.Length]
+		end := len(block) - blockChecksumBytes
+		binary.BigEndian.PutUint32(block[end:], blockChecksum(objectKey, ref.Offset, block[:end]))
+	}
 	meta := segmentMeta{
+		Key:        objectKey,
 		Size:       int64(b.buf.Len()),
 		Root:       level[0].ref,
 		MinKey:     b.minKey,
@@ -155,7 +192,7 @@ func (b *segmentBuilder) finish() ([]byte, segmentMeta, error) {
 		Count:      b.count,
 		Tombstones: b.tombstones,
 	}
-	return b.buf.Bytes(), meta, nil
+	return out, meta, nil
 }
 
 // decodedBlock is either a data block or an index block.
@@ -165,15 +202,58 @@ type decodedBlock struct {
 	index   []indexEntry
 }
 
-func decodeBlock(b []byte) (*decodedBlock, error) {
+// decodeBlock checks the block at ref of the object at objectKey, whose bytes are b, and decodes
+// it. Bytes that fail the check or do not decode give an error that wraps [ErrCorrupt].
+func decodeBlock(objectKey string, ref blockRef, b []byte) (*decodedBlock, error) {
+	body, err := checkBlock(objectKey, ref, b)
+	if err != nil {
+		return nil, err
+	}
+	return parseBlock(objectKey, ref, body)
+}
+
+// checkBlock's length and checksum, and return its bytes before the checksum.
+func checkBlock(objectKey string, ref blockRef, b []byte) ([]byte, error) {
+	body, err := blockBody(objectKey, ref, b)
+	if err != nil {
+		return nil, err
+	}
+	if want := binary.BigEndian.Uint32(b[len(body):]); blockChecksum(objectKey, ref.Offset, body) != want {
+		return nil, fmt.Errorf("%w: block %d+%d of %q fails its checksum", ErrCorrupt, ref.Offset, ref.Length, objectKey)
+	}
+	return body, nil
+}
+
+// blockBody is the bytes of the block before its checksum, when b has the block's length.
+func blockBody(objectKey string, ref blockRef, b []byte) ([]byte, error) {
+	if ref.Offset < 0 || int64(len(b)) != ref.Length || len(b) < minBlockBytes {
+		return nil, fmt.Errorf("%w: block %d+%d of %q has %d bytes", ErrCorrupt, ref.Offset, ref.Length, objectKey, len(b))
+	}
+	return b[:len(b)-blockChecksumBytes], nil
+}
+
+// parseBlock decodes the bytes before the checksum of the block at ref of the object at
+// objectKey.
+func parseBlock(objectKey string, ref blockRef, b []byte) (*decodedBlock, error) {
+	d, err := parseBlockBody(ref, b)
+	if err != nil {
+		return nil, fmt.Errorf("%w: block %d+%d of %q: %w", ErrCorrupt, ref.Offset, ref.Length, objectKey, err)
+	}
+	return d, nil
+}
+
+func parseBlockBody(ref blockRef, b []byte) (*decodedBlock, error) {
 	if len(b) < 2 {
-		return nil, errors.New("engine: block too short")
+		return nil, errors.New("block too short")
+	}
+	if ref.Offset < 0 {
+		return nil, errors.New("block at a negative offset")
 	}
 	kind := b[0]
 	r := bytes.NewReader(b[1:])
 	n, err := binary.ReadUvarint(r)
 	if err != nil {
-		return nil, fmt.Errorf("engine: reading block count: %w", err)
+		return nil, fmt.Errorf("reading block count: %w", err)
 	}
 	readBytes := func() ([]byte, error) {
 		l, err := binary.ReadUvarint(r)
@@ -191,53 +271,80 @@ func decodeBlock(b []byte) (*decodedBlock, error) {
 	}
 	// Every entry takes at least two bytes, so a count beyond that is corrupt. Checking it here
 	// also keeps a corrupt count from driving a huge allocation.
+	if n == 0 {
+		return nil, errors.New("block without entries")
+	}
 	if n > uint64(r.Len())/2+1 {
-		return nil, fmt.Errorf("engine: block count %d exceeds its %d bytes", n, r.Len())
+		return nil, fmt.Errorf("block count %d exceeds its %d bytes", n, r.Len())
+	}
+	var last []byte
+	ordered := func(i int, key []byte) error {
+		if i > 0 && bytes.Compare(key, last) <= 0 {
+			return fmt.Errorf("key %d of the block is not after the one before it", i)
+		}
+		last = key
+		return nil
 	}
 	d := &decodedBlock{kind: kind}
 	switch kind {
 	case blockKindData:
 		d.entries = make([]entry, 0, n)
-		for range n {
+		for i := range int(n) {
 			key, err := readBytes()
 			if err != nil {
-				return nil, fmt.Errorf("engine: reading key: %w", err)
+				return nil, fmt.Errorf("reading key: %w", err)
+			}
+			if err := ordered(i, key); err != nil {
+				return nil, err
 			}
 			flags, err := r.ReadByte()
 			if err != nil {
-				return nil, fmt.Errorf("engine: reading flags: %w", err)
+				return nil, fmt.Errorf("reading flags: %w", err)
 			}
-			e := entry{key: key, tombstone: flags&1 == 1}
+			if flags > 1 {
+				return nil, fmt.Errorf("unknown flags %d", flags)
+			}
+			e := entry{key: key, tombstone: flags == 1}
 			if !e.tombstone {
 				e.value, err = readBytes()
 				if err != nil {
-					return nil, fmt.Errorf("engine: reading value: %w", err)
+					return nil, fmt.Errorf("reading value: %w", err)
 				}
 			}
 			d.entries = append(d.entries, e)
 		}
 	case blockKindIndex:
 		d.index = make([]indexEntry, 0, n)
-		for range n {
+		// Every child lies after the one before it and before this block, so that no walk can
+		// visit a block twice through one index block, or loop.
+		var next uint64
+		for i := range int(n) {
 			key, err := readBytes()
 			if err != nil {
-				return nil, fmt.Errorf("engine: reading index key: %w", err)
+				return nil, fmt.Errorf("reading index key: %w", err)
+			}
+			if err := ordered(i, key); err != nil {
+				return nil, err
 			}
 			offset, err := binary.ReadUvarint(r)
 			if err != nil {
-				return nil, fmt.Errorf("engine: reading index offset: %w", err)
+				return nil, fmt.Errorf("reading index offset: %w", err)
 			}
 			length, err := binary.ReadUvarint(r)
 			if err != nil {
-				return nil, fmt.Errorf("engine: reading index length: %w", err)
+				return nil, fmt.Errorf("reading index length: %w", err)
 			}
+			if offset < next || length < minBlockBytes || length > uint64(ref.Offset) || offset > uint64(ref.Offset)-length {
+				return nil, fmt.Errorf("child %d+%d of index entry %d is not after the one before it and before the block", offset, length, i)
+			}
+			next = offset + length
 			d.index = append(d.index, indexEntry{firstKey: key, ref: blockRef{Offset: int64(offset), Length: int64(length)}})
 		}
 	default:
-		return nil, fmt.Errorf("engine: unknown block kind %d", kind)
+		return nil, fmt.Errorf("unknown block kind %d", kind)
 	}
 	if r.Len() != 0 {
-		return nil, fmt.Errorf("engine: %d trailing bytes in block", r.Len())
+		return nil, fmt.Errorf("%d trailing bytes in block", r.Len())
 	}
 	return d, nil
 }
@@ -272,7 +379,7 @@ func segmentLookup(root blockRef, key []byte, fetch blockFetcher) (entry, bool, 
 	ref := root
 	for depth := 0; ; depth++ {
 		if depth >= maxTreeDepth {
-			return entry{}, false, errors.New("engine: segment index deeper than allowed")
+			return entry{}, false, fmt.Errorf("%w: segment index deeper than allowed", ErrCorrupt)
 		}
 		d, err := fetch(ref)
 		if err != nil {
@@ -283,7 +390,7 @@ func segmentLookup(root blockRef, key []byte, fetch blockFetcher) (entry, bool, 
 			return e, ok, nil
 		}
 		if len(d.index) == 0 {
-			return entry{}, false, errors.New("engine: empty index block")
+			return entry{}, false, fmt.Errorf("%w: empty index block", ErrCorrupt)
 		}
 		ref = d.index[d.childFor(key)].ref
 	}
@@ -296,6 +403,29 @@ type segmentIterator struct {
 	cur   entry
 	valid bool
 	err   error
+	// leafEnd is the end of the last data block that the walk fetched. Data blocks lie in key
+	// order in the object, so each one the walk fetches must lie after the one before it, which
+	// bounds a walk of a corrupt index to one visit of every data block.
+	leafEnd int64
+	// yielded reports whether the walk yielded an entry, and last is the key of the last one.
+	// Every entry must have a key after the one before it.
+	yielded bool
+	last    []byte
+}
+
+// fetchBlock for the walk, checking that a data block lies after the one before it.
+func (it *segmentIterator) fetchBlock(ref blockRef) (*decodedBlock, error) {
+	d, err := it.fetch(ref)
+	if err != nil {
+		return nil, err
+	}
+	if d.kind == blockKindData {
+		if ref.Offset < it.leafEnd {
+			return nil, fmt.Errorf("%w: data block %d+%d of a segment lies before the one the walk read before it", ErrCorrupt, ref.Offset, ref.Length)
+		}
+		it.leafEnd = ref.Offset + ref.Length
+	}
+	return d, nil
 }
 
 type iterFrame struct {
@@ -314,10 +444,10 @@ func (it *segmentIterator) seek(root blockRef, start []byte) {
 	ref := root
 	for {
 		if len(it.stack) >= maxTreeDepth {
-			it.err = errors.New("engine: segment index deeper than allowed")
+			it.err = fmt.Errorf("%w: segment index deeper than allowed", ErrCorrupt)
 			return
 		}
-		d, err := it.fetch(ref)
+		d, err := it.fetchBlock(ref)
 		if err != nil {
 			it.err = err
 			return
@@ -332,7 +462,7 @@ func (it *segmentIterator) seek(root blockRef, start []byte) {
 			return
 		}
 		if len(d.index) == 0 {
-			it.err = errors.New("engine: empty index block")
+			it.err = fmt.Errorf("%w: empty index block", ErrCorrupt)
 			return
 		}
 		pos := 0
@@ -351,6 +481,12 @@ func (it *segmentIterator) settle() {
 		if top.block.kind == blockKindData {
 			if top.pos < len(top.block.entries) {
 				it.cur = top.block.entries[top.pos]
+				if it.yielded && bytes.Compare(it.cur.key, it.last) <= 0 {
+					it.err = fmt.Errorf("%w: a segment has the key %q after %q", ErrCorrupt, it.cur.key, it.last)
+					it.valid = false
+					return
+				}
+				it.yielded, it.last = true, it.cur.key
 				it.valid = true
 				return
 			}
@@ -362,11 +498,11 @@ func (it *segmentIterator) settle() {
 		}
 		if top.pos < len(top.block.index) {
 			if len(it.stack) >= maxTreeDepth {
-				it.err = errors.New("engine: segment index deeper than allowed")
+				it.err = fmt.Errorf("%w: segment index deeper than allowed", ErrCorrupt)
 				it.valid = false
 				return
 			}
-			d, err := it.fetch(top.block.index[top.pos].ref)
+			d, err := it.fetchBlock(top.block.index[top.pos].ref)
 			if err != nil {
 				it.err = err
 				it.valid = false

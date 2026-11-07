@@ -1,16 +1,56 @@
 package engine
 
 import (
+	"bytes"
+	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"hash/crc32"
 	"strconv"
 	"strings"
 	"time"
 )
 
-// manifestVersion of the encoding. Version 2 keeps stamped garbage in garbage batch objects,
-// which the manifest only references. Version 1 listed every piece of garbage in the manifest.
-const manifestVersion = 2
+// manifestVersion of the encoding. Version 3 seals the manifest and garbage batches with a
+// checksum, and gives every block of a segment one. Version 2 kept stamped garbage in garbage
+// batch objects, which the manifest only references, and version 1 listed every piece of garbage
+// in the manifest. Versions 1 and 2 are plain JSON.
+const manifestVersion = 3
+
+// The manifest and the garbage batches are sealed: their objects hold a magic number of four
+// bytes, then the CRC-32C of the object's key and of the JSON as four big-endian bytes, and then
+// the JSON. The key in the checksum makes the bytes of another object fail it too.
+const (
+	manifestMagic     = "mdbm"
+	garbageBatchMagic = "mdbg"
+	sealBytes         = 8
+)
+
+// seal the JSON body of the object at key.
+func seal(magic, key string, body []byte) []byte {
+	out := make([]byte, sealBytes, sealBytes+len(body))
+	copy(out, magic)
+	binary.BigEndian.PutUint32(out[4:], sealChecksum(key, body))
+	return append(out, body...)
+}
+
+func sealChecksum(key string, body []byte) uint32 {
+	crc := crc32.Update(0, castagnoli, []byte(key))
+	return crc32.Update(crc, castagnoli, body)
+}
+
+// unseal the object at key, whose bytes are b, and return its JSON body.
+func unseal(magic, what, key string, b []byte) ([]byte, error) {
+	if len(b) < sealBytes || string(b[:4]) != magic {
+		return nil, fmt.Errorf("%w: %s %q does not begin as one", ErrCorrupt, what, key)
+	}
+	body := b[sealBytes:]
+	if sealChecksum(key, body) != binary.BigEndian.Uint32(b[4:]) {
+		return nil, fmt.Errorf("%w: %s %q fails its checksum", ErrCorrupt, what, key)
+	}
+	return body, nil
+}
 
 // manifest is the root of the database: the current commit sequence and the live segments.
 // It is replaced atomically with a conditional write on every commit.
@@ -59,8 +99,9 @@ type batchRef struct {
 	Objects int `json:"objects"`
 }
 
-// garbageBatchVersion of the encoding of a garbage batch object.
-const garbageBatchVersion = 1
+// garbageBatchVersion of the encoding of a garbage batch object. Version 2 is sealed, and
+// version 1 was plain JSON.
+const garbageBatchVersion = 2
 
 // garbageBatch is the body of a garbage batch object: the keys of the garbage that one GC pass
 // stamped. Garbage batch objects are immutable.
@@ -72,21 +113,31 @@ type garbageBatch struct {
 	Prev string `json:"prev,omitempty"`
 }
 
-func encodeGarbageBatch(b *garbageBatch) ([]byte, error) {
+// encodeGarbageBatch for the object at key.
+func encodeGarbageBatch(key string, b *garbageBatch) ([]byte, error) {
 	body, err := json.Marshal(b)
 	if err != nil {
 		return nil, fmt.Errorf("engine: encoding garbage batch: %w", err)
 	}
-	return body, nil
+	return seal(garbageBatchMagic, key, body), nil
 }
 
-func decodeGarbageBatch(body []byte) (*garbageBatch, error) {
+// decodeGarbageBatch of the object at key, whose bytes are body. Bytes that fail the checksum or
+// do not decode to a valid batch give an error that wraps [ErrCorrupt].
+func decodeGarbageBatch(key string, body []byte) (*garbageBatch, error) {
+	j, err := unseal(garbageBatchMagic, "garbage batch", key, body)
+	if err != nil {
+		return nil, err
+	}
 	var b garbageBatch
-	if err := json.Unmarshal(body, &b); err != nil {
-		return nil, fmt.Errorf("engine: decoding garbage batch: %w", err)
+	if err := json.Unmarshal(j, &b); err != nil {
+		return nil, fmt.Errorf("%w: decoding garbage batch %q: %w", ErrCorrupt, key, err)
 	}
 	if b.Version != garbageBatchVersion {
-		return nil, fmt.Errorf("engine: unsupported garbage batch version %d", b.Version)
+		return nil, fmt.Errorf("%w: garbage batch %q has version %d, and this version of maragudb reads only version %d", ErrUnsupportedManifest, key, b.Version, garbageBatchVersion)
+	}
+	if b.Prev == key {
+		return nil, fmt.Errorf("%w: garbage batch %q names itself as the batch before it", ErrCorrupt, key)
 	}
 	return &b, nil
 }
@@ -97,30 +148,76 @@ type commitRecord struct {
 	ID  string `json:"id"`
 }
 
-func encodeManifest(m *manifest) ([]byte, error) {
+// encodeManifest for the object at key.
+func encodeManifest(key string, m *manifest) ([]byte, error) {
 	b, err := json.Marshal(m)
 	if err != nil {
 		return nil, fmt.Errorf("engine: encoding manifest: %w", err)
 	}
-	return b, nil
+	return seal(manifestMagic, key, b), nil
 }
 
-func decodeManifest(b []byte) (*manifest, error) {
+// decodeManifest of the object at key, whose bytes are b. A manifest of an earlier version gives
+// an error that wraps [ErrUnsupportedManifest], and bytes that fail the checksum or do not
+// decode to a valid manifest give one that wraps [ErrCorrupt].
+func decodeManifest(key string, b []byte) (*manifest, error) {
 	// The version is read on its own first, because the fields of other versions may not decode.
 	var v struct {
 		Version int `json:"version"`
 	}
-	if err := json.Unmarshal(b, &v); err != nil {
-		return nil, fmt.Errorf("engine: decoding manifest: %w", err)
+	if bytes.HasPrefix(b, []byte("{")) {
+		// Versions 1 and 2 are plain JSON.
+		if err := json.Unmarshal(b, &v); err == nil && v.Version > 0 && v.Version < manifestVersion {
+			return nil, fmt.Errorf("%w: the manifest has version %d, and this version of maragudb reads only version %d", ErrUnsupportedManifest, v.Version, manifestVersion)
+		}
+	}
+	j, err := unseal(manifestMagic, "manifest", key, b)
+	if err != nil {
+		return nil, err
+	}
+	if err := json.Unmarshal(j, &v); err != nil {
+		return nil, fmt.Errorf("%w: decoding manifest: %w", ErrCorrupt, err)
 	}
 	if v.Version != manifestVersion {
 		return nil, fmt.Errorf("%w: the manifest has version %d, and this version of maragudb reads only version %d", ErrUnsupportedManifest, v.Version, manifestVersion)
 	}
 	var m manifest
-	if err := json.Unmarshal(b, &m); err != nil {
-		return nil, fmt.Errorf("engine: decoding manifest: %w", err)
+	if err := json.Unmarshal(j, &m); err != nil {
+		return nil, fmt.Errorf("%w: decoding manifest: %w", ErrCorrupt, err)
+	}
+	if err := m.validate(); err != nil {
+		return nil, fmt.Errorf("%w: manifest %q: %w", ErrCorrupt, key, err)
 	}
 	return &m, nil
+}
+
+// validate what the engine relies on in a decoded manifest: that every segment's root block lies
+// within its object, that counts and sizes are not negative, and that the commit records are in
+// order and end at most at the manifest's sequence number.
+func (m *manifest) validate() error {
+	for i, seg := range m.Segments {
+		switch {
+		case seg.Key == "":
+			return fmt.Errorf("segment %d has no key", i)
+		case seg.Size < 0 || seg.Count < 0 || seg.Tombstones < 0 || seg.Tombstones > seg.Count:
+			return fmt.Errorf("segment %q has size %d, %d entries, and %d tombstones", seg.Key, seg.Size, seg.Count, seg.Tombstones)
+		case seg.Root.Offset < 0 || seg.Root.Length < minBlockBytes || seg.Root.Length > seg.Size-seg.Root.Offset:
+			return fmt.Errorf("the root block %d+%d of segment %q is not within its %d bytes", seg.Root.Offset, seg.Root.Length, seg.Key, seg.Size)
+		case bytes.Compare(seg.MinKey, seg.MaxKey) > 0:
+			return fmt.Errorf("segment %q has a smallest key after its largest", seg.Key)
+		}
+	}
+	for i, ref := range m.Batches {
+		if ref.Key == "" || ref.Objects < 0 {
+			return fmt.Errorf("chain %d of garbage batches has key %q and %d objects", i, ref.Key, ref.Objects)
+		}
+	}
+	for i, c := range m.Commits {
+		if c.Seq > m.Seq || i > 0 && c.Seq <= m.Commits[i-1].Seq {
+			return errors.New("the commit records are not in order up to the manifest's sequence number")
+		}
+	}
+	return nil
 }
 
 // clone deeply enough that mutating the copy's slices does not affect the original.

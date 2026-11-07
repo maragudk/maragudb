@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync/atomic"
 	"time"
 
 	"github.com/antithesishq/antithesis-sdk-go/assert"
@@ -17,10 +18,11 @@ func blockCacheKey(objectKey string, ref blockRef) string {
 }
 
 // readBlock of a segment through the caches. Blocks are immutable, so cached copies are never stale.
-// A missing object means the snapshot's objects were garbage collected.
+// A missing object means the snapshot's objects were garbage collected. A block is checked before
+// it is served or cached: one from a cache that fails its check is a miss, and one from the store
+// gives an error that wraps [ErrCorrupt].
 func (db *DB) readBlock(ctx context.Context, snapshotAt time.Time, objectKey string, ref blockRef) (*decodedBlock, error) {
 	ck := blockCacheKey(objectKey, ref)
-	// A corrupt cache entry is ignored and replaced from the store.
 	if db.mem != nil {
 		// The decoded block is kept with the cached bytes, so that a hit does not decode them
 		// again. Readers share it and never change it.
@@ -29,25 +31,28 @@ func (db *DB) readBlock(ctx context.Context, snapshotAt time.Time, objectKey str
 				db.memHits.Add(1)
 				return d, nil
 			}
-			if d, err := decodeBlock(b); err == nil {
+			d, err := db.decodeBlock(objectKey, ref, b)
+			if err == nil {
 				db.memHits.Add(1)
 				db.mem.SetParsed(ck, b, d)
 				return d, nil
 			}
-			db.log.Warn("corrupt block in memory cache", "key", ck)
+			db.cacheRefused(&db.memRefused, "memory", ck, err)
 		}
 		db.memMisses.Add(1)
 	}
 	if db.disk != nil {
 		if b, ok := db.disk.Get(ck); ok {
-			if d, err := decodeBlock(b); err == nil {
+			d, err := db.decodeBlock(objectKey, ref, b)
+			if err == nil {
 				db.diskHits.Add(1)
 				if db.mem != nil {
 					db.mem.Put(ck, b)
+					db.mem.SetParsed(ck, b, d)
 				}
 				return d, nil
 			}
-			db.log.Warn("corrupt block in disk cache", "key", ck)
+			db.cacheRefused(&db.diskRefused, "disk", ck, err)
 		}
 		db.diskMisses.Add(1)
 	}
@@ -62,13 +67,62 @@ func (db *DB) readBlock(ctx context.Context, snapshotAt time.Time, objectKey str
 		}
 		return nil, fmt.Errorf("engine: reading block of %q: %w", objectKey, err)
 	}
+	if db.mutations.SegmentUnchecked {
+		db.cacheBlock(ck, res.Body, nil)
+	}
+	d, err := db.decodeBlock(objectKey, ref, res.Body)
+	if err != nil {
+		db.corruptRead(ctx, err)
+		return nil, err
+	}
+	if !db.mutations.SegmentUnchecked {
+		db.cacheBlock(ck, res.Body, d)
+	}
+	return d, nil
+}
+
+// decodeBlock of a segment, checking it unless [Mutations.SegmentUnchecked] is set.
+func (db *DB) decodeBlock(objectKey string, ref blockRef, b []byte) (*decodedBlock, error) {
+	if !db.mutations.SegmentUnchecked {
+		return decodeBlock(objectKey, ref, b)
+	}
+	body, err := blockBody(objectKey, ref, b)
+	if err != nil {
+		return nil, err
+	}
+	return parseBlock(objectKey, ref, body)
+}
+
+// cacheBlock read from the store in the caches, with its decoded form d in the memory cache
+// unless it is nil.
+func (db *DB) cacheBlock(ck string, b []byte, d *decodedBlock) {
 	if db.mem != nil {
-		db.mem.Put(ck, res.Body)
+		db.mem.Put(ck, b)
+		if d != nil {
+			db.mem.SetParsed(ck, b, d)
+		}
 	}
 	if db.disk != nil {
-		db.disk.Put(ck, res.Body)
+		db.disk.Put(ck, b)
 	}
-	return decodeBlock(res.Body)
+}
+
+// cacheRefused counts and logs bytes that a cache returned and that failed their check. A cache
+// returns what it was given, and only checked bytes are given to it, so this never happens
+// without a bug.
+func (db *DB) cacheRefused(counter *atomic.Int64, tier, key string, err error) {
+	counter.Add(1)
+	db.log.Warn("refused damaged bytes from the "+tier+" cache", "key", key, "error", err)
+	if db.mutations == (Mutations{}) {
+		assert.Unreachable("a cache returns bytes that fail their check", map[string]any{"tier": tier, "key": key, "error": err.Error()})
+	}
+}
+
+// corruptRead marks a read from the store that gave damaged bytes.
+func (db *DB) corruptRead(ctx context.Context, err error) {
+	db.log.Warn("refused damaged bytes from the store", "error", err)
+	assert.Sometimes(true, "a read of damaged bytes from the store fails with ErrCorrupt", nil)
+	reach.Hit(ctx, reach.DamagedReadRefused)
 }
 
 // getBlock from the store. Reads are idempotent, so a transient failure is retried a bounded

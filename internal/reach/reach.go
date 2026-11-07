@@ -43,6 +43,7 @@ const (
 	ForeignKeyCascadeTables  State = "STATE-FK-CASCADE-TABLES"
 	DiskCacheEviction        State = "STATE-DISK-CACHE-EVICTION"
 	DiskCacheRefused         State = "STATE-DISK-CACHE-REFUSED"
+	DamagedReadRefused       State = "STATE-DAMAGED-READ-REFUSED"
 )
 
 // Declared state, with what it means and the message of the Antithesis assertion that marks it.
@@ -81,6 +82,7 @@ func Declarations() []Declared {
 		{ForeignKeyCascadeTables, "one statement's ON DELETE CASCADE actions delete rows in more than one table", "a cascade deletes rows in more than one table"},
 		{DiskCacheEviction, "a client's disk cache evicts its least recently used entries to stay within its bound", "a disk cache evicts to stay within its bound"},
 		{DiskCacheRefused, "a client's disk cache refuses a file that a crash damaged or removed, and the read goes to the store", "a disk cache refuses a damaged file"},
+		{DamagedReadRefused, "a read from the store gets damaged bytes of a block, the manifest, or a garbage batch, and fails with ErrCorrupt instead of serving or caching them", "a read of damaged bytes from the store fails with ErrCorrupt"},
 	}
 }
 

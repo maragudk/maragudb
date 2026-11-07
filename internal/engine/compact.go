@@ -395,11 +395,10 @@ func (db *DB) mergeSegments(ctx context.Context, startedAt time.Time, m *manifes
 	if count == 0 {
 		return nil, nil
 	}
-	body, meta, err := b.finish()
+	body, meta, err := b.finish(db.key(segmentKey(m.Seq, db.newID())))
 	if err != nil {
 		return nil, err
 	}
-	meta.Key = db.key(segmentKey(m.Seq, db.newID()))
 	if err := progress(); err != nil {
 		return nil, err
 	}
@@ -665,11 +664,11 @@ func (db *DB) gc(ctx context.Context, progress func() error) (int, bool, error) 
 			if batch == nil || batch.Prev != prev {
 				// A batch written for an earlier attempt that joined another chain is an orphan now.
 				batch = &garbageBatch{Version: garbageBatchVersion, StampedAt: now, Keys: stamp, Prev: prev}
-				body, err := encodeGarbageBatch(batch)
+				batchKey = db.key(garbageBatchKey(base.Seq, db.newID()))
+				body, err := encodeGarbageBatch(batchKey, batch)
 				if err != nil {
 					return deleted, deleted > 0, err
 				}
-				batchKey = db.key(garbageBatchKey(base.Seq, db.newID()))
 				if err := db.putObject(ctx, batchKey, body); err != nil {
 					return deleted, deleted > 0, fmt.Errorf("engine: garbage collecting: %w", err)
 				}
@@ -724,7 +723,7 @@ func (db *DB) readChains(ctx context.Context, m *manifest, progress func() error
 		var c chain
 		for key := ref.Key; key != ""; {
 			if _, ok := keep[key]; ok {
-				return nil, fmt.Errorf("engine: garbage batch %q is in two chains or twice in one", key)
+				return nil, fmt.Errorf("%w: garbage batch %q is in two chains or twice in one", ErrCorrupt, key)
 			}
 			db.batchMu.Lock()
 			b, ok := db.batches[key]
@@ -770,7 +769,12 @@ func (db *DB) getGarbageBatch(ctx context.Context, m *manifest, key string) (*ga
 	if err != nil {
 		return nil, fmt.Errorf("engine: reading garbage batch %q: %w", key, err)
 	}
-	return decodeGarbageBatch(res.Body)
+	b, err := decodeGarbageBatch(key, res.Body)
+	if err != nil {
+		db.corruptRead(ctx, err)
+		return nil, err
+	}
+	return b, nil
 }
 
 // cacheBatch that this process wrote.

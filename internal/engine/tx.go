@@ -185,14 +185,12 @@ func (tx *Tx) Commit(ctx context.Context) error {
 			return err
 		}
 	}
-	body, meta, err := b.finish()
+	db := tx.db
+	id := db.newID()
+	body, meta, err := b.finish(db.key(segmentKey(tx.m.Seq, id)))
 	if err != nil {
 		return err
 	}
-
-	db := tx.db
-	id := db.newID()
-	meta.Key = db.key(segmentKey(tx.m.Seq, id))
 	if err := db.putObject(ctx, meta.Key, body); err != nil {
 		return err
 	}

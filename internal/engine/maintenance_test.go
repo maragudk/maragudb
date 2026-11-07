@@ -327,8 +327,7 @@ func amplification(t *testing.T, n, commits, inserts int, mutations engine.Mutat
 // segmentSizes of the live segments that the manifest in the store lists, oldest first.
 func segmentSizes(t *testing.T, w *world) []int64 {
 	t.Helper()
-	body, ok := w.fake.Body("db/manifest")
-	is.True(t, ok)
+	body := manifestJSON(t, w)
 	var man struct {
 		Segments []struct {
 			Size int64 `json:"size"`
