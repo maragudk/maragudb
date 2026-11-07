@@ -28,23 +28,18 @@ func TestMain(m *testing.M) {
 
 func newFileRunner(t *testing.T) *fileRunner {
 	t.Helper()
-	return &fileRunner{pg: pgdiff.Postgres(t), newMaragudb: openMaragudb(5 * time.Second)}
+	return &fileRunner{pg: pgdiff.Postgres(t), newMaragudb: openMaragudb}
 }
 
-// openMaragudb opens a fresh maragudb whose garbage collection deletes the segments that
-// compaction replaced after the grace period. Background maintenance checks for work often, so
-// that a file of thousands of commits neither reads through hundreds of segments nor, with a
-// short grace period, writes a manifest whose list of garbage grows with every compaction. A
-// statement that runs for longer than the grace period fails with ErrSnapshotExpired, which no
-// statement of the make test subset comes near, while some of the full corpus run for seconds.
-func openMaragudb(grace time.Duration) func() (*sql.DB, error) {
-	return func() (*sql.DB, error) {
-		c, err := maragudb.NewConnector(maragudb.Options{Store: s3test.NewStore(s3fake.New()), MaintenanceInterval: new(20 * time.Millisecond), GCGracePeriod: new(grace)}, "s3://bucket/sqllogictest")
-		if err != nil {
-			return nil, err
-		}
-		return sql.OpenDB(c), nil
+// openMaragudb opens a fresh maragudb with the default grace period. Background maintenance
+// checks for work often, so that a file of thousands of commits does not read through hundreds
+// of segments.
+func openMaragudb() (*sql.DB, error) {
+	c, err := maragudb.NewConnector(maragudb.Options{Store: s3test.NewStore(s3fake.New()), MaintenanceInterval: new(20 * time.Millisecond)}, "s3://bucket/sqllogictest")
+	if err != nil {
+		return nil, err
 	}
+	return sql.OpenDB(c), nil
 }
 
 // runScript runs a test file given as text, and fails on harness errors.
@@ -373,9 +368,6 @@ func TestCorpus(t *testing.T) {
 
 		start := time.Now()
 		r := newFileRunner(t)
-		if name != subsetName {
-			r.newMaragudb = openMaragudb(time.Hour)
-		}
 		reports, err := r.runFiles(t.Context(), c, files, runtime.GOMAXPROCS(0))
 		is.NotError(t, err)
 		total := newFileReport()
