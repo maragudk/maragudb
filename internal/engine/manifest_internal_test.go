@@ -14,6 +14,8 @@ import (
 )
 
 func TestManifest(t *testing.T) {
+	t.Parallel()
+
 	t.Run("encode then decode round-trips", func(t *testing.T) {
 		hegel.Test(t, func(ht *hegel.T) {
 			m := &manifest{
@@ -175,6 +177,8 @@ func TestManifest(t *testing.T) {
 }
 
 func TestGarbageBatch(t *testing.T) {
+	t.Parallel()
+
 	t.Run("encode then decode round-trips", func(t *testing.T) {
 		hegel.Test(t, func(ht *hegel.T) {
 			b := &garbageBatch{
@@ -298,6 +302,8 @@ func FuzzGarbageBatch(f *testing.F) {
 }
 
 func TestObjectKey(t *testing.T) {
+	t.Parallel()
+
 	t.Run("round-trips the base sequence of segment and garbage batch keys and sorts by it", func(t *testing.T) {
 		hegel.Test(t, func(ht *hegel.T) {
 			a := hegel.Draw(ht, hegel.Integers[uint64](0, 1<<63))

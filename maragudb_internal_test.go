@@ -17,6 +17,8 @@ import (
 )
 
 func TestOptions_withDefaults(t *testing.T) {
+	t.Parallel()
+
 	t.Run("bounds the disk cache to 1 GiB by default, and keeps a bound that is set", func(t *testing.T) {
 		verify.Covers(t, "DiskCacheBytes defaults to 1 GiB, and a bound that is set, also zero, stays", "INV-OPTIONS")
 		is.Equal(t, int64(1<<30), *Options{}.withDefaults().DiskCacheBytes)
@@ -25,6 +27,8 @@ func TestOptions_withDefaults(t *testing.T) {
 }
 
 func TestDriverOptions(t *testing.T) {
+	t.Parallel()
+
 	t.Run("recover a panic in a driver call as ErrInternal, log it with its stack, and run a write that panicked after its commit once", func(t *testing.T) {
 		verify.Covers(t, "through the public driver's options, an UPDATE outside a transaction that panics after its commit fails with ErrInternal and not driver.ErrBadConn, Options.Logger gets the panic with its stack at the error level, and the update lands once", "INV-PANIC-RECOVERED")
 		fake := s3fake.New()

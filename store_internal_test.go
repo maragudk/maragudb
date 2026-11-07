@@ -61,6 +61,8 @@ func errClass(err error) string {
 }
 
 func TestStoreClient(t *testing.T) {
+	t.Parallel()
+
 	t.Run("behaves exactly like the client it adapts, for every sequence of requests", func(t *testing.T) {
 		hegel.Test(t, func(ht *hegel.T) {
 			direct := s3fake.New()
@@ -146,6 +148,8 @@ func (s *scriptedStore) List(context.Context, string) ([]string, error) {
 }
 
 func TestStoreClient_misbehavingStores(t *testing.T) {
+	t.Parallel()
+
 	t.Run("rejects an empty ETag, which would turn every conditional write unconditional", func(t *testing.T) {
 		c := storeClient{store: &scriptedStore{body: []byte("v")}}
 		_, err := c.Get(t.Context(), "k", s3.GetOptions{})

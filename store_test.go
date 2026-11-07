@@ -138,6 +138,8 @@ func (s failingStore) List(context.Context, string) ([]string, error) {
 }
 
 func TestOptions_Store(t *testing.T) {
+	t.Parallel()
+
 	t.Run("runs a database over a store written outside the module, shared by two connectors", func(t *testing.T) {
 		store := newMemStore()
 		open := func() *sql.DB {

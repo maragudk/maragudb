@@ -149,6 +149,8 @@ func queryRows(t *testing.T, db interface {
 }
 
 func TestRegisterDriver(t *testing.T) {
+	t.Parallel()
+
 	t.Run("registers under the given name and opens with sql.Open", func(t *testing.T) {
 		verify.Covers(t, "RegisterDriver registers the driver explicitly under a name, and sql.Open with an s3://bucket/prefix DSN works", "INV-REGISTER", "INV-DSN")
 		w := newWorld(t)
@@ -178,6 +180,8 @@ func TestRegisterDriver(t *testing.T) {
 }
 
 func TestDB(t *testing.T) {
+	t.Parallel()
+
 	t.Run("fails with ErrUnsupportedManifest, whose message names the versions, on a database whose manifest an earlier version wrote, and leaves it as it is", func(t *testing.T) {
 		verify.Covers(t, "a statement on a database whose manifest has the encoding of version 1 fails with an error that wraps maragudb.ErrUnsupportedManifest and names the versions, returns no rows, and leaves the manifest as it is", "AC-6.4")
 		w := newWorld(t)
@@ -332,6 +336,8 @@ func TestDB(t *testing.T) {
 }
 
 func TestTx(t *testing.T) {
+	t.Parallel()
+
 	t.Run("commits and rolls back through database/sql, with DDL in the transaction", func(t *testing.T) {
 		db := newDB(t)
 		tx, err := db.BeginTx(t.Context(), nil)
@@ -482,6 +488,8 @@ func TestTx(t *testing.T) {
 }
 
 func TestStats(t *testing.T) {
+	t.Parallel()
+
 	t.Run("counts requests and cache hits across connections", func(t *testing.T) {
 		verify.Covers(t, "Stats reports request counts by kind and cache hits across connections", "INV-STATS")
 		db := newDB(t)
@@ -542,6 +550,8 @@ func TestStats(t *testing.T) {
 }
 
 func TestDiskCache(t *testing.T) {
+	t.Parallel()
+
 	t.Run("keeps the files of the disk cache within DiskCacheBytes, and serves reads from them after a restart", func(t *testing.T) {
 		verify.Covers(t, "a database with a disk cache of 64 KiB, which commits and reads many times that, keeps the files of its disk cache within the bound after every statement, and a database opened again on the directory reads from it", "INV-DISK-CACHE-BOUND")
 		w := newWorld(t)
@@ -661,6 +671,8 @@ func TestDiskCacheHelperProcess(t *testing.T) {
 }
 
 func TestMaintenance(t *testing.T) {
+	t.Parallel()
+
 	t.Run("writes manifests no larger after 10,000 commits than after 1,000, with the default grace period and maintenance interval", func(t *testing.T) {
 		verify.Covers(t, "with the default grace period and maintenance, a commit every 300 ms for 50 minutes, so that no garbage expires, writes manifests whose bytes beside the live segments grow by at most 2 KiB from the first 1,000 commits to the last, with at most 68 live segments: the 50 commits of the longest interval between maintenance steps, and three per tier of a database of 10,000 rows", "AC-6.4")
 		synctest.Test(t, func(t *testing.T) {
@@ -870,6 +882,8 @@ func segments(t *testing.T, db *sql.DB, n, rowBytes int) int {
 }
 
 func TestRequestBudgets(t *testing.T) {
+	t.Parallel()
+
 	sizes := []int{100, 1_000, 10_000, 100_000}
 	load := func(t *testing.T, db *sql.DB, n int) {
 		t.Helper()
@@ -993,6 +1007,8 @@ func TestRequestBudgets(t *testing.T) {
 }
 
 func TestRequestBudgets_Indexes(t *testing.T) {
+	t.Parallel()
+
 	sizes := []int{100, 1_000, 10_000, 100_000}
 	// load a table with a unique index and another index, whose entries are keys next to the
 	// rows, so the tree holds about three keys per row.
@@ -1089,6 +1105,8 @@ func TestRequestBudgets_Indexes(t *testing.T) {
 }
 
 func TestRequestBudgets_ForeignKeys(t *testing.T) {
+	t.Parallel()
+
 	sizes := []int{100, 1_000, 10_000, 100_000}
 	// load parents, and a child table that references them.
 	load := func(t *testing.T, db *sql.DB, n int) {
@@ -1169,6 +1187,8 @@ func TestRequestBudgets_ForeignKeys(t *testing.T) {
 }
 
 func TestRequestBudgets_Joins(t *testing.T) {
+	t.Parallel()
+
 	t.Run("a join from one parent row to its children through an index on their foreign key makes a logarithmic number of GETs per row with a cold cache", func(t *testing.T) {
 		verify.Covers(t, "a SELECT that joins one parent row to its children with ON c.pid = p.id, through an index on c (pid), makes with a cold cache one descent of the tree of every segment for each table definition, for the parent, for the index entries, and for each child, at every database size, after many commits with the merges of the tiers, which leave fewer than four segments per tier, and after a compaction of every segment", "AC-5.8")
 		const children = 3

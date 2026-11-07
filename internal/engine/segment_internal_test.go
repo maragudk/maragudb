@@ -97,6 +97,8 @@ func equalEntries(a, b []entry) bool {
 }
 
 func TestSegment(t *testing.T) {
+	t.Parallel()
+
 	t.Run("iterating a built segment from the start yields exactly the entries added", func(t *testing.T) {
 		hegel.Test(t, func(ht *hegel.T) {
 			entries := drawEntries(ht, 1, 60)

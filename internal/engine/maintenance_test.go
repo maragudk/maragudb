@@ -19,6 +19,8 @@ import (
 )
 
 func TestMaintainer_Step(t *testing.T) {
+	t.Parallel()
+
 	grace := 10 * time.Minute
 
 	t.Run("compacts when four segments are in one tier, collects garbage after the grace period, and makes no requests in between", func(t *testing.T) {
@@ -342,6 +344,8 @@ func segmentSizes(t *testing.T, w *world) []int64 {
 }
 
 func TestMaintainer_Compaction(t *testing.T) {
+	t.Parallel()
+
 	t.Run("reads and writes about as many bytes per committed byte for the same commits on a database ten times as large", func(t *testing.T) {
 		verify.Covers(t, "the same 1,000 commits of an insert, an update, and a delete each, with maintenance after every commit, make compaction read and write at most 1.5 times as many bytes per committed byte on a database of 20,000 keys as on one of 2,000, and the same 300 commits with the mutant that merges every segment, at least 5 times as many", "AC-6.5")
 		verify.Covers(t, "1,000 commits on databases of 2,000 and 20,000 keys, with a maintenance step after every commit, leave fewer than four segments in each tier, where a segment counts in the highest tier of itself and the newer segments", "AC-5.3")
@@ -370,6 +374,8 @@ func TestMaintainer_Compaction(t *testing.T) {
 }
 
 func TestMaintainer_Lease(t *testing.T) {
+	t.Parallel()
+
 	t.Run("acquire, renew, take over after expiry, and release", func(t *testing.T) {
 		w := newWorld(t)
 		db1 := w.open(1, engine.Options{})

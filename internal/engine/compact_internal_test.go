@@ -21,6 +21,8 @@ func sized(sizes ...int64) []segmentMeta {
 }
 
 func TestTiers_plan(t *testing.T) {
+	t.Parallel()
+
 	tiers := Tiers{FanIn: 4, BaseBytes: 100}
 
 	t.Run("puts segments below the base in tier 0, and each tier fan-in times larger than the one below", func(t *testing.T) {
@@ -181,6 +183,8 @@ func TestTiers_plan(t *testing.T) {
 }
 
 func TestDB_members(t *testing.T) {
+	t.Parallel()
+
 	t.Run("are the windows' segments, or with the mutant, the windows without their second-oldest segment and with the one after them", func(t *testing.T) {
 		db := &DB{}
 		is.Equal(t, "[[0 1 2] [3 4]]", fmt.Sprint(db.members([]window{{0, 3}, {3, 5}}, 6)))
@@ -191,6 +195,8 @@ func TestDB_members(t *testing.T) {
 }
 
 func TestReplaceMerged(t *testing.T) {
+	t.Parallel()
+
 	t.Run("puts each output in the place of its oldest member and drops the other members and empty outputs", func(t *testing.T) {
 		segs := sized(0, 1, 2, 3, 4, 5, 6)
 		got := replaceMerged(segs, []merge{

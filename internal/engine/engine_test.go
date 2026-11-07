@@ -170,6 +170,8 @@ func collectAll(t *testing.T, w *world, db *engine.DB, grace time.Duration) {
 }
 
 func TestOpen(t *testing.T) {
+	t.Parallel()
+
 	t.Run("creates the manifest once and reuses it", func(t *testing.T) {
 		w := newWorld(t)
 		db1 := w.open(1, engine.Options{})
@@ -263,6 +265,8 @@ func TestOpen(t *testing.T) {
 }
 
 func TestTx(t *testing.T) {
+	t.Parallel()
+
 	t.Run("reads its own writes and sees them after commit", func(t *testing.T) {
 		w := newWorld(t)
 		db := w.open(1, engine.Options{})
@@ -356,6 +360,8 @@ func TestTx(t *testing.T) {
 }
 
 func TestTx_Commit(t *testing.T) {
+	t.Parallel()
+
 	t.Run("a commit from another process is visible to a transaction begun after it", func(t *testing.T) {
 		verify.Covers(t, "a transaction in another process sees a commit acknowledged before it began, read from the store", "INV-STRICT-SERIALIZABLE", "INV-S3-ONLY")
 		w := newWorld(t)
@@ -541,6 +547,8 @@ func TestTx_Commit(t *testing.T) {
 }
 
 func TestDB_Compact(t *testing.T) {
+	t.Parallel()
+
 	t.Run("merges all segments into one and keeps the data", func(t *testing.T) {
 		verify.Covers(t, "compaction merges every segment into one and keeps every value", "AC-6.1")
 		w := newWorld(t)
@@ -786,6 +794,8 @@ func oldState(changes ...string) map[string]string {
 }
 
 func TestDB_CompactTiers(t *testing.T) {
+	t.Parallel()
+
 	t.Run("merges segments that exclude the oldest one, keeps their tombstones, which still hide older values, and counts the bytes it reads and writes", func(t *testing.T) {
 		verify.Covers(t, "a tiered compaction of the two newest of three segments keeps the tombstone of one of them, which still hides the value in the oldest, and counts as read and written the bytes of its input and output objects", "AC-6.1", "AC-6.5")
 		w := newWorld(t)
@@ -913,6 +923,8 @@ func TestDB_CompactTiers(t *testing.T) {
 }
 
 func TestDB_GC(t *testing.T) {
+	t.Parallel()
+
 	grace := 10 * time.Minute
 
 	t.Run("deletes compacted segments only after the grace period, keeping old snapshots readable", func(t *testing.T) {
@@ -1304,6 +1316,8 @@ func TestDB_GC(t *testing.T) {
 }
 
 func TestDB_ReadRetries(t *testing.T) {
+	t.Parallel()
+
 	// Each database here reads without caches, so every block read goes to the store.
 	cold := func(t *testing.T, w *world, seed uint64) *engine.DB {
 		t.Helper()
@@ -1416,6 +1430,8 @@ func (c *damagedCache) Get(key string) ([]byte, bool) {
 }
 
 func TestDB_Damage(t *testing.T) {
+	t.Parallel()
+
 	flip := func(key string, body []byte) []byte {
 		body[len(body)/2] ^= 1
 		return body
@@ -1551,6 +1567,8 @@ func TestDB_Damage(t *testing.T) {
 }
 
 func TestDB_Stats(t *testing.T) {
+	t.Parallel()
+
 	t.Run("counts cache hits and misses per tier", func(t *testing.T) {
 		verify.Covers(t, "Stats counts memory and disk cache hits and misses", "INV-STATS")
 		w := newWorld(t)
@@ -1613,6 +1631,8 @@ func loadKeys(t *testing.T, db *engine.DB, n int) {
 }
 
 func TestRequestBudgets(t *testing.T) {
+	t.Parallel()
+
 	sizes := []int{100, 1_000, 10_000, 100_000}
 
 	t.Run("a commit uses two PUTs and one GET regardless of database size", func(t *testing.T) {
@@ -1687,6 +1707,8 @@ func TestRequestBudgets(t *testing.T) {
 }
 
 func TestMutations(t *testing.T) {
+	t.Parallel()
+
 	t.Run("SegmentUnchecked serves a block whose bytes the store damaged, and keeps serving it from the cache", func(t *testing.T) {
 		verify.Covers(t, "with the mutant, a block whose value the store damaged is served as a wrong value, and served again from the memory cache after the store returns whole bytes", "MUT-SEGMENT-UNCHECKED")
 		w := newWorld(t)
@@ -1972,6 +1994,8 @@ func TestMutations(t *testing.T) {
 }
 
 func TestContext(t *testing.T) {
+	t.Parallel()
+
 	t.Run("a cancelled context fails the request", func(t *testing.T) {
 		w := newWorld(t)
 		db := w.open(1, engine.Options{})
@@ -1983,6 +2007,8 @@ func TestContext(t *testing.T) {
 }
 
 func TestDB_Tigris(t *testing.T) {
+	t.Parallel()
+
 	verify.Covers(t, "the engine's Tigris suite can run: the credentials are there and Tigris answers", "AC-7.1")
 	client, cfg := tigristest.NewClient(t)
 	// Each subtest gets its own database under the run's prefix, so they do not depend on each other.

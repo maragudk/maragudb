@@ -39,6 +39,8 @@ func (m model) clone() model {
 }
 
 func TestEngine_MatchesModel(t *testing.T) {
+	t.Parallel()
+
 	t.Run("transactions over several processes with compaction and GC behave like a map", func(t *testing.T) {
 		verify.Covers(t, "random transactions over several processes, with compaction and GC, behave like a map", "INV-MULTI-WRITER")
 		hegel.Test(t, func(ht *hegel.T) {
