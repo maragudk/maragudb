@@ -478,9 +478,12 @@ func (s *Session) update(ctx context.Context, st *ast.Update, params []value.Val
 	type assignment struct {
 		col int
 		e   *cexpr
+		// foldErr and stableErr are what folding the expression raised.
+		foldErr, stableErr error
 	}
 	// Postgres analyzes WHERE first, then every SET expression, and then converts each to its
-	// column's type. It folds the SET expressions before WHERE.
+	// column's type. It folds the SET expressions before WHERE, in the order of their columns,
+	// into which its rewriter sorts them.
 	b.phase = phaseWhere
 	f, err := b.where(st.Where, "WHERE")
 	if err != nil {
@@ -488,12 +491,14 @@ func (s *Session) update(ctx context.Context, st *ast.Update, params []value.Val
 	}
 	b.phase = phaseOutput
 	values := make([]*cexpr, len(st.Set))
+	binders := make([]*binder, len(st.Set))
 	for i, a := range st.Set {
+		binders[i] = b.fresh()
 		if _, ok := a.Value.(*ast.Default); ok {
 			// Bound with its column below.
 			continue
 		}
-		if values[i], err = b.bind(a.Value); err != nil {
+		if values[i], err = binders[i].bind(a.Value); err != nil {
 			return Result{}, err
 		}
 	}
@@ -515,12 +520,12 @@ func (s *Session) update(ctx context.Context, st *ast.Update, params []value.Val
 		if values[j] == nil {
 			e, err = s.defaultExpr(b, t, i)
 		} else {
-			e, err = b.assignable(values[j], t, i)
+			e, err = binders[j].assignable(values[j], t, i)
 		}
 		if err != nil {
 			return Result{}, err
 		}
-		sets = append(sets, assignment{i, e})
+		sets = append(sets, assignment{col: i, e: e, foldErr: binders[j].foldErr, stableErr: binders[j].stableErr})
 		movesKeys = movesKeys || t.constrains(i)
 	}
 	seen := map[int]bool{}
@@ -529,6 +534,14 @@ func (s *Session) update(ctx context.Context, st *ast.Update, params []value.Val
 			return Result{}, fmt.Errorf("%w: multiple assignments to same column %q", ErrSyntax, t.Columns[set.col].Name)
 		}
 		seen[set.col] = true
+	}
+	byColumn := slices.Clone(sets)
+	slices.SortStableFunc(byColumn, func(x, y assignment) int { return cmp.Compare(x.col, y.col) })
+	for _, set := range byColumn {
+		if set.foldErr != nil && (b.foldErr == nil || b.foldPhase > phaseOutput) {
+			b.foldErr, b.foldPhase = set.foldErr, phaseOutput
+		}
+		b.stableErr = cmp.Or(b.stableErr, set.stableErr)
 	}
 	// The planner needs the folded constants.
 	if err := b.folding(); err != nil {

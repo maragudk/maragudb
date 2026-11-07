@@ -137,6 +137,8 @@ func TestSubqueryWrites(t *testing.T) {
 			outcome{sql: "DELETE FROM sc WHERE id NOT IN (SELECT x.id FROM sc x WHERE x.v > 0)"},
 			outcome{sql: "SELECT * FROM sc ORDER BY id"},
 			outcome{sql: "UPDATE sc SET v = (SELECT id FROM sa)", code: "21000"},
+			// Postgres folds the SET expressions in the order of their columns.
+			outcome{sql: "UPDATE sc SET t = CAST(CAST('' AS text) AS bigint)::text, v = CAST(CAST('NaN' AS double precision) AS bigint)", code: "22003"},
 		)
 	})
 }
