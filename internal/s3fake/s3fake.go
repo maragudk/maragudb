@@ -2,12 +2,13 @@
 //
 // It implements conditional writes faithfully, counts requests by kind, and can inject faults
 // driven by a seeded random source: errors, latency in virtual time, lost acknowledgements
-// (the write is applied but the response is an error), client crashes at any step, and outages
+// (the write is applied but the response is an error), client crashes at any step, outages
 // and partitions that make the store unreachable for a stretch of virtual time while the clients
-// keep running.
+// keep running, and damaged bodies of reads.
 package s3fake
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/hex"
@@ -107,6 +108,13 @@ type Faults struct {
 	// OutageTimeout is how long a request that times out during an outage takes, in virtual
 	// time. Zero makes every request in an outage fail at once.
 	OutageTimeout time.Duration
+	// DamageRate is the probability that a GET that returns a body returns it damaged: with a
+	// bit flipped, cut short, or as the bytes of another object at the same range. The object in
+	// the store stays whole. See [Client.Damaged].
+	DamageRate float64
+	// Damage, when non-nil, replaces the body of every GET that returns one with what it returns
+	// for the key and the body, instead of DamageRate.
+	Damage func(key string, body []byte) []byte
 }
 
 // Process is a simulated client process that can crash.
@@ -169,6 +177,11 @@ type Client struct {
 	outages map[string]time.Time
 	// started counts the outages started by [Faults.OutageRate].
 	started int
+
+	damageMu sync.Mutex
+	// damaged counts the GETs that returned a damaged body, by process name, where the empty name
+	// is the requests without a process.
+	damaged map[string]int
 	// Log receives one line per request when non-nil.
 	Log func(string)
 }
@@ -199,7 +212,7 @@ func New(opts ...Option) *Client {
 	for _, opt := range opts {
 		opt(c)
 	}
-	if c.faults.Rand == nil && (c.faults.ErrorRate > 0 || c.faults.LostAckRate > 0 || c.faults.CrashRate > 0 || c.faults.MaxLatency > 0 || c.faults.OutageTimeout > 0 || c.faults.OutageRate > 0) {
+	if c.faults.Rand == nil && (c.faults.ErrorRate > 0 || c.faults.LostAckRate > 0 || c.faults.CrashRate > 0 || c.faults.MaxLatency > 0 || c.faults.OutageTimeout > 0 || c.faults.OutageRate > 0 || c.faults.DamageRate > 0) {
 		panic("s3fake: faults require a Rand")
 	}
 	if c.faults.OutageRate > 0 && c.faults.MaxOutage <= 0 {
@@ -275,6 +288,86 @@ func (c *Client) unavailable(p *Process) bool {
 	}
 	until, ok := c.outages[p.Name]
 	return ok && now.Before(until)
+}
+
+// Damaged counts the GETs whose body [Faults.DamageRate] or [Faults.Damage] damaged, for the
+// requests of the [Process] with the given name, or of no process when the name is empty.
+func (c *Client) Damaged(process string) int {
+	c.damageMu.Lock()
+	defer c.damageMu.Unlock()
+	return c.damaged[process]
+}
+
+// damage the body of a GET of key by p, as [Faults.DamageRate] and [Faults.Damage] say.
+func (c *Client) damage(p *Process, key string, opts s3.GetOptions, body []byte) []byte {
+	f := c.faults
+	var damaged []byte
+	switch {
+	case f.Damage != nil:
+		damaged = f.Damage(key, bytes.Clone(body))
+	case f.Rand != nil && f.DamageRate > 0:
+		damaged = c.drawDamage(key, opts, body)
+	}
+	if damaged == nil || bytes.Equal(damaged, body) {
+		return body
+	}
+	name := ""
+	if p != nil {
+		name = p.Name
+	}
+	c.damageMu.Lock()
+	if c.damaged == nil {
+		c.damaged = map[string]int{}
+	}
+	c.damaged[name]++
+	c.damageMu.Unlock()
+	c.log("GET %s: damaged body", key)
+	return damaged
+}
+
+// drawDamage of a body, or nil when [Faults.DamageRate] leaves it whole.
+func (c *Client) drawDamage(key string, opts s3.GetOptions, body []byte) []byte {
+	c.randMu.Lock()
+	defer c.randMu.Unlock()
+	f := c.faults
+	if f.Rand.Float64() >= f.DamageRate || len(body) == 0 {
+		return nil
+	}
+	switch f.Rand.IntN(3) {
+	case 0:
+		b := bytes.Clone(body)
+		b[f.Rand.IntN(len(b))] ^= 1 << f.Rand.IntN(8)
+		return b
+	case 1:
+		return bytes.Clone(body[:f.Rand.IntN(len(body))])
+	}
+	// The bytes of another object at the same range, as a store that confuses objects returns.
+	c.store.mu.Lock()
+	keys := make([]string, 0, len(c.store.objects))
+	for k := range c.store.objects {
+		if k != key {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	var other []byte
+	if len(keys) > 0 {
+		other = c.store.objects[keys[f.Rand.IntN(len(keys))]].body
+	}
+	c.store.mu.Unlock()
+	if opts.Range != nil {
+		if r := *opts.Range; r.Offset < int64(len(other)) {
+			other = other[r.Offset:min(int64(len(other)), r.Offset+r.Length)]
+		} else {
+			other = nil
+		}
+	}
+	if len(other) == 0 {
+		b := bytes.Clone(body)
+		b[0] ^= 1
+		return b
+	}
+	return bytes.Clone(other)
 }
 
 // WithoutFaults returns a client over the same objects and clock that injects no faults.
@@ -495,6 +588,7 @@ func (c *Client) Get(ctx context.Context, key string, opts s3.GetOptions) (s3.Ob
 	if err != nil {
 		return s3.Object{}, err
 	}
+	res.Body = c.damage(processFrom(ctx), key, opts, res.Body)
 	return res, nil
 }
 

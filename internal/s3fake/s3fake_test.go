@@ -1,6 +1,7 @@
 package s3fake_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -527,5 +528,62 @@ func TestClient_MatchesModel(t *testing.T) {
 				}
 			}
 		}, hegel.WithTestCases(500))
+	})
+}
+
+func TestClient_DamageRate(t *testing.T) {
+	t.Run("damages the bodies of reads with flipped bits, cuts, and the bytes of other objects at the same range, leaves the objects whole, and counts the damage by process", func(t *testing.T) {
+		verify.Covers(t, "the fake store damages the bodies of reads at a rate, with a flipped bit, a cut, or another object's bytes at the same range, while the objects stay whole", "INV-DAMAGE-DETECTED")
+		c := s3fake.New(s3fake.WithFaults(s3fake.Faults{Rand: rand.New(rand.NewPCG(1, 2)), DamageRate: 0.5}))
+		clean := c.WithoutFaults()
+		a := []byte("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+		b := []byte("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+		_, err := clean.Put(t.Context(), "a", a, s3.PutOptions{})
+		is.NotError(t, err)
+		_, err = clean.Put(t.Context(), "b", b, s3.PutOptions{})
+		is.NotError(t, err)
+		p := &s3fake.Process{Name: "p"}
+		ctx := s3fake.WithProcess(t.Context(), p)
+		var whole, flipped, cut, other int
+		for range 300 {
+			o, err := c.Get(ctx, "a", s3.GetOptions{Range: &s3.ByteRange{Offset: 10, Length: 20}})
+			is.NotError(t, err)
+			want := a[10:30]
+			switch {
+			case bytes.Equal(o.Body, want):
+				whole++
+			case bytes.Equal(o.Body, b[10:30]):
+				other++
+			case len(o.Body) < len(want) && bytes.Equal(o.Body, want[:len(o.Body)]):
+				cut++
+			case len(o.Body) == len(want):
+				flipped++
+			default:
+				t.Fatalf("unexpected body %q", o.Body)
+			}
+		}
+		is.True(t, whole > 100 && flipped > 20 && cut > 20 && other > 20, fmt.Sprint(whole, flipped, cut, other))
+		is.Equal(t, 300-whole, c.Damaged("p"))
+		is.Equal(t, 0, c.Damaged(""))
+		body, ok := c.Body("a")
+		is.True(t, ok)
+		is.True(t, bytes.Equal(a, body))
+		o, err := clean.Get(t.Context(), "a", s3.GetOptions{})
+		is.NotError(t, err)
+		is.True(t, bytes.Equal(a, o.Body), "a fault-free view never damages")
+	})
+
+	t.Run("a damage script replaces the body of every read that returns one", func(t *testing.T) {
+		c := s3fake.New(s3fake.WithFaults(s3fake.Faults{Damage: func(key string, body []byte) []byte {
+			return append(body, '!')
+		}}))
+		_, err := c.Put(t.Context(), "k", []byte("v"), s3.PutOptions{})
+		is.NotError(t, err)
+		o, err := c.Get(t.Context(), "k", s3.GetOptions{})
+		is.NotError(t, err)
+		is.Equal(t, "v!", string(o.Body))
+		_, err = c.Get(t.Context(), "k", s3.GetOptions{IfNoneMatch: o.ETag})
+		is.Error(t, s3.ErrNotModified, err)
+		is.Equal(t, 1, c.Damaged(""))
 	})
 }
