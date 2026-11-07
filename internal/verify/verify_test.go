@@ -297,6 +297,27 @@ func TestRender(t *testing.T) {
 		is.True(t, strings.Contains(verify.Render(nil, c), "| sqllogictest corpus | not run |"), "not run")
 	})
 
+	t.Run("shows the benchmark metrics and how many differ from the baseline", func(t *testing.T) {
+		facts := []verify.Fact{
+			{Package: "b", PID: 1, Start: &verify.Start{}},
+			{Package: "b", PID: 1, Test: "TestWorkloads", Bench: &verify.Bench{Workload: "reads", Metric: "GETs", Measured: 0.5, Baseline: 0.5, HasBaseline: true}},
+			{Package: "b", PID: 1, Test: "TestWorkloads", Bench: &verify.Bench{Workload: "reads", Metric: "PUTs", Measured: 1.25, Baseline: 2, HasBaseline: true, Change: "better"}},
+			{Package: "b", PID: 1, Test: "TestWorkloads", Bench: &verify.Bench{Workload: "writes", Metric: "PUTs", Measured: 3, Change: "worse"}},
+			{Package: "b", PID: 1, Test: "TestWorkloads", Bench: &verify.Bench{Workload: "writes", Metric: "bytes written", Measured: 1e6, Baseline: 0.9402285379431585, HasBaseline: true, Change: "worse"}},
+			{Package: "b", PID: 1, End: &verify.End{Code: 1}},
+		}
+		report := verify.Render(facts, c)
+		for _, want := range []string{
+			"<details><summary>Benchmark metrics: 3 of 4 differ from the baseline</summary>",
+			"| writes | bytes written | 1000000 | 0.9402 | worse |",
+			"| reads | GETs | 0.5 | 0.5 |  |",
+			"| reads | PUTs | 1.25 | 2 | better |",
+			"| writes | PUTs | 3 | none | worse |",
+		} {
+			is.True(t, strings.Contains(report, want), fmt.Sprintf("report contains %q:\n%s", want, report))
+		}
+	})
+
 	t.Run("uses only the latest run of a package", func(t *testing.T) {
 		facts := []verify.Fact{
 			{Package: "a", PID: 1, Start: &verify.Start{}},

@@ -10,10 +10,10 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 ## At a glance
 
-- 36 acceptance criteria (`AC-`), 28 key invariants (`INV-`), 31 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
+- 37 acceptance criteria (`AC-`), 28 key invariants (`INV-`), 31 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
 - 31 mutants (`MUT-`), deliberate bugs, of which 29 are detected by the simulator's checkers within 20 seeds.
 - 29 interesting states (`STATE-`) that the simulator's fixed corpus must reach.
-- 302 declarations of coverage in the tests.
+- 304 declarations of coverage in the tests.
 
 ## Acceptance criteria
 
@@ -232,6 +232,13 @@ Each entry names the test's package, the test's name, and what the test asserts,
 > S3 request budgets: A join from one row of a table to the rows that reference it, through an index on the referencing columns, with a cold cache uses the budget of a point lookup for each row it reads, within the tiered bound.
 
 - `.` `TestRequestBudgets_Joins/a_join_from_one_parent_row_to_its_children_through_an_index_on_their_foreign_key_makes_a_logarithmic_number_of_GETs_per_row_with_a_cold_cache`: a SELECT that joins one parent row to its children with ON c.pid = p.id, through an index on c (pid), makes with a cold cache one descent of the tree of every segment for each table definition, for the parent, for the index entries, and for each child, at every database size, after many commits with the merges of the tiers, which leave fewer than four segments per tier, and after a compaction of every segment; after the many commits, at most one and a half times the GETs of the compacted database, or two more, at every size up to 100,000 rows
+
+### `AC-5.9`
+
+> S3 request budgets: A set of benchmark workloads in the style of YCSB runs in virtual time over the fake S3, so that it is deterministic also with several clients: point reads, point writes, range scans, a mix of reads and writes, contending writers, cold opens, a restart on a disk cache, and writes during maintenance. Per operation, no workload makes more requests of a kind, moves more bytes, or has more conflicts or retries than a committed baseline, and no cache hit rate is lower. A worse number fails the test with the workload, the metric, and both values.
+
+- `internal/bench` `TestWorkloads/no_workload_costs_more_per_operation_than_the_committed_baseline`: each benchmark workload, run in virtual time over the fake store, makes no more requests of each kind and moves no more bytes per operation, and has no lower cache hit rates, than testdata/baseline.json holds
+- `internal/bench` `TestWorkloads/the_workloads_with_several_processes_make_the_same_requests_on_every_run`: a second run of the contending writers and of the writes with maintenance in virtual time, over another copy of the same database, gives the same requests, bytes, conflicts, retries, cache hits, and latencies
 
 ### `AC-5.4`
 

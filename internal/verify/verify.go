@@ -48,6 +48,7 @@ type Fact struct {
 	Corpus     *Corpus        `json:"corpus,omitempty"`
 	Budget     *Budget        `json:"budget,omitempty"`
 	Latency    *Latency       `json:"latency,omitempty"`
+	Bench      *Bench         `json:"bench,omitempty"`
 	Antithesis *Antithesis    `json:"antithesis,omitempty"`
 }
 
@@ -168,6 +169,18 @@ type Budget struct {
 type Latency struct {
 	Name     string        `json:"name"`
 	Duration time.Duration `json:"duration"`
+}
+
+// Bench is a metric of a benchmark workload against its committed baseline.
+type Bench struct {
+	Workload string  `json:"workload"`
+	Metric   string  `json:"metric"`
+	Measured float64 `json:"measured"`
+	// Baseline is the committed value, when HasBaseline is true.
+	Baseline    float64 `json:"baseline"`
+	HasBaseline bool    `json:"hasBaseline"`
+	// Change is "better", "worse", or empty when the metric equals its baseline.
+	Change string `json:"change,omitempty"`
 }
 
 // Antithesis is the result of one test command of the Antithesis harness, run locally.

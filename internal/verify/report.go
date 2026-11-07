@@ -102,6 +102,7 @@ func Render(facts []Fact, c Catalog) string {
 	var corpora []*Corpus
 	var budgets []Fact
 	var latencies []Fact
+	var benches []Fact
 	var antithesis []Fact
 	for _, f := range facts {
 		run := func() *packageRun {
@@ -163,6 +164,8 @@ func Render(facts []Fact, c Catalog) string {
 			budgets = append(budgets, f)
 		case f.Latency != nil:
 			latencies = append(latencies, f)
+		case f.Bench != nil:
+			benches = append(benches, f)
 		case f.Antithesis != nil:
 			antithesis = append(antithesis, f)
 		}
@@ -383,6 +386,23 @@ func Render(facts []Fact, c Catalog) string {
 		}
 		b.WriteString("\n</details>\n")
 	}
+	if len(benches) > 0 {
+		changed := 0
+		for _, f := range benches {
+			if f.Bench.Change != "" {
+				changed++
+			}
+		}
+		fmt.Fprintf(&b, "\n<details><summary>Benchmark metrics: %d of %d differ from the baseline</summary>\n\n| Workload | Metric | Measured | Baseline | Change |\n|---|---|---|---|---|\n", changed, len(benches))
+		for _, f := range benches {
+			base := "none"
+			if f.Bench.HasBaseline {
+				base = decimals(f.Bench.Baseline)
+			}
+			fmt.Fprintf(&b, "| %s | %s | %s | %s | %s |\n", f.Bench.Workload, f.Bench.Metric, decimals(f.Bench.Measured), base, f.Bench.Change)
+		}
+		b.WriteString("\n</details>\n")
+	}
 	if len(antithesis) > 0 {
 		b.WriteString("\n<details><summary>Antithesis harness</summary>\n\n| Test command | Result |\n|---|---|\n")
 		for _, f := range antithesis {
@@ -395,6 +415,12 @@ func Render(facts []Fact, c Catalog) string {
 		b.WriteString("\n</details>\n")
 	}
 	return b.String()
+}
+
+// decimals renders v with up to four decimals.
+func decimals(v float64) string {
+	s := strings.TrimRight(fmt.Sprintf("%.4f", v), "0")
+	return strings.TrimSuffix(s, ".")
 }
 
 type reasonCount struct {

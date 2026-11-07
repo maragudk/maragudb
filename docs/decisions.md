@@ -636,3 +636,18 @@ Alternatives considered:
 - Longer runs or more clients for the foreign-key mutants. They raised the rates by half at twice the cost of the run, while the checks above see the effect in the runs as they are.
 - Checking the constraints of the store after every acknowledged write of the foreign-key workload, for `MUT-CHECK-SKIP-UPDATE`. Measured, it raised the rates by one or two seeds in 100 and made the runs half again as long: the checker already saw nearly every violation that was committed.
 - Leaving the manifest alone, as the earlier entry did when it rejected a watcher of the manifest's sequence numbers as white-box. The manifest checks read the store's objects, as the storage checker does after the run, through two exported decoders, and check two properties of the storage design that any correct engine has: GC keeps what a snapshot within the grace period can read, and compaction does not change what the database holds. A watcher of sequence numbers would check how this engine numbers its commits.
+
+## 2026-11-07: Benchmarks gate exact request counts in virtual time, and only report latency and cost
+
+Context: issue #3 asks for a benchmark suite. maragudb's costs are requests to the store, the bytes they move, and round trips. The request budgets of criterion 5 cover single queries, and nothing measured workloads, contention, cold starts, or maintenance under load.
+
+Decision:
+- **Eight workloads in the style of YCSB**, in `internal/bench`, over one table of 100,000 rows: point reads, point writes, range scans of 100 rows, a mix of 95% reads and 5% writes, four contending writers, cold opens, a restart on a disk cache, and writes during maintenance. Each client is a process with its own driver, engine, and caches. Maintenance runs as a maintainer in the writer's process, as the driver's loop does, but driven by the workload, because the driver's loop sleeps in real time.
+- **The gate is exact.** Every workload runs in the simulator's scheduler over a copy of the loaded fake store, with a fixed virtual latency per request kind and seeded identifiers, so that a run makes the same requests in the same order every time, also with several clients. So the workloads with several clients are in the gate too. `make test` compares requests of each kind, bytes, conflicts, retries, and cache hit rates per operation with a committed baseline, and fails on any worse number. A better number passes and is shown; `make bench-ratchet` rewrites the baseline, as `make ratchet` does for the differential harness.
+- **Latency, throughput, and dollars are only reported.** `make bench` runs the same workloads in real time against Tigris under a prefix of its own, and writes p50, p99, throughput, and dollars per million operations into docs/benchmarks.md. Dollars come from the requests that the run counted and Tigris's published prices, whose source and date are next to the constants. It never runs in CI.
+
+Alternatives considered:
+- A tolerance on the gate, such as 5%. The numbers are exact, so any change is a real change, and a tolerance would let small regressions add up. The cost is that every change that reads differently needs a ratchet, and the failure names the metric and both values so that the decision is quick.
+- Leaving the workloads with several clients out of the gate. The scheduler makes them deterministic, and contention is where database-wide conflicts cost the most.
+- Gating latencies in virtual time. They follow from the request counts and the fixed latencies, so they add nothing that the counts do not gate.
+- Comparisons with SQLite, Litestream, and Postgres, which the issue mentions. They are out of scope for now.

@@ -103,6 +103,18 @@ func (c Counts) Total() int64 {
 	return c.Get + c.GetConditional + c.Put + c.PutConditional + c.Delete + c.List
 }
 
+// Add returns c plus o.
+func (c Counts) Add(o Counts) Counts {
+	return Counts{
+		Get:            c.Get + o.Get,
+		GetConditional: c.GetConditional + o.GetConditional,
+		Put:            c.Put + o.Put,
+		PutConditional: c.PutConditional + o.PutConditional,
+		Delete:         c.Delete + o.Delete,
+		List:           c.List + o.List,
+	}
+}
+
 // Sub returns c minus o.
 func (c Counts) Sub(o Counts) Counts {
 	return Counts{

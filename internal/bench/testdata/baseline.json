@@ -1,0 +1,80 @@
+{
+  "cold-open": {
+    "GETs": 4.2,
+    "bytes read": 59465,
+    "conditional GETs": 1,
+    "memory cache hit rate": 0.18181818181818182,
+    "segments at the end": 3
+  },
+  "contending-writers": {
+    "GETs": 3.41,
+    "PUTs": 3.43,
+    "bytes read": 62703.42,
+    "bytes written": 76341.965,
+    "conditional GETs": 3.43,
+    "conditional PUTs": 3.43,
+    "conflicts": 2.43,
+    "manifest bytes written": 75788.75,
+    "memory cache hit rate": 0.9402285379431585,
+    "retries": 1.31,
+    "segments at the end": 132
+  },
+  "disk-cache-restart": {
+    "GETs": 0.34,
+    "bytes read": 5520.755,
+    "conditional GETs": 1,
+    "disk cache hit rate": 0.4380165289256198,
+    "memory cache hit rate": 0.8578143360752056,
+    "segments at the end": 3
+  },
+  "point-reads": {
+    "GETs": 0.292,
+    "bytes read": 4740.788,
+    "conditional GETs": 1,
+    "memory cache hit rate": 0.9322820037105751,
+    "segments at the end": 3
+  },
+  "point-writes": {
+    "GETs": 0.545,
+    "PUTs": 1,
+    "bytes read": 8986.955,
+    "bytes written": 24807.075,
+    "conditional GETs": 1,
+    "conditional PUTs": 1,
+    "manifest bytes written": 24645.91,
+    "memory cache hit rate": 0.8535620052770448,
+    "segments at the end": 203
+  },
+  "range-scans": {
+    "GETs": 1.13,
+    "bytes read": 18344.28,
+    "conditional GETs": 1,
+    "memory cache hit rate": 0.8564167725540025,
+    "segments at the end": 3
+  },
+  "read-write-mix": {
+    "GETs": 0.376,
+    "PUTs": 0.059,
+    "bytes read": 6103.619,
+    "bytes written": 544.797,
+    "conditional GETs": 1,
+    "conditional PUTs": 0.059,
+    "manifest bytes written": 535.278,
+    "memory cache hit rate": 0.9072978303747534,
+    "segments at the end": 62
+  },
+  "writes-with-maintenance": {
+    "GETs": 0.47,
+    "LISTs": 0.02,
+    "PUTs": 1.0975,
+    "bytes read": 7226.1475,
+    "bytes written": 16515.195,
+    "compaction bytes written per committed byte": 2.221901171235205,
+    "conditional GETs": 1.065,
+    "conditional PUTs": 1.115,
+    "conflicts": 0.0625,
+    "manifest bytes written": 15942.835,
+    "memory cache hit rate": 0.9105597230236584,
+    "segments at the end": 34
+  }
+}

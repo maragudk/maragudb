@@ -89,6 +89,21 @@ sqllogictest-ratchet:
 ratchet:
 	go test ./internal/pgdiff -run 'TestDifferential/the_generator' -count 1 -args -update
 
+# Rewrite the baseline in /internal/bench/testdata/baseline.json: the requests of each kind, the
+# bytes, the conflicts, and the cache hit rates per operation of each benchmark workload, run in
+# virtual time over the fake store. Commit it when a change makes a workload cheaper, or when a
+# higher cost is accepted; the test fails when a metric gets worse.
+.PHONY: bench-ratchet
+bench-ratchet:
+	go test ./internal/bench -run 'TestWorkloads' -count 1 -args -update
+
+# Run the benchmark workloads in real time against Tigris, with the credentials of the Tigris
+# suite, under a prefix of their own that is deleted at the end, and write the results into
+# docs/benchmarks.md. It never runs in CI.
+.PHONY: bench
+bench:
+	MARAGUDB_BENCH=1 go test ./internal/bench -run 'TestTigris' -count 1 -v -timeout 0
+
 # Run the Postgres differential harness with many more cases (default 3000).
 PGDIFF_CASES ?= 3000
 .PHONY: pgdiff
