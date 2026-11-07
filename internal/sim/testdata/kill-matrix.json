@@ -1,6 +1,8 @@
 {
   "seeds": 20,
   "cannotSeeds": 5,
+  "rateSeeds": 100,
+  "floor": 20,
   "cells": [
     "list-append through the engine, no maintainers",
     "list-append through the engine, 2 maintainers",
@@ -27,106 +29,135 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "compaction",
             "durability",
             "list-append"
-          ]
+          ],
+          "detections": 100
         },
         {
           "cell": "list-append through the engine, 2 maintainers",
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "compaction",
+            "grace period",
             "durability",
             "list-append",
             "storage"
-          ]
+          ],
+          "detections": 100
         },
         {
           "cell": "bank through the engine, no maintainers",
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "compaction",
+            "real-time order",
             "durability"
-          ]
+          ],
+          "detections": 100
         },
         {
           "cell": "bank through the engine, 2 maintainers",
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "compaction",
+            "real-time order",
             "durability"
-          ]
+          ],
+          "detections": 100
         },
         {
           "cell": "list-append through SQL, no maintainers",
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "compaction",
             "durability",
             "list-append"
-          ]
+          ],
+          "detections": 100
         },
         {
           "cell": "list-append through SQL, 2 maintainers",
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "compaction",
             "durability",
             "list-append"
-          ]
+          ],
+          "detections": 100
         },
         {
           "cell": "bank through SQL, no maintainers",
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "compaction",
+            "real-time order",
             "durability"
-          ]
+          ],
+          "detections": 99
         },
         {
           "cell": "bank through SQL, 2 maintainers",
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "compaction",
+            "grace period",
+            "real-time order",
             "durability",
             "storage"
-          ]
+          ],
+          "detections": 100
         },
         {
           "cell": "unique through SQL, no maintainers",
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "compaction",
             "durability",
             "real-time order"
-          ]
+          ],
+          "detections": 99
         },
         {
           "cell": "unique through SQL, 2 maintainers",
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "compaction",
             "durability",
             "real-time order"
-          ]
+          ],
+          "detections": 100
         },
         {
           "cell": "foreign-key through SQL, no maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
-            "real-time order",
-            "durability"
-          ]
+            "compaction"
+          ],
+          "detections": 100
         },
         {
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "compaction",
             "real-time order",
-            "durability"
-          ]
+            "durability",
+            "grace period"
+          ],
+          "detections": 100
         }
       ]
     },
@@ -149,7 +180,8 @@
             "grace period",
             "final read",
             "list-append"
-          ]
+          ],
+          "detections": 100
         },
         {
           "cell": "bank through the engine, no maintainers",
@@ -162,7 +194,8 @@
           "seed": 1,
           "checkers": [
             "grace period"
-          ]
+          ],
+          "detections": 99
         },
         {
           "cell": "list-append through SQL, no maintainers",
@@ -172,10 +205,11 @@
         {
           "cell": "list-append through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
             "grace period"
-          ]
+          ],
+          "detections": 98
         },
         {
           "cell": "bank through SQL, no maintainers",
@@ -188,7 +222,8 @@
           "seed": 1,
           "checkers": [
             "grace period"
-          ]
+          ],
+          "detections": 100
         },
         {
           "cell": "unique through SQL, no maintainers",
@@ -201,7 +236,8 @@
           "seed": 1,
           "checkers": [
             "grace period"
-          ]
+          ],
+          "detections": 98
         },
         {
           "cell": "foreign-key through SQL, no maintainers",
@@ -211,11 +247,11 @@
         {
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
-            "grace period",
-            "final read"
-          ]
+            "grace period"
+          ],
+          "detections": 96
         }
       ]
     },
@@ -236,7 +272,8 @@
           "seed": 2,
           "checkers": [
             "storage"
-          ]
+          ],
+          "detections": 84
         },
         {
           "cell": "bank through the engine, no maintainers",
@@ -249,7 +286,8 @@
           "seed": 2,
           "checkers": [
             "storage"
-          ]
+          ],
+          "detections": 73
         },
         {
           "cell": "list-append through SQL, no maintainers",
@@ -262,7 +300,8 @@
           "seed": 1,
           "checkers": [
             "storage"
-          ]
+          ],
+          "detections": 84
         },
         {
           "cell": "bank through SQL, no maintainers",
@@ -275,7 +314,8 @@
           "seed": 1,
           "checkers": [
             "storage"
-          ]
+          ],
+          "detections": 79
         },
         {
           "cell": "unique through SQL, no maintainers",
@@ -288,7 +328,8 @@
           "seed": 1,
           "checkers": [
             "storage"
-          ]
+          ],
+          "detections": 67
         },
         {
           "cell": "foreign-key through SQL, no maintainers",
@@ -301,7 +342,8 @@
           "seed": 2,
           "checkers": [
             "storage"
-          ]
+          ],
+          "detections": 65
         }
       ]
     },
@@ -322,7 +364,8 @@
           "seed": 1,
           "checkers": [
             "storage"
-          ]
+          ],
+          "detections": 99
         },
         {
           "cell": "bank through the engine, no maintainers",
@@ -335,7 +378,8 @@
           "seed": 1,
           "checkers": [
             "storage"
-          ]
+          ],
+          "detections": 98
         },
         {
           "cell": "list-append through SQL, no maintainers",
@@ -348,7 +392,8 @@
           "seed": 1,
           "checkers": [
             "storage"
-          ]
+          ],
+          "detections": 98
         },
         {
           "cell": "bank through SQL, no maintainers",
@@ -361,7 +406,8 @@
           "seed": 1,
           "checkers": [
             "storage"
-          ]
+          ],
+          "detections": 99
         },
         {
           "cell": "unique through SQL, no maintainers",
@@ -374,7 +420,8 @@
           "seed": 1,
           "checkers": [
             "storage"
-          ]
+          ],
+          "detections": 91
         },
         {
           "cell": "foreign-key through SQL, no maintainers",
@@ -387,7 +434,8 @@
           "seed": 1,
           "checkers": [
             "storage"
-          ]
+          ],
+          "detections": 98
         }
       ]
     },
@@ -405,10 +453,11 @@
         {
           "cell": "list-append through the engine, 2 maintainers",
           "status": "detected",
-          "seed": 17,
+          "seed": 1,
           "checkers": [
             "grace period"
-          ]
+          ],
+          "detections": 90
         },
         {
           "cell": "bank through the engine, no maintainers",
@@ -418,10 +467,11 @@
         {
           "cell": "bank through the engine, 2 maintainers",
           "status": "detected",
-          "seed": 4,
+          "seed": 1,
           "checkers": [
             "grace period"
-          ]
+          ],
+          "detections": 89
         },
         {
           "cell": "list-append through SQL, no maintainers",
@@ -431,10 +481,11 @@
         {
           "cell": "list-append through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 5,
+          "seed": 1,
           "checkers": [
             "grace period"
-          ]
+          ],
+          "detections": 80
         },
         {
           "cell": "bank through SQL, no maintainers",
@@ -444,10 +495,11 @@
         {
           "cell": "bank through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 3,
+          "seed": 1,
           "checkers": [
             "grace period"
-          ]
+          ],
+          "detections": 93
         },
         {
           "cell": "unique through SQL, no maintainers",
@@ -457,10 +509,11 @@
         {
           "cell": "unique through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 19,
+          "seed": 1,
           "checkers": [
             "grace period"
-          ]
+          ],
+          "detections": 81
         },
         {
           "cell": "foreign-key through SQL, no maintainers",
@@ -470,10 +523,11 @@
         {
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 6,
+          "seed": 1,
           "checkers": [
             "grace period"
-          ]
+          ],
+          "detections": 76
         }
       ]
     },
@@ -493,10 +547,12 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "grace period",
             "final read",
             "list-append",
             "storage"
-          ]
+          ],
+          "detections": 76
         },
         {
           "cell": "bank through the engine, no maintainers",
@@ -508,8 +564,10 @@
           "status": "detected",
           "seed": 4,
           "checkers": [
+            "grace period",
             "storage"
-          ]
+          ],
+          "detections": 71
         },
         {
           "cell": "list-append through SQL, no maintainers",
@@ -525,7 +583,8 @@
             "final read",
             "list-append",
             "storage"
-          ]
+          ],
+          "detections": 63
         },
         {
           "cell": "bank through SQL, no maintainers",
@@ -540,7 +599,8 @@
             "grace period",
             "final read",
             "storage"
-          ]
+          ],
+          "detections": 77
         },
         {
           "cell": "unique through SQL, no maintainers",
@@ -555,7 +615,8 @@
             "grace period",
             "final read",
             "storage"
-          ]
+          ],
+          "detections": 58
         },
         {
           "cell": "foreign-key through SQL, no maintainers",
@@ -567,8 +628,10 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "grace period",
             "storage"
-          ]
+          ],
+          "detections": 65
         }
       ]
     },
@@ -588,9 +651,11 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "compaction",
             "durability",
             "list-append"
-          ]
+          ],
+          "detections": 95
         },
         {
           "cell": "bank through the engine, no maintainers",
@@ -602,9 +667,12 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "compaction",
             "bank",
+            "real-time order",
             "durability"
-          ]
+          ],
+          "detections": 99
         },
         {
           "cell": "list-append through SQL, no maintainers",
@@ -614,11 +682,11 @@
         {
           "cell": "list-append through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 3,
+          "seed": 1,
           "checkers": [
-            "durability",
-            "list-append"
-          ]
+            "compaction"
+          ],
+          "detections": 37
         },
         {
           "cell": "bank through SQL, no maintainers",
@@ -630,8 +698,11 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
-            "index consistency"
-          ]
+            "compaction",
+            "index consistency",
+            "real-time order"
+          ],
+          "detections": 76
         },
         {
           "cell": "unique through SQL, no maintainers",
@@ -643,9 +714,11 @@
           "status": "detected",
           "seed": 2,
           "checkers": [
+            "compaction",
             "unique",
             "index consistency"
-          ]
+          ],
+          "detections": 46
         },
         {
           "cell": "foreign-key through SQL, no maintainers",
@@ -657,8 +730,10 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "compaction",
             "index consistency"
-          ]
+          ],
+          "detections": 98
         }
       ]
     },
@@ -666,7 +741,7 @@
       "id": "MUT-COMPACT-DROP-TOMBSTONES",
       "name": "tombstones dropped in a merge that excludes the oldest segment",
       "replay": "compact-drop-tombstones",
-      "description": "`engine.Mutations.CompactDropTombstones` drops tombstones in every merge, also in one that excludes the oldest segment, so that a value that an older segment holds shows again after its delete.",
+      "description": "`engine.Mutations.CompactDropTombstones` drops tombstones in every merge, also in one that excludes the oldest segment, so that a value that an older segment holds shows again after its delete. It runs with maintainers that merge only the segments that the tiers make due, never the whole database.",
       "results": [
         {
           "cell": "list-append through the engine, no maintainers",
@@ -676,11 +751,13 @@
         {
           "cell": "list-append through the engine, 2 maintainers",
           "status": "detected",
-          "seed": 10,
+          "seed": 2,
           "checkers": [
+            "compaction",
             "durability",
             "list-append"
-          ]
+          ],
+          "detections": 36
         },
         {
           "cell": "bank through the engine, no maintainers",
@@ -710,10 +787,12 @@
         {
           "cell": "bank through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
+            "compaction",
             "index consistency"
-          ]
+          ],
+          "detections": 83
         },
         {
           "cell": "unique through SQL, no maintainers",
@@ -723,10 +802,13 @@
         {
           "cell": "unique through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 1,
+          "seed": 3,
           "checkers": [
+            "compaction",
+            "unique",
             "index consistency"
-          ]
+          ],
+          "detections": 62
         },
         {
           "cell": "foreign-key through SQL, no maintainers",
@@ -736,10 +818,11 @@
         {
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 3,
+          "seed": 2,
           "checkers": [
-            "foreign key"
-          ]
+            "compaction"
+          ],
+          "detections": 45
         }
       ]
     },
@@ -759,9 +842,11 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "compaction",
             "durability",
             "list-append"
-          ]
+          ],
+          "detections": 93
         },
         {
           "cell": "bank through the engine, no maintainers",
@@ -773,8 +858,11 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "compaction",
+            "real-time order",
             "durability"
-          ]
+          ],
+          "detections": 93
         },
         {
           "cell": "list-append through SQL, no maintainers",
@@ -786,9 +874,11 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "compaction",
             "final read",
             "list-append"
-          ]
+          ],
+          "detections": 92
         },
         {
           "cell": "bank through SQL, no maintainers",
@@ -800,8 +890,11 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "compaction",
+            "real-time order",
             "durability"
-          ]
+          ],
+          "detections": 94
         },
         {
           "cell": "unique through SQL, no maintainers",
@@ -813,9 +906,11 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "compaction",
             "durability",
             "real-time order"
-          ]
+          ],
+          "detections": 90
         },
         {
           "cell": "foreign-key through SQL, no maintainers",
@@ -825,11 +920,11 @@
         {
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 3,
+          "seed": 1,
           "checkers": [
-            "real-time order",
-            "durability"
-          ]
+            "compaction"
+          ],
+          "detections": 84
         }
       ]
     },
@@ -849,8 +944,11 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "compaction",
+            "grace period",
             "list-append"
-          ]
+          ],
+          "detections": 86
         },
         {
           "cell": "bank through the engine, no maintainers",
@@ -862,9 +960,13 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "compaction",
             "bank",
-            "durability"
-          ]
+            "real-time order",
+            "durability",
+            "grace period"
+          ],
+          "detections": 73
         },
         {
           "cell": "list-append through SQL, no maintainers",
@@ -876,9 +978,11 @@
           "status": "detected",
           "seed": 2,
           "checkers": [
+            "compaction",
             "durability",
             "list-append"
-          ]
+          ],
+          "detections": 76
         },
         {
           "cell": "bank through SQL, no maintainers",
@@ -890,8 +994,11 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "compaction",
+            "real-time order",
             "durability"
-          ]
+          ],
+          "detections": 88
         },
         {
           "cell": "unique through SQL, no maintainers",
@@ -903,8 +1010,10 @@
           "status": "detected",
           "seed": 2,
           "checkers": [
+            "compaction",
             "durability"
-          ]
+          ],
+          "detections": 67
         },
         {
           "cell": "foreign-key through SQL, no maintainers",
@@ -916,9 +1025,11 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "compaction",
             "real-time order",
             "durability"
-          ]
+          ],
+          "detections": 66
         }
       ]
     },
@@ -934,7 +1045,8 @@
           "seed": 1,
           "checkers": [
             "list-append"
-          ]
+          ],
+          "detections": 100
         },
         {
           "cell": "list-append through the engine, 2 maintainers",
@@ -942,20 +1054,26 @@
           "seed": 1,
           "checkers": [
             "list-append"
-          ]
+          ],
+          "detections": 100
         },
         {
           "cell": "bank through the engine, no maintainers",
-          "status": "undetected",
-          "reason": "a transfer from a stale snapshot conflicts at commit, so that none is lost, and an audit from one reads an older state that conserves money; the bank workload checks no audit against the transfers acknowledged before it"
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "real-time order"
+          ],
+          "detections": 100
         },
         {
           "cell": "bank through the engine, 2 maintainers",
           "status": "detected",
-          "seed": 10,
+          "seed": 1,
           "checkers": [
-            "grace period"
-          ]
+            "real-time order"
+          ],
+          "detections": 100
         },
         {
           "cell": "list-append through SQL, no maintainers",
@@ -963,7 +1081,8 @@
           "seed": 1,
           "checkers": [
             "list-append"
-          ]
+          ],
+          "detections": 100
         },
         {
           "cell": "list-append through SQL, 2 maintainers",
@@ -971,20 +1090,26 @@
           "seed": 1,
           "checkers": [
             "list-append"
-          ]
+          ],
+          "detections": 100
         },
         {
           "cell": "bank through SQL, no maintainers",
-          "status": "undetected",
-          "reason": "a transfer from a stale snapshot conflicts at commit, so that none is lost, and an audit from one reads an older state that conserves money; the bank workload checks no audit against the transfers acknowledged before it"
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "real-time order"
+          ],
+          "detections": 100
         },
         {
           "cell": "bank through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
-            "grace period"
-          ]
+            "real-time order"
+          ],
+          "detections": 100
         },
         {
           "cell": "unique through SQL, no maintainers",
@@ -992,7 +1117,8 @@
           "seed": 1,
           "checkers": [
             "real-time order"
-          ]
+          ],
+          "detections": 87
         },
         {
           "cell": "unique through SQL, 2 maintainers",
@@ -1000,7 +1126,8 @@
           "seed": 2,
           "checkers": [
             "real-time order"
-          ]
+          ],
+          "detections": 89
         },
         {
           "cell": "foreign-key through SQL, no maintainers",
@@ -1008,7 +1135,8 @@
           "seed": 2,
           "checkers": [
             "real-time order"
-          ]
+          ],
+          "detections": 67
         },
         {
           "cell": "foreign-key through SQL, 2 maintainers",
@@ -1016,7 +1144,8 @@
           "seed": 2,
           "checkers": [
             "real-time order"
-          ]
+          ],
+          "detections": 58
         }
       ]
     },
@@ -1032,7 +1161,8 @@
           "seed": 1,
           "checkers": [
             "durability"
-          ]
+          ],
+          "detections": 100
         },
         {
           "cell": "list-append through the engine, 2 maintainers",
@@ -1040,23 +1170,28 @@
           "seed": 1,
           "checkers": [
             "durability"
-          ]
+          ],
+          "detections": 100
         },
         {
           "cell": "bank through the engine, no maintainers",
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "real-time order",
             "durability"
-          ]
+          ],
+          "detections": 100
         },
         {
           "cell": "bank through the engine, 2 maintainers",
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "real-time order",
             "durability"
-          ]
+          ],
+          "detections": 100
         },
         {
           "cell": "list-append through SQL, no maintainers",
@@ -1064,7 +1199,8 @@
           "seed": 1,
           "checkers": [
             "durability"
-          ]
+          ],
+          "detections": 100
         },
         {
           "cell": "list-append through SQL, 2 maintainers",
@@ -1072,24 +1208,29 @@
           "seed": 1,
           "checkers": [
             "durability"
-          ]
+          ],
+          "detections": 100
         },
         {
           "cell": "bank through SQL, no maintainers",
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "real-time order",
             "durability"
-          ]
+          ],
+          "detections": 100
         },
         {
           "cell": "bank through SQL, 2 maintainers",
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "real-time order",
             "durability",
             "storage"
-          ]
+          ],
+          "detections": 100
         },
         {
           "cell": "unique through SQL, no maintainers",
@@ -1098,7 +1239,8 @@
           "checkers": [
             "durability",
             "real-time order"
-          ]
+          ],
+          "detections": 99
         },
         {
           "cell": "unique through SQL, 2 maintainers",
@@ -1107,7 +1249,8 @@
           "checkers": [
             "durability",
             "real-time order"
-          ]
+          ],
+          "detections": 99
         },
         {
           "cell": "foreign-key through SQL, no maintainers",
@@ -1116,7 +1259,8 @@
           "checkers": [
             "real-time order",
             "durability"
-          ]
+          ],
+          "detections": 93
         },
         {
           "cell": "foreign-key through SQL, 2 maintainers",
@@ -1125,7 +1269,8 @@
           "checkers": [
             "real-time order",
             "durability"
-          ]
+          ],
+          "detections": 97
         }
       ]
     },
@@ -1145,9 +1290,11 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "compaction",
             "durability",
             "list-append"
-          ]
+          ],
+          "detections": 88
         },
         {
           "cell": "bank through the engine, no maintainers",
@@ -1159,8 +1306,11 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "compaction",
+            "real-time order",
             "durability"
-          ]
+          ],
+          "detections": 93
         },
         {
           "cell": "list-append through SQL, no maintainers",
@@ -1172,9 +1322,11 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "compaction",
             "durability",
             "list-append"
-          ]
+          ],
+          "detections": 91
         },
         {
           "cell": "bank through SQL, no maintainers",
@@ -1186,9 +1338,12 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "compaction",
             "index consistency",
+            "real-time order",
             "durability"
-          ]
+          ],
+          "detections": 94
         },
         {
           "cell": "unique through SQL, no maintainers",
@@ -1198,10 +1353,11 @@
         {
           "cell": "unique through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 3,
+          "seed": 2,
           "checkers": [
-            "index consistency"
-          ]
+            "compaction"
+          ],
+          "detections": 82
         },
         {
           "cell": "foreign-key through SQL, no maintainers",
@@ -1211,11 +1367,11 @@
         {
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 3,
+          "seed": 2,
           "checkers": [
-            "real-time order",
-            "durability"
-          ]
+            "compaction"
+          ],
+          "detections": 62
         }
       ]
     },
@@ -1251,7 +1407,8 @@
           "seed": 1,
           "checkers": [
             "list-append"
-          ]
+          ],
+          "detections": 88
         },
         {
           "cell": "list-append through SQL, 2 maintainers",
@@ -1259,7 +1416,8 @@
           "seed": 1,
           "checkers": [
             "list-append"
-          ]
+          ],
+          "detections": 65
         },
         {
           "cell": "bank through SQL, no maintainers",
@@ -1268,8 +1426,10 @@
           "checkers": [
             "workload invariants",
             "bank",
+            "real-time order",
             "durability"
-          ]
+          ],
+          "detections": 92
         },
         {
           "cell": "bank through SQL, 2 maintainers",
@@ -1278,8 +1438,10 @@
           "checkers": [
             "workload invariants",
             "bank",
+            "real-time order",
             "durability"
-          ]
+          ],
+          "detections": 79
         },
         {
           "cell": "unique through SQL, no maintainers",
@@ -1287,7 +1449,8 @@
           "seed": 1,
           "checkers": [
             "index consistency"
-          ]
+          ],
+          "detections": 95
         },
         {
           "cell": "unique through SQL, 2 maintainers",
@@ -1295,23 +1458,26 @@
           "seed": 1,
           "checkers": [
             "index consistency"
-          ]
+          ],
+          "detections": 94
         },
         {
           "cell": "foreign-key through SQL, no maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
-            "foreign key"
-          ]
+            "real-time order"
+          ],
+          "detections": 37
         },
         {
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 16,
+          "seed": 2,
           "checkers": [
-            "foreign key"
-          ]
+            "real-time order"
+          ],
+          "detections": 28
         }
       ]
     },
@@ -1348,7 +1514,8 @@
           "checkers": [
             "durability",
             "list-append"
-          ]
+          ],
+          "detections": 78
         },
         {
           "cell": "list-append through SQL, 2 maintainers",
@@ -1357,7 +1524,8 @@
           "checkers": [
             "durability",
             "list-append"
-          ]
+          ],
+          "detections": 76
         },
         {
           "cell": "bank through SQL, no maintainers",
@@ -1376,7 +1544,8 @@
           "checkers": [
             "durability",
             "real-time order"
-          ]
+          ],
+          "detections": 61
         },
         {
           "cell": "unique through SQL, 2 maintainers",
@@ -1385,16 +1554,17 @@
           "checkers": [
             "durability",
             "real-time order"
-          ]
+          ],
+          "detections": 60
         },
         {
           "cell": "foreign-key through SQL, no maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
-            "durability",
-            "real-time order"
-          ]
+            "durability"
+          ],
+          "detections": 64
         },
         {
           "cell": "foreign-key through SQL, 2 maintainers",
@@ -1402,7 +1572,8 @@
           "seed": 1,
           "checkers": [
             "durability"
-          ]
+          ],
+          "detections": 56
         }
       ]
     },
@@ -1448,7 +1619,8 @@
           "seed": 1,
           "checkers": [
             "index consistency"
-          ]
+          ],
+          "detections": 100
         },
         {
           "cell": "bank through SQL, 2 maintainers",
@@ -1456,7 +1628,8 @@
           "seed": 1,
           "checkers": [
             "index consistency"
-          ]
+          ],
+          "detections": 100
         },
         {
           "cell": "unique through SQL, no maintainers",
@@ -1464,7 +1637,8 @@
           "seed": 1,
           "checkers": [
             "index consistency"
-          ]
+          ],
+          "detections": 100
         },
         {
           "cell": "unique through SQL, 2 maintainers",
@@ -1472,7 +1646,8 @@
           "seed": 1,
           "checkers": [
             "index consistency"
-          ]
+          ],
+          "detections": 98
         },
         {
           "cell": "foreign-key through SQL, no maintainers",
@@ -1480,7 +1655,8 @@
           "seed": 1,
           "checkers": [
             "index consistency"
-          ]
+          ],
+          "detections": 81
         },
         {
           "cell": "foreign-key through SQL, 2 maintainers",
@@ -1488,7 +1664,8 @@
           "seed": 2,
           "checkers": [
             "index consistency"
-          ]
+          ],
+          "detections": 58
         }
       ]
     },
@@ -1545,7 +1722,8 @@
           "checkers": [
             "unique",
             "index consistency"
-          ]
+          ],
+          "detections": 100
         },
         {
           "cell": "unique through SQL, 2 maintainers",
@@ -1554,7 +1732,8 @@
           "checkers": [
             "unique",
             "index consistency"
-          ]
+          ],
+          "detections": 99
         },
         {
           "cell": "foreign-key through SQL, no maintainers",
@@ -1621,7 +1800,8 @@
           "checkers": [
             "unique",
             "index consistency"
-          ]
+          ],
+          "detections": 43
         },
         {
           "cell": "unique through SQL, 2 maintainers",
@@ -1630,7 +1810,8 @@
           "checkers": [
             "unique",
             "index consistency"
-          ]
+          ],
+          "detections": 26
         },
         {
           "cell": "foreign-key through SQL, no maintainers",
@@ -1706,7 +1887,8 @@
           "seed": 1,
           "checkers": [
             "foreign key"
-          ]
+          ],
+          "detections": 99
         },
         {
           "cell": "foreign-key through SQL, 2 maintainers",
@@ -1714,7 +1896,8 @@
           "seed": 1,
           "checkers": [
             "foreign key"
-          ]
+          ],
+          "detections": 97
         }
       ]
     },
@@ -1780,7 +1963,8 @@
           "seed": 2,
           "checkers": [
             "foreign key"
-          ]
+          ],
+          "detections": 75
         },
         {
           "cell": "foreign-key through SQL, 2 maintainers",
@@ -1788,7 +1972,8 @@
           "seed": 2,
           "checkers": [
             "foreign key"
-          ]
+          ],
+          "detections": 58
         }
       ]
     },
@@ -1854,7 +2039,8 @@
           "seed": 1,
           "checkers": [
             "foreign key"
-          ]
+          ],
+          "detections": 90
         },
         {
           "cell": "foreign-key through SQL, 2 maintainers",
@@ -1862,7 +2048,8 @@
           "seed": 1,
           "checkers": [
             "foreign key"
-          ]
+          ],
+          "detections": 80
         }
       ]
     },
@@ -1870,7 +2057,7 @@
       "id": "MUT-CHECK-SKIP-UPDATE",
       "name": "CHECK on INSERT only",
       "replay": "check-skip-update",
-      "description": "`exec.Mutations.CheckSkipUpdate` checks the CHECK constraints of a row only when it is inserted, not when an UPDATE or a foreign key action changes it.",
+      "description": "`exec.Mutations.CheckSkipUpdate` checks the CHECK constraints of a row only when it is inserted, not when an UPDATE or a foreign key action changes it. It runs with one key, so that the foreign key workload draws its keys from a pool of two.",
       "results": [
         {
           "cell": "list-append through the engine, no maintainers",
@@ -1925,18 +2112,20 @@
         {
           "cell": "foreign-key through SQL, no maintainers",
           "status": "detected",
-          "seed": 6,
+          "seed": 2,
           "checkers": [
             "check constraint"
-          ]
+          ],
+          "detections": 48
         },
         {
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 20,
+          "seed": 2,
           "checkers": [
             "check constraint"
-          ]
+          ],
+          "detections": 37
         }
       ]
     },
@@ -1973,7 +2162,8 @@
           "checkers": [
             "durability",
             "list-append"
-          ]
+          ],
+          "detections": 47
         },
         {
           "cell": "list-append through SQL, 2 maintainers",
@@ -1982,7 +2172,8 @@
           "checkers": [
             "durability",
             "list-append"
-          ]
+          ],
+          "detections": 36
         },
         {
           "cell": "bank through SQL, no maintainers",
@@ -2096,7 +2287,8 @@
           "seed": 1,
           "checkers": [
             "cache integrity"
-          ]
+          ],
+          "detections": 74
         },
         {
           "cell": "list-append through the engine, 2 maintainers",
@@ -2104,7 +2296,8 @@
           "seed": 2,
           "checkers": [
             "cache integrity"
-          ]
+          ],
+          "detections": 66
         },
         {
           "cell": "bank through the engine, no maintainers",
@@ -2112,7 +2305,8 @@
           "seed": 2,
           "checkers": [
             "cache integrity"
-          ]
+          ],
+          "detections": 76
         },
         {
           "cell": "bank through the engine, 2 maintainers",
@@ -2120,7 +2314,8 @@
           "seed": 1,
           "checkers": [
             "cache integrity"
-          ]
+          ],
+          "detections": 64
         },
         {
           "cell": "list-append through SQL, no maintainers",
@@ -2128,7 +2323,8 @@
           "seed": 2,
           "checkers": [
             "cache integrity"
-          ]
+          ],
+          "detections": 88
         },
         {
           "cell": "list-append through SQL, 2 maintainers",
@@ -2136,7 +2332,8 @@
           "seed": 1,
           "checkers": [
             "cache integrity"
-          ]
+          ],
+          "detections": 83
         },
         {
           "cell": "bank through SQL, no maintainers",
@@ -2144,7 +2341,8 @@
           "seed": 2,
           "checkers": [
             "cache integrity"
-          ]
+          ],
+          "detections": 90
         },
         {
           "cell": "bank through SQL, 2 maintainers",
@@ -2152,7 +2350,8 @@
           "seed": 1,
           "checkers": [
             "cache integrity"
-          ]
+          ],
+          "detections": 86
         },
         {
           "cell": "unique through SQL, no maintainers",
@@ -2160,7 +2359,8 @@
           "seed": 1,
           "checkers": [
             "cache integrity"
-          ]
+          ],
+          "detections": 93
         },
         {
           "cell": "unique through SQL, 2 maintainers",
@@ -2168,7 +2368,8 @@
           "seed": 1,
           "checkers": [
             "cache integrity"
-          ]
+          ],
+          "detections": 76
         },
         {
           "cell": "foreign-key through SQL, no maintainers",
@@ -2176,7 +2377,8 @@
           "seed": 1,
           "checkers": [
             "cache integrity"
-          ]
+          ],
+          "detections": 90
         },
         {
           "cell": "foreign-key through SQL, 2 maintainers",
@@ -2184,7 +2386,8 @@
           "seed": 1,
           "checkers": [
             "cache integrity"
-          ]
+          ],
+          "detections": 81
         }
       ]
     },
@@ -2268,25 +2471,29 @@
           "seed": 1,
           "checkers": [
             "cache integrity"
-          ]
+          ],
+          "detections": 64
         },
         {
           "cell": "list-append through the engine, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
-            "durability",
-            "list-append"
-          ]
+            "cache integrity"
+          ],
+          "detections": 59
         },
         {
           "cell": "bank through the engine, no maintainers",
           "status": "detected",
           "seed": 2,
           "checkers": [
+            "cache integrity",
             "bank",
+            "real-time order",
             "durability"
-          ]
+          ],
+          "detections": 59
         },
         {
           "cell": "bank through the engine, 2 maintainers",
@@ -2294,43 +2501,51 @@
           "seed": 3,
           "checkers": [
             "cache integrity"
-          ]
+          ],
+          "detections": 56
         },
         {
           "cell": "list-append through SQL, no maintainers",
           "status": "detected",
           "seed": 2,
           "checkers": [
+            "cache integrity",
             "workload invariants",
             "damaged reads",
             "list-append"
-          ]
+          ],
+          "detections": 68
         },
         {
           "cell": "list-append through SQL, 2 maintainers",
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "compaction",
             "durability",
             "list-append"
-          ]
+          ],
+          "detections": 70
         },
         {
           "cell": "bank through SQL, no maintainers",
           "status": "detected",
           "seed": 2,
           "checkers": [
-            "workload invariants",
-            "cache integrity"
-          ]
+            "cache integrity",
+            "workload invariants"
+          ],
+          "detections": 73
         },
         {
           "cell": "bank through SQL, 2 maintainers",
           "status": "detected",
           "seed": 1,
           "checkers": [
+            "cache integrity",
             "damaged reads"
-          ]
+          ],
+          "detections": 68
         },
         {
           "cell": "unique through SQL, no maintainers",
@@ -2339,15 +2554,18 @@
           "checkers": [
             "cache integrity",
             "index consistency"
-          ]
+          ],
+          "detections": 60
         },
         {
           "cell": "unique through SQL, 2 maintainers",
           "status": "detected",
           "seed": 1,
           "checkers": [
-            "index consistency"
-          ]
+            "index consistency",
+            "cache integrity"
+          ],
+          "detections": 60
         },
         {
           "cell": "foreign-key through SQL, no maintainers",
@@ -2355,15 +2573,17 @@
           "seed": 1,
           "checkers": [
             "cache integrity"
-          ]
+          ],
+          "detections": 63
         },
         {
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
             "cache integrity"
-          ]
+          ],
+          "detections": 56
         }
       ]
     },
@@ -2380,7 +2600,8 @@
           "checkers": [
             "durability",
             "list-append"
-          ]
+          ],
+          "detections": 100
         },
         {
           "cell": "list-append through the engine, 2 maintainers",
@@ -2389,7 +2610,8 @@
           "checkers": [
             "durability",
             "list-append"
-          ]
+          ],
+          "detections": 99
         },
         {
           "cell": "bank through the engine, no maintainers",
@@ -2397,8 +2619,10 @@
           "seed": 1,
           "checkers": [
             "bank",
+            "real-time order",
             "durability"
-          ]
+          ],
+          "detections": 100
         },
         {
           "cell": "bank through the engine, 2 maintainers",
@@ -2407,8 +2631,10 @@
           "checkers": [
             "workload invariants",
             "bank",
+            "real-time order",
             "durability"
-          ]
+          ],
+          "detections": 100
         },
         {
           "cell": "list-append through SQL, no maintainers",
@@ -2416,7 +2642,8 @@
           "seed": 2,
           "checkers": [
             "durability"
-          ]
+          ],
+          "detections": 93
         },
         {
           "cell": "list-append through SQL, 2 maintainers",
@@ -2426,7 +2653,8 @@
             "workload invariants",
             "durability",
             "list-append"
-          ]
+          ],
+          "detections": 97
         },
         {
           "cell": "bank through SQL, no maintainers",
@@ -2436,8 +2664,10 @@
             "workload invariants",
             "index consistency",
             "bank",
+            "real-time order",
             "durability"
-          ]
+          ],
+          "detections": 99
         },
         {
           "cell": "bank through SQL, 2 maintainers",
@@ -2447,8 +2677,10 @@
             "workload invariants",
             "index consistency",
             "bank",
+            "real-time order",
             "durability"
-          ]
+          ],
+          "detections": 100
         },
         {
           "cell": "unique through SQL, no maintainers",
@@ -2457,7 +2689,8 @@
           "checkers": [
             "index consistency",
             "unique"
-          ]
+          ],
+          "detections": 100
         },
         {
           "cell": "unique through SQL, 2 maintainers",
@@ -2466,7 +2699,8 @@
           "checkers": [
             "unique",
             "index consistency"
-          ]
+          ],
+          "detections": 99
         },
         {
           "cell": "foreign-key through SQL, no maintainers",
@@ -2474,7 +2708,8 @@
           "seed": 1,
           "checkers": [
             "foreign key"
-          ]
+          ],
+          "detections": 59
         },
         {
           "cell": "foreign-key through SQL, 2 maintainers",
@@ -2483,7 +2718,8 @@
           "checkers": [
             "foreign key",
             "final read"
-          ]
+          ],
+          "detections": 99
         }
       ]
     },
@@ -2491,97 +2727,108 @@
       "id": "MUT-FILTER-UNCHECKED",
       "name": "filter blocks read without their checksum",
       "replay": "filter-unchecked",
-      "description": "`engine.Mutations.FilterUnchecked` decodes the filter blocks of segments without checking their checksums, and caches what the store returns before decoding it, so that a filter block whose bytes the store damaged is trusted, or cached and trusted later. It runs with damaged reads from the store and with blocks of 128 bytes, so that segments have filter blocks.",
+      "description": "`engine.Mutations.FilterUnchecked` decodes the filter blocks of segments without checking their checksums, and caches what the store returns before decoding it, so that a filter block whose bytes the store damaged is trusted, or cached and trusted later. It runs with blocks of 64 bytes, so that segments have filter blocks, and with one in ten reads from the store damaged.",
       "results": [
         {
           "cell": "list-append through the engine, no maintainers",
           "status": "detected",
-          "seed": 20,
+          "seed": 1,
           "checkers": [
             "cache integrity"
-          ]
+          ],
+          "detections": 47
         },
         {
           "cell": "list-append through the engine, 2 maintainers",
           "status": "detected",
-          "seed": 3,
+          "seed": 2,
           "checkers": [
             "cache integrity"
-          ]
+          ],
+          "detections": 48
         },
         {
           "cell": "bank through the engine, no maintainers",
           "status": "not applicable",
-          "reason": "the bank workload through the engine keeps four accounts, whose segments fit in one block even of 128 bytes, so no segment has a filter block"
+          "reason": "the bank workload through the engine keeps four accounts, whose segments fit in one block even of 64 bytes, so no segment has a filter block"
         },
         {
           "cell": "bank through the engine, 2 maintainers",
           "status": "not applicable",
-          "reason": "the bank workload through the engine keeps four accounts, whose segments fit in one block even of 128 bytes, so no segment has a filter block"
+          "reason": "the bank workload through the engine keeps four accounts, whose segments fit in one block even of 64 bytes, so no segment has a filter block"
         },
         {
           "cell": "list-append through SQL, no maintainers",
           "status": "detected",
-          "seed": 1,
+          "seed": 2,
           "checkers": [
             "cache integrity"
-          ]
+          ],
+          "detections": 56
         },
         {
           "cell": "list-append through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 10,
+          "seed": 2,
           "checkers": [
             "cache integrity"
-          ]
+          ],
+          "detections": 58
         },
         {
           "cell": "bank through SQL, no maintainers",
           "status": "detected",
-          "seed": 3,
+          "seed": 1,
           "checkers": [
             "cache integrity"
-          ]
+          ],
+          "detections": 90
         },
         {
           "cell": "bank through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 7,
+          "seed": 1,
           "checkers": [
             "cache integrity"
-          ]
+          ],
+          "detections": 86
         },
         {
           "cell": "unique through SQL, no maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
             "cache integrity"
-          ]
+          ],
+          "detections": 84
         },
         {
           "cell": "unique through SQL, 2 maintainers",
           "status": "detected",
           "seed": 1,
           "checkers": [
-            "cache integrity"
-          ]
+            "cache integrity",
+            "index consistency"
+          ],
+          "detections": 82
         },
         {
           "cell": "foreign-key through SQL, no maintainers",
           "status": "detected",
-          "seed": 12,
+          "seed": 2,
           "checkers": [
             "cache integrity"
-          ]
+          ],
+          "detections": 68
         },
         {
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 1,
+          "seed": 3,
           "checkers": [
             "cache integrity"
-          ]
+          ],
+          "detections": 67
         }
       ]
     },
@@ -2597,7 +2844,8 @@
           "seed": 1,
           "checkers": [
             "disk cache bound"
-          ]
+          ],
+          "detections": 86
         },
         {
           "cell": "list-append through the engine, 2 maintainers",
@@ -2605,7 +2853,8 @@
           "seed": 1,
           "checkers": [
             "disk cache bound"
-          ]
+          ],
+          "detections": 80
         },
         {
           "cell": "bank through the engine, no maintainers",
@@ -2613,7 +2862,8 @@
           "seed": 2,
           "checkers": [
             "disk cache bound"
-          ]
+          ],
+          "detections": 73
         },
         {
           "cell": "bank through the engine, 2 maintainers",
@@ -2621,7 +2871,8 @@
           "seed": 1,
           "checkers": [
             "disk cache bound"
-          ]
+          ],
+          "detections": 77
         },
         {
           "cell": "list-append through SQL, no maintainers",
@@ -2629,7 +2880,8 @@
           "seed": 2,
           "checkers": [
             "disk cache bound"
-          ]
+          ],
+          "detections": 95
         },
         {
           "cell": "list-append through SQL, 2 maintainers",
@@ -2637,7 +2889,8 @@
           "seed": 1,
           "checkers": [
             "disk cache bound"
-          ]
+          ],
+          "detections": 90
         },
         {
           "cell": "bank through SQL, no maintainers",
@@ -2645,7 +2898,8 @@
           "seed": 1,
           "checkers": [
             "disk cache bound"
-          ]
+          ],
+          "detections": 90
         },
         {
           "cell": "bank through SQL, 2 maintainers",
@@ -2653,7 +2907,8 @@
           "seed": 1,
           "checkers": [
             "disk cache bound"
-          ]
+          ],
+          "detections": 87
         },
         {
           "cell": "unique through SQL, no maintainers",
@@ -2661,7 +2916,8 @@
           "seed": 1,
           "checkers": [
             "disk cache bound"
-          ]
+          ],
+          "detections": 91
         },
         {
           "cell": "unique through SQL, 2 maintainers",
@@ -2669,7 +2925,8 @@
           "seed": 1,
           "checkers": [
             "disk cache bound"
-          ]
+          ],
+          "detections": 84
         },
         {
           "cell": "foreign-key through SQL, no maintainers",
@@ -2677,7 +2934,8 @@
           "seed": 1,
           "checkers": [
             "disk cache bound"
-          ]
+          ],
+          "detections": 90
         },
         {
           "cell": "foreign-key through SQL, 2 maintainers",
@@ -2685,7 +2943,8 @@
           "seed": 1,
           "checkers": [
             "disk cache bound"
-          ]
+          ],
+          "detections": 85
         }
       ]
     },
@@ -2701,7 +2960,8 @@
           "seed": 1,
           "checkers": [
             "panic"
-          ]
+          ],
+          "detections": 94
         },
         {
           "cell": "list-append through the engine, 2 maintainers",
@@ -2709,7 +2969,8 @@
           "seed": 1,
           "checkers": [
             "panic"
-          ]
+          ],
+          "detections": 86
         },
         {
           "cell": "bank through the engine, no maintainers",
@@ -2717,7 +2978,8 @@
           "seed": 2,
           "checkers": [
             "panic"
-          ]
+          ],
+          "detections": 91
         },
         {
           "cell": "bank through the engine, 2 maintainers",
@@ -2725,7 +2987,8 @@
           "seed": 2,
           "checkers": [
             "panic"
-          ]
+          ],
+          "detections": 91
         },
         {
           "cell": "list-append through SQL, no maintainers",
@@ -2733,7 +2996,8 @@
           "seed": 1,
           "checkers": [
             "panic"
-          ]
+          ],
+          "detections": 88
         },
         {
           "cell": "list-append through SQL, 2 maintainers",
@@ -2741,7 +3005,8 @@
           "seed": 1,
           "checkers": [
             "panic"
-          ]
+          ],
+          "detections": 85
         },
         {
           "cell": "bank through SQL, no maintainers",
@@ -2749,7 +3014,8 @@
           "seed": 1,
           "checkers": [
             "panic"
-          ]
+          ],
+          "detections": 91
         },
         {
           "cell": "bank through SQL, 2 maintainers",
@@ -2757,7 +3023,8 @@
           "seed": 1,
           "checkers": [
             "panic"
-          ]
+          ],
+          "detections": 83
         },
         {
           "cell": "unique through SQL, no maintainers",
@@ -2765,7 +3032,8 @@
           "seed": 1,
           "checkers": [
             "panic"
-          ]
+          ],
+          "detections": 82
         },
         {
           "cell": "unique through SQL, 2 maintainers",
@@ -2773,7 +3041,8 @@
           "seed": 2,
           "checkers": [
             "panic"
-          ]
+          ],
+          "detections": 72
         },
         {
           "cell": "foreign-key through SQL, no maintainers",
@@ -2781,7 +3050,8 @@
           "seed": 1,
           "checkers": [
             "panic"
-          ]
+          ],
+          "detections": 85
         },
         {
           "cell": "foreign-key through SQL, 2 maintainers",
@@ -2789,7 +3059,8 @@
           "seed": 1,
           "checkers": [
             "panic"
-          ]
+          ],
+          "detections": 75
         }
       ]
     }

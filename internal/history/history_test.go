@@ -468,6 +468,151 @@ func TestCheckBankDurability(t *testing.T) {
 	})
 }
 
+func TestCheckBankAudits(t *testing.T) {
+	verify.Covers(t, "the bank audit checker accepts audits that the transfers acknowledged before them and a set of the others that began before they ended explain, and rejects an audit that misses a transfer acknowledged before it began", "INV-STRICT-SERIALIZABLE")
+	// audit is a read-only transaction from invoke to complete that saw balances.
+	audit := func(id, invoke, complete int, balances map[string]int64) (history.Tx, history.BankAudit) {
+		return tx(id, invoke, complete, history.OK), history.BankAudit{TxID: id, Balances: balances}
+	}
+	tests := []struct {
+		name     string
+		txs      []history.Tx
+		balances map[string]int64
+		want     string
+	}{
+		{
+			name:     "accepts an audit that saw every transfer acknowledged before it began",
+			txs:      []history.Tx{transfer(1, history.OK, "a", "b", 10), transfer(2, history.OK, "b", "c", 30)},
+			balances: map[string]int64{"a": 90, "b": 80, "c": 130},
+		},
+		{
+			name:     "accepts an audit that missed a transfer that was acknowledged only after it began",
+			txs:      []history.Tx{transfer(1, history.OK, "a", "b", 10), tx(2, 31, 35, history.OK, app("b", -30), app("c", 30))},
+			balances: map[string]int64{"a": 90, "b": 110, "c": 100},
+		},
+		{
+			name:     "accepts an audit that saw a transfer that was acknowledged only after it began",
+			txs:      []history.Tx{transfer(1, history.OK, "a", "b", 10), tx(2, 31, 35, history.OK, app("b", -30), app("c", 30))},
+			balances: map[string]int64{"a": 90, "b": 80, "c": 130},
+		},
+		{
+			name:     "accepts an audit that saw some of the transfers with an unknown outcome, but not those that failed",
+			txs:      []history.Tx{transfer(1, history.Unknown, "a", "b", 10), transfer(2, history.Unknown, "b", "c", 30), transfer(3, history.Failed, "c", "a", 5)},
+			balances: map[string]int64{"a": 100, "b": 70, "c": 130},
+		},
+		{
+			name:     "rejects an audit that missed a transfer acknowledged before it began",
+			txs:      []history.Tx{transfer(1, history.OK, "a", "b", 10), transfer(2, history.OK, "b", "c", 30)},
+			balances: map[string]int64{"a": 90, "b": 110, "c": 100},
+			want:     "stale read",
+		},
+		{
+			name:     "rejects an audit that saw a transfer that began after it ended",
+			txs:      []history.Tx{transfer(1, history.OK, "a", "b", 10), tx(2, 50, 55, history.OK, app("b", -30), app("c", 30))},
+			balances: map[string]int64{"a": 90, "b": 80, "c": 130},
+			want:     "stale read",
+		},
+		{
+			name:     "rejects an audit that saw a failed transfer",
+			txs:      []history.Tx{transfer(1, history.Failed, "a", "b", 10)},
+			balances: map[string]int64{"a": 90, "b": 110},
+			want:     "stale read",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			at, a := audit(100, 30, 40, test.balances)
+			err := history.CheckBankAudits(append(test.txs, at), []history.BankAudit{a}, 100)
+			if test.want == "" {
+				is.NotError(t, err)
+				return
+			}
+			is.Equal(t, test.want, anomalyKind(t, err), fmt.Sprint(err))
+		})
+	}
+
+	t.Run("ignores an audit without a transaction, such as the final state", func(t *testing.T) {
+		txs := []history.Tx{transfer(1, history.OK, "a", "b", 10)}
+		is.NotError(t, history.CheckBankAudits(txs, []history.BankAudit{{TxID: -1, Balances: map[string]int64{"a": 100, "b": 100}}}, 100))
+	})
+
+	t.Run("reports that it cannot decide too many combinations of concurrent transfers", func(t *testing.T) {
+		var txs []history.Tx
+		for id := 1; id <= 44; id++ {
+			txs = append(txs, transfer(id, history.Unknown, "a", "b", int64(id)))
+		}
+		at, a := audit(100, 1000, 1010, map[string]int64{"a": 100, "b": 100})
+		err := history.CheckBankAudits(append(txs, at), []history.BankAudit{a}, 100)
+		is.True(t, errors.Is(err, history.ErrUndecided), fmt.Sprint(err))
+		is.Equal(t, "", anomalyKind(t, err))
+	})
+
+	t.Run("accepts every audit of a serial history, and rejects one that misses a transfer acknowledged before it began", func(t *testing.T) {
+		hegel.Test(t, func(ht *hegel.T) {
+			accounts := []string{"a", "b", "c", "d"}
+			balances := map[string]int64{}
+			for _, a := range accounts {
+				balances[a] = 100
+			}
+			withUnknown := hegel.Draw(ht, hegel.Booleans())
+			outcomes := []history.Outcome{history.OK, history.OK, history.Failed}
+			if withUnknown {
+				outcomes = append(outcomes, history.Unknown)
+			}
+			var txs []history.Tx
+			var audits []history.BankAudit
+			// last is the last transfer acknowledged before the next audit begins.
+			var last *history.Tx
+			n := hegel.Draw(ht, hegel.Integers(1, 30))
+			for id := 1; id <= n; id++ {
+				if hegel.Draw(ht, hegel.Integers(0, 2)) == 0 {
+					snapshot := map[string]int64{}
+					for k, v := range balances {
+						snapshot[k] = v
+					}
+					txs = append(txs, tx(id, id*10, id*10+5, history.OK))
+					audits = append(audits, history.BankAudit{TxID: id, Balances: snapshot})
+					continue
+				}
+				outcome := hegel.Draw(ht, hegel.SampledFrom(outcomes))
+				from := hegel.Draw(ht, hegel.SampledFrom(accounts))
+				to := hegel.Draw(ht, hegel.SampledFrom(accounts[1:]))
+				if from == to {
+					from = accounts[0]
+				}
+				amount := int64(hegel.Draw(ht, hegel.Integers(1, 50)))
+				if outcome == history.OK || outcome == history.Unknown && hegel.Draw(ht, hegel.Booleans()) {
+					balances[from] -= amount
+					balances[to] += amount
+				}
+				txs = append(txs, transfer(id, outcome, from, to, amount))
+				if outcome == history.OK {
+					last = &txs[len(txs)-1]
+				}
+			}
+			if err := history.CheckBankAudits(txs, audits, 100); err != nil {
+				ht.Fatalf("rejected a serial history: %v", err)
+			}
+			if withUnknown || last == nil {
+				return
+			}
+			// An audit after the last acknowledged transfer that does not see it.
+			stale := map[string]int64{}
+			for k, v := range balances {
+				stale[k] = v
+			}
+			for _, op := range last.Ops {
+				stale[op.Key] -= op.Value
+			}
+			id := n + 1
+			txs = append(txs, tx(id, id*10, id*10+5, history.OK))
+			if err := history.CheckBankAudits(txs, append(audits, history.BankAudit{TxID: id, Balances: stale}), 100); err == nil {
+				ht.Fatalf("accepted an audit without %v", *last)
+			}
+		}, hegel.WithTestCases(500))
+	})
+}
+
 // serialHistory generates transactions that ran one after another over a model, so the
 // history is strictly serializable by construction.
 func serialHistory(ht *hegel.T) ([]history.Tx, map[string][]int64) {

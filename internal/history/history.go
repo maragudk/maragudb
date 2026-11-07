@@ -141,6 +141,68 @@ var ErrUndecided = errors.New("too many combinations of transfers with an unknow
 // returns [ErrUndecided], and no [*Anomaly], when their combinations are more than
 // [maxCombinations] for each half of them.
 func CheckBankDurability(txs []Tx, initial int64, final map[string]int64) error {
+	var acked, unknown []Tx
+	for _, tx := range txs {
+		switch tx.Outcome {
+		case OK:
+			acked = append(acked, tx)
+		case Unknown:
+			unknown = append(unknown, tx)
+		}
+	}
+	diff, err := explainBalances(acked, unknown, initial, final, maxCombinations)
+	if err != nil || diff == nil {
+		return err
+	}
+	return &Anomaly{Kind: "lost acknowledged write", Message: fmt.Sprintf("the final balances differ from those of the acknowledged transfers by %v, which no set of the %d transfers whose outcome is unknown makes up", diff, len(unknown))}
+}
+
+// CheckBankAudits verifies that every audit of the bank workload saw every transfer acknowledged
+// before it began, as strict serializability requires. The balances of an audit must be initial
+// plus the amounts of every transfer acknowledged before the audit began and of one set of the
+// other transfers that did not fail and that began before the audit ended. An audit whose TxID is
+// none of the transactions, such as the final state, is not checked. It returns [ErrUndecided], and
+// no [*Anomaly], when the combinations of the other transfers of an audit are more than
+// [maxAuditCombinations] for each half of them, which it checks once for every audit.
+func CheckBankAudits(txs []Tx, audits []BankAudit, initial int64) error {
+	byID := make(map[int]Tx, len(txs))
+	for _, tx := range txs {
+		byID[tx.ID] = tx
+	}
+	var undecided error
+	for _, a := range audits {
+		at, ok := byID[a.TxID]
+		if !ok {
+			continue
+		}
+		var before, maybe []Tx
+		for _, tx := range txs {
+			switch {
+			case tx.Outcome == Failed || tx.ID == at.ID:
+			case tx.Outcome == OK && tx.Complete < at.Invoke:
+				before = append(before, tx)
+			case tx.Invoke < at.Complete:
+				maybe = append(maybe, tx)
+			}
+		}
+		diff, err := explainBalances(before, maybe, initial, a.Balances, maxAuditCombinations)
+		switch {
+		case err != nil:
+			undecided = err
+		case diff != nil:
+			return &Anomaly{Kind: "stale read", Message: fmt.Sprintf("audit %d read balances that differ from those of the %d transfers acknowledged before it began by %v, which no set of the %d transfers that may have committed before it read makes up: %v", a.TxID, len(before), diff, len(maybe), a.Balances), Txs: []Tx{at}}
+		}
+	}
+	return undecided
+}
+
+// explainBalances reports how balances differ from initial plus the amounts of every transfer in
+// certain and of the best set of those in possible, or nil when one set of possible makes them up
+// exactly. A transfer is a transaction whose appends are the amounts that it moved into accounts,
+// negative for the account it moved them from. Transfers in possible that move the same amounts
+// count as one with a multiplicity, and it returns [ErrUndecided] when their combinations are more
+// than budget for each half of them.
+func explainBalances(certain, possible []Tx, initial int64, balances map[string]int64, budget int) (map[string]int64, error) {
 	index := map[string]int{}
 	var accounts []string
 	account := func(name string) int {
@@ -152,8 +214,8 @@ func CheckBankDurability(txs []Tx, initial int64, final map[string]int64) error 
 		}
 		return i
 	}
-	names := make([]string, 0, len(final))
-	for name := range final {
+	names := make([]string, 0, len(balances))
+	for name := range balances {
 		names = append(names, name)
 	}
 	sort.Strings(names)
@@ -161,28 +223,25 @@ func CheckBankDurability(txs []Tx, initial int64, final map[string]int64) error 
 		account(name)
 	}
 	type delta map[int]int64
-	var acked, unknown []delta
-	for _, tx := range txs {
-		if tx.Outcome == Failed {
-			continue
-		}
-		d := delta{}
-		for _, op := range tx.Ops {
-			if op.Kind == Append {
-				d[account(op.Key)] += op.Value
+	deltas := func(txs []Tx) []delta {
+		var ds []delta
+		for _, tx := range txs {
+			d := delta{}
+			for _, op := range tx.Ops {
+				if op.Kind == Append {
+					d[account(op.Key)] += op.Value
+				}
 			}
+			ds = append(ds, d)
 		}
-		if tx.Outcome == OK {
-			acked = append(acked, d)
-		} else {
-			unknown = append(unknown, d)
-		}
+		return ds
 	}
+	sure, maybe := deltas(certain), deltas(possible)
 	missing := make([]int64, len(accounts))
 	for name, i := range index {
-		missing[i] = final[name] - initial
+		missing[i] = balances[name] - initial
 	}
-	for _, d := range acked {
+	for _, d := range sure {
 		for i, v := range d {
 			missing[i] -= v
 		}
@@ -191,7 +250,7 @@ func CheckBankDurability(txs []Tx, initial int64, final map[string]int64) error 
 	// number up to its size may have landed, and a transfer that moves nothing does not matter.
 	groupOf := map[string]int{}
 	var groups []group
-	for _, d := range unknown {
+	for _, d := range maybe {
 		v := make([]int64, len(accounts))
 		zero := true
 		for i, x := range d {
@@ -209,12 +268,12 @@ func CheckBankDurability(txs []Tx, initial int64, final map[string]int64) error 
 		groupOf[k] = len(groups)
 		groups = append(groups, group{vector: v, size: 1})
 	}
-	found, ok := sumsTo(groups, missing)
+	found, ok := sumsTo(groups, missing, budget)
 	if !ok {
-		return ErrUndecided
+		return nil, ErrUndecided
 	}
 	if found {
-		return nil
+		return nil, nil
 	}
 	diff := map[string]int64{}
 	for i, name := range accounts {
@@ -222,11 +281,15 @@ func CheckBankDurability(txs []Tx, initial int64, final map[string]int64) error 
 			diff[name] = missing[i]
 		}
 	}
-	return &Anomaly{Kind: "lost acknowledged write", Message: fmt.Sprintf("the final balances differ from those of the acknowledged transfers by %v, which no set of the %d transfers whose outcome is unknown makes up", diff, len(unknown))}
+	return diff, nil
 }
 
-// maxCombinations of the groups of each half that [sumsTo] tries.
-const maxCombinations = 1 << 20
+// maxCombinations of the groups of each half that [sumsTo] tries for the final balances, and
+// maxAuditCombinations for the balances of an audit, of which there are many in a history.
+const (
+	maxCombinations      = 1 << 20
+	maxAuditCombinations = 1 << 10
+)
 
 // group of equal vectors, of which a sum may take any number up to size.
 type group struct {
@@ -245,18 +308,18 @@ func vectorKey(v []int64) string {
 // sumsTo reports whether some choice of up to the size of each group of vectors sums to target,
 // by meeting in the middle: it keeps the sums of every choice in the first half of the groups,
 // and looks up what each choice in the second half leaves of the target. It reports false for ok
-// when a half has more than [maxCombinations] choices.
-func sumsTo(groups []group, target []int64) (found, ok bool) {
+// when a half has more than budget choices.
+func sumsTo(groups []group, target []int64, budget int) (found, ok bool) {
 	// The halves split the combinations rather than the groups.
 	half, left := 0, 1
-	for half < len(groups) && left*(groups[half].size+1) <= maxCombinations {
+	for half < len(groups) && left*(groups[half].size+1) <= budget {
 		left *= groups[half].size + 1
 		half++
 	}
 	right := 1
 	for _, g := range groups[half:] {
 		right *= g.size + 1
-		if right > maxCombinations {
+		if right > budget {
 			return false, false
 		}
 	}

@@ -160,8 +160,14 @@ type object struct {
 
 // store holds the objects, shared between a client and its fault-free views.
 type store struct {
-	mu      sync.Mutex
-	objects map[string]object
+	// changeMu is held from a change to the objects until onChange returned, so that the calls
+	// of onChange are in the order of the changes, and mu only during the change, so that
+	// onChange can read the objects.
+	changeMu sync.Mutex
+	mu       sync.Mutex
+	objects  map[string]object
+	// onChange is called with every change to the objects, right after it.
+	onChange func(key string, body []byte, deleted bool)
 }
 
 // Client is a fake object store. It implements [s3.Client].
@@ -383,6 +389,16 @@ func (c *Client) drawDamage(key string, opts s3.GetOptions, body []byte) []byte 
 	return bytes.Clone(other)
 }
 
+// OnChange calls f with every write and delete that reaches the store, through c or any other view
+// of the same objects, right after it reaches it and before any other change, whether or not the
+// request then fails. f gets the body of a write, which it must not change, and may read the
+// objects, but must not change them.
+func (c *Client) OnChange(f func(key string, body []byte, deleted bool)) {
+	c.store.mu.Lock()
+	defer c.store.mu.Unlock()
+	c.store.onChange = f
+}
+
 // WithoutFaults returns a client over the same objects and clock that injects no faults.
 func (c *Client) WithoutFaults() *Client {
 	return &Client{clock: c.clock, store: c.store}
@@ -414,6 +430,15 @@ func (c *Client) Body(key string) ([]byte, bool) {
 		return nil, false
 	}
 	return append([]byte(nil), o.body...), true
+}
+
+// View of the body of the object at key, if present, without a copy, which the caller must not
+// change. A later write replaces the body rather than changing it.
+func (c *Client) View(key string) ([]byte, bool) {
+	c.store.mu.Lock()
+	defer c.store.mu.Unlock()
+	o, ok := c.store.objects[key]
+	return o.body, ok
 }
 
 // Now in the fake's clock.
@@ -608,20 +633,28 @@ func (c *Client) Get(ctx context.Context, key string, opts s3.GetOptions) (s3.Ob
 func (c *Client) Put(ctx context.Context, key string, body []byte, opts s3.PutOptions) (string, error) {
 	etag := etagOf(body)
 	err := c.request(ctx, s3.PutKind(opts), key, true, func() error {
+		c.store.changeMu.Lock()
+		defer c.store.changeMu.Unlock()
 		c.store.mu.Lock()
-		defer c.store.mu.Unlock()
 		o, exists := c.store.objects[key]
-		if opts.IfNoneMatch && exists {
-			return s3.ErrPreconditionFailed
+		var err error
+		switch {
+		case opts.IfNoneMatch && exists:
+			err = s3.ErrPreconditionFailed
+		case opts.IfMatch != "" && !exists:
+			err = s3.ErrNotFound
+		case opts.IfMatch != "" && o.etag != opts.IfMatch:
+			err = s3.ErrPreconditionFailed
+		default:
+			o = object{body: append([]byte(nil), body...), etag: etag, modified: c.clock.Now()}
+			c.store.objects[key] = o
 		}
-		if opts.IfMatch != "" && !exists {
-			return s3.ErrNotFound
+		onChange := c.store.onChange
+		c.store.mu.Unlock()
+		if err == nil && onChange != nil {
+			onChange(key, o.body, false)
 		}
-		if opts.IfMatch != "" && o.etag != opts.IfMatch {
-			return s3.ErrPreconditionFailed
-		}
-		c.store.objects[key] = object{body: append([]byte(nil), body...), etag: etag, modified: c.clock.Now()}
-		return nil
+		return err
 	})
 	if err != nil {
 		return "", err
@@ -631,9 +664,15 @@ func (c *Client) Put(ctx context.Context, key string, body []byte, opts s3.PutOp
 
 func (c *Client) Delete(ctx context.Context, key string) error {
 	return c.request(ctx, s3.KindDelete, key, true, func() error {
+		c.store.changeMu.Lock()
+		defer c.store.changeMu.Unlock()
 		c.store.mu.Lock()
-		defer c.store.mu.Unlock()
 		delete(c.store.objects, key)
+		onChange := c.store.onChange
+		c.store.mu.Unlock()
+		if onChange != nil {
+			onChange(key, nil, true)
+		}
 		return nil
 	})
 }

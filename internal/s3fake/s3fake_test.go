@@ -604,3 +604,83 @@ func TestClient_DamageRate(t *testing.T) {
 		is.Equal(t, 1, c.Damaged(""))
 	})
 }
+
+func TestClient_OnChange(t *testing.T) {
+	t.Run("sees every write and delete that reaches the store, through every view of it, and none that fails or does not reach it", func(t *testing.T) {
+		c := s3fake.New(s3fake.WithFaults(s3fake.Faults{Rand: rand.New(rand.NewPCG(1, 2)), Decide: func(kind s3.Kind, key string) s3fake.Outcome {
+			switch key {
+			case "lost":
+				return s3fake.OutcomeLostAck
+			case "refused":
+				return s3fake.OutcomeError
+			}
+			return s3fake.OutcomeNormal
+		}}))
+		var changes []string
+		c.OnChange(func(key string, body []byte, deleted bool) {
+			changes = append(changes, fmt.Sprintf("%s=%s deleted %v", key, body, deleted))
+		})
+		_, err := c.Put(t.Context(), "a", []byte("1"), s3.PutOptions{})
+		is.NotError(t, err)
+		_, err = c.Put(t.Context(), "lost", []byte("2"), s3.PutOptions{})
+		is.Error(t, s3fake.ErrInjected, err)
+		_, err = c.Put(t.Context(), "refused", []byte("3"), s3.PutOptions{})
+		is.Error(t, s3fake.ErrInjected, err)
+		_, err = c.Put(t.Context(), "a", []byte("4"), s3.PutOptions{IfMatch: `"nope"`})
+		is.Error(t, s3.ErrPreconditionFailed, err)
+		_, err = c.WithoutFaults().Put(t.Context(), "b", []byte("5"), s3.PutOptions{})
+		is.NotError(t, err)
+		is.NotError(t, c.Delete(t.Context(), "a"))
+		_, err = c.Get(t.Context(), "b", s3.GetOptions{})
+		is.NotError(t, err)
+		is.EqualSlice(t, []string{"a=1 deleted false", "lost=2 deleted false", "b=5 deleted false", "a= deleted true"}, changes)
+	})
+
+	t.Run("calls f in the order of the changes, so that the store holds what f is told until f returns, with writes from many goroutines", func(t *testing.T) {
+		c := s3fake.New()
+		var mu sync.Mutex
+		mismatches, calls := 0, 0
+		c.OnChange(func(key string, body []byte, deleted bool) {
+			got, ok := c.View(key)
+			mu.Lock()
+			defer mu.Unlock()
+			calls++
+			if ok == deleted || !bytes.Equal(got, body) {
+				mismatches++
+			}
+		})
+		var wg sync.WaitGroup
+		for i := range 8 {
+			wg.Go(func() {
+				for j := range 50 {
+					if j%5 == 4 {
+						is.NotError(t, c.Delete(t.Context(), "k"))
+						continue
+					}
+					_, err := c.Put(t.Context(), "k", []byte(fmt.Sprint(i, j)), s3.PutOptions{})
+					is.NotError(t, err)
+				}
+			})
+		}
+		wg.Wait()
+		is.Equal(t, 400, calls)
+		is.Equal(t, 0, mismatches)
+	})
+}
+
+func TestClient_View(t *testing.T) {
+	t.Run("is the body of an object, which a later write replaces rather than changes", func(t *testing.T) {
+		c := s3fake.New()
+		_, err := c.Put(t.Context(), "k", []byte("v1"), s3.PutOptions{})
+		is.NotError(t, err)
+		v1, ok := c.View("k")
+		is.True(t, ok)
+		_, err = c.Put(t.Context(), "k", []byte("v2"), s3.PutOptions{})
+		is.NotError(t, err)
+		v2, _ := c.View("k")
+		is.Equal(t, "v1", string(v1))
+		is.Equal(t, "v2", string(v2))
+		_, ok = c.View("missing")
+		is.True(t, !ok)
+	})
+}

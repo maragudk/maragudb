@@ -241,6 +241,20 @@ func corpus() []sim.Config {
 		}
 		cfgs = append(cfgs, cfg)
 	}
+	// Maintainers that never merge the whole database, and reads from the store of which one in
+	// ten is damaged, with blocks of 64 bytes, in every workload, through the engine and through
+	// SQL.
+	for seed := uint64(920); seed < 928; seed++ {
+		cfg := sim.DefaultConfig(seed)
+		cfg.Workload = sim.Workload(seed % 4)
+		cfg.SQL = cfg.Workload >= sim.Unique || seed%8 >= 4
+		cfg.Maintainers = 2
+		cfg.TieredCompactions = true
+		cfg.StoreDamage = true
+		cfg.DamageRate = 0.1
+		cfg.BlockSize = 64
+		cfgs = append(cfgs, cfg)
+	}
 	// The same through the SQL layer and the database/sql driver.
 	for seed := uint64(300); seed < 330; seed++ {
 		for _, w := range []sim.Workload{sim.ListAppend, sim.Bank} {
@@ -356,6 +370,7 @@ func TestSimulator(t *testing.T) {
 		is.True(t, totals.Conflicts > 100, "conflicts")
 		is.True(t, totals.Unknown > 50, "unknown outcomes")
 		is.Equal(t, 0, totals.Undecided, "bank runs whose final balances the durability checker could not decide")
+		is.Equal(t, 0, totals.UndecidedAudits, "bank runs with an audit whose balances the real-time checker could not decide")
 		is.True(t, totals.LiveUnknown > 50, "unknown outcomes in processes that keep running")
 		is.True(t, totals.Outages > 200, "outages and partitions")
 		is.True(t, totals.Unavailable > 100, "operations failed by an unreachable store")
@@ -571,6 +586,10 @@ func TestSimulator(t *testing.T) {
 		if os.Getenv("MARAGUDB_STORE_DAMAGE") != "" {
 			cfg.StoreDamage = true
 		}
+		if p := os.Getenv("MARAGUDB_DAMAGE_RATE"); p != "" {
+			cfg.DamageRate, err = strconv.ParseFloat(p, 64)
+			is.NotError(t, err)
+		}
 		if n := os.Getenv("MARAGUDB_BLOCK_SIZE"); n != "" {
 			cfg.BlockSize, err = strconv.Atoi(n)
 			is.NotError(t, err)
@@ -581,6 +600,9 @@ func TestSimulator(t *testing.T) {
 		}
 		if os.Getenv("MARAGUDB_ONE_COMPACTOR") != "" {
 			cfg.OneCompactor = true
+		}
+		if os.Getenv("MARAGUDB_TIERED_COMPACTIONS") != "" {
+			cfg.TieredCompactions = true
 		}
 		if p := os.Getenv("MARAGUDB_COMMIT_PARTITIONS"); p != "" {
 			cfg.CommitPartitions, err = strconv.ParseFloat(p, 64)
@@ -599,23 +621,7 @@ func TestSimulator(t *testing.T) {
 			for _, m := range mutants() {
 				if m.replay == name {
 					found = true
-					cfg.Mutations = m.mutations
-					cfg.SQLMutations = m.sqlMutations
-					cfg.DiskMutations = m.diskMutations
-					cfg.DiskFaults = cfg.DiskFaults || m.diskMutations != (cache.DiskMutations{})
-					cfg.StoreDamage = cfg.StoreDamage || m.storeDamage
-					if m.blockSize != 0 {
-						cfg.BlockSize = m.blockSize
-					}
-					if cfg.Maintenance == sim.MaintenanceOff {
-						cfg.Maintenance = m.maintenance
-					}
-					cfg.CompactionStall = cmp.Or(cfg.CompactionStall, m.compactionStall)
-					cfg.OneCompactor = cfg.OneCompactor || m.oneCompactor
-					cfg.CommitPartitions = cmp.Or(cfg.CommitPartitions, m.commitPartitions)
-					if m.sqlMutations != (exec.Mutations{}) {
-						cfg.SQL = true
-					}
+					cfg = m.apply(cfg)
 				}
 			}
 			if !found {
@@ -671,6 +677,17 @@ func TestSimulator(t *testing.T) {
 			if rng.IntN(4) == 0 {
 				cfg.BlockSize = 64 + rng.IntN(448)
 			}
+			if cfg.StoreDamage && rng.IntN(4) == 0 {
+				cfg.DamageRate = rng.Float64() * 0.2
+			}
+			if rng.IntN(4) == 0 {
+				cfg.CompactionStall = time.Duration(1+rng.IntN(1000)) * time.Millisecond
+			}
+			cfg.OneCompactor = rng.IntN(4) == 0
+			cfg.TieredCompactions = rng.IntN(4) == 0
+			if rng.IntN(4) == 0 {
+				cfg.CommitPartitions = rng.Float64() * 0.5
+			}
 			res := runSim(cfg)
 			runs++
 			batch.add(res)
@@ -725,18 +742,24 @@ type mutant struct {
 	sqlMutations                  exec.Mutations
 	// diskMutations break the disk cache, and run with [sim.Config.DiskFaults].
 	diskMutations cache.DiskMutations
-	// storeDamage runs the mutant with [sim.Config.StoreDamage].
+	// storeDamage and damageRate run the mutant with [sim.Config.StoreDamage] and
+	// [sim.Config.DamageRate].
 	storeDamage bool
+	damageRate  float64
 	// blockSize runs the mutant with [sim.Config.BlockSize].
 	blockSize int
 	// maintenance runs the mutant with the clients' maintenance in this mode, when it is not
 	// [sim.MaintenanceOff].
 	maintenance sim.MaintenanceMode
-	// compactionStall, oneCompactor, and commitPartitions run the mutant with
-	// [sim.Config.CompactionStall], [sim.Config.OneCompactor], and [sim.Config.CommitPartitions].
-	compactionStall  time.Duration
-	oneCompactor     bool
-	commitPartitions float64
+	// compactionStall, oneCompactor, tieredCompactions, and commitPartitions run the mutant with
+	// [sim.Config.CompactionStall], [sim.Config.OneCompactor], [sim.Config.TieredCompactions], and
+	// [sim.Config.CommitPartitions].
+	compactionStall   time.Duration
+	oneCompactor      bool
+	tieredCompactions bool
+	commitPartitions  float64
+	// keys runs the mutant with [sim.Config.Keys], when it is not zero.
+	keys int
 	// unsimulated, for a mutant that no cell can run, is why not, and a targeted test detects it.
 	unsimulated string
 	// engineOnly, for a mutant that only the cells through the engine can run, is why the cells
@@ -904,14 +927,18 @@ func mutants() []mutant {
 		},
 		{
 			id: "MUT-COMPACT-DROP-TOMBSTONES", replay: "compact-drop-tombstones", name: "tombstones dropped in a merge that excludes the oldest segment",
-			description:  "`engine.Mutations.CompactDropTombstones` drops tombstones in every merge, also in one that excludes the oldest segment, so that a value that an older segment holds shows again after its delete.",
-			mutations:    engine.Mutations{CompactDropTombstones: true},
-			unmaintained: noMaintainedMerge,
+			description: "`engine.Mutations.CompactDropTombstones` drops tombstones in every merge, also in one that excludes the oldest segment, so that a value that an older segment holds shows again after its delete. It runs with maintainers that merge only the segments that the tiers make due, never the whole database.",
+			mutations:   engine.Mutations{CompactDropTombstones: true},
+			// A merge of the whole database includes the oldest segment, so it drops tombstones
+			// rightly, and leaves none for the next merge to drop wrongly. Merges by tiers alone
+			// leave the oldest segment out and keep tombstones over it.
+			tieredCompactions: true,
+			unmaintained:      noMaintainedMerge,
 			unreached: map[cell]string{
 				{workload: sim.Bank, maintainers: 2}:                  "the bank workload through the engine never deletes a key, so no merge meets a tombstone",
 				{workload: sim.ListAppend, sql: true, maintainers: 2}: "the list-append workload through SQL never deletes a row, and its tables have no index besides the primary key, so no merge meets a tombstone",
 			},
-			checkers: []string{sim.CheckerListAppend},
+			checkers: []string{sim.CheckerListAppend, sim.CheckerCompaction},
 		},
 		{
 			id: "MUT-COMPACT-REBASE-LOSES-SEGMENT", replay: "compact-rebase-loses-segment", name: "a rebase that loses a segment added meanwhile",
@@ -935,16 +962,7 @@ func mutants() []mutant {
 			id: "MUT-SKIP-FRESHNESS", replay: "freshness", name: "serving the cache without a freshness check",
 			description: "`engine.Mutations.SkipFreshnessCheck` starts transactions from the cached manifest without asking the store, so a transaction can miss commits acknowledged before it began.",
 			mutations:   engine.Mutations{SkipFreshnessCheck: true},
-			cannot: func() map[cell]string {
-				m := bankCells("a transfer from a stale snapshot conflicts at commit, so that none is lost, and an audit from one reads an older state that conserves money; the bank workload checks no audit against the transfers acknowledged before it")
-				// A stale snapshot can lose an object that maintenance collected meanwhile, which the
-				// audits through SQL, which read the accounts twice, by rows and with SUM, and the
-				// readers that pause for almost a grace period run into.
-				delete(m, cell{workload: sim.Bank, sql: true, maintainers: 2})
-				delete(m, cell{workload: sim.Bank, maintainers: 2})
-				return m
-			}(),
-			checkers: []string{sim.CheckerListAppend},
+			checkers:    []string{sim.CheckerListAppend, sim.CheckerRealTime},
 		},
 		{
 			id: "MUT-ACK-BEFORE-CONFIRM", replay: "ack", name: "acking before the write is confirmed",
@@ -963,7 +981,7 @@ func mutants() []mutant {
 			id: "MUT-FRESH-SNAPSHOT", replay: "fresh-snapshot", name: "a fresh snapshot per statement",
 			description:  "`exec.Mutations.FreshSnapshotPerStatement` starts every statement of an explicit transaction that has not written yet from the latest commit, so an audit can straddle a transfer and a reader can see two states.",
 			sqlMutations: exec.Mutations{FreshSnapshotPerStatement: true},
-			checkers:     []string{sim.CheckerBank, sim.CheckerListAppend},
+			checkers:     []string{sim.CheckerBank, sim.CheckerListAppend, sim.CheckerRealTime},
 		},
 		{
 			id: "MUT-RETRY-UNKNOWN", replay: "retry-unknown", name: "retrying an autocommit statement after an unknown commit outcome",
@@ -1019,10 +1037,13 @@ func mutants() []mutant {
 		},
 		{
 			id: "MUT-CHECK-SKIP-UPDATE", replay: "check-skip-update", name: "CHECK on INSERT only",
-			description:  "`exec.Mutations.CheckSkipUpdate` checks the CHECK constraints of a row only when it is inserted, not when an UPDATE or a foreign key action changes it.",
+			description:  "`exec.Mutations.CheckSkipUpdate` checks the CHECK constraints of a row only when it is inserted, not when an UPDATE or a foreign key action changes it. It runs with one key, so that the foreign key workload draws its keys from a pool of two.",
 			sqlMutations: exec.Mutations{CheckSkipUpdate: true},
-			cannot:       merge(workloadCells(sim.ListAppend, noCheck), workloadCells(sim.Bank, noCheck), workloadCells(sim.Unique, noCheck)),
-			checkers:     []string{sim.CheckerCheck},
+			// An UPDATE that breaks a CHECK must find its row, and the parent that it points a
+			// child at, among the keys of the pool, which most UPDATEs miss in a pool of eight.
+			keys:     1,
+			cannot:   merge(workloadCells(sim.ListAppend, noCheck), workloadCells(sim.Bank, noCheck), workloadCells(sim.Unique, noCheck)),
+			checkers: []string{sim.CheckerCheck},
 		},
 		{
 			id: "MUT-SUBQUERY-STALE-READS", replay: "subquery-stale-reads", name: "subquery reads that a retry does not repeat",
@@ -1073,15 +1094,20 @@ func mutants() []mutant {
 		},
 		{
 			id: "MUT-FILTER-UNCHECKED", replay: "filter-unchecked", name: "filter blocks read without their checksum",
-			description: "`engine.Mutations.FilterUnchecked` decodes the filter blocks of segments without checking their checksums, and caches what the store returns before decoding it, so that a filter block whose bytes the store damaged is trusted, or cached and trusted later. It runs with damaged reads from the store and with blocks of 128 bytes, so that segments have filter blocks.",
+			description: "`engine.Mutations.FilterUnchecked` decodes the filter blocks of segments without checking their checksums, and caches what the store returns before decoding it, so that a filter block whose bytes the store damaged is trusted, or cached and trusted later. It runs with blocks of 64 bytes, so that segments have filter blocks, and with one in ten reads from the store damaged.",
 			mutations:   engine.Mutations{FilterUnchecked: true},
+			// Most reads of filter blocks from the store are of the clients without caches, which
+			// read a filter block on every lookup, and the damage that they trust is mostly in bits
+			// that the lookup does not test. Small blocks give segments more filter blocks, and more
+			// damage reaches the reads of the clients that cache them.
 			storeDamage: true,
-			blockSize:   128,
+			damageRate:  0.1,
+			blockSize:   64,
 			unreached: func() map[cell]string {
 				m := map[cell]string{}
 				for _, c := range cells() {
 					if c.workload == sim.Bank && !c.sql {
-						m[c] = "the bank workload through the engine keeps four accounts, whose segments fit in one block even of 128 bytes, so no segment has a filter block"
+						m[c] = "the bank workload through the engine keeps four accounts, whose segments fit in one block even of 64 bytes, so no segment has a filter block"
 					}
 				}
 				return m
@@ -1102,6 +1128,43 @@ func mutants() []mutant {
 			checkers:    []string{sim.CheckerPanic},
 		},
 	}
+}
+
+// config that runs the mutant in the cell with the seed.
+func (m mutant) config(c cell, seed uint64) sim.Config {
+	cfg := sim.DefaultConfig(seed)
+	cfg.Workload = c.workload
+	cfg.SQL = c.sql
+	cfg.Maintainers = c.maintainers
+	return m.apply(cfg)
+}
+
+// apply the mutant to cfg: its mutations, and the faults and settings that it runs with, where
+// cfg leaves them off. The block size and the keys of the mutant replace those of cfg.
+func (m mutant) apply(cfg sim.Config) sim.Config {
+	cfg.Mutations = m.mutations
+	cfg.SQLMutations = m.sqlMutations
+	cfg.DiskMutations = m.diskMutations
+	cfg.DiskFaults = cfg.DiskFaults || m.diskMutations != (cache.DiskMutations{})
+	cfg.StoreDamage = cfg.StoreDamage || m.storeDamage
+	cfg.DamageRate = cmp.Or(cfg.DamageRate, m.damageRate)
+	if m.blockSize != 0 {
+		cfg.BlockSize = m.blockSize
+	}
+	if cfg.Maintenance == sim.MaintenanceOff {
+		cfg.Maintenance = m.maintenance
+	}
+	cfg.CompactionStall = cmp.Or(cfg.CompactionStall, m.compactionStall)
+	cfg.OneCompactor = cfg.OneCompactor || m.oneCompactor
+	cfg.TieredCompactions = cfg.TieredCompactions || m.tieredCompactions
+	cfg.CommitPartitions = cmp.Or(cfg.CommitPartitions, m.commitPartitions)
+	if m.keys != 0 {
+		cfg.Keys = m.keys
+	}
+	if m.sqlMutations != (exec.Mutations{}) {
+		cfg.SQL = true
+	}
+	return cfg
 }
 
 // applicable reports whether the mutant can run in the cell, and why not: a mutant in the SQL
@@ -1170,16 +1233,26 @@ func TestRateWord(t *testing.T) {
 	}
 }
 
-// killMatrixSeeds tried in every cell.
+// killMatrixSeeds tried in `make test` in every cell until one detects the mutant. A cell that
+// detects it must do so with one of them.
 const killMatrixSeeds = 20
 
 // cannotSeeds tried in `make test` in a cell that is said to be unable to detect the mutant. No
-// seed detects it there, so every seed that the cell tries runs. `make verification` and `make
-// soak` try all [killMatrixSeeds] there, as in every other cell.
+// seed detects it there, so every seed that the cell tries runs.
 const cannotSeeds = 5
 
-// allSeeds reports whether every cell tries all [killMatrixSeeds]: when the kill matrix is
-// written, with -update, and in the soak.
+// rateSeeds tried in every cell that can run the mutant when [allSeeds], and rateFloor the fewest
+// of them that must detect the mutant in a cell that detects it. A cell that detects it with fewer
+// is fragile: a change elsewhere that shifts the histories can leave it without a detection in the
+// first [killMatrixSeeds]. The seeds are fixed, so the count is the same in every run, and it is
+// in the kill matrix, where a change shows as a difference.
+const (
+	rateSeeds = 100
+	rateFloor = 20
+)
+
+// allSeeds reports whether every cell tries all [rateSeeds]: when the kill matrix is written,
+// with -update, and in the soak.
 func allSeeds() bool {
 	return *update || os.Getenv("MARAGUDB_SOAK") != ""
 }
@@ -1270,6 +1343,49 @@ func TestRun_targetedFaults(t *testing.T) {
 		}
 		is.True(t, stalls > 8, fmt.Sprint(stalls, " stalls"))
 		is.True(t, reached > 0, "GC keeps a live segment that an expired garbage batch lists")
+	})
+
+	t.Run("tiered compactions leave every maintainer merging only the segments that the tiers make due, and a damage rate damages that share of the reads", func(t *testing.T) {
+		t.Parallel()
+		var cfgs []sim.Config
+		var mu sync.Mutex
+		count := map[bool]map[string]int{true: {}, false: {}}
+		for seed := uint64(1); seed <= 8; seed++ {
+			for _, targeted := range []bool{false, true} {
+				cfg := sim.DefaultConfig(seed)
+				cfg.Maintainers = 2
+				cfg.StoreDamage = true
+				if targeted {
+					cfg.TieredCompactions = true
+					cfg.DamageRate = 0.2
+				}
+				cfg.Trace = func(line string) {
+					mu.Lock()
+					defer mu.Unlock()
+					switch {
+					case strings.Contains(line, "compact the whole database true"):
+						count[targeted]["whole"]++
+					case strings.Contains(line, "compact the whole database false"):
+						count[targeted]["tiers"]++
+					case strings.Contains(line, ": damaged body"):
+						count[targeted]["damaged"]++
+					case strings.Contains(line, " s3 GET "):
+						count[targeted]["reads"]++
+					}
+				}
+				cfgs = append(cfgs, cfg)
+			}
+		}
+		for _, res := range runAll(cfgs) {
+			is.True(t, !res.Failed(), res.Report())
+		}
+		msg := fmt.Sprint(count)
+		is.True(t, count[false]["whole"] > 0 && count[false]["tiers"] > 0, msg)
+		is.True(t, count[true]["whole"] == 0 && count[true]["tiers"] > 0, msg)
+		// The default damages one in fifty of the reads.
+		rate := func(c map[string]int) float64 { return float64(c["damaged"]) / float64(c["reads"]) }
+		is.True(t, rate(count[false]) > 0.01 && rate(count[false]) < 0.04, msg)
+		is.True(t, rate(count[true]) > 0.15 && rate(count[true]) < 0.25, msg)
 	})
 
 	t.Run("commit partitions leave the outcome of commits unknown in processes that keep running", func(t *testing.T) {
@@ -1420,7 +1536,7 @@ func TestMutants(t *testing.T) {
 	// the whole matrix is compared once they are all done.
 	ran := make([]*verify.KillMatrixMutant, len(ms))
 	t.Cleanup(func() {
-		km := verify.KillMatrix{Seeds: killMatrixSeeds, CannotSeeds: cannotSeeds}
+		km := verify.KillMatrix{Seeds: killMatrixSeeds, CannotSeeds: cannotSeeds, RateSeeds: rateSeeds, Floor: rateFloor}
 		for _, c := range cells() {
 			km.Cells = append(km.Cells, c.String())
 		}
@@ -1431,13 +1547,34 @@ func TestMutants(t *testing.T) {
 			}
 			km.Mutants = append(km.Mutants, *kmm)
 		}
+		path := filepath.Join("..", "..", verify.KillMatrixPath)
+		if !allSeeds() {
+			// The detections in all seeds are not counted, so they are those of the golden file,
+			// for the cells that it has detected too.
+			var golden verify.KillMatrix
+			if b, err := os.ReadFile(path); err == nil {
+				_ = json.Unmarshal(b, &golden)
+			}
+			detections := map[[2]string]int{}
+			for _, m := range golden.Mutants {
+				for _, r := range m.Results {
+					detections[[2]string{m.ID, r.Cell}] = r.Detections
+				}
+			}
+			for i, m := range km.Mutants {
+				for j, r := range m.Results {
+					if r.Status == verify.Detected {
+						km.Mutants[i].Results[j].Detections = detections[[2]string{m.ID, r.Cell}]
+					}
+				}
+			}
+		}
 		got, err := json.MarshalIndent(km, "", "  ")
 		if err != nil {
 			t.Errorf("marshaling the kill matrix: %v", err)
 			return
 		}
 		got = append(got, '\n')
-		path := filepath.Join("..", "..", verify.KillMatrixPath)
 		if *update {
 			if err := os.WriteFile(path, got, 0o644); err != nil {
 				t.Errorf("writing the kill matrix: %v", err)
@@ -1459,8 +1596,8 @@ func TestMutants(t *testing.T) {
 			t.Parallel()
 			kmm := verify.KillMatrixMutant{ID: m.id, Name: m.name, Replay: m.replay, Description: m.description}
 			// Every cell tries its seeds in order until one detects the mutant, a cell that cannot
-			// detect it only the first [cannotSeeds] unless [allSeeds], and the cells run in
-			// parallel.
+			// detect it only the first [cannotSeeds], and with [allSeeds] every cell tries all
+			// [rateSeeds] and counts the ones that detect it. The cells run in parallel.
 			cs := cells()
 			results := make([]verify.KillMatrixResult, len(cs))
 			var wg sync.WaitGroup
@@ -1472,29 +1609,25 @@ func TestMutants(t *testing.T) {
 					continue
 				}
 				seeds := uint64(killMatrixSeeds)
-				if _, cannot := m.cannot[c]; cannot && !allSeeds() {
+				_, cannot := m.cannot[c]
+				switch {
+				case allSeeds():
+					seeds = rateSeeds
+				case cannot:
 					seeds = cannotSeeds
 				}
 				wg.Go(func() {
 					r := &results[j]
 					for seed := uint64(1); seed <= seeds; seed++ {
-						cfg := sim.DefaultConfig(seed)
-						cfg.Workload = c.workload
-						cfg.SQL = c.sql
-						cfg.Maintainers = c.maintainers
-						cfg.Mutations = m.mutations
-						cfg.SQLMutations = m.sqlMutations
-						cfg.DiskMutations = m.diskMutations
-						cfg.DiskFaults = m.diskMutations != (cache.DiskMutations{})
-						cfg.StoreDamage = m.storeDamage
-						cfg.BlockSize = m.blockSize
-						cfg.Maintenance = m.maintenance
-						cfg.CompactionStall = m.compactionStall
-						cfg.OneCompactor = m.oneCompactor
-						cfg.CommitPartitions = m.commitPartitions
-						res := runSim(cfg)
-						if res.Failed() {
+						res := runSim(m.config(c, seed))
+						if !res.Failed() {
+							continue
+						}
+						if r.Status != verify.Detected {
 							r.Status, r.Seed, r.Checkers = verify.Detected, seed, res.Checkers()
+						}
+						r.Detections++
+						if !allSeeds() {
 							return
 						}
 					}
@@ -1512,7 +1645,7 @@ func TestMutants(t *testing.T) {
 					caught[name] = true
 				}
 				if r.Status == verify.Detected && c.maintainers == 0 && !slices.ContainsFunc(r.Checkers, func(name string) bool {
-					return name == sim.CheckerListAppend || name == sim.CheckerDurability || name == sim.CheckerBank || name == sim.CheckerUnique || name == sim.CheckerIndex || name == sim.CheckerForeignKey || name == sim.CheckerCheck || name == sim.CheckerRealTime || name == sim.CheckerStorage || name == sim.CheckerDiskCache || name == sim.CheckerCache || name == sim.CheckerDamage ||
+					return name == sim.CheckerListAppend || name == sim.CheckerDurability || name == sim.CheckerBank || name == sim.CheckerUnique || name == sim.CheckerIndex || name == sim.CheckerForeignKey || name == sim.CheckerCheck || name == sim.CheckerRealTime || name == sim.CheckerStorage || name == sim.CheckerDiskCache || name == sim.CheckerCache || name == sim.CheckerDamage || name == sim.CheckerCompaction ||
 						(name == sim.CheckerPanic && slices.Contains(m.checkers, sim.CheckerPanic))
 				}) {
 					t.Errorf("%v: without maintainers, a history or invariant checker must find the mutant, but only %v did", c, r.Checkers)
@@ -1525,6 +1658,14 @@ func TestMutants(t *testing.T) {
 					t.Errorf("%v: not detected in %d seeds, and no reason says why it cannot be", c, killMatrixSeeds)
 				case r.Status == verify.Undetected:
 					r.Reason = reason
+				case allSeeds() && r.Seed > killMatrixSeeds:
+					t.Errorf("%v: first detected with seed %d, after the %d seeds that `make test` tries", c, r.Seed, killMatrixSeeds)
+				case allSeeds() && r.Detections < rateFloor:
+					t.Errorf("%v: detected with %d of %d seeds, fewer than the floor of %d, so that a change that shifts the histories can leave it undetected in the first %d; make its interleaving likely with a fault scoped to the mutant, or a check see its effect more often", c, r.Detections, rateSeeds, rateFloor, killMatrixSeeds)
+				}
+				if !allSeeds() {
+					// The golden file has the count, which only all seeds give.
+					r.Detections = 0
 				}
 				verify.Record(t, verify.Fact{Mutant: &verify.Mutant{ID: m.id, Cell: c.String(), Detected: r.Status == verify.Detected, Seed: r.Seed, Checkers: r.Checkers}})
 				kmm.Results = append(kmm.Results, r)

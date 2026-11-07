@@ -160,6 +160,19 @@ func simConfig(seed uint64) sim.Config {
 	// quarter get reads whose bodies the store damages, independently.
 	cfg.DiskFaults = rng.IntN(4) == 0
 	cfg.StoreDamage = rng.IntN(4) == 0
+	// A quarter of the runs each get one of the faults that make rare interleavings likely:
+	// maintainers that stall between the output and the manifest write of a compaction, one
+	// maintainer that compacts while the others only collect garbage, maintainers that never merge
+	// the whole database, and clients partitioned right after a manifest write lands, drawn
+	// independently.
+	if rng.IntN(4) == 0 {
+		cfg.CompactionStall = time.Duration(250+rng.IntN(751)) * time.Millisecond
+	}
+	cfg.OneCompactor = rng.IntN(4) == 0
+	cfg.TieredCompactions = rng.IntN(4) == 0
+	if rng.IntN(4) == 0 {
+		cfg.CommitPartitions = 0.5 * (1 - rng.Float64())
+	}
 	return cfg
 }
 

@@ -487,8 +487,7 @@ func (c *client) bankSQL(ctx context.Context) {
 		}
 		h.Complete = c.run.stamp()
 		h.Outcome = history.OK
-		c.record(h)
-		c.run.audits = append(c.run.audits, history.BankAudit{TxID: h.ID, Balances: balances})
+		c.run.audits = append(c.run.audits, history.BankAudit{TxID: c.record(h), Balances: balances})
 		return
 	}
 

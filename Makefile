@@ -28,7 +28,8 @@ test:
 report:
 	go run ./internal/verify/cmd/report -dir $(VERIFY_DIR)
 
-# Regenerate the mutant kill matrix and docs/verification.md.
+# Regenerate the mutant kill matrix, with the count of seeds 1 to 100 that detect each mutant in
+# each configuration, and docs/verification.md.
 .PHONY: verification
 verification:
 	go test ./internal/sim -run 'TestMutants' -count 1 -args -update
@@ -38,11 +39,12 @@ verification:
 # WORKLOAD=foreign-key, the last two of which run through SQL, API=sql, CORPUS=1 to use the
 # corpus configuration of that seed, workload, and API, MAINTAINERS=<n> (default 2),
 # MAINTENANCE=lease|none|overlap, DISK_FAULTS=1 for small disk caches whose files are damaged,
-# STORE_DAMAGE=1 for reads whose bodies the store damages, BLOCK_SIZE=<n> for segment blocks of
-# n bytes, COMPACTION_STALL=<duration> for maintainers that stall between the output and the
-# manifest write of a compaction, ONE_COMPACTOR=1 for one maintainer that compacts and others that
-# only collect garbage, COMMIT_PARTITIONS=<rate> for clients partitioned right after a manifest
-# write lands, and MUTATION=<name>, where the names
+# STORE_DAMAGE=1 for reads whose bodies the store damages, DAMAGE_RATE=<rate> for the share of
+# them, BLOCK_SIZE=<n> for segment blocks of n bytes, COMPACTION_STALL=<duration> for maintainers
+# that stall between the output and the manifest write of a compaction, ONE_COMPACTOR=1 for one
+# maintainer that compacts and others that only collect garbage, TIERED_COMPACTIONS=1 for
+# maintainers that never merge the whole database, COMMIT_PARTITIONS=<rate> for clients
+# partitioned right after a manifest write lands, and MUTATION=<name>, where the names
 # are in the kill matrix in
 # docs/verification.md: cas, gc, gc-batch-objects-first, gc-sweep-segments-only,
 # gc-chain-first-stamp, gc-delete-referenced, compact-non-adjacent, compact-drop-tombstones,
@@ -53,10 +55,11 @@ verification:
 # segment-unchecked, filter-omits-keys, filter-unchecked, and maintenance-unrecovered.
 .PHONY: replay
 replay:
-	MARAGUDB_SEED=$(SEED) MARAGUDB_WORKLOAD=$(WORKLOAD) MARAGUDB_API=$(API) MARAGUDB_CORPUS=$(CORPUS) MARAGUDB_MAINTAINERS=$(MAINTAINERS) MARAGUDB_MAINTENANCE=$(MAINTENANCE) MARAGUDB_DISK_FAULTS=$(DISK_FAULTS) MARAGUDB_STORE_DAMAGE=$(STORE_DAMAGE) MARAGUDB_BLOCK_SIZE=$(BLOCK_SIZE) MARAGUDB_COMPACTION_STALL=$(COMPACTION_STALL) MARAGUDB_ONE_COMPACTOR=$(ONE_COMPACTOR) MARAGUDB_COMMIT_PARTITIONS=$(COMMIT_PARTITIONS) MARAGUDB_MUTATION=$(MUTATION) go test ./internal/sim -run 'TestSimulator/replay' -count 1 -v
+	MARAGUDB_SEED=$(SEED) MARAGUDB_WORKLOAD=$(WORKLOAD) MARAGUDB_API=$(API) MARAGUDB_CORPUS=$(CORPUS) MARAGUDB_MAINTAINERS=$(MAINTAINERS) MARAGUDB_MAINTENANCE=$(MAINTENANCE) MARAGUDB_DISK_FAULTS=$(DISK_FAULTS) MARAGUDB_STORE_DAMAGE=$(STORE_DAMAGE) MARAGUDB_DAMAGE_RATE=$(DAMAGE_RATE) MARAGUDB_BLOCK_SIZE=$(BLOCK_SIZE) MARAGUDB_COMPACTION_STALL=$(COMPACTION_STALL) MARAGUDB_ONE_COMPACTOR=$(ONE_COMPACTOR) MARAGUDB_TIERED_COMPACTIONS=$(TIERED_COMPACTIONS) MARAGUDB_COMMIT_PARTITIONS=$(COMMIT_PARTITIONS) MARAGUDB_MUTATION=$(MUTATION) go test ./internal/sim -run 'TestSimulator/replay' -count 1 -v
 
-# Run the mutant kill matrix with every seed in every cell, then the simulator with random seeds
-# and configurations for SOAK_DURATION (default 5m), and then the full sqllogictest corpus.
+# Run the mutant kill matrix with seeds 1 to 100 in every cell, which must match the kill matrix,
+# then the simulator with random seeds and configurations for SOAK_DURATION (default 5m), and then
+# the full sqllogictest corpus.
 SOAK_DURATION ?= 5m
 .PHONY: soak
 soak:

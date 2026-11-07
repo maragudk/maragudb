@@ -4,12 +4,15 @@
 package sim
 
 import (
+	"bytes"
 	"cmp"
 	"context"
 	"database/sql"
 	"errors"
 	"fmt"
+	"maps"
 	"math/rand/v2"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -146,6 +149,9 @@ type Config struct {
 	// objects in the store stay whole. Without it, no read is damaged, and the earlier
 	// configurations keep their histories.
 	StoreDamage bool
+	// DamageRate is the share of the reads whose bodies [Config.StoreDamage] damages, when it is
+	// not zero, instead of one in fifty.
+	DamageRate float64
 	// BlockSize of the segment blocks that the processes write, when it is not zero, instead of
 	// the default of 16 KiB. With blocks far smaller than the default, the segments of a run have
 	// trees of several levels and filter blocks, which the default blocks never give a database
@@ -163,6 +169,10 @@ type Config struct {
 	// others only collect garbage, so that no compaction of a maintainer loses to another one. It
 	// leaves the clients' maintenance as it is.
 	OneCompactor bool
+	// TieredCompactions makes the maintainers of [Config.Maintainers] merge only the segments that
+	// the tiers make due, and never the whole database, so that their merges leave the oldest
+	// segment out. It leaves the clients' maintenance as it is.
+	TieredCompactions bool
 	// CommitPartitions is the probability that a manifest write of a client that lands is
 	// followed by a partition of the client for 300 ms of virtual time, which loses the answer of
 	// the write and of the reads that would learn whether it landed, so that the client's commit
@@ -251,9 +261,10 @@ type Stats struct {
 	// maintainers that changed the database again after one.
 	MaintenancePanics, MaintenanceBackoffs, MaintenanceResumed int
 	// Undecided counts the runs of the bank workload whose final balances
-	// [history.CheckBankDurability] could not decide.
-	Undecided int
-	Elapsed   time.Duration
+	// [history.CheckBankDurability] could not decide, and UndecidedAudits those with an audit whose
+	// balances [history.CheckBankAudits] could not decide.
+	Undecided, UndecidedAudits int
+	Elapsed                    time.Duration
 }
 
 // Add the counts of o, for totals over several runs.
@@ -285,6 +296,7 @@ func (s *Stats) Add(o Stats) {
 	s.MaintenanceBackoffs += o.MaintenanceBackoffs
 	s.MaintenanceResumed += o.MaintenanceResumed
 	s.Undecided += o.Undecided
+	s.UndecidedAudits += o.UndecidedAudits
 	s.Elapsed += o.Elapsed
 }
 
@@ -300,7 +312,9 @@ const (
 	CheckerDurability = "durability"
 	// CheckerBank is [history.CheckBank], the conservation of money.
 	CheckerBank = "bank"
-	// CheckerGracePeriod finds readers younger than the GC grace period that lost their snapshot.
+	// CheckerGracePeriod finds readers younger than the GC grace period that lost their snapshot,
+	// and segments deleted while the manifest in the store references them or less than a grace
+	// period after they left it.
 	CheckerGracePeriod = "grace period"
 	// CheckerWorkload finds states the workload never writes, such as a missing account.
 	CheckerWorkload = "workload invariants"
@@ -323,9 +337,14 @@ const (
 	// and then the store must hold only the manifest, the lease, the live segments, and the
 	// objects of writes that the manifest has not moved past.
 	CheckerStorage = "storage"
+	// CheckerCompaction finds a manifest write that takes segments out of the manifest in the
+	// store, as a compaction does, and changes what the database holds: every key with its newest
+	// value must be the same at the manifest before it and at the one after.
+	CheckerCompaction = "compaction"
 	// CheckerRealTime finds a reader that misses a commit acknowledged before it began, through
-	// a counter that only grows, or through a row that no statement could have changed since an
-	// acknowledged statement inserted it, or that sees a row of a failed statement.
+	// a counter that only grows, through a row that no statement could have changed since an
+	// acknowledged statement inserted it, or through the balances of a bank audit with
+	// [history.CheckBankAudits], or that sees a row of a failed statement.
 	CheckerRealTime = "real-time order"
 	// CheckerDiskCache finds a client whose disk cache holds files that take more bytes than its
 	// bound, or more than it counts, after any of its operations.
@@ -387,6 +406,9 @@ func (r Result) Report() string {
 	if r.Stats.Undecided > 0 {
 		b.WriteString(", final balances undecided")
 	}
+	if r.Stats.UndecidedAudits > 0 {
+		b.WriteString(", the balances of an audit undecided")
+	}
 	for _, a := range r.Anomalies {
 		fmt.Fprintf(&b, "\nANOMALY: %v", a)
 	}
@@ -422,11 +444,20 @@ type run struct {
 	userWrites []userWrite
 	userReads  []userRead
 	// fkWrites are the writes of the foreign key workload with fresh keys or deletes of parents,
-	// fkReads the rows that its readers saw, and ticks the values of its counter that acknowledged
-	// increments wrote.
-	fkWrites []fkWrite
-	fkReads  []fkRead
-	ticks    []int64
+	// fkReads the rows that its readers saw, ticks the values of its counter that acknowledged
+	// increments wrote, and tickWrites the increments that did not fail.
+	fkWrites   []fkWrite
+	fkReads    []fkRead
+	ticks      []int64
+	tickWrites []fkTick
+	// manifest is the body of the manifest in the store, live the segments that it references, and
+	// left the time at which each segment that it no longer references left it. contents are what
+	// the database holds at the manifest contentsAt, when known.
+	manifest   []byte
+	live       map[string]bool
+	left       map[string]time.Time
+	contents   map[string]string
+	contentsAt []byte
 	// panicked is the first panic that the SQL driver or a maintenance step recovered, other
 	// than an injected one, with the stack where it happened, which the task that made the call
 	// panics with again once the call returned.
@@ -471,7 +502,7 @@ const initialBalance = 100
 // damageRate of the reads of the run's store.
 func damageRate(cfg Config) float64 {
 	if cfg.StoreDamage {
-		return 0.02
+		return cmp.Or(cfg.DamageRate, 0.02)
 	}
 	return 0
 }
@@ -512,6 +543,8 @@ func Run(cfg Config) (res Result) {
 		OutageTimeout: cfg.OutageTimeout,
 		DamageRate:    damageRate(cfg),
 	}))
+	r.live, r.left = map[string]bool{}, map[string]time.Time{}
+	r.fake.OnChange(r.watchStore)
 	if cfg.Trace != nil {
 		r.fake.Log = func(line string) {
 			cfg.Trace(fmt.Sprintf("%v s3 %s", r.sched.Elapsed(), line))
@@ -586,6 +619,13 @@ func Run(cfg Config) (res Result) {
 		if err := history.CheckBank(r.audits, r.total); err != nil {
 			r.anoms = append(r.anoms, &Anomaly{Checker: CheckerBank, Err: err})
 		}
+		switch err := history.CheckBankAudits(r.txs, r.audits, initialBalance); {
+		case errors.Is(err, history.ErrUndecided):
+			r.stats.UndecidedAudits++
+			r.trace("an audit is undecided: %v", err)
+		case err != nil:
+			r.anoms = append(r.anoms, &Anomaly{Checker: CheckerRealTime, Err: err})
+		}
 		if err == nil {
 			switch err := history.CheckBankDurability(r.txs, initialBalance, balances); {
 			case errors.Is(err, history.ErrUndecided):
@@ -603,6 +643,81 @@ func Run(cfg Config) (res Result) {
 	}
 	res.Digest = r.digest(res)
 	return res
+}
+
+// watchStore follows the manifest in the store as every write and delete reaches the store. It
+// finds a segment that is deleted while the manifest references it, or less than a grace period
+// after it left the manifest, which a reader that began right before may still need, and a
+// manifest write that takes segments out of the manifest, as a compaction does, and changes what
+// the database holds.
+func (r *run) watchStore(key string, body []byte, deleted bool) {
+	now := r.sched.Now()
+	switch {
+	case key == "db/manifest" && !deleted:
+		keys, err := engine.ManifestSegments(key, body)
+		if err != nil {
+			// Nothing is known of the segments of a manifest that does not decode, so a later
+			// manifest write is compared with none.
+			r.manifest, r.live = body, map[string]bool{}
+			return
+		}
+		live := make(map[string]bool, len(keys))
+		for _, k := range keys {
+			live[k] = true
+			delete(r.left, k)
+		}
+		compacted := false
+		for k := range r.live {
+			if !live[k] {
+				r.left[k] = now
+				compacted = true
+			}
+		}
+		if compacted {
+			r.checkCompaction(key, r.manifest, body)
+		}
+		r.manifest, r.live = body, live
+	case deleted && strings.HasPrefix(key, "db/seg/"):
+		if r.live[key] {
+			r.anomaly(CheckerGracePeriod, "the segment %s is deleted while the manifest references it", key)
+			return
+		}
+		if at, ok := r.left[key]; ok && now.Sub(at) < r.cfg.GracePeriod {
+			r.anomaly(CheckerGracePeriod, "the segment %s is deleted %v after it left the manifest, within the grace period of %v", key, now.Sub(at), r.cfg.GracePeriod)
+		}
+	}
+}
+
+// checkCompaction checks that the manifest after, which took segments out of the manifest before,
+// holds what before holds.
+func (r *run) checkCompaction(key string, before, after []byte) {
+	want := r.contents
+	if !bytes.Equal(before, r.contentsAt) {
+		var err error
+		if want, err = engine.ManifestContents(key, before, r.fake.View); err != nil {
+			return
+		}
+	}
+	got, err := engine.ManifestContents(key, after, r.fake.View)
+	if err != nil {
+		r.anomaly(CheckerCompaction, "reading the database after a compaction: %v", err)
+		return
+	}
+	r.contents, r.contentsAt = got, after
+	var changed []string
+	for _, k := range slices.Sorted(maps.Keys(want)) {
+		if v, ok := got[k]; !ok || v != want[k] {
+			changed = append(changed, fmt.Sprintf("%q: %q, then %q (present %v)", k, want[k], v, ok))
+		}
+	}
+	for _, k := range slices.Sorted(maps.Keys(got)) {
+		if _, ok := want[k]; !ok {
+			changed = append(changed, fmt.Sprintf("%q: absent, then %q", k, got[k]))
+		}
+	}
+	if len(changed) > 0 {
+		r.anomaly(CheckerCompaction, "a manifest write that takes segments out of the manifest changes %d keys of the database: %s", len(changed), strings.Join(changed, ", "))
+	}
 }
 
 func (r *run) digest(res Result) string {
@@ -867,6 +982,9 @@ type client struct {
 	freed map[string]bool
 	// partitionRng draws the partitions of [Config.CommitPartitions].
 	partitionRng *rand.Rand
+	// landed are the bodies of the client's manifest writes that reached the store since the
+	// client last recorded a transaction, or began an operation or a maintenance step.
+	landed map[string]bool
 }
 
 func (c *client) loop(ctx context.Context) {
@@ -879,7 +997,8 @@ func (c *client) loop(ctx context.Context) {
 			c.proc = &s3fake.Process{Name: fmt.Sprint("client", c.id)}
 			pctx := s3fake.WithProcess(ctx, c.proc)
 			c.openDisk(ctx)
-			opts := c.run.engineOptions(c.id, c.rng, c.disk)
+			opts := c.run.engineOptions(c.id, c.rng, checkedDisk{Disk: c.disk, c: c})
+			opts.Client = commitWatch{Client: opts.Client, c: c}
 			if c.run.cfg.CommitPartitions > 0 {
 				opts.Client = partitioningStore{Client: opts.Client, c: c}
 			}
@@ -908,6 +1027,7 @@ func (c *client) loop(ctx context.Context) {
 		}
 		pctx := s3fake.WithProcess(ctx, c.proc)
 		c.damagedAt = c.run.fake.Damaged(c.proc.Name)
+		c.landed = nil
 		switch {
 		case c.run.cfg.Workload == Unique:
 			c.uniqueSQL(pctx)
@@ -930,7 +1050,9 @@ func (c *client) loop(ctx context.Context) {
 		}
 		c.afterCrash()
 		if c.maint != nil && c.rng.IntN(3) == 0 {
+			c.landed = nil
 			c.step(pctx)
+			c.landed = nil
 			c.run.repanic()
 			c.checkDisk(ctx)
 			c.checkCache()
@@ -1060,6 +1182,47 @@ func (c *client) checkCache() {
 	}
 }
 
+// checkedDisk is a client's disk cache as its engine sees it: every block that the engine puts in
+// it must be the bytes of its object at that range in the store, since the engine caches only
+// blocks that it wrote or checked, and blocks are immutable.
+type checkedDisk struct {
+	*cache.Disk
+	c *client
+}
+
+func (d checkedDisk) Put(key string, value []byte) {
+	d.c.checkCached(key, value)
+	d.Disk.Put(key, value)
+}
+
+// checkCached checks that value, which the client's engine caches at key, is what the store holds
+// there, when key is a block's and the store still has its object.
+func (c *client) checkCached(key string, value []byte) {
+	objectKey, ref, ok := strings.Cut(key, "@")
+	if !ok {
+		return
+	}
+	offset, length, ok := strings.Cut(ref, "+")
+	if !ok {
+		return
+	}
+	off, err := strconv.ParseInt(offset, 10, 64)
+	if err != nil {
+		return
+	}
+	n, err := strconv.ParseInt(length, 10, 64)
+	if err != nil {
+		return
+	}
+	body, ok := c.run.fake.View(objectKey)
+	if !ok {
+		return
+	}
+	if off < 0 || n < 0 || off+n > int64(len(body)) || !bytes.Equal(body[off:off+n], value) {
+		c.run.anomaly(CheckerCache, "client %d: its engine put %d bytes in its disk cache at %s that differ from the store's", c.id, len(value), key)
+	}
+}
+
 // checkError of an operation of the client: an [engine.ErrCorrupt] needs a read of the operation
 // that the store damaged, and through the engine, every error must be of a kind that the engine
 // or the store gives.
@@ -1165,10 +1328,21 @@ func (c *client) readError(ctx context.Context, tx *engine.Tx, err error) {
 	}
 }
 
-func (c *client) record(tx history.Tx) {
+// record the transaction in the history, and return its ID. A transaction commits once, so at most
+// one of the client's manifest writes since the last one reached the store, and when one did, the
+// transaction did not fail.
+func (c *client) record(tx history.Tx) int {
+	switch {
+	case len(c.landed) > 1:
+		c.run.anomaly(CheckerDurability, "client %d: %d manifest writes of one transaction reached the store: %v", c.id, len(c.landed), tx)
+	case len(c.landed) == 1 && tx.Outcome == history.Failed:
+		c.run.anomaly(CheckerDurability, "client %d: a manifest write of the transaction reached the store, but it failed: %v", c.id, tx)
+	}
+	c.landed = nil
 	tx.ID = len(c.run.txs) + 1
 	c.run.txs = append(c.run.txs, tx)
 	c.run.trace("%v", tx)
+	return tx.ID
 }
 
 // outcome of a commit. Only [engine.ErrCommitUnknown] is ambiguous; every other error means
@@ -1328,8 +1502,7 @@ func (c *client) bankTx(ctx context.Context) {
 		}
 		h.Complete = c.run.stamp()
 		h.Outcome = history.OK
-		c.record(h)
-		c.run.audits = append(c.run.audits, history.BankAudit{TxID: h.ID, Balances: balances})
+		c.run.audits = append(c.run.audits, history.BankAudit{TxID: c.record(h), Balances: balances})
 		return
 	}
 
@@ -1416,7 +1589,7 @@ func (m *maintainer) loop(ctx context.Context) {
 		if m.rng.IntN(2) == 0 && (m.id == 0 || !m.run.cfg.OneCompactor) {
 			// Compaction loses to concurrent commits, so retry a few times. Most compactions merge
 			// the segments that the tiers make due, and some merge the whole database.
-			full := m.rng.IntN(2) == 0
+			full := m.rng.IntN(2) == 0 && !m.run.cfg.TieredCompactions
 			var err error
 			for range 5 {
 				rebases := m.db.Stats().CompactionRebases
@@ -1435,7 +1608,7 @@ func (m *maintainer) loop(ctx context.Context) {
 			if err == nil {
 				m.run.stats.Compactions++
 			}
-			m.run.trace("maintainer %d: compact: %v", m.id, err)
+			m.run.trace("maintainer %d: compact the whole database %v: %v", m.id, full, err)
 			if crashed, _ := m.proc.Crashed(); crashed {
 				assert.Sometimes(true, "a process crashes during a compaction", nil)
 				reach.Hit(ctx, reach.CrashMidCompaction)
@@ -1499,6 +1672,31 @@ func (s stallingStore) Put(ctx context.Context, key string, body []byte, opts s3
 	if err == nil && strings.HasPrefix(key, "db/seg/") {
 		s.m.wroteOutput = key
 	}
+	return etag, err
+}
+
+// commitWatch is the store as a client's engine sees it. It records the manifest writes of the
+// client that reach the store: one that succeeds, and one whose answer is lost, which the store
+// then holds.
+type commitWatch struct {
+	s3.Client
+	c *client
+}
+
+func (w commitWatch) Put(ctx context.Context, key string, body []byte, opts s3.PutOptions) (string, error) {
+	etag, err := w.Client.Put(ctx, key, body, opts)
+	if key != "db/manifest" {
+		return etag, err
+	}
+	if err != nil {
+		if b, ok := w.c.run.fake.View(key); !ok || !bytes.Equal(b, body) {
+			return etag, err
+		}
+	}
+	if w.c.landed == nil {
+		w.c.landed = map[string]bool{}
+	}
+	w.c.landed[string(body)] = true
 	return etag, err
 }
 

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -168,6 +169,71 @@ func encodeManifest(key string, m *manifest) ([]byte, error) {
 		return nil, fmt.Errorf("engine: encoding manifest: %w", err)
 	}
 	return seal(manifestMagic, key, b), nil
+}
+
+// ManifestSegments are the keys of the live segments of the manifest whose object is at key and
+// whose bytes are b, oldest first. Bytes that fail the checksum or do not decode give an error
+// that wraps [ErrCorrupt], and a manifest of an earlier version one that wraps
+// [ErrUnsupportedManifest].
+func ManifestSegments(key string, b []byte) ([]string, error) {
+	if bytes.HasPrefix(b, []byte("{")) {
+		_, err := decodeManifest(key, b)
+		return nil, err
+	}
+	j, err := unseal(manifestMagic, "manifest", key, b)
+	if err != nil {
+		return nil, err
+	}
+	// Only the keys of the segments are decoded, since the rest of a manifest takes far longer.
+	var m struct {
+		Version  int `json:"version"`
+		Segments []struct {
+			Key string `json:"key"`
+		} `json:"segments"`
+	}
+	if err := json.Unmarshal(j, &m); err != nil {
+		return nil, fmt.Errorf("%w: decoding manifest: %w", ErrCorrupt, err)
+	}
+	if m.Version != manifestVersion {
+		return nil, fmt.Errorf("%w: the manifest has version %d, and this version of maragudb reads only version %d", ErrUnsupportedManifest, m.Version, manifestVersion)
+	}
+	keys := make([]string, len(m.Segments))
+	for i, seg := range m.Segments {
+		keys[i] = seg.Key
+	}
+	return keys, nil
+}
+
+// ManifestContents is the database at the manifest whose object is at key and whose bytes are b:
+// every key with its newest value, without the deleted ones. object gives the bytes of the object
+// at a key, and false when there is none. Bytes that do not decode give an error that wraps
+// [ErrCorrupt], and a segment that object does not have one that wraps [ErrSnapshotExpired].
+func ManifestContents(key string, b []byte, object func(key string) ([]byte, bool)) (map[string]string, error) {
+	m, err := decodeManifest(key, b)
+	if err != nil {
+		return nil, err
+	}
+	it := &Iterator{}
+	for _, seg := range slices.Backward(m.Segments) {
+		body, ok := object(seg.Key)
+		if !ok {
+			return nil, fmt.Errorf("%w: segment %q is gone", ErrSnapshotExpired, seg.Key)
+		}
+		it.sources = append(it.sources, newSegmentIterator(seg.Root, nil, func(ref blockRef) (*decodedBlock, error) {
+			if ref.Offset < 0 || ref.Length < 0 || ref.Offset+ref.Length > int64(len(body)) {
+				return nil, fmt.Errorf("%w: block %d+%d of %q is outside its %d bytes", ErrCorrupt, ref.Offset, ref.Length, seg.Key, len(body))
+			}
+			return decodeBlock(seg.Key, ref, body[ref.Offset:ref.Offset+ref.Length])
+		}))
+	}
+	contents := map[string]string{}
+	for it.Next() {
+		contents[string(it.Key())] = string(it.Value())
+	}
+	if err := it.Err(); err != nil {
+		return nil, err
+	}
+	return contents, nil
 }
 
 // decodeManifest of the object at key, whose bytes are b. A manifest of an earlier version gives

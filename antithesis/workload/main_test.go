@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"maragu.dev/is"
 
@@ -69,6 +70,35 @@ func TestCommands(t *testing.T) {
 		is.True(t, disk > 400/6 && disk < 400/3, fmt.Sprint(disk))
 		is.True(t, damage > 400/6 && damage < 400/3, fmt.Sprint(damage))
 		is.True(t, both > 0)
+	})
+
+	t.Run("the sim command turns on each targeted fault in some runs and not in others", func(t *testing.T) {
+		verify.Covers(t, "of the configurations that the sim test command draws for 400 seeds, between a sixth and a third have compaction stalls, one compactor, compactions by tiers only, and commit partitions each, and some have a stall with one compactor", "AC-8.2")
+		var stall, one, tiered, partitions, stallOne int
+		for seed := range uint64(400) {
+			cfg := simConfig(seed)
+			if cfg.CompactionStall > 0 {
+				stall++
+				is.True(t, cfg.CompactionStall >= 250*time.Millisecond && cfg.CompactionStall <= time.Second, fmt.Sprint(cfg.CompactionStall))
+			}
+			if cfg.OneCompactor {
+				one++
+			}
+			if cfg.TieredCompactions {
+				tiered++
+			}
+			if cfg.CommitPartitions > 0 {
+				partitions++
+				is.True(t, cfg.CommitPartitions <= 0.5, fmt.Sprint(cfg.CommitPartitions))
+			}
+			if cfg.CompactionStall > 0 && cfg.OneCompactor {
+				stallOne++
+			}
+		}
+		for _, n := range []int{stall, one, tiered, partitions} {
+			is.True(t, n > 400/6 && n < 400/3, fmt.Sprint(stall, one, tiered, partitions))
+		}
+		is.True(t, stallOne > 0)
 	})
 
 	t.Run("the workload cross-compiles to linux/amd64", func(t *testing.T) {

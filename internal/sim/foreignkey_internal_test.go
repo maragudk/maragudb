@@ -71,7 +71,9 @@ func TestForeignKeyCheck(t *testing.T) {
 		writes []fkWrite
 		rows   fkRows
 		invoke int
-		ok     bool
+		// by is when the reader's snapshot was taken at the latest, or none when it is zero.
+		by int
+		ok bool
 	}{
 		{name: "accepts the child and toy of an acknowledged insert", writes: []fkWrite{insert(0, 10, history.OK, child)}, rows: whole, invoke: -1, ok: true},
 		{name: "rejects a missing child whose parent no write deletes", writes: []fkWrite{insert(0, 10, history.OK, child)}, rows: none, invoke: -1},
@@ -86,10 +88,17 @@ func TestForeignKeyCheck(t *testing.T) {
 		{name: "accepts a child of an insert with an unknown outcome or not", writes: []fkWrite{insert(0, 10, history.Unknown, child)}, rows: none, invoke: -1, ok: true},
 		{name: "rejects a reader that misses a child acknowledged before it began", writes: []fkWrite{insert(0, 10, history.OK, child)}, rows: none, invoke: 20},
 		{name: "accepts a reader that misses a child acknowledged after it began", writes: []fkWrite{insert(0, 30, history.OK, child)}, rows: none, invoke: 20, ok: true},
+		{name: "rejects a reader that sees a child of a write that began after its snapshot was taken", writes: []fkWrite{insert(30, 40, history.OK, child)}, rows: whole, invoke: 20, by: 25},
+		{name: "rejects a reader that sees a toy of a write with an unknown outcome that began after its snapshot was taken", writes: []fkWrite{insert(30, 40, history.Unknown, child)}, rows: rows(map[int64][2]sql.NullInt64{}, map[int64]toy{200: {cid: 100, label: "toy"}}), invoke: 20, by: 25},
+		{name: "accepts a reader that sees a child of a write that began before its snapshot was taken", writes: []fkWrite{insert(22, 40, history.OK, child)}, rows: whole, invoke: 20, by: 25, ok: true},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			err := newForeignKeyCheck(test.writes).check(test.rows, dur(test.invoke))
+			by := dur(test.by)
+			if test.by == 0 {
+				by = -1
+			}
+			err := newForeignKeyCheck(test.writes).check(test.rows, dur(test.invoke), by)
 			if test.ok {
 				is.NotError(t, err)
 				return

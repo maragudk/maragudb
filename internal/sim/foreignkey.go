@@ -68,6 +68,8 @@ func (c *client) foreignKeySQL(ctx context.Context) {
 	var w fkWrite
 	var res sql.Result
 	var err error
+	// tick is the value that an increment of the counter writes, or zero.
+	var tick int64
 	switch c.rng.IntN(19) {
 	case 0, 1:
 		c.auditForeignKeys(ctx, h)
@@ -124,7 +126,7 @@ func (c *client) foreignKeySQL(ctx context.Context) {
 	case 14:
 		err = c.foreignKeyTx(ctx, &w)
 	case 15:
-		err = c.tick(ctx)
+		tick, err = c.tick(ctx)
 	}
 	switch {
 	case errors.Is(err, exec.ErrForeignKey), errors.Is(err, exec.ErrRestrict):
@@ -138,6 +140,9 @@ func (c *client) foreignKeySQL(ctx context.Context) {
 		h.Err = err.Error()
 	}
 	c.record(h)
+	if tick > 0 && h.Outcome != history.Failed {
+		c.run.tickWrites = append(c.run.tickWrites, fkTick{invoke: h.Invoke, value: tick})
+	}
 	w.invoke, w.complete, w.outcome = h.Invoke, h.Complete, h.Outcome
 	if res != nil && h.Outcome == history.OK {
 		if n, _ := res.RowsAffected(); n == 0 {
@@ -152,27 +157,34 @@ func (c *client) foreignKeySQL(ctx context.Context) {
 }
 
 // tick increments the counter in a transaction, and records its new value when the commit is
-// acknowledged.
-func (c *client) tick(ctx context.Context) error {
+// acknowledged. It returns the value that its commit writes, once it got to write it.
+func (c *client) tick(ctx context.Context) (int64, error) {
 	tx, err := c.sql.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return 0, err
 	}
 	defer func() { _ = tx.Rollback() }()
 	var n int64
 	if err := tx.QueryRowContext(ctx, "SELECT n FROM ticks WHERE id = 0").Scan(&n); err != nil {
-		return err
+		return 0, err
 	}
 	c.pause(ctx)
 	if _, err := tx.ExecContext(ctx, "UPDATE ticks SET n = $1 WHERE id = 0", n+1); err != nil {
-		return err
+		return 0, err
 	}
 	if err := tx.Commit(); err != nil {
-		return err
+		return n + 1, err
 	}
 	c.run.ticked = max(c.run.ticked, n+1)
 	c.run.ticks = append(c.run.ticks, n+1)
-	return nil
+	return n + 1, nil
+}
+
+// fkTick is an increment of the counter of the foreign key workload that began at invoke and did
+// not fail, which wrote value.
+type fkTick struct {
+	invoke time.Duration
+	value  int64
 }
 
 // moveNode moves the node $1 to the key $2 and points the node $3 at the key it leaves, which
@@ -428,7 +440,15 @@ func (c *client) auditForeignKeys(ctx context.Context, h history.Tx) {
 		return
 	}
 	defer func() { _ = tx.Rollback() }()
-	rows, err := readForeignKeyRows(ctx, tx, func() { c.pause(ctx) })
+	// The snapshot is taken by the time the first statement returned, so no write that began
+	// after can be in it.
+	reads, snapshotBy := 0, time.Duration(-1)
+	rows, err := readForeignKeyRows(ctx, tx, func() {
+		if reads++; reads == 2 {
+			snapshotBy = max(c.run.sched.Elapsed(), c.run.lastStamp)
+		}
+		c.pause(ctx)
+	})
 	if err != nil {
 		c.readErrorSQL(ctx, startedAt, err)
 		return
@@ -452,7 +472,7 @@ func (c *client) auditForeignKeys(ctx context.Context, h history.Tx) {
 	c.run.checkForeignKeyRows(rows, fmt.Sprintf("client %d", c.id))
 	// The rows are checked against the writes once every write has its outcome, because a write
 	// whose outcome is not known yet may be in the snapshot.
-	c.run.fkReads = append(c.run.fkReads, fkRead{client: c.id, invoke: h.Invoke, rows: rows})
+	c.run.fkReads = append(c.run.fkReads, fkRead{client: c.id, invoke: h.Invoke, snapshotBy: snapshotBy, rows: rows, ticks: n})
 	h.Complete = c.run.stamp()
 	h.Outcome = history.OK
 	c.record(h)
@@ -483,7 +503,7 @@ func (r *run) readFinalForeignKeys(ctx context.Context, db *sql.DB) ([]string, e
 		r.anomaly(CheckerForeignKey, "final state: %s", o)
 	}
 	r.checkForeignKeyRows(rows, "final state")
-	if err := newForeignKeyCheck(r.fkWrites).check(rows, -1); err != nil {
+	if err := newForeignKeyCheck(r.fkWrites).check(rows, -1, -1); err != nil {
 		r.anomaly(CheckerDurability, "final state: %v", err)
 	}
 	var n int64
@@ -555,12 +575,14 @@ type fkChild struct {
 	toys       []int64
 }
 
-// fkRead is the rows of the foreign key workload that a reader saw in its snapshot, which it began
-// to read at invoke.
+// fkRead is the rows of the foreign key workload that a reader saw in its snapshot, and the value
+// of the counter, which it began to read at invoke, and which was taken by snapshotBy at the
+// latest, on the clock of the history.
 type fkRead struct {
-	client int
-	invoke time.Duration
-	rows   fkRows
+	client             int
+	invoke, snapshotBy time.Duration
+	rows               fkRows
+	ticks              int64
 }
 
 // checkForeignKeyReads checks the rows that every reader saw against the writes, once every write
@@ -568,14 +590,29 @@ type fkRead struct {
 func (r *run) checkForeignKeyReads() {
 	fc := newForeignKeyCheck(r.fkWrites)
 	for _, read := range r.fkReads {
-		if err := fc.check(read.rows, read.invoke); err != nil {
+		if err := fc.check(read.rows, read.invoke, read.snapshotBy); err != nil {
 			r.anomaly(CheckerRealTime, "client %d: %v", read.client, err)
+		}
+		if most := mostTicked(r.tickWrites, read.snapshotBy); read.ticks > most {
+			r.anomaly(CheckerRealTime, "client %d: the counter is %d, but no increment that began before the reader's snapshot was taken set it above %d", read.client, read.ticks, most)
 		}
 	}
 }
 
+// mostTicked is the highest value that an increment of the counter that began by snapshotBy, and
+// that did not fail, wrote, which is the highest value that a snapshot taken by then can have.
+func mostTicked(ticks []fkTick, snapshotBy time.Duration) int64 {
+	var most int64
+	for _, t := range ticks {
+		if t.invoke <= snapshotBy {
+			most = max(most, t.value)
+		}
+	}
+	return most
+}
+
 // foreignKeyCheck checks rows of the foreign key workload against its writes. No child or toy of
-// a failed write may be there. A child that an acknowledged write inserted before the reader
+// a failed write may be there, nor of a write that began after the reader's snapshot was taken. A child that an acknowledged write inserted before the reader
 // began must be there as it was inserted, with its toys, unless some write that did not fail and
 // was not acknowledged before the insert began could have deleted its parent. Other writes are
 // ignored, so that the reader may see them or not.
@@ -597,18 +634,23 @@ func newForeignKeyCheck(writes []fkWrite) foreignKeyCheck {
 	return fc
 }
 
-// check rows that a reader that began at invoke saw, or the final state when invoke is negative.
-func (fc foreignKeyCheck) check(rows fkRows, invoke time.Duration) error {
+// check rows that a reader that began at invoke saw in a snapshot taken by snapshotBy, or the
+// final state when invoke and snapshotBy are negative.
+func (fc foreignKeyCheck) check(rows fkRows, invoke, snapshotBy time.Duration) error {
 	for i, w := range fc.writes {
 		for k, ch := range w.children {
 			got, ok := rows.children[ch.id]
-			if w.outcome == history.Failed {
+			if absent := w.outcome == history.Failed || snapshotBy >= 0 && w.invoke > snapshotBy; absent {
+				why := "the write that inserted it failed"
+				if w.outcome != history.Failed {
+					why = "the write that inserted it began after the reader's snapshot was taken"
+				}
 				if ok {
-					return fmt.Errorf("child %d is there, but the write that inserted it failed", ch.id)
+					return fmt.Errorf("child %d is there, but %s", ch.id, why)
 				}
 				for _, id := range ch.toys {
 					if _, ok := rows.toys[id]; ok {
-						return fmt.Errorf("toy %d is there, but the write that inserted it failed", id)
+						return fmt.Errorf("toy %d is there, but %s", id, why)
 					}
 				}
 				continue

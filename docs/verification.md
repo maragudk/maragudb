@@ -13,7 +13,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - 36 acceptance criteria (`AC-`), 28 key invariants (`INV-`), 31 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
 - 31 mutants (`MUT-`), deliberate bugs, of which 29 are detected by the simulator's checkers within 20 seeds.
 - 29 interesting states (`STATE-`) that the simulator's fixed corpus must reach.
-- 300 declarations of coverage in the tests.
+- 302 declarations of coverage in the tests.
 
 ## Acceptance criteria
 
@@ -330,6 +330,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `antithesis/workload` `TestCommands/every_test_command_of_the_harness_runs_a_command_of_the_workload,_against_the_store_the_compose_file_runs`: every test command in /antithesis/test/maragudb has a valid prefix and names a workload command, and the compose file runs versitygw and the workload image
 - `antithesis/workload` `TestCommands/the_sim_command_runs_simulator_seeds_without_anomalies`: the sim test command's simulation runs eight seeds with random configurations, drawn here from a fixed source, and reports no anomalies
 - `antithesis/workload` `TestCommands/the_sim_command_turns_on_disk_faults_and_damaged_reads_from_the_store_in_some_runs_and_not_in_others`: of the configurations that the sim test command draws for 400 seeds, between a sixth and a third have disk faults, between a sixth and a third have damaged reads from the store, and some have both
+- `antithesis/workload` `TestCommands/the_sim_command_turns_on_each_targeted_fault_in_some_runs_and_not_in_others`: of the configurations that the sim test command draws for 400 seeds, between a sixth and a third have compaction stalls, one compactor, compactions by tiers only, and commit partitions each, and some have a stall with one compactor
 - `internal/workload` `TestRun/*`: the real-store workload that the Antithesis harness runs finds no anomalies under errors and lost acknowledgements, with commits, conflicts, and background compactions
 
 ### `AC-8.3`
@@ -485,6 +486,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 > Isolation: strict serializable. A read transaction sees every commit that was acknowledged before the transaction started.
 
 - `internal/engine` `TestTx_Commit/a_commit_from_another_process_is_visible_to_a_transaction_begun_after_it`: a transaction in another process sees a commit acknowledged before it began, read from the store
+- `internal/history` `TestCheckBankAudits`: the bank audit checker accepts audits that the transfers acknowledged before them and a set of the others that began before they ended explain, and rejects an audit that misses a transfer acknowledged before it began
 - `internal/history` `TestCheckListAppend`: the list-append checker accepts serializable histories and rejects stale reads, write skew, lost updates, reads of failed writes, duplicate values, and cycles through real-time edges
 - `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus, with injected errors, latency, lost acknowledgements, outages, and crashes, finds no anomalies with any checker and exercises every fault
 - `internal/sql/exec` `TestMutations/SubqueryStaleAcrossRetries_makes_a_retried_autocommit_statement_write_what_its_subquery_read_before_the_conflict`: an autocommit statement that retries after a conflict evaluates its subqueries again in the new snapshot, and with the mutant it reuses the results of the conflicted attempt, which loses the concurrent write
@@ -892,41 +894,41 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 ## Mutant kill matrix
 
-Every mutant runs in every simulator configuration below, with seeds 1 to 20, until a checker finds an anomaly. A configuration that never detects a mutant states why it cannot. `make verification` and `make soak` try all 20 seeds in such a configuration, and `make test` seeds 1 to 5.
+Every mutant runs in every simulator configuration below, with seeds 1 to 20, until a checker finds an anomaly. A configuration that never detects a mutant states why it cannot, and `make test` tries seeds 1 to 5 there. `make verification` and `make soak` try seeds 1 to 100 in every configuration that can run the mutant, and fail when a configuration that detects the mutant does so with fewer than 20 of them, or when one that cannot detects it with any. The count of those seeds that detect the mutant is in the result of each configuration.
 
-| Mutant | Detected in | First seed | Checkers |
-|---|---|---|---|
-| `MUT-COMMIT-WITHOUT-CAS` commit without CAS | 12 of 12 configurations | 1 | durability, list-append, real-time order, storage |
-| `MUT-GC-IGNORE-GRACE` GC ignoring the grace period | 6 of 12 configurations | 1 | final read, grace period, list-append |
-| `MUT-GC-BATCH-OBJECTS-FIRST` garbage batches deleted before their garbage | 6 of 6 configurations | 1 | storage |
-| `MUT-GC-SWEEP-SEGMENTS-ONLY` an orphan sweep that misses garbage batches | 6 of 6 configurations | 1 | storage |
-| `MUT-GC-CHAIN-FIRST-STAMP` a chain of garbage batches with the stamp of its first batch | 6 of 6 configurations | 3 | grace period |
-| `MUT-GC-DELETE-REFERENCED` GC deleting expired garbage that is referenced again | 6 of 6 configurations | 1 | final read, grace period, list-append, storage |
-| `MUT-COMPACT-NON-ADJACENT` a merge of segments that are not adjacent | 6 of 6 configurations | 1 | bank, durability, index consistency, list-append, unique |
-| `MUT-COMPACT-DROP-TOMBSTONES` tombstones dropped in a merge that excludes the oldest segment | 4 of 4 configurations | 1 | durability, foreign key, index consistency, list-append |
-| `MUT-COMPACT-REBASE-LOSES-SEGMENT` a rebase that loses a segment added meanwhile | 6 of 6 configurations | 1 | durability, final read, list-append, real-time order |
-| `MUT-COMPACT-REBASE-ON-COMPACTION` a rebase on another compaction | 6 of 6 configurations | 1 | bank, durability, list-append, real-time order |
-| `MUT-SKIP-FRESHNESS` serving the cache without a freshness check | 10 of 12 configurations | 1 | grace period, list-append, real-time order |
-| `MUT-ACK-BEFORE-CONFIRM` acking before the write is confirmed | 12 of 12 configurations | 1 | durability, real-time order, storage |
-| `MUT-COMPACTED-AHEAD` the compacted segment ahead of newer ones after a rebase | 6 of 12 configurations | 1 | durability, index consistency, list-append, real-time order |
-| `MUT-FRESH-SNAPSHOT` a fresh snapshot per statement | 8 of 8 configurations | 1 | bank, durability, foreign key, index consistency, list-append, workload invariants |
-| `MUT-RETRY-UNKNOWN` retrying an autocommit statement after an unknown commit outcome | 6 of 8 configurations | 1 | durability, list-append, real-time order |
-| `MUT-INDEX-STALE-DELETE` stale index entries after an UPDATE or DELETE | 6 of 8 configurations | 1 | index consistency |
-| `MUT-UNIQUE-NO-CHECK` no unique check | 2 of 8 configurations | 1 | index consistency, unique |
-| `MUT-UNIQUE-OWN-WRITES` a unique check that misses the statement's own writes | 2 of 8 configurations | 2 | index consistency, unique |
-| `MUT-FK-NO-CHILD-CHECK` no check of a referencing row | 2 of 8 configurations | 1 | foreign key |
-| `MUT-FK-NO-PARENT-CHECK` no check or action on the referencing rows | 2 of 8 configurations | 2 | foreign key |
-| `MUT-FK-OWN-WRITES` foreign key lookups that miss the statement's own writes | 2 of 8 configurations | 1 | foreign key |
-| `MUT-CHECK-SKIP-UPDATE` CHECK on INSERT only | 2 of 8 configurations | 6 | check constraint |
-| `MUT-SUBQUERY-STALE-READS` subquery reads that a retry does not repeat | 2 of 2 configurations | 3 | durability, list-append |
-| `MUT-UPDATE-SEES-OWN-WRITES` an UPDATE that revisits the rows it wrote | 0 of 8 configurations | none |  |
-| `MUT-DISK-CACHE-UNVERIFIED` a disk cache that serves damaged files | 12 of 12 configurations | 1 | cache integrity |
-| `MUT-DISK-CACHE-SERVE-CUT-READ` a disk cache that serves a read that an eviction cut short | 0 of 0 configurations | none |  |
-| `MUT-SEGMENT-UNCHECKED` blocks of segments read without their checksum | 12 of 12 configurations | 1 | bank, cache integrity, damaged reads, durability, index consistency, list-append, workload invariants |
-| `MUT-FILTER-OMITS-KEYS` key filters that leave out keys | 12 of 12 configurations | 1 | bank, durability, final read, foreign key, index consistency, list-append, unique, workload invariants |
-| `MUT-FILTER-UNCHECKED` filter blocks read without their checksum | 10 of 10 configurations | 1 | cache integrity |
-| `MUT-DISK-CACHE-UNCOUNTED` a disk cache that does not count the files of an earlier process | 12 of 12 configurations | 1 | disk cache bound |
-| `MUT-MAINTENANCE-UNRECOVERED` a maintenance step that does not recover a panic | 12 of 12 configurations | 1 | panic |
+| Mutant | Detected in | First seed | Fewest detections in 100 seeds | Checkers |
+|---|---|---|---|---|
+| `MUT-COMMIT-WITHOUT-CAS` commit without CAS | 12 of 12 configurations | 1 | 99 | compaction, durability, grace period, list-append, real-time order, storage |
+| `MUT-GC-IGNORE-GRACE` GC ignoring the grace period | 6 of 12 configurations | 1 | 96 | final read, grace period, list-append |
+| `MUT-GC-BATCH-OBJECTS-FIRST` garbage batches deleted before their garbage | 6 of 6 configurations | 1 | 65 | storage |
+| `MUT-GC-SWEEP-SEGMENTS-ONLY` an orphan sweep that misses garbage batches | 6 of 6 configurations | 1 | 91 | storage |
+| `MUT-GC-CHAIN-FIRST-STAMP` a chain of garbage batches with the stamp of its first batch | 6 of 6 configurations | 1 | 76 | grace period |
+| `MUT-GC-DELETE-REFERENCED` GC deleting expired garbage that is referenced again | 6 of 6 configurations | 1 | 58 | final read, grace period, list-append, storage |
+| `MUT-COMPACT-NON-ADJACENT` a merge of segments that are not adjacent | 6 of 6 configurations | 1 | 37 | bank, compaction, durability, index consistency, list-append, real-time order, unique |
+| `MUT-COMPACT-DROP-TOMBSTONES` tombstones dropped in a merge that excludes the oldest segment | 4 of 4 configurations | 1 | 36 | compaction, durability, index consistency, list-append, unique |
+| `MUT-COMPACT-REBASE-LOSES-SEGMENT` a rebase that loses a segment added meanwhile | 6 of 6 configurations | 1 | 84 | compaction, durability, final read, list-append, real-time order |
+| `MUT-COMPACT-REBASE-ON-COMPACTION` a rebase on another compaction | 6 of 6 configurations | 1 | 66 | bank, compaction, durability, grace period, list-append, real-time order |
+| `MUT-SKIP-FRESHNESS` serving the cache without a freshness check | 12 of 12 configurations | 1 | 58 | list-append, real-time order |
+| `MUT-ACK-BEFORE-CONFIRM` acking before the write is confirmed | 12 of 12 configurations | 1 | 93 | durability, real-time order, storage |
+| `MUT-COMPACTED-AHEAD` the compacted segment ahead of newer ones after a rebase | 6 of 12 configurations | 1 | 62 | compaction, durability, index consistency, list-append, real-time order |
+| `MUT-FRESH-SNAPSHOT` a fresh snapshot per statement | 8 of 8 configurations | 1 | 28 | bank, durability, index consistency, list-append, real-time order, workload invariants |
+| `MUT-RETRY-UNKNOWN` retrying an autocommit statement after an unknown commit outcome | 6 of 8 configurations | 1 | 56 | durability, list-append, real-time order |
+| `MUT-INDEX-STALE-DELETE` stale index entries after an UPDATE or DELETE | 6 of 8 configurations | 1 | 58 | index consistency |
+| `MUT-UNIQUE-NO-CHECK` no unique check | 2 of 8 configurations | 1 | 99 | index consistency, unique |
+| `MUT-UNIQUE-OWN-WRITES` a unique check that misses the statement's own writes | 2 of 8 configurations | 2 | 26 | index consistency, unique |
+| `MUT-FK-NO-CHILD-CHECK` no check of a referencing row | 2 of 8 configurations | 1 | 97 | foreign key |
+| `MUT-FK-NO-PARENT-CHECK` no check or action on the referencing rows | 2 of 8 configurations | 2 | 58 | foreign key |
+| `MUT-FK-OWN-WRITES` foreign key lookups that miss the statement's own writes | 2 of 8 configurations | 1 | 80 | foreign key |
+| `MUT-CHECK-SKIP-UPDATE` CHECK on INSERT only | 2 of 8 configurations | 2 | 37 | check constraint |
+| `MUT-SUBQUERY-STALE-READS` subquery reads that a retry does not repeat | 2 of 2 configurations | 3 | 36 | durability, list-append |
+| `MUT-UPDATE-SEES-OWN-WRITES` an UPDATE that revisits the rows it wrote | 0 of 8 configurations | none | none |  |
+| `MUT-DISK-CACHE-UNVERIFIED` a disk cache that serves damaged files | 12 of 12 configurations | 1 | 64 | cache integrity |
+| `MUT-DISK-CACHE-SERVE-CUT-READ` a disk cache that serves a read that an eviction cut short | 0 of 0 configurations | none | none |  |
+| `MUT-SEGMENT-UNCHECKED` blocks of segments read without their checksum | 12 of 12 configurations | 1 | 56 | bank, cache integrity, compaction, damaged reads, durability, index consistency, list-append, real-time order, workload invariants |
+| `MUT-FILTER-OMITS-KEYS` key filters that leave out keys | 12 of 12 configurations | 1 | 59 | bank, durability, final read, foreign key, index consistency, list-append, real-time order, unique, workload invariants |
+| `MUT-FILTER-UNCHECKED` filter blocks read without their checksum | 10 of 10 configurations | 1 | 47 | cache integrity, index consistency |
+| `MUT-DISK-CACHE-UNCOUNTED` a disk cache that does not count the files of an earlier process | 12 of 12 configurations | 1 | 73 | disk cache bound |
+| `MUT-MAINTENANCE-UNRECOVERED` a maintenance step that does not recover a panic | 12 of 12 configurations | 1 | 72 | panic |
 
 ### `MUT-COMMIT-WITHOUT-CAS`
 
@@ -934,18 +936,18 @@ Every mutant runs in every simulator configuration below, with seeds 1 to 20, un
 
 | Configuration | Result |
 |---|---|
-| list-append through the engine, no maintainers | detected with seed 1 by durability, list-append |
-| list-append through the engine, 2 maintainers | detected with seed 1 by durability, list-append, storage |
-| bank through the engine, no maintainers | detected with seed 1 by durability |
-| bank through the engine, 2 maintainers | detected with seed 1 by durability |
-| list-append through SQL, no maintainers | detected with seed 1 by durability, list-append |
-| list-append through SQL, 2 maintainers | detected with seed 1 by durability, list-append |
-| bank through SQL, no maintainers | detected with seed 1 by durability |
-| bank through SQL, 2 maintainers | detected with seed 1 by durability, storage |
-| unique through SQL, no maintainers | detected with seed 1 by durability, real-time order |
-| unique through SQL, 2 maintainers | detected with seed 1 by durability, real-time order |
-| foreign-key through SQL, no maintainers | detected with seed 2 by real-time order, durability |
-| foreign-key through SQL, 2 maintainers | detected with seed 1 by real-time order, durability |
+| list-append through the engine, no maintainers | detected with seed 1 by compaction, durability, list-append, and with 100 of 100 seeds |
+| list-append through the engine, 2 maintainers | detected with seed 1 by compaction, grace period, durability, list-append, storage, and with 100 of 100 seeds |
+| bank through the engine, no maintainers | detected with seed 1 by compaction, real-time order, durability, and with 100 of 100 seeds |
+| bank through the engine, 2 maintainers | detected with seed 1 by compaction, real-time order, durability, and with 100 of 100 seeds |
+| list-append through SQL, no maintainers | detected with seed 1 by compaction, durability, list-append, and with 100 of 100 seeds |
+| list-append through SQL, 2 maintainers | detected with seed 1 by compaction, durability, list-append, and with 100 of 100 seeds |
+| bank through SQL, no maintainers | detected with seed 1 by compaction, real-time order, durability, and with 99 of 100 seeds |
+| bank through SQL, 2 maintainers | detected with seed 1 by compaction, grace period, real-time order, durability, storage, and with 100 of 100 seeds |
+| unique through SQL, no maintainers | detected with seed 1 by compaction, durability, real-time order, and with 99 of 100 seeds |
+| unique through SQL, 2 maintainers | detected with seed 1 by compaction, durability, real-time order, and with 100 of 100 seeds |
+| foreign-key through SQL, no maintainers | detected with seed 1 by compaction, and with 100 of 100 seeds |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by compaction, real-time order, durability, grace period, and with 100 of 100 seeds |
 
 Targeted tests:
 
@@ -959,17 +961,17 @@ Targeted tests:
 | Configuration | Result |
 |---|---|
 | list-append through the engine, no maintainers | cannot detect: without maintainers nothing is ever deleted, so no reader can lose an object |
-| list-append through the engine, 2 maintainers | detected with seed 1 by grace period, final read, list-append |
+| list-append through the engine, 2 maintainers | detected with seed 1 by grace period, final read, list-append, and with 100 of 100 seeds |
 | bank through the engine, no maintainers | cannot detect: without maintainers nothing is ever deleted, so no reader can lose an object |
-| bank through the engine, 2 maintainers | detected with seed 1 by grace period |
+| bank through the engine, 2 maintainers | detected with seed 1 by grace period, and with 99 of 100 seeds |
 | list-append through SQL, no maintainers | cannot detect: without maintainers nothing is ever deleted, so no reader can lose an object |
-| list-append through SQL, 2 maintainers | detected with seed 2 by grace period |
+| list-append through SQL, 2 maintainers | detected with seed 1 by grace period, and with 98 of 100 seeds |
 | bank through SQL, no maintainers | cannot detect: without maintainers nothing is ever deleted, so no reader can lose an object |
-| bank through SQL, 2 maintainers | detected with seed 1 by grace period |
+| bank through SQL, 2 maintainers | detected with seed 1 by grace period, and with 100 of 100 seeds |
 | unique through SQL, no maintainers | cannot detect: without maintainers nothing is ever deleted, so no reader can lose an object |
-| unique through SQL, 2 maintainers | detected with seed 1 by grace period |
+| unique through SQL, 2 maintainers | detected with seed 1 by grace period, and with 98 of 100 seeds |
 | foreign-key through SQL, no maintainers | cannot detect: without maintainers nothing is ever deleted, so no reader can lose an object |
-| foreign-key through SQL, 2 maintainers | detected with seed 2 by grace period, final read |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by grace period, and with 96 of 100 seeds |
 
 Targeted tests:
 
@@ -982,17 +984,17 @@ Targeted tests:
 | Configuration | Result |
 |---|---|
 | list-append through the engine, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| list-append through the engine, 2 maintainers | detected with seed 2 by storage |
+| list-append through the engine, 2 maintainers | detected with seed 2 by storage, and with 84 of 100 seeds |
 | bank through the engine, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| bank through the engine, 2 maintainers | detected with seed 2 by storage |
+| bank through the engine, 2 maintainers | detected with seed 2 by storage, and with 73 of 100 seeds |
 | list-append through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| list-append through SQL, 2 maintainers | detected with seed 1 by storage |
+| list-append through SQL, 2 maintainers | detected with seed 1 by storage, and with 84 of 100 seeds |
 | bank through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| bank through SQL, 2 maintainers | detected with seed 1 by storage |
+| bank through SQL, 2 maintainers | detected with seed 1 by storage, and with 79 of 100 seeds |
 | unique through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| unique through SQL, 2 maintainers | detected with seed 1 by storage |
+| unique through SQL, 2 maintainers | detected with seed 1 by storage, and with 67 of 100 seeds |
 | foreign-key through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| foreign-key through SQL, 2 maintainers | detected with seed 2 by storage |
+| foreign-key through SQL, 2 maintainers | detected with seed 2 by storage, and with 65 of 100 seeds |
 
 Targeted tests:
 
@@ -1005,17 +1007,17 @@ Targeted tests:
 | Configuration | Result |
 |---|---|
 | list-append through the engine, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| list-append through the engine, 2 maintainers | detected with seed 1 by storage |
+| list-append through the engine, 2 maintainers | detected with seed 1 by storage, and with 99 of 100 seeds |
 | bank through the engine, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| bank through the engine, 2 maintainers | detected with seed 1 by storage |
+| bank through the engine, 2 maintainers | detected with seed 1 by storage, and with 98 of 100 seeds |
 | list-append through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| list-append through SQL, 2 maintainers | detected with seed 1 by storage |
+| list-append through SQL, 2 maintainers | detected with seed 1 by storage, and with 98 of 100 seeds |
 | bank through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| bank through SQL, 2 maintainers | detected with seed 1 by storage |
+| bank through SQL, 2 maintainers | detected with seed 1 by storage, and with 99 of 100 seeds |
 | unique through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| unique through SQL, 2 maintainers | detected with seed 1 by storage |
+| unique through SQL, 2 maintainers | detected with seed 1 by storage, and with 91 of 100 seeds |
 | foreign-key through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| foreign-key through SQL, 2 maintainers | detected with seed 1 by storage |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by storage, and with 98 of 100 seeds |
 
 Targeted tests:
 
@@ -1028,17 +1030,17 @@ Targeted tests:
 | Configuration | Result |
 |---|---|
 | list-append through the engine, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| list-append through the engine, 2 maintainers | detected with seed 17 by grace period |
+| list-append through the engine, 2 maintainers | detected with seed 1 by grace period, and with 90 of 100 seeds |
 | bank through the engine, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| bank through the engine, 2 maintainers | detected with seed 4 by grace period |
+| bank through the engine, 2 maintainers | detected with seed 1 by grace period, and with 89 of 100 seeds |
 | list-append through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| list-append through SQL, 2 maintainers | detected with seed 5 by grace period |
+| list-append through SQL, 2 maintainers | detected with seed 1 by grace period, and with 80 of 100 seeds |
 | bank through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| bank through SQL, 2 maintainers | detected with seed 3 by grace period |
+| bank through SQL, 2 maintainers | detected with seed 1 by grace period, and with 93 of 100 seeds |
 | unique through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| unique through SQL, 2 maintainers | detected with seed 19 by grace period |
+| unique through SQL, 2 maintainers | detected with seed 1 by grace period, and with 81 of 100 seeds |
 | foreign-key through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| foreign-key through SQL, 2 maintainers | detected with seed 6 by grace period |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by grace period, and with 76 of 100 seeds |
 
 Targeted tests:
 
@@ -1051,17 +1053,17 @@ Targeted tests:
 | Configuration | Result |
 |---|---|
 | list-append through the engine, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| list-append through the engine, 2 maintainers | detected with seed 1 by final read, list-append, storage |
+| list-append through the engine, 2 maintainers | detected with seed 1 by grace period, final read, list-append, storage, and with 76 of 100 seeds |
 | bank through the engine, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| bank through the engine, 2 maintainers | detected with seed 4 by storage |
+| bank through the engine, 2 maintainers | detected with seed 4 by grace period, storage, and with 71 of 100 seeds |
 | list-append through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| list-append through SQL, 2 maintainers | detected with seed 1 by grace period, final read, list-append, storage |
+| list-append through SQL, 2 maintainers | detected with seed 1 by grace period, final read, list-append, storage, and with 63 of 100 seeds |
 | bank through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| bank through SQL, 2 maintainers | detected with seed 1 by grace period, final read, storage |
+| bank through SQL, 2 maintainers | detected with seed 1 by grace period, final read, storage, and with 77 of 100 seeds |
 | unique through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| unique through SQL, 2 maintainers | detected with seed 1 by grace period, final read, storage |
+| unique through SQL, 2 maintainers | detected with seed 1 by grace period, final read, storage, and with 58 of 100 seeds |
 | foreign-key through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
-| foreign-key through SQL, 2 maintainers | detected with seed 1 by storage |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by grace period, storage, and with 65 of 100 seeds |
 
 Targeted tests:
 
@@ -1074,17 +1076,17 @@ Targeted tests:
 | Configuration | Result |
 |---|---|
 | list-append through the engine, no maintainers | not applicable: without maintainers nothing compacts |
-| list-append through the engine, 2 maintainers | detected with seed 1 by durability, list-append |
+| list-append through the engine, 2 maintainers | detected with seed 1 by compaction, durability, list-append, and with 95 of 100 seeds |
 | bank through the engine, no maintainers | not applicable: without maintainers nothing compacts |
-| bank through the engine, 2 maintainers | detected with seed 1 by bank, durability |
+| bank through the engine, 2 maintainers | detected with seed 1 by compaction, bank, real-time order, durability, and with 99 of 100 seeds |
 | list-append through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| list-append through SQL, 2 maintainers | detected with seed 3 by durability, list-append |
+| list-append through SQL, 2 maintainers | detected with seed 1 by compaction, and with 37 of 100 seeds |
 | bank through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| bank through SQL, 2 maintainers | detected with seed 1 by index consistency |
+| bank through SQL, 2 maintainers | detected with seed 1 by compaction, index consistency, real-time order, and with 76 of 100 seeds |
 | unique through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| unique through SQL, 2 maintainers | detected with seed 2 by unique, index consistency |
+| unique through SQL, 2 maintainers | detected with seed 2 by compaction, unique, index consistency, and with 46 of 100 seeds |
 | foreign-key through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| foreign-key through SQL, 2 maintainers | detected with seed 1 by index consistency |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by compaction, index consistency, and with 98 of 100 seeds |
 
 Targeted tests:
 
@@ -1092,22 +1094,22 @@ Targeted tests:
 
 ### `MUT-COMPACT-DROP-TOMBSTONES`
 
-`engine.Mutations.CompactDropTombstones` drops tombstones in every merge, also in one that excludes the oldest segment, so that a value that an older segment holds shows again after its delete.
+`engine.Mutations.CompactDropTombstones` drops tombstones in every merge, also in one that excludes the oldest segment, so that a value that an older segment holds shows again after its delete. It runs with maintainers that merge only the segments that the tiers make due, never the whole database.
 
 | Configuration | Result |
 |---|---|
 | list-append through the engine, no maintainers | not applicable: without maintainers nothing compacts |
-| list-append through the engine, 2 maintainers | detected with seed 10 by durability, list-append |
+| list-append through the engine, 2 maintainers | detected with seed 2 by compaction, durability, list-append, and with 36 of 100 seeds |
 | bank through the engine, no maintainers | not applicable: without maintainers nothing compacts |
 | bank through the engine, 2 maintainers | not applicable: the bank workload through the engine never deletes a key, so no merge meets a tombstone |
 | list-append through SQL, no maintainers | not applicable: without maintainers nothing compacts |
 | list-append through SQL, 2 maintainers | not applicable: the list-append workload through SQL never deletes a row, and its tables have no index besides the primary key, so no merge meets a tombstone |
 | bank through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| bank through SQL, 2 maintainers | detected with seed 2 by index consistency |
+| bank through SQL, 2 maintainers | detected with seed 1 by compaction, index consistency, and with 83 of 100 seeds |
 | unique through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| unique through SQL, 2 maintainers | detected with seed 1 by index consistency |
+| unique through SQL, 2 maintainers | detected with seed 3 by compaction, unique, index consistency, and with 62 of 100 seeds |
 | foreign-key through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| foreign-key through SQL, 2 maintainers | detected with seed 3 by foreign key |
+| foreign-key through SQL, 2 maintainers | detected with seed 2 by compaction, and with 45 of 100 seeds |
 
 Targeted tests:
 
@@ -1120,17 +1122,17 @@ Targeted tests:
 | Configuration | Result |
 |---|---|
 | list-append through the engine, no maintainers | not applicable: without maintainers nothing compacts |
-| list-append through the engine, 2 maintainers | detected with seed 1 by durability, list-append |
+| list-append through the engine, 2 maintainers | detected with seed 1 by compaction, durability, list-append, and with 93 of 100 seeds |
 | bank through the engine, no maintainers | not applicable: without maintainers nothing compacts |
-| bank through the engine, 2 maintainers | detected with seed 1 by durability |
+| bank through the engine, 2 maintainers | detected with seed 1 by compaction, real-time order, durability, and with 93 of 100 seeds |
 | list-append through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| list-append through SQL, 2 maintainers | detected with seed 1 by final read, list-append |
+| list-append through SQL, 2 maintainers | detected with seed 1 by compaction, final read, list-append, and with 92 of 100 seeds |
 | bank through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| bank through SQL, 2 maintainers | detected with seed 1 by durability |
+| bank through SQL, 2 maintainers | detected with seed 1 by compaction, real-time order, durability, and with 94 of 100 seeds |
 | unique through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| unique through SQL, 2 maintainers | detected with seed 1 by durability, real-time order |
+| unique through SQL, 2 maintainers | detected with seed 1 by compaction, durability, real-time order, and with 90 of 100 seeds |
 | foreign-key through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| foreign-key through SQL, 2 maintainers | detected with seed 3 by real-time order, durability |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by compaction, and with 84 of 100 seeds |
 
 Targeted tests:
 
@@ -1143,17 +1145,17 @@ Targeted tests:
 | Configuration | Result |
 |---|---|
 | list-append through the engine, no maintainers | not applicable: without maintainers nothing compacts |
-| list-append through the engine, 2 maintainers | detected with seed 1 by list-append |
+| list-append through the engine, 2 maintainers | detected with seed 1 by compaction, grace period, list-append, and with 86 of 100 seeds |
 | bank through the engine, no maintainers | not applicable: without maintainers nothing compacts |
-| bank through the engine, 2 maintainers | detected with seed 1 by bank, durability |
+| bank through the engine, 2 maintainers | detected with seed 1 by compaction, bank, real-time order, durability, grace period, and with 73 of 100 seeds |
 | list-append through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| list-append through SQL, 2 maintainers | detected with seed 2 by durability, list-append |
+| list-append through SQL, 2 maintainers | detected with seed 2 by compaction, durability, list-append, and with 76 of 100 seeds |
 | bank through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| bank through SQL, 2 maintainers | detected with seed 1 by durability |
+| bank through SQL, 2 maintainers | detected with seed 1 by compaction, real-time order, durability, and with 88 of 100 seeds |
 | unique through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| unique through SQL, 2 maintainers | detected with seed 2 by durability |
+| unique through SQL, 2 maintainers | detected with seed 2 by compaction, durability, and with 67 of 100 seeds |
 | foreign-key through SQL, no maintainers | not applicable: without maintainers nothing compacts |
-| foreign-key through SQL, 2 maintainers | detected with seed 1 by real-time order, durability |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by compaction, real-time order, durability, and with 66 of 100 seeds |
 
 Targeted tests:
 
@@ -1165,18 +1167,18 @@ Targeted tests:
 
 | Configuration | Result |
 |---|---|
-| list-append through the engine, no maintainers | detected with seed 1 by list-append |
-| list-append through the engine, 2 maintainers | detected with seed 1 by list-append |
-| bank through the engine, no maintainers | cannot detect: a transfer from a stale snapshot conflicts at commit, so that none is lost, and an audit from one reads an older state that conserves money; the bank workload checks no audit against the transfers acknowledged before it |
-| bank through the engine, 2 maintainers | detected with seed 10 by grace period |
-| list-append through SQL, no maintainers | detected with seed 1 by list-append |
-| list-append through SQL, 2 maintainers | detected with seed 1 by list-append |
-| bank through SQL, no maintainers | cannot detect: a transfer from a stale snapshot conflicts at commit, so that none is lost, and an audit from one reads an older state that conserves money; the bank workload checks no audit against the transfers acknowledged before it |
-| bank through SQL, 2 maintainers | detected with seed 2 by grace period |
-| unique through SQL, no maintainers | detected with seed 1 by real-time order |
-| unique through SQL, 2 maintainers | detected with seed 2 by real-time order |
-| foreign-key through SQL, no maintainers | detected with seed 2 by real-time order |
-| foreign-key through SQL, 2 maintainers | detected with seed 2 by real-time order |
+| list-append through the engine, no maintainers | detected with seed 1 by list-append, and with 100 of 100 seeds |
+| list-append through the engine, 2 maintainers | detected with seed 1 by list-append, and with 100 of 100 seeds |
+| bank through the engine, no maintainers | detected with seed 1 by real-time order, and with 100 of 100 seeds |
+| bank through the engine, 2 maintainers | detected with seed 1 by real-time order, and with 100 of 100 seeds |
+| list-append through SQL, no maintainers | detected with seed 1 by list-append, and with 100 of 100 seeds |
+| list-append through SQL, 2 maintainers | detected with seed 1 by list-append, and with 100 of 100 seeds |
+| bank through SQL, no maintainers | detected with seed 1 by real-time order, and with 100 of 100 seeds |
+| bank through SQL, 2 maintainers | detected with seed 1 by real-time order, and with 100 of 100 seeds |
+| unique through SQL, no maintainers | detected with seed 1 by real-time order, and with 87 of 100 seeds |
+| unique through SQL, 2 maintainers | detected with seed 2 by real-time order, and with 89 of 100 seeds |
+| foreign-key through SQL, no maintainers | detected with seed 2 by real-time order, and with 67 of 100 seeds |
+| foreign-key through SQL, 2 maintainers | detected with seed 2 by real-time order, and with 58 of 100 seeds |
 
 ### `MUT-ACK-BEFORE-CONFIRM`
 
@@ -1184,18 +1186,18 @@ Targeted tests:
 
 | Configuration | Result |
 |---|---|
-| list-append through the engine, no maintainers | detected with seed 1 by durability |
-| list-append through the engine, 2 maintainers | detected with seed 1 by durability |
-| bank through the engine, no maintainers | detected with seed 1 by durability |
-| bank through the engine, 2 maintainers | detected with seed 1 by durability |
-| list-append through SQL, no maintainers | detected with seed 1 by durability |
-| list-append through SQL, 2 maintainers | detected with seed 1 by durability |
-| bank through SQL, no maintainers | detected with seed 1 by durability |
-| bank through SQL, 2 maintainers | detected with seed 1 by durability, storage |
-| unique through SQL, no maintainers | detected with seed 1 by durability, real-time order |
-| unique through SQL, 2 maintainers | detected with seed 1 by durability, real-time order |
-| foreign-key through SQL, no maintainers | detected with seed 1 by real-time order, durability |
-| foreign-key through SQL, 2 maintainers | detected with seed 1 by real-time order, durability |
+| list-append through the engine, no maintainers | detected with seed 1 by durability, and with 100 of 100 seeds |
+| list-append through the engine, 2 maintainers | detected with seed 1 by durability, and with 100 of 100 seeds |
+| bank through the engine, no maintainers | detected with seed 1 by real-time order, durability, and with 100 of 100 seeds |
+| bank through the engine, 2 maintainers | detected with seed 1 by real-time order, durability, and with 100 of 100 seeds |
+| list-append through SQL, no maintainers | detected with seed 1 by durability, and with 100 of 100 seeds |
+| list-append through SQL, 2 maintainers | detected with seed 1 by durability, and with 100 of 100 seeds |
+| bank through SQL, no maintainers | detected with seed 1 by real-time order, durability, and with 100 of 100 seeds |
+| bank through SQL, 2 maintainers | detected with seed 1 by real-time order, durability, storage, and with 100 of 100 seeds |
+| unique through SQL, no maintainers | detected with seed 1 by durability, real-time order, and with 99 of 100 seeds |
+| unique through SQL, 2 maintainers | detected with seed 1 by durability, real-time order, and with 99 of 100 seeds |
+| foreign-key through SQL, no maintainers | detected with seed 1 by real-time order, durability, and with 93 of 100 seeds |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by real-time order, durability, and with 97 of 100 seeds |
 
 Targeted tests:
 
@@ -1208,17 +1210,17 @@ Targeted tests:
 | Configuration | Result |
 |---|---|
 | list-append through the engine, no maintainers | cannot detect: without maintainers nothing compacts, so there is never a rebase |
-| list-append through the engine, 2 maintainers | detected with seed 1 by durability, list-append |
+| list-append through the engine, 2 maintainers | detected with seed 1 by compaction, durability, list-append, and with 88 of 100 seeds |
 | bank through the engine, no maintainers | cannot detect: without maintainers nothing compacts, so there is never a rebase |
-| bank through the engine, 2 maintainers | detected with seed 1 by durability |
+| bank through the engine, 2 maintainers | detected with seed 1 by compaction, real-time order, durability, and with 93 of 100 seeds |
 | list-append through SQL, no maintainers | cannot detect: without maintainers nothing compacts, so there is never a rebase |
-| list-append through SQL, 2 maintainers | detected with seed 1 by durability, list-append |
+| list-append through SQL, 2 maintainers | detected with seed 1 by compaction, durability, list-append, and with 91 of 100 seeds |
 | bank through SQL, no maintainers | cannot detect: without maintainers nothing compacts, so there is never a rebase |
-| bank through SQL, 2 maintainers | detected with seed 1 by index consistency, durability |
+| bank through SQL, 2 maintainers | detected with seed 1 by compaction, index consistency, real-time order, durability, and with 94 of 100 seeds |
 | unique through SQL, no maintainers | cannot detect: without maintainers nothing compacts, so there is never a rebase |
-| unique through SQL, 2 maintainers | detected with seed 3 by index consistency |
+| unique through SQL, 2 maintainers | detected with seed 2 by compaction, and with 82 of 100 seeds |
 | foreign-key through SQL, no maintainers | cannot detect: without maintainers nothing compacts, so there is never a rebase |
-| foreign-key through SQL, 2 maintainers | detected with seed 3 by real-time order, durability |
+| foreign-key through SQL, 2 maintainers | detected with seed 2 by compaction, and with 62 of 100 seeds |
 
 Targeted tests:
 
@@ -1235,14 +1237,14 @@ Targeted tests:
 | list-append through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
 | bank through the engine, no maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
 | bank through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
-| list-append through SQL, no maintainers | detected with seed 1 by list-append |
-| list-append through SQL, 2 maintainers | detected with seed 1 by list-append |
-| bank through SQL, no maintainers | detected with seed 1 by workload invariants, bank, durability |
-| bank through SQL, 2 maintainers | detected with seed 1 by workload invariants, bank, durability |
-| unique through SQL, no maintainers | detected with seed 1 by index consistency |
-| unique through SQL, 2 maintainers | detected with seed 1 by index consistency |
-| foreign-key through SQL, no maintainers | detected with seed 2 by foreign key |
-| foreign-key through SQL, 2 maintainers | detected with seed 16 by foreign key |
+| list-append through SQL, no maintainers | detected with seed 1 by list-append, and with 88 of 100 seeds |
+| list-append through SQL, 2 maintainers | detected with seed 1 by list-append, and with 65 of 100 seeds |
+| bank through SQL, no maintainers | detected with seed 1 by workload invariants, bank, real-time order, durability, and with 92 of 100 seeds |
+| bank through SQL, 2 maintainers | detected with seed 1 by workload invariants, bank, real-time order, durability, and with 79 of 100 seeds |
+| unique through SQL, no maintainers | detected with seed 1 by index consistency, and with 95 of 100 seeds |
+| unique through SQL, 2 maintainers | detected with seed 1 by index consistency, and with 94 of 100 seeds |
+| foreign-key through SQL, no maintainers | detected with seed 1 by real-time order, and with 37 of 100 seeds |
+| foreign-key through SQL, 2 maintainers | detected with seed 2 by real-time order, and with 28 of 100 seeds |
 
 Targeted tests:
 
@@ -1258,14 +1260,14 @@ Targeted tests:
 | list-append through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
 | bank through the engine, no maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
 | bank through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
-| list-append through SQL, no maintainers | detected with seed 1 by durability, list-append |
-| list-append through SQL, 2 maintainers | detected with seed 1 by durability, list-append |
+| list-append through SQL, no maintainers | detected with seed 1 by durability, list-append, and with 78 of 100 seeds |
+| list-append through SQL, 2 maintainers | detected with seed 1 by durability, list-append, and with 76 of 100 seeds |
 | bank through SQL, no maintainers | cannot detect: the bank workload writes only in explicit transactions, so no autocommit statement is ever retried, and a doubled transfer conserves money anyway |
 | bank through SQL, 2 maintainers | cannot detect: the bank workload writes only in explicit transactions, so no autocommit statement is ever retried, and a doubled transfer conserves money anyway |
-| unique through SQL, no maintainers | detected with seed 1 by durability, real-time order |
-| unique through SQL, 2 maintainers | detected with seed 1 by durability, real-time order |
-| foreign-key through SQL, no maintainers | detected with seed 2 by durability, real-time order |
-| foreign-key through SQL, 2 maintainers | detected with seed 1 by durability |
+| unique through SQL, no maintainers | detected with seed 1 by durability, real-time order, and with 61 of 100 seeds |
+| unique through SQL, 2 maintainers | detected with seed 1 by durability, real-time order, and with 60 of 100 seeds |
+| foreign-key through SQL, no maintainers | detected with seed 1 by durability, and with 64 of 100 seeds |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by durability, and with 56 of 100 seeds |
 
 Targeted tests:
 
@@ -1283,12 +1285,12 @@ Targeted tests:
 | bank through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
 | list-append through SQL, no maintainers | cannot detect: the tables of the list-append workload have no index besides the primary key |
 | list-append through SQL, 2 maintainers | cannot detect: the tables of the list-append workload have no index besides the primary key |
-| bank through SQL, no maintainers | detected with seed 1 by index consistency |
-| bank through SQL, 2 maintainers | detected with seed 1 by index consistency |
-| unique through SQL, no maintainers | detected with seed 1 by index consistency |
-| unique through SQL, 2 maintainers | detected with seed 1 by index consistency |
-| foreign-key through SQL, no maintainers | detected with seed 1 by index consistency |
-| foreign-key through SQL, 2 maintainers | detected with seed 2 by index consistency |
+| bank through SQL, no maintainers | detected with seed 1 by index consistency, and with 100 of 100 seeds |
+| bank through SQL, 2 maintainers | detected with seed 1 by index consistency, and with 100 of 100 seeds |
+| unique through SQL, no maintainers | detected with seed 1 by index consistency, and with 100 of 100 seeds |
+| unique through SQL, 2 maintainers | detected with seed 1 by index consistency, and with 98 of 100 seeds |
+| foreign-key through SQL, no maintainers | detected with seed 1 by index consistency, and with 81 of 100 seeds |
+| foreign-key through SQL, 2 maintainers | detected with seed 2 by index consistency, and with 58 of 100 seeds |
 
 Targeted tests:
 
@@ -1308,8 +1310,8 @@ Targeted tests:
 | list-append through SQL, 2 maintainers | cannot detect: the workload has no unique index besides the primary key |
 | bank through SQL, no maintainers | cannot detect: the workload has no unique index besides the primary key |
 | bank through SQL, 2 maintainers | cannot detect: the workload has no unique index besides the primary key |
-| unique through SQL, no maintainers | detected with seed 1 by unique, index consistency |
-| unique through SQL, 2 maintainers | detected with seed 1 by unique, index consistency |
+| unique through SQL, no maintainers | detected with seed 1 by unique, index consistency, and with 100 of 100 seeds |
+| unique through SQL, 2 maintainers | detected with seed 1 by unique, index consistency, and with 99 of 100 seeds |
 | foreign-key through SQL, no maintainers | cannot detect: the workload has no unique index besides the primary key |
 | foreign-key through SQL, 2 maintainers | cannot detect: the workload has no unique index besides the primary key |
 
@@ -1331,8 +1333,8 @@ Targeted tests:
 | list-append through SQL, 2 maintainers | cannot detect: the workload has no unique index besides the primary key |
 | bank through SQL, no maintainers | cannot detect: the workload has no unique index besides the primary key |
 | bank through SQL, 2 maintainers | cannot detect: the workload has no unique index besides the primary key |
-| unique through SQL, no maintainers | detected with seed 5 by unique, index consistency |
-| unique through SQL, 2 maintainers | detected with seed 2 by unique, index consistency |
+| unique through SQL, no maintainers | detected with seed 5 by unique, index consistency, and with 43 of 100 seeds |
+| unique through SQL, 2 maintainers | detected with seed 2 by unique, index consistency, and with 26 of 100 seeds |
 | foreign-key through SQL, no maintainers | cannot detect: the workload has no unique index besides the primary key |
 | foreign-key through SQL, 2 maintainers | cannot detect: the workload has no unique index besides the primary key |
 
@@ -1356,8 +1358,8 @@ Targeted tests:
 | bank through SQL, 2 maintainers | cannot detect: the workload has no foreign keys |
 | unique through SQL, no maintainers | cannot detect: the workload has no foreign keys |
 | unique through SQL, 2 maintainers | cannot detect: the workload has no foreign keys |
-| foreign-key through SQL, no maintainers | detected with seed 1 by foreign key |
-| foreign-key through SQL, 2 maintainers | detected with seed 1 by foreign key |
+| foreign-key through SQL, no maintainers | detected with seed 1 by foreign key, and with 99 of 100 seeds |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by foreign key, and with 97 of 100 seeds |
 
 ### `MUT-FK-NO-PARENT-CHECK`
 
@@ -1375,8 +1377,8 @@ Targeted tests:
 | bank through SQL, 2 maintainers | cannot detect: the workload has no foreign keys |
 | unique through SQL, no maintainers | cannot detect: the workload has no foreign keys |
 | unique through SQL, 2 maintainers | cannot detect: the workload has no foreign keys |
-| foreign-key through SQL, no maintainers | detected with seed 2 by foreign key |
-| foreign-key through SQL, 2 maintainers | detected with seed 2 by foreign key |
+| foreign-key through SQL, no maintainers | detected with seed 2 by foreign key, and with 75 of 100 seeds |
+| foreign-key through SQL, 2 maintainers | detected with seed 2 by foreign key, and with 58 of 100 seeds |
 
 ### `MUT-FK-OWN-WRITES`
 
@@ -1394,12 +1396,12 @@ Targeted tests:
 | bank through SQL, 2 maintainers | cannot detect: the workload has no foreign keys |
 | unique through SQL, no maintainers | cannot detect: the workload has no foreign keys |
 | unique through SQL, 2 maintainers | cannot detect: the workload has no foreign keys |
-| foreign-key through SQL, no maintainers | detected with seed 1 by foreign key |
-| foreign-key through SQL, 2 maintainers | detected with seed 1 by foreign key |
+| foreign-key through SQL, no maintainers | detected with seed 1 by foreign key, and with 90 of 100 seeds |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by foreign key, and with 80 of 100 seeds |
 
 ### `MUT-CHECK-SKIP-UPDATE`
 
-`exec.Mutations.CheckSkipUpdate` checks the CHECK constraints of a row only when it is inserted, not when an UPDATE or a foreign key action changes it.
+`exec.Mutations.CheckSkipUpdate` checks the CHECK constraints of a row only when it is inserted, not when an UPDATE or a foreign key action changes it. It runs with one key, so that the foreign key workload draws its keys from a pool of two.
 
 | Configuration | Result |
 |---|---|
@@ -1413,8 +1415,8 @@ Targeted tests:
 | bank through SQL, 2 maintainers | cannot detect: the workload has no CHECK constraints |
 | unique through SQL, no maintainers | cannot detect: the workload has no CHECK constraints |
 | unique through SQL, 2 maintainers | cannot detect: the workload has no CHECK constraints |
-| foreign-key through SQL, no maintainers | detected with seed 6 by check constraint |
-| foreign-key through SQL, 2 maintainers | detected with seed 20 by check constraint |
+| foreign-key through SQL, no maintainers | detected with seed 2 by check constraint, and with 48 of 100 seeds |
+| foreign-key through SQL, 2 maintainers | detected with seed 2 by check constraint, and with 37 of 100 seeds |
 
 ### `MUT-SUBQUERY-STALE-READS`
 
@@ -1426,8 +1428,8 @@ Targeted tests:
 | list-append through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
 | bank through the engine, no maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
 | bank through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
-| list-append through SQL, no maintainers | detected with seed 3 by durability, list-append |
-| list-append through SQL, 2 maintainers | detected with seed 4 by durability, list-append |
+| list-append through SQL, no maintainers | detected with seed 3 by durability, list-append, and with 47 of 100 seeds |
+| list-append through SQL, 2 maintainers | detected with seed 4 by durability, list-append, and with 36 of 100 seeds |
 | bank through SQL, no maintainers | not applicable: only the list-append workload writes with a subquery, an append to a packed list that reads the list in a subquery |
 | bank through SQL, 2 maintainers | not applicable: only the list-append workload writes with a subquery, an append to a packed list that reads the list in a subquery |
 | unique through SQL, no maintainers | not applicable: only the list-append workload writes with a subquery, an append to a packed list that reads the list in a subquery |
@@ -1468,18 +1470,18 @@ Targeted tests:
 
 | Configuration | Result |
 |---|---|
-| list-append through the engine, no maintainers | detected with seed 1 by cache integrity |
-| list-append through the engine, 2 maintainers | detected with seed 2 by cache integrity |
-| bank through the engine, no maintainers | detected with seed 2 by cache integrity |
-| bank through the engine, 2 maintainers | detected with seed 1 by cache integrity |
-| list-append through SQL, no maintainers | detected with seed 2 by cache integrity |
-| list-append through SQL, 2 maintainers | detected with seed 1 by cache integrity |
-| bank through SQL, no maintainers | detected with seed 2 by cache integrity |
-| bank through SQL, 2 maintainers | detected with seed 1 by cache integrity |
-| unique through SQL, no maintainers | detected with seed 1 by cache integrity |
-| unique through SQL, 2 maintainers | detected with seed 1 by cache integrity |
-| foreign-key through SQL, no maintainers | detected with seed 1 by cache integrity |
-| foreign-key through SQL, 2 maintainers | detected with seed 1 by cache integrity |
+| list-append through the engine, no maintainers | detected with seed 1 by cache integrity, and with 74 of 100 seeds |
+| list-append through the engine, 2 maintainers | detected with seed 2 by cache integrity, and with 66 of 100 seeds |
+| bank through the engine, no maintainers | detected with seed 2 by cache integrity, and with 76 of 100 seeds |
+| bank through the engine, 2 maintainers | detected with seed 1 by cache integrity, and with 64 of 100 seeds |
+| list-append through SQL, no maintainers | detected with seed 2 by cache integrity, and with 88 of 100 seeds |
+| list-append through SQL, 2 maintainers | detected with seed 1 by cache integrity, and with 83 of 100 seeds |
+| bank through SQL, no maintainers | detected with seed 2 by cache integrity, and with 90 of 100 seeds |
+| bank through SQL, 2 maintainers | detected with seed 1 by cache integrity, and with 86 of 100 seeds |
+| unique through SQL, no maintainers | detected with seed 1 by cache integrity, and with 93 of 100 seeds |
+| unique through SQL, 2 maintainers | detected with seed 1 by cache integrity, and with 76 of 100 seeds |
+| foreign-key through SQL, no maintainers | detected with seed 1 by cache integrity, and with 90 of 100 seeds |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by cache integrity, and with 81 of 100 seeds |
 
 Targeted tests:
 
@@ -1514,18 +1516,18 @@ Targeted tests:
 
 | Configuration | Result |
 |---|---|
-| list-append through the engine, no maintainers | detected with seed 1 by cache integrity |
-| list-append through the engine, 2 maintainers | detected with seed 2 by durability, list-append |
-| bank through the engine, no maintainers | detected with seed 2 by bank, durability |
-| bank through the engine, 2 maintainers | detected with seed 3 by cache integrity |
-| list-append through SQL, no maintainers | detected with seed 2 by workload invariants, damaged reads, list-append |
-| list-append through SQL, 2 maintainers | detected with seed 1 by durability, list-append |
-| bank through SQL, no maintainers | detected with seed 2 by workload invariants, cache integrity |
-| bank through SQL, 2 maintainers | detected with seed 1 by damaged reads |
-| unique through SQL, no maintainers | detected with seed 2 by cache integrity, index consistency |
-| unique through SQL, 2 maintainers | detected with seed 1 by index consistency |
-| foreign-key through SQL, no maintainers | detected with seed 1 by cache integrity |
-| foreign-key through SQL, 2 maintainers | detected with seed 2 by cache integrity |
+| list-append through the engine, no maintainers | detected with seed 1 by cache integrity, and with 64 of 100 seeds |
+| list-append through the engine, 2 maintainers | detected with seed 1 by cache integrity, and with 59 of 100 seeds |
+| bank through the engine, no maintainers | detected with seed 2 by cache integrity, bank, real-time order, durability, and with 59 of 100 seeds |
+| bank through the engine, 2 maintainers | detected with seed 3 by cache integrity, and with 56 of 100 seeds |
+| list-append through SQL, no maintainers | detected with seed 2 by cache integrity, workload invariants, damaged reads, list-append, and with 68 of 100 seeds |
+| list-append through SQL, 2 maintainers | detected with seed 1 by compaction, durability, list-append, and with 70 of 100 seeds |
+| bank through SQL, no maintainers | detected with seed 2 by cache integrity, workload invariants, and with 73 of 100 seeds |
+| bank through SQL, 2 maintainers | detected with seed 1 by cache integrity, damaged reads, and with 68 of 100 seeds |
+| unique through SQL, no maintainers | detected with seed 2 by cache integrity, index consistency, and with 60 of 100 seeds |
+| unique through SQL, 2 maintainers | detected with seed 1 by index consistency, cache integrity, and with 60 of 100 seeds |
+| foreign-key through SQL, no maintainers | detected with seed 1 by cache integrity, and with 63 of 100 seeds |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by cache integrity, and with 56 of 100 seeds |
 
 Targeted tests:
 
@@ -1537,18 +1539,18 @@ Targeted tests:
 
 | Configuration | Result |
 |---|---|
-| list-append through the engine, no maintainers | detected with seed 1 by durability, list-append |
-| list-append through the engine, 2 maintainers | detected with seed 1 by durability, list-append |
-| bank through the engine, no maintainers | detected with seed 1 by bank, durability |
-| bank through the engine, 2 maintainers | detected with seed 1 by workload invariants, bank, durability |
-| list-append through SQL, no maintainers | detected with seed 2 by durability |
-| list-append through SQL, 2 maintainers | detected with seed 1 by workload invariants, durability, list-append |
-| bank through SQL, no maintainers | detected with seed 1 by workload invariants, index consistency, bank, durability |
-| bank through SQL, 2 maintainers | detected with seed 1 by workload invariants, index consistency, bank, durability |
-| unique through SQL, no maintainers | detected with seed 1 by index consistency, unique |
-| unique through SQL, 2 maintainers | detected with seed 1 by unique, index consistency |
-| foreign-key through SQL, no maintainers | detected with seed 1 by foreign key |
-| foreign-key through SQL, 2 maintainers | detected with seed 1 by foreign key, final read |
+| list-append through the engine, no maintainers | detected with seed 1 by durability, list-append, and with 100 of 100 seeds |
+| list-append through the engine, 2 maintainers | detected with seed 1 by durability, list-append, and with 99 of 100 seeds |
+| bank through the engine, no maintainers | detected with seed 1 by bank, real-time order, durability, and with 100 of 100 seeds |
+| bank through the engine, 2 maintainers | detected with seed 1 by workload invariants, bank, real-time order, durability, and with 100 of 100 seeds |
+| list-append through SQL, no maintainers | detected with seed 2 by durability, and with 93 of 100 seeds |
+| list-append through SQL, 2 maintainers | detected with seed 1 by workload invariants, durability, list-append, and with 97 of 100 seeds |
+| bank through SQL, no maintainers | detected with seed 1 by workload invariants, index consistency, bank, real-time order, durability, and with 99 of 100 seeds |
+| bank through SQL, 2 maintainers | detected with seed 1 by workload invariants, index consistency, bank, real-time order, durability, and with 100 of 100 seeds |
+| unique through SQL, no maintainers | detected with seed 1 by index consistency, unique, and with 100 of 100 seeds |
+| unique through SQL, 2 maintainers | detected with seed 1 by unique, index consistency, and with 99 of 100 seeds |
+| foreign-key through SQL, no maintainers | detected with seed 1 by foreign key, and with 59 of 100 seeds |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by foreign key, final read, and with 99 of 100 seeds |
 
 Targeted tests:
 
@@ -1556,22 +1558,22 @@ Targeted tests:
 
 ### `MUT-FILTER-UNCHECKED`
 
-`engine.Mutations.FilterUnchecked` decodes the filter blocks of segments without checking their checksums, and caches what the store returns before decoding it, so that a filter block whose bytes the store damaged is trusted, or cached and trusted later. It runs with damaged reads from the store and with blocks of 128 bytes, so that segments have filter blocks.
+`engine.Mutations.FilterUnchecked` decodes the filter blocks of segments without checking their checksums, and caches what the store returns before decoding it, so that a filter block whose bytes the store damaged is trusted, or cached and trusted later. It runs with blocks of 64 bytes, so that segments have filter blocks, and with one in ten reads from the store damaged.
 
 | Configuration | Result |
 |---|---|
-| list-append through the engine, no maintainers | detected with seed 20 by cache integrity |
-| list-append through the engine, 2 maintainers | detected with seed 3 by cache integrity |
-| bank through the engine, no maintainers | not applicable: the bank workload through the engine keeps four accounts, whose segments fit in one block even of 128 bytes, so no segment has a filter block |
-| bank through the engine, 2 maintainers | not applicable: the bank workload through the engine keeps four accounts, whose segments fit in one block even of 128 bytes, so no segment has a filter block |
-| list-append through SQL, no maintainers | detected with seed 1 by cache integrity |
-| list-append through SQL, 2 maintainers | detected with seed 10 by cache integrity |
-| bank through SQL, no maintainers | detected with seed 3 by cache integrity |
-| bank through SQL, 2 maintainers | detected with seed 7 by cache integrity |
-| unique through SQL, no maintainers | detected with seed 2 by cache integrity |
-| unique through SQL, 2 maintainers | detected with seed 1 by cache integrity |
-| foreign-key through SQL, no maintainers | detected with seed 12 by cache integrity |
-| foreign-key through SQL, 2 maintainers | detected with seed 1 by cache integrity |
+| list-append through the engine, no maintainers | detected with seed 1 by cache integrity, and with 47 of 100 seeds |
+| list-append through the engine, 2 maintainers | detected with seed 2 by cache integrity, and with 48 of 100 seeds |
+| bank through the engine, no maintainers | not applicable: the bank workload through the engine keeps four accounts, whose segments fit in one block even of 64 bytes, so no segment has a filter block |
+| bank through the engine, 2 maintainers | not applicable: the bank workload through the engine keeps four accounts, whose segments fit in one block even of 64 bytes, so no segment has a filter block |
+| list-append through SQL, no maintainers | detected with seed 2 by cache integrity, and with 56 of 100 seeds |
+| list-append through SQL, 2 maintainers | detected with seed 2 by cache integrity, and with 58 of 100 seeds |
+| bank through SQL, no maintainers | detected with seed 1 by cache integrity, and with 90 of 100 seeds |
+| bank through SQL, 2 maintainers | detected with seed 1 by cache integrity, and with 86 of 100 seeds |
+| unique through SQL, no maintainers | detected with seed 1 by cache integrity, and with 84 of 100 seeds |
+| unique through SQL, 2 maintainers | detected with seed 1 by cache integrity, index consistency, and with 82 of 100 seeds |
+| foreign-key through SQL, no maintainers | detected with seed 2 by cache integrity, and with 68 of 100 seeds |
+| foreign-key through SQL, 2 maintainers | detected with seed 3 by cache integrity, and with 67 of 100 seeds |
 
 Targeted tests:
 
@@ -1583,18 +1585,18 @@ Targeted tests:
 
 | Configuration | Result |
 |---|---|
-| list-append through the engine, no maintainers | detected with seed 1 by disk cache bound |
-| list-append through the engine, 2 maintainers | detected with seed 1 by disk cache bound |
-| bank through the engine, no maintainers | detected with seed 2 by disk cache bound |
-| bank through the engine, 2 maintainers | detected with seed 1 by disk cache bound |
-| list-append through SQL, no maintainers | detected with seed 2 by disk cache bound |
-| list-append through SQL, 2 maintainers | detected with seed 1 by disk cache bound |
-| bank through SQL, no maintainers | detected with seed 1 by disk cache bound |
-| bank through SQL, 2 maintainers | detected with seed 1 by disk cache bound |
-| unique through SQL, no maintainers | detected with seed 1 by disk cache bound |
-| unique through SQL, 2 maintainers | detected with seed 1 by disk cache bound |
-| foreign-key through SQL, no maintainers | detected with seed 1 by disk cache bound |
-| foreign-key through SQL, 2 maintainers | detected with seed 1 by disk cache bound |
+| list-append through the engine, no maintainers | detected with seed 1 by disk cache bound, and with 86 of 100 seeds |
+| list-append through the engine, 2 maintainers | detected with seed 1 by disk cache bound, and with 80 of 100 seeds |
+| bank through the engine, no maintainers | detected with seed 2 by disk cache bound, and with 73 of 100 seeds |
+| bank through the engine, 2 maintainers | detected with seed 1 by disk cache bound, and with 77 of 100 seeds |
+| list-append through SQL, no maintainers | detected with seed 2 by disk cache bound, and with 95 of 100 seeds |
+| list-append through SQL, 2 maintainers | detected with seed 1 by disk cache bound, and with 90 of 100 seeds |
+| bank through SQL, no maintainers | detected with seed 1 by disk cache bound, and with 90 of 100 seeds |
+| bank through SQL, 2 maintainers | detected with seed 1 by disk cache bound, and with 87 of 100 seeds |
+| unique through SQL, no maintainers | detected with seed 1 by disk cache bound, and with 91 of 100 seeds |
+| unique through SQL, 2 maintainers | detected with seed 1 by disk cache bound, and with 84 of 100 seeds |
+| foreign-key through SQL, no maintainers | detected with seed 1 by disk cache bound, and with 90 of 100 seeds |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by disk cache bound, and with 85 of 100 seeds |
 
 Targeted tests:
 
@@ -1606,18 +1608,18 @@ Targeted tests:
 
 | Configuration | Result |
 |---|---|
-| list-append through the engine, no maintainers | detected with seed 1 by panic |
-| list-append through the engine, 2 maintainers | detected with seed 1 by panic |
-| bank through the engine, no maintainers | detected with seed 2 by panic |
-| bank through the engine, 2 maintainers | detected with seed 2 by panic |
-| list-append through SQL, no maintainers | detected with seed 1 by panic |
-| list-append through SQL, 2 maintainers | detected with seed 1 by panic |
-| bank through SQL, no maintainers | detected with seed 1 by panic |
-| bank through SQL, 2 maintainers | detected with seed 1 by panic |
-| unique through SQL, no maintainers | detected with seed 1 by panic |
-| unique through SQL, 2 maintainers | detected with seed 2 by panic |
-| foreign-key through SQL, no maintainers | detected with seed 1 by panic |
-| foreign-key through SQL, 2 maintainers | detected with seed 1 by panic |
+| list-append through the engine, no maintainers | detected with seed 1 by panic, and with 94 of 100 seeds |
+| list-append through the engine, 2 maintainers | detected with seed 1 by panic, and with 86 of 100 seeds |
+| bank through the engine, no maintainers | detected with seed 2 by panic, and with 91 of 100 seeds |
+| bank through the engine, 2 maintainers | detected with seed 2 by panic, and with 91 of 100 seeds |
+| list-append through SQL, no maintainers | detected with seed 1 by panic, and with 88 of 100 seeds |
+| list-append through SQL, 2 maintainers | detected with seed 1 by panic, and with 85 of 100 seeds |
+| bank through SQL, no maintainers | detected with seed 1 by panic, and with 91 of 100 seeds |
+| bank through SQL, 2 maintainers | detected with seed 1 by panic, and with 83 of 100 seeds |
+| unique through SQL, no maintainers | detected with seed 1 by panic, and with 82 of 100 seeds |
+| unique through SQL, 2 maintainers | detected with seed 2 by panic, and with 72 of 100 seeds |
+| foreign-key through SQL, no maintainers | detected with seed 1 by panic, and with 85 of 100 seeds |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by panic, and with 75 of 100 seeds |
 
 ## Reached states
 

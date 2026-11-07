@@ -100,10 +100,10 @@ func writeCoverage(b *strings.Builder, covs []Coverage) {
 
 func writeKillMatrix(b *strings.Builder, km KillMatrix, byID map[string][]Coverage) {
 	b.WriteString("\n## Mutant kill matrix\n\n")
-	fmt.Fprintf(b, "Every mutant runs in every simulator configuration below, with seeds 1 to %d, until a checker finds an anomaly. A configuration that never detects a mutant states why it cannot. `make verification` and `make soak` try all %d seeds in such a configuration, and `make test` seeds 1 to %d.\n\n", km.Seeds, km.Seeds, km.CannotSeeds)
-	b.WriteString("| Mutant | Detected in | First seed | Checkers |\n|---|---|---|---|\n")
+	fmt.Fprintf(b, "Every mutant runs in every simulator configuration below, with seeds 1 to %d, until a checker finds an anomaly. A configuration that never detects a mutant states why it cannot, and `make test` tries seeds 1 to %d there. `make verification` and `make soak` try seeds 1 to %d in every configuration that can run the mutant, and fail when a configuration that detects the mutant does so with fewer than %d of them, or when one that cannot detects it with any. The count of those seeds that detect the mutant is in the result of each configuration.\n\n", km.Seeds, km.CannotSeeds, km.RateSeeds, km.Floor)
+	fmt.Fprintf(b, "| Mutant | Detected in | First seed | Fewest detections in %d seeds | Checkers |\n|---|---|---|---|---|\n", km.RateSeeds)
 	for _, m := range km.Mutants {
-		n, applicable := 0, 0
+		n, applicable, fewest := 0, 0, 0
 		var first uint64
 		checkers := map[string]bool{}
 		for _, r := range m.Results {
@@ -117,20 +117,23 @@ func writeKillMatrix(b *strings.Builder, km KillMatrix, byID map[string][]Covera
 			if first == 0 || r.Seed < first {
 				first = r.Seed
 			}
+			if n == 1 || r.Detections < fewest {
+				fewest = r.Detections
+			}
 			for _, c := range r.Checkers {
 				checkers[c] = true
 			}
 		}
-		seed := "none"
+		seed, rate := "none", "none"
 		if first > 0 {
-			seed = fmt.Sprint(first)
+			seed, rate = fmt.Sprint(first), fmt.Sprint(fewest)
 		}
 		var names []string
 		for c := range checkers {
 			names = append(names, c)
 		}
 		sort.Strings(names)
-		fmt.Fprintf(b, "| `%s` %s | %d of %d configurations | %s | %s |\n", m.ID, m.Name, n, applicable, seed, strings.Join(names, ", "))
+		fmt.Fprintf(b, "| `%s` %s | %d of %d configurations | %s | %s | %s |\n", m.ID, m.Name, n, applicable, seed, rate, strings.Join(names, ", "))
 	}
 	for _, m := range km.Mutants {
 		fmt.Fprintf(b, "\n### `%s`\n\n%s\n\n", m.ID, m.Description)
@@ -139,7 +142,7 @@ func writeKillMatrix(b *strings.Builder, km KillMatrix, byID map[string][]Covera
 			var result string
 			switch r.Status {
 			case Detected:
-				result = fmt.Sprintf("detected with seed %d by %s", r.Seed, strings.Join(r.Checkers, ", "))
+				result = fmt.Sprintf("detected with seed %d by %s, and with %d of %d seeds", r.Seed, strings.Join(r.Checkers, ", "), r.Detections, km.RateSeeds)
 			case Undetected:
 				result = "cannot detect: " + r.Reason
 			case NotApplicable:

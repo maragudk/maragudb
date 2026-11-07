@@ -32,9 +32,13 @@ func (r Requirement) Kind() string {
 type KillMatrix struct {
 	// Seeds tried in every cell before a mutant counts as undetected there.
 	Seeds int `json:"seeds"`
-	// CannotSeeds tried in `make test` in a cell that is said to be unable to detect a mutant,
-	// where `make verification` and `make soak` try all [KillMatrix.Seeds].
+	// CannotSeeds tried in `make test` in a cell that is said to be unable to detect a mutant.
 	CannotSeeds int `json:"cannotSeeds"`
+	// RateSeeds are the seeds, from 1, that `make verification` and `make soak` try in every cell
+	// that can run a mutant, and Floor the fewest of them that must detect the mutant in a cell
+	// that detects it.
+	RateSeeds int `json:"rateSeeds"`
+	Floor     int `json:"floor"`
 	// Cells are the simulator configurations every mutant runs in.
 	Cells   []string           `json:"cells"`
 	Mutants []KillMatrixMutant `json:"mutants"`
@@ -57,6 +61,8 @@ type KillMatrixResult struct {
 	// Seed of first detection and the Checkers that found it, when detected.
 	Seed     uint64   `json:"seed,omitempty"`
 	Checkers []string `json:"checkers,omitempty"`
+	// Detections are how many of the [KillMatrix.RateSeeds] detect the mutant, when detected.
+	Detections int `json:"detections,omitempty"`
 	// Reason the cell cannot detect the mutant, when not detected or not applicable.
 	Reason string `json:"reason,omitempty"`
 }
