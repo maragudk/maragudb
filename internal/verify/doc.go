@@ -100,7 +100,7 @@ func writeCoverage(b *strings.Builder, covs []Coverage) {
 
 func writeKillMatrix(b *strings.Builder, km KillMatrix, byID map[string][]Coverage) {
 	b.WriteString("\n## Mutant kill matrix\n\n")
-	fmt.Fprintf(b, "Every mutant runs in every simulator configuration below, with seeds 1 to %d, until a checker finds an anomaly. A configuration that never detects a mutant states why it cannot.\n\n", km.Seeds)
+	fmt.Fprintf(b, "Every mutant runs in every simulator configuration below, with seeds 1 to %d, until a checker finds an anomaly. A configuration that never detects a mutant states why it cannot. `make verification` and `make soak` try all %d seeds in such a configuration, and `make test` seeds 1 to %d.\n\n", km.Seeds, km.Seeds, km.CannotSeeds)
 	b.WriteString("| Mutant | Detected in | First seed | Checkers |\n|---|---|---|---|\n")
 	for _, m := range km.Mutants {
 		n, applicable := 0, 0

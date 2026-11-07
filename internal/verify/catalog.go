@@ -32,6 +32,9 @@ func (r Requirement) Kind() string {
 type KillMatrix struct {
 	// Seeds tried in every cell before a mutant counts as undetected there.
 	Seeds int `json:"seeds"`
+	// CannotSeeds tried in `make test` in a cell that is said to be unable to detect a mutant,
+	// where `make verification` and `make soak` try all [KillMatrix.Seeds].
+	CannotSeeds int `json:"cannotSeeds"`
 	// Cells are the simulator configurations every mutant runs in.
 	Cells   []string           `json:"cells"`
 	Mutants []KillMatrixMutant `json:"mutants"`

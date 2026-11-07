@@ -1029,6 +1029,17 @@ var update = flag.Bool("update", false, "write the kill matrix to "+verify.KillM
 // killMatrixSeeds tried in every cell.
 const killMatrixSeeds = 20
 
+// cannotSeeds tried in `make test` in a cell that is said to be unable to detect the mutant. No
+// seed detects it there, so every seed that the cell tries runs. `make verification` and `make
+// soak` try all [killMatrixSeeds] there, as in every other cell.
+const cannotSeeds = 5
+
+// allSeeds reports whether every cell tries all [killMatrixSeeds]: when the kill matrix is
+// written, with -update, and in the soak.
+func allSeeds() bool {
+	return *update || os.Getenv("MARAGUDB_SOAK") != ""
+}
+
 func TestRun(t *testing.T) {
 	t.Run("leaves no goroutine running after the run, in every workload and maintenance mode, through the engine and SQL, with and without heavy faults", func(t *testing.T) {
 		for _, w := range []sim.Workload{sim.ListAppend, sim.Bank, sim.Unique, sim.ForeignKey} {
@@ -1115,7 +1126,7 @@ func TestMutants(t *testing.T) {
 	// the whole matrix is compared once they are all done.
 	ran := make([]*verify.KillMatrixMutant, len(ms))
 	t.Cleanup(func() {
-		km := verify.KillMatrix{Seeds: killMatrixSeeds}
+		km := verify.KillMatrix{Seeds: killMatrixSeeds, CannotSeeds: cannotSeeds}
 		for _, c := range cells() {
 			km.Cells = append(km.Cells, c.String())
 		}
@@ -1153,7 +1164,8 @@ func TestMutants(t *testing.T) {
 		t.Run(m.id, func(t *testing.T) {
 			t.Parallel()
 			kmm := verify.KillMatrixMutant{ID: m.id, Name: m.name, Replay: m.replay, Description: m.description}
-			// Every cell tries its seeds in order until one detects the mutant, and the cells run in
+			// Every cell tries its seeds in order until one detects the mutant, a cell that cannot
+			// detect it only the first [cannotSeeds] unless [allSeeds], and the cells run in
 			// parallel.
 			cs := cells()
 			results := make([]verify.KillMatrixResult, len(cs))
@@ -1165,9 +1177,13 @@ func TestMutants(t *testing.T) {
 					results[j].Reason = reason
 					continue
 				}
+				seeds := uint64(killMatrixSeeds)
+				if _, cannot := m.cannot[c]; cannot && !allSeeds() {
+					seeds = cannotSeeds
+				}
 				wg.Go(func() {
 					r := &results[j]
-					for seed := uint64(1); seed <= killMatrixSeeds; seed++ {
+					for seed := uint64(1); seed <= seeds; seed++ {
 						cfg := sim.DefaultConfig(seed)
 						cfg.Workload = c.workload
 						cfg.SQL = c.sql

@@ -51,11 +51,12 @@ verification:
 replay:
 	MARAGUDB_SEED=$(SEED) MARAGUDB_WORKLOAD=$(WORKLOAD) MARAGUDB_API=$(API) MARAGUDB_CORPUS=$(CORPUS) MARAGUDB_MAINTAINERS=$(MAINTAINERS) MARAGUDB_MAINTENANCE=$(MAINTENANCE) MARAGUDB_DISK_FAULTS=$(DISK_FAULTS) MARAGUDB_STORE_DAMAGE=$(STORE_DAMAGE) MARAGUDB_MUTATION=$(MUTATION) go test ./internal/sim -run 'TestSimulator/replay' -count 1 -v
 
-# Run the simulator with random seeds and configurations for SOAK_DURATION (default 5m), and
-# then the full sqllogictest corpus.
+# Run the mutant kill matrix with every seed in every cell, then the simulator with random seeds
+# and configurations for SOAK_DURATION (default 5m), and then the full sqllogictest corpus.
 SOAK_DURATION ?= 5m
 .PHONY: soak
 soak:
+	MARAGUDB_SOAK=1 go test ./internal/sim -run 'TestMutants' -count 1 -timeout 0
 	MARAGUDB_SOAK=1 MARAGUDB_SOAK_DURATION=$(SOAK_DURATION) go test ./internal/sim -run 'TestSimulator/soak' -count 1 -v -timeout 0
 	$(MAKE) sqllogictest
 

@@ -1,5 +1,6 @@
 {
   "seeds": 20,
+  "cannotSeeds": 5,
   "cells": [
     "list-append through the engine, no maintainers",
     "list-append through the engine, 2 maintainers",

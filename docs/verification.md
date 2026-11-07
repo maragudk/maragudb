@@ -864,7 +864,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 ## Mutant kill matrix
 
-Every mutant runs in every simulator configuration below, with seeds 1 to 20, until a checker finds an anomaly. A configuration that never detects a mutant states why it cannot.
+Every mutant runs in every simulator configuration below, with seeds 1 to 20, until a checker finds an anomaly. A configuration that never detects a mutant states why it cannot. `make verification` and `make soak` try all 20 seeds in such a configuration, and `make test` seeds 1 to 5.
 
 | Mutant | Detected in | First seed | Checkers |
 |---|---|---|---|
