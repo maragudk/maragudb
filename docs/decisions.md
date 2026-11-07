@@ -498,3 +498,25 @@ Alternatives considered:
 - Implementing Postgres's inference exactly, with the type of the first coercion in the order of its analysis. maragudb resolves output columns at once where Postgres resolves them at the end of the analysis, and other orders differ too, so the mismatches would follow the order of the binder.
 - Rejecting every repeated parameter. `WHERE k = $1` in two places is common, and the simulator's workloads use it.
 - Matching 42P08 instead of rejecting. It depends on the same order.
+
+## 2026-11-07: The kill matrix tries five seeds in `make test` where a configuration says it cannot detect a mutant, and all twenty in `make verification` and `make soak`
+
+Context: `TestMutants` in `/internal/sim/sim_test.go` runs each of 28 mutants in 12 simulator configurations, seeds 1 to 20, until a checker detects it. A configuration that says why it cannot detect a mutant never does, so it ran all 20 seeds every time: 79 such cells, 1,580 of about 2,000 mutant runs, only to confirm the reason. `internal/sim` under `go test -race` with `GOMAXPROCS=4` took about 86 s.
+
+Decision: in `make test`, such a cell tries seeds 1 to 5, the constant `cannotSeeds`. `make verification`, which writes the kill matrix, and `make soak`, which now runs `TestMutants` with `MARAGUDB_SOAK=1` first, try all 20. A cell that says it cannot detect the mutant and then does still fails the test. A cell that can detect a mutant tries up to 20 seeds in every run, so every verdict and first detecting seed is unchanged; the kill matrix gained only the field `cannotSeeds`. The package now takes about 47 s.
+
+Alternatives considered:
+- Skipping a mutated run when the unmutated run of the same seed never reaches the mutated code. It needs a probe at every mutation site in production code, and one missing probe would hide a detection.
+- Running the kill matrix in a child process built without the race detector, about ten times faster. It changes what CI checks, so it waits for a decision of its own.
+- Fewer seeds in every cell. First detecting seeds go up to 16 and would move.
+
+## 2026-11-07: The sqllogictest runner splits the read-only queries at the end of a long file into shards that run at the same time
+
+Context: `make test` runs a fixed subset of 22 corpus files on `GOMAXPROCS` workers. `random/select/slt_good_0.test` spends about 22 s in Postgres alone, on queries such as 5-way cross joins with `DISTINCT`, about 2 ms each, one after another, so it was the tail of the run.
+
+Decision: most files of the corpus create and fill their tables, and then only query them. The runner splits the read-only queries at the end of a file, `query` records whose SQL is a `SELECT` without `INTO`, into shards of at most 3,000, which run at the same time. The first shard runs after the records before the queries. Every other shard runs on a fresh maragudb and a fresh Postgres schema that first run those records again, without the read-only queries among them. A read-only query outside a transaction changes nothing, and maragudb rejects the functions that change state, such as `nextval`, so the query gives the same result there. A file with a statement that begins or ends a transaction (`BEGIN`, `START`, `COMMIT`, `END`, `ROLLBACK`, `ABORT`, `SAVEPOINT`, `RELEASE`, `PREPARE`) runs in one sequence. The report counts what a run in one sequence counts: every record once, up to the first difference, which is that of the earliest shard. So each file's baseline is unchanged. A worker mostly waits for Postgres, so there are three workers per CPU, and the shards that run at the same time, across files, are at most the workers, which bounds the connections to Postgres. The runner starts the largest files first. This applies to the `make test` subset and to the full corpus in `make soak`. `internal/sqllogictest` went from about 50 s to about 26 s.
+
+Alternatives considered:
+- More workers without shards. About 35 s, because the one long file stays the tail.
+- Dropping or replacing that file in the `make test` subset. It loses coverage in `make test`.
+- Running `ANALYZE` in Postgres, whose estimate for tables that were never analyzed makes it build a huge hash table for `DISTINCT`. It changes Postgres's plans and so which row fails first, which the comparison depends on.
