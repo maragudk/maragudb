@@ -41,20 +41,26 @@
         },
         {
           "cell": "bank through the engine, no maintainers",
-          "status": "undetected",
-          "reason": "an unconditional manifest write drops whole concurrent commits, a dropped transfer conserves money, and the bank checker only checks totals"
+          "status": "detected",
+          "seed": 7,
+          "checkers": [
+            "storage"
+          ]
         },
         {
           "cell": "bank through the engine, 2 maintainers",
-          "status": "undetected",
-          "reason": "an unconditional manifest write drops whole concurrent commits, a dropped transfer conserves money, and the bank checker only checks totals"
+          "status": "detected",
+          "seed": 3,
+          "checkers": [
+            "storage"
+          ]
         },
         {
           "cell": "list-append through SQL, no maintainers",
           "status": "detected",
           "seed": 1,
           "checkers": [
-            "final read",
+            "durability",
             "list-append"
           ]
         },
@@ -64,28 +70,38 @@
           "seed": 1,
           "checkers": [
             "durability",
-            "list-append"
+            "list-append",
+            "storage"
           ]
         },
         {
           "cell": "bank through SQL, no maintainers",
-          "status": "undetected",
-          "reason": "an unconditional manifest write drops whole concurrent commits, a dropped transfer conserves money, and the bank checker only checks totals"
+          "status": "detected",
+          "seed": 2,
+          "checkers": [
+            "storage"
+          ]
         },
         {
           "cell": "bank through SQL, 2 maintainers",
-          "status": "undetected",
-          "reason": "an unconditional manifest write drops whole concurrent commits, a dropped transfer conserves money, and the bank checker only checks totals"
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "storage"
+          ]
         },
         {
           "cell": "unique through SQL, no maintainers",
           "status": "undetected",
-          "reason": "an unconditional manifest write drops whole concurrent commits, which leaves a consistent state in which no value repeats, and the unique workload does not check that acknowledged writes survive"
+          "reason": "an unconditional manifest write drops whole concurrent commits, which leaves a consistent state in which no value repeats, the unique workload does not check that acknowledged writes survive, and in 20 seeds no dropped commit leaves the store with objects that GC cannot collect"
         },
         {
           "cell": "unique through SQL, 2 maintainers",
-          "status": "undetected",
-          "reason": "an unconditional manifest write drops whole concurrent commits, which leaves a consistent state in which no value repeats, and the unique workload does not check that acknowledged writes survive"
+          "status": "detected",
+          "seed": 16,
+          "checkers": [
+            "storage"
+          ]
         },
         {
           "cell": "foreign-key through SQL, no maintainers",
@@ -98,7 +114,7 @@
         {
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 3,
+          "seed": 2,
           "checkers": [
             "real-time order"
           ]
@@ -119,10 +135,9 @@
         {
           "cell": "list-append through the engine, 2 maintainers",
           "status": "detected",
-          "seed": 1,
+          "seed": 2,
           "checkers": [
-            "final read",
-            "list-append"
+            "grace period"
           ]
         },
         {
@@ -133,7 +148,7 @@
         {
           "cell": "bank through the engine, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
             "grace period"
           ]
@@ -148,7 +163,9 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
-            "grace period"
+            "grace period",
+            "final read",
+            "list-append"
           ]
         },
         {
@@ -172,7 +189,7 @@
         {
           "cell": "unique through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 1,
+          "seed": 2,
           "checkers": [
             "grace period"
           ]
@@ -187,9 +204,343 @@
           "status": "detected",
           "seed": 1,
           "checkers": [
-            "grace period",
-            "final read"
+            "grace period"
           ]
+        }
+      ]
+    },
+    {
+      "id": "MUT-GC-BATCH-OBJECTS-FIRST",
+      "name": "garbage batches deleted before their garbage",
+      "replay": "gc-batch-objects-first",
+      "description": "`engine.Mutations.GCBatchObjectsFirst` deletes the objects of an expired chain of garbage batches before the garbage they list and before the manifest write that drops the chain, so that a failed delete or a crash leaves the manifest referencing a missing batch.",
+      "results": [
+        {
+          "cell": "list-append through the engine, no maintainers",
+          "status": "not applicable",
+          "reason": "without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete"
+        },
+        {
+          "cell": "list-append through the engine, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "storage"
+          ]
+        },
+        {
+          "cell": "bank through the engine, no maintainers",
+          "status": "not applicable",
+          "reason": "without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete"
+        },
+        {
+          "cell": "bank through the engine, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "storage"
+          ]
+        },
+        {
+          "cell": "list-append through SQL, no maintainers",
+          "status": "not applicable",
+          "reason": "without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete"
+        },
+        {
+          "cell": "list-append through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "storage"
+          ]
+        },
+        {
+          "cell": "bank through SQL, no maintainers",
+          "status": "not applicable",
+          "reason": "without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete"
+        },
+        {
+          "cell": "bank through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 2,
+          "checkers": [
+            "storage"
+          ]
+        },
+        {
+          "cell": "unique through SQL, no maintainers",
+          "status": "not applicable",
+          "reason": "without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete"
+        },
+        {
+          "cell": "unique through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 2,
+          "checkers": [
+            "storage"
+          ]
+        },
+        {
+          "cell": "foreign-key through SQL, no maintainers",
+          "status": "not applicable",
+          "reason": "without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete"
+        },
+        {
+          "cell": "foreign-key through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "storage"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "MUT-GC-SWEEP-SEGMENTS-ONLY",
+      "name": "an orphan sweep that misses garbage batches",
+      "replay": "gc-sweep-segments-only",
+      "description": "`engine.Mutations.GCSweepSegmentsOnly` lists only segments when GC sweeps for orphans, so that a garbage batch whose GC pass lost or crashed, or whose delete failed after its chain was dropped, is never deleted.",
+      "results": [
+        {
+          "cell": "list-append through the engine, no maintainers",
+          "status": "not applicable",
+          "reason": "without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete"
+        },
+        {
+          "cell": "list-append through the engine, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "storage"
+          ]
+        },
+        {
+          "cell": "bank through the engine, no maintainers",
+          "status": "not applicable",
+          "reason": "without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete"
+        },
+        {
+          "cell": "bank through the engine, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "storage"
+          ]
+        },
+        {
+          "cell": "list-append through SQL, no maintainers",
+          "status": "not applicable",
+          "reason": "without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete"
+        },
+        {
+          "cell": "list-append through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "storage"
+          ]
+        },
+        {
+          "cell": "bank through SQL, no maintainers",
+          "status": "not applicable",
+          "reason": "without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete"
+        },
+        {
+          "cell": "bank through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "storage"
+          ]
+        },
+        {
+          "cell": "unique through SQL, no maintainers",
+          "status": "not applicable",
+          "reason": "without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete"
+        },
+        {
+          "cell": "unique through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "storage"
+          ]
+        },
+        {
+          "cell": "foreign-key through SQL, no maintainers",
+          "status": "not applicable",
+          "reason": "without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete"
+        },
+        {
+          "cell": "foreign-key through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "storage"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "MUT-GC-CHAIN-FIRST-STAMP",
+      "name": "a chain of garbage batches with the stamp of its first batch",
+      "replay": "gc-chain-first-stamp",
+      "description": "`engine.Mutations.GCChainKeepsFirstStamp` adds every GC pass's garbage batch to the newest chain, however old, and keeps the stamp of the chain's first batch, so that garbage is deleted before it is a grace period old.",
+      "results": [
+        {
+          "cell": "list-append through the engine, no maintainers",
+          "status": "not applicable",
+          "reason": "without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete"
+        },
+        {
+          "cell": "list-append through the engine, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "grace period"
+          ]
+        },
+        {
+          "cell": "bank through the engine, no maintainers",
+          "status": "not applicable",
+          "reason": "without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete"
+        },
+        {
+          "cell": "bank through the engine, 2 maintainers",
+          "status": "detected",
+          "seed": 3,
+          "checkers": [
+            "grace period"
+          ]
+        },
+        {
+          "cell": "list-append through SQL, no maintainers",
+          "status": "not applicable",
+          "reason": "without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete"
+        },
+        {
+          "cell": "list-append through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 8,
+          "checkers": [
+            "grace period"
+          ]
+        },
+        {
+          "cell": "bank through SQL, no maintainers",
+          "status": "not applicable",
+          "reason": "without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete"
+        },
+        {
+          "cell": "bank through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 16,
+          "checkers": [
+            "grace period"
+          ]
+        },
+        {
+          "cell": "unique through SQL, no maintainers",
+          "status": "not applicable",
+          "reason": "without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete"
+        },
+        {
+          "cell": "unique through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 6,
+          "checkers": [
+            "grace period"
+          ]
+        },
+        {
+          "cell": "foreign-key through SQL, no maintainers",
+          "status": "not applicable",
+          "reason": "without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete"
+        },
+        {
+          "cell": "foreign-key through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 7,
+          "checkers": [
+            "grace period"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "MUT-GC-DELETE-REFERENCED",
+      "name": "GC deleting expired garbage that is referenced again",
+      "replay": "gc-delete-referenced",
+      "description": "`engine.Mutations.GCDeleteReferenced` deletes the garbage of an expired chain of garbage batches also when the manifest references it otherwise, such as the output of a compaction that GC stamped as an orphan before the compaction's rebase landed.",
+      "results": [
+        {
+          "cell": "list-append through the engine, no maintainers",
+          "status": "not applicable",
+          "reason": "without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete"
+        },
+        {
+          "cell": "list-append through the engine, 2 maintainers",
+          "status": "detected",
+          "seed": 8,
+          "checkers": [
+            "storage"
+          ]
+        },
+        {
+          "cell": "bank through the engine, no maintainers",
+          "status": "not applicable",
+          "reason": "without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete"
+        },
+        {
+          "cell": "bank through the engine, 2 maintainers",
+          "status": "detected",
+          "seed": 7,
+          "checkers": [
+            "storage"
+          ]
+        },
+        {
+          "cell": "list-append through SQL, no maintainers",
+          "status": "not applicable",
+          "reason": "without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete"
+        },
+        {
+          "cell": "list-append through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "in 20 seeds, no GC pass stamps the output of a compaction as an orphan between the compaction's segment write and its rebased manifest write, which the mutant needs; `TestMutations` of the engine makes that happen and detects the mutant"
+        },
+        {
+          "cell": "bank through SQL, no maintainers",
+          "status": "not applicable",
+          "reason": "without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete"
+        },
+        {
+          "cell": "bank through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "in 20 seeds, no GC pass stamps the output of a compaction as an orphan between the compaction's segment write and its rebased manifest write, which the mutant needs; `TestMutations` of the engine makes that happen and detects the mutant"
+        },
+        {
+          "cell": "unique through SQL, no maintainers",
+          "status": "not applicable",
+          "reason": "without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete"
+        },
+        {
+          "cell": "unique through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 15,
+          "checkers": [
+            "storage"
+          ]
+        },
+        {
+          "cell": "foreign-key through SQL, no maintainers",
+          "status": "not applicable",
+          "reason": "without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete"
+        },
+        {
+          "cell": "foreign-key through SQL, 2 maintainers",
+          "status": "undetected",
+          "reason": "in 20 seeds, no GC pass stamps the output of a compaction as an orphan between the compaction's segment write and its rebased manifest write, which the mutant needs; `TestMutations` of the engine makes that happen and detects the mutant"
         }
       ]
     },
@@ -222,8 +573,11 @@
         },
         {
           "cell": "bank through the engine, 2 maintainers",
-          "status": "undetected",
-          "reason": "a stale snapshot makes a transfer conflict or read an older consistent state, which conserves money"
+          "status": "detected",
+          "seed": 18,
+          "checkers": [
+            "grace period"
+          ]
         },
         {
           "cell": "list-append through SQL, no maintainers",
@@ -249,7 +603,7 @@
         {
           "cell": "bank through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 5,
+          "seed": 2,
           "checkers": [
             "grace period"
           ]
@@ -262,7 +616,7 @@
         {
           "cell": "unique through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 5,
+          "seed": 6,
           "checkers": [
             "grace period"
           ]
@@ -278,7 +632,7 @@
         {
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 1,
+          "seed": 2,
           "checkers": [
             "real-time order"
           ]
@@ -310,12 +664,15 @@
         {
           "cell": "bank through the engine, no maintainers",
           "status": "undetected",
-          "reason": "an acknowledged transfer that never landed is missing as a whole, which conserves money"
+          "reason": "an acknowledged transfer that never landed is missing as a whole, which conserves money, and without maintainers its segment is an orphan that GC collects like that of any failed commit"
         },
         {
           "cell": "bank through the engine, 2 maintainers",
-          "status": "undetected",
-          "reason": "an acknowledged transfer that never landed is missing as a whole, which conserves money"
+          "status": "detected",
+          "seed": 3,
+          "checkers": [
+            "storage"
+          ]
         },
         {
           "cell": "list-append through SQL, no maintainers",
@@ -336,22 +693,28 @@
         {
           "cell": "bank through SQL, no maintainers",
           "status": "undetected",
-          "reason": "an acknowledged transfer that never landed is missing as a whole, which conserves money"
+          "reason": "an acknowledged transfer that never landed is missing as a whole, which conserves money, and without maintainers its segment is an orphan that GC collects like that of any failed commit"
         },
         {
           "cell": "bank through SQL, 2 maintainers",
-          "status": "undetected",
-          "reason": "an acknowledged transfer that never landed is missing as a whole, which conserves money"
+          "status": "detected",
+          "seed": 4,
+          "checkers": [
+            "storage"
+          ]
         },
         {
           "cell": "unique through SQL, no maintainers",
           "status": "undetected",
-          "reason": "an acknowledged write that never landed is missing as a whole, which leaves a consistent state, and the unique workload does not check that acknowledged writes survive"
+          "reason": "an acknowledged write that never landed is missing as a whole, which leaves a consistent state, the unique workload does not check that acknowledged writes survive, and without maintainers the segment of such a write is an orphan that GC collects like any other"
         },
         {
           "cell": "unique through SQL, 2 maintainers",
-          "status": "undetected",
-          "reason": "an acknowledged write that never landed is missing as a whole, which leaves a consistent state, and the unique workload does not check that acknowledged writes survive"
+          "status": "detected",
+          "seed": 8,
+          "checkers": [
+            "storage"
+          ]
         },
         {
           "cell": "foreign-key through SQL, no maintainers",
@@ -366,7 +729,8 @@
           "status": "detected",
           "seed": 2,
           "checkers": [
-            "real-time order"
+            "real-time order",
+            "storage"
           ]
         }
       ]
@@ -385,7 +749,7 @@
         {
           "cell": "list-append through the engine, 2 maintainers",
           "status": "detected",
-          "seed": 1,
+          "seed": 2,
           "checkers": [
             "durability",
             "list-append"
@@ -423,7 +787,7 @@
         {
           "cell": "bank through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
             "index consistency"
           ]
@@ -510,10 +874,9 @@
         {
           "cell": "bank through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 1,
+          "seed": 2,
           "checkers": [
-            "workload invariants",
-            "bank"
+            "workload invariants"
           ]
         },
         {
@@ -535,7 +898,7 @@
         {
           "cell": "foreign-key through SQL, no maintainers",
           "status": "detected",
-          "seed": 8,
+          "seed": 14,
           "checkers": [
             "foreign key"
           ]
@@ -543,7 +906,7 @@
         {
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 14,
+          "seed": 2,
           "checkers": [
             "foreign key"
           ]
@@ -689,7 +1052,7 @@
         {
           "cell": "unique through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 1,
+          "seed": 2,
           "checkers": [
             "index consistency"
           ]
@@ -705,7 +1068,7 @@
         {
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
             "index consistency"
           ]
@@ -846,7 +1209,7 @@
         {
           "cell": "unique through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 9,
+          "seed": 2,
           "checkers": [
             "unique",
             "index consistency"
@@ -1005,7 +1368,7 @@
         {
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
             "foreign key"
           ]
@@ -1153,7 +1516,7 @@
         {
           "cell": "foreign-key through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 1,
+          "seed": 6,
           "checkers": [
             "check constraint"
           ]
@@ -1189,17 +1552,19 @@
         {
           "cell": "list-append through SQL, no maintainers",
           "status": "detected",
-          "seed": 3,
+          "seed": 2,
           "checkers": [
-            "durability"
+            "durability",
+            "list-append"
           ]
         },
         {
           "cell": "list-append through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 1,
+          "seed": 2,
           "checkers": [
-            "durability"
+            "durability",
+            "list-append"
           ]
         },
         {

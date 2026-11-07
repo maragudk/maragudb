@@ -10,10 +10,10 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 ## At a glance
 
-- 34 acceptance criteria (`AC-`), 24 key invariants (`INV-`), 31 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
-- 16 mutants (`MUT-`), deliberate bugs, of which 15 are detected by the simulator's checkers within 20 seeds.
-- 17 interesting states (`STATE-`) that the simulator's fixed corpus must reach.
-- 207 declarations of coverage in the tests.
+- 35 acceptance criteria (`AC-`), 24 key invariants (`INV-`), 31 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
+- 20 mutants (`MUT-`), deliberate bugs, of which 19 are detected by the simulator's checkers within 20 seeds.
+- 20 interesting states (`STATE-`) that the simulator's fixed corpus must reach.
+- 220 declarations of coverage in the tests.
 
 ## Acceptance criteria
 
@@ -235,21 +235,29 @@ Each entry names the test's package, the test's name, and what the test asserts,
 > Bounded storage. After compaction, the object count grows with data size, not with commit count.
 
 - `.` `TestMaintenance/compacts_and_collects_garbage_in_the_background_and_reports_it_in_the_statistics`: background maintenance compacts and collects garbage and reports it in Stats
-- `.` `TestStats/compaction_and_GC_bound_the_objects`: after 11 commits, compaction leaves one segment, and GC deletes the 11 old ones only after the grace period
+- `.` `TestStats/compaction_and_GC_bound_the_objects`: after 11 commits, compaction leaves one segment, and GC deletes the 11 old ones and their garbage batch only after the grace period
 - `internal/engine` `TestDB_Compact/merges_all_segments_into_one_and_keeps_the_data`: compaction merges every segment into one and keeps every value
 - `internal/engine` `TestDB_Compact/rebases_on_commits_that_only_added_segments,_which_keep_shadowing_the_compacted_one`: a compaction that lost to plain commits rebases on them, and their newer values stay visible
+- `internal/engine` `TestDB_GC/deletes_the_garbage_batches_of_an_expired_chain_only_after_the_manifest_dropped_it,_so_the_next_pass_completes_a_pass_whose_delete_failed`: when a delete of expired garbage fails, its chain of garbage batches stays in the manifest with its batch objects, and the next pass, in another process, deletes the rest
+- `internal/engine` `TestDB_GC/gives_up_instead_of_rebasing_once_it_is_older_than_half_the_grace_period,_and_its_garbage_batch_is_collected`: a GC pass older than half the grace period writes no manifest that references its garbage batch, which is then swept as an orphan
 - `internal/engine` `TestDB_GC/stamps_orphans_from_failed_commits_once_the_manifest_has_moved_on_and_deletes_them_after_the_grace_period`: segments of failed commits are stamped and deleted after the grace period, so failed commits do not grow the store
+- `internal/engine` `TestDB_GC/stamps_the_garbage_of_passes_less_than_an_eighth_of_the_grace_period_apart_into_one_chain_of_garbage_batches,_so_the_manifest_references_at_most_ten_chains`: with a compaction and a GC pass every 30 seconds for two hours and a one hour grace period, the manifest never references more than ten chains of garbage batches, each spanning less than an eighth of the grace period, and every chain is deleted with its garbage once its latest stamp is a grace period old
+- `internal/engine` `TestDB_GC/sweeps_the_garbage_batch_of_a_pass_that_crashed_before_its_manifest_write_as_an_orphan`: a garbage batch whose GC pass crashed before its manifest write is stamped as an orphan and deleted after the grace period
+- `internal/engine` `TestDB_GC/writes_its_garbage_batch_again_when_it_rebases_on_a_pass_that_started_a_chain_meanwhile,_and_the_first_batch_is_swept`: a GC pass whose manifest write loses to another pass that started a chain of garbage batches joins that chain with a new batch, and every batch and piece of garbage is collected after the grace period
 - `internal/engine` `TestDB_Tigris/compaction_and_GC_keep_the_data_and_bound_the_objects`: on Tigris, compaction and GC keep the data and leave one segment
 - `internal/engine` `TestMaintainer_Step/compacts_at_the_segment_threshold,_collects_garbage_after_the_grace_period,_and_makes_no_requests_in_between`: maintenance compacts at the segment threshold, deletes garbage after the grace period, and makes no requests when idle
 - `internal/sim` `TestSimulator/compaction_succeeds_against_steady_writers_by_rebasing_on_their_commits`: at least 90 percent of compactions succeed against fault-free steady writers, so storage stays bounded under load
+- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: after every run of the fixed corpus, GC passes a grace period apart leave only the live segments and the objects of writes against the final manifest, and fail on no missing garbage batch
 
 ### `AC-6.2`
 
 > Bounded storage: GC never deletes an object that a snapshot within the configured grace period still references.
 
-- `.` `TestStats/compaction_and_GC_bound_the_objects`: after 11 commits, compaction leaves one segment, and GC deletes the 11 old ones only after the grace period
+- `.` `TestStats/compaction_and_GC_bound_the_objects`: after 11 commits, compaction leaves one segment, and GC deletes the 11 old ones and their garbage batch only after the grace period
 - `internal/engine` `TestDB_GC/deletes_compacted_segments_only_after_the_grace_period,_keeping_old_snapshots_readable`: GC deletes compacted segments only after the grace period, and a snapshot taken before compaction stays readable until then
+- `internal/engine` `TestDB_GC/gives_up_instead_of_rebasing_once_it_is_older_than_half_the_grace_period,_and_its_garbage_batch_is_collected`: a GC pass older than half the grace period writes no manifest that references its garbage batch, which is then swept as an orphan
 - `internal/engine` `TestDB_GC/never_deletes_the_output_of_a_compaction_that_rebases_within_the_grace_period`: GC never deletes the segment of a compaction that is still rebasing within the grace period
+- `internal/engine` `TestDB_GC/writes_its_garbage_batch_again_when_it_rebases_on_a_pass_that_started_a_chain_meanwhile,_and_the_first_batch_is_swept`: a GC pass whose manifest write loses to another pass that started a chain of garbage batches joins that chain with a new batch, and every batch and piece of garbage is collected after the grace period
 - `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus, with injected errors, latency, lost acknowledgements, outages, and crashes, finds no anomalies with any checker and exercises every fault
 
 ### `AC-6.3`
@@ -257,6 +265,15 @@ Each entry names the test's package, the test's name, and what the test asserts,
 > Bounded storage: A reader older than the grace period gets a clear error, never wrong data.
 
 - `internal/engine` `TestDB_GC/a_reader_older_than_the_grace_period_gets_ErrSnapshotExpired_before_reading_anything`: a transaction older than the grace period gets ErrSnapshotExpired, never data
+
+### `AC-6.4`
+
+> Bounded storage: The manifest that a commit writes has a size independent of the number of commits within the grace period: it is bounded by the live segments, the window of commit records, and the number of maintenance passes within the grace period.
+
+- `.` `TestDB/fails_with_an_error_that_names_the_versions_on_a_database_whose_manifest_an_earlier_version_wrote`: a statement on a database whose manifest has the encoding of version 1 fails with an error that names the versions, and returns no rows
+- `.` `TestMaintenance/writes_manifests_no_larger_after_10,000_commits_than_after_1,000,_with_the_default_grace_period_and_maintenance_interval`: with the default grace period and maintenance, a commit every 300 ms for 50 minutes, so that no garbage expires, writes manifests whose bytes beside the live segments grow by at most 2 KiB from the first 1,000 commits to the last, with at most 60 live segments
+- `internal/engine` `TestDB_GC/stamps_the_garbage_of_passes_less_than_an_eighth_of_the_grace_period_apart_into_one_chain_of_garbage_batches,_so_the_manifest_references_at_most_ten_chains`: with a compaction and a GC pass every 30 seconds for two hours and a one hour grace period, the manifest never references more than ten chains of garbage batches, each spanning less than an eighth of the grace period, and every chain is deleted with its garbage once its latest stamp is a grace period old
+- `internal/engine` `TestOpen/fails_with_ErrUnsupportedManifest_on_a_manifest_of_version_1,_which_listed_stamped_garbage_itself`: a database whose manifest has the encoding of version 1 fails to open with an error that names the versions, and is left as it is
 
 ### `AC-7.1`
 
@@ -771,21 +788,25 @@ Every mutant runs in every simulator configuration below, with seeds 1 to 20, un
 
 | Mutant | Detected in | First seed | Checkers |
 |---|---|---|---|
-| `MUT-COMMIT-WITHOUT-CAS` commit without CAS | 6 of 12 configurations | 1 | durability, final read, list-append, real-time order |
+| `MUT-COMMIT-WITHOUT-CAS` commit without CAS | 11 of 12 configurations | 1 | durability, list-append, real-time order, storage |
 | `MUT-GC-IGNORE-GRACE` GC ignoring the grace period | 6 of 12 configurations | 1 | final read, grace period, list-append |
-| `MUT-SKIP-FRESHNESS` serving the cache without a freshness check | 8 of 12 configurations | 1 | grace period, list-append, real-time order |
-| `MUT-ACK-BEFORE-CONFIRM` acking before the write is confirmed | 6 of 12 configurations | 1 | durability, real-time order |
+| `MUT-GC-BATCH-OBJECTS-FIRST` garbage batches deleted before their garbage | 6 of 6 configurations | 1 | storage |
+| `MUT-GC-SWEEP-SEGMENTS-ONLY` an orphan sweep that misses garbage batches | 6 of 6 configurations | 1 | storage |
+| `MUT-GC-CHAIN-FIRST-STAMP` a chain of garbage batches with the stamp of its first batch | 6 of 6 configurations | 1 | grace period |
+| `MUT-GC-DELETE-REFERENCED` GC deleting expired garbage that is referenced again | 3 of 6 configurations | 7 | storage |
+| `MUT-SKIP-FRESHNESS` serving the cache without a freshness check | 9 of 12 configurations | 1 | grace period, list-append, real-time order |
+| `MUT-ACK-BEFORE-CONFIRM` acking before the write is confirmed | 9 of 12 configurations | 1 | durability, real-time order, storage |
 | `MUT-COMPACTED-AHEAD` the compacted segment ahead of newer ones after a rebase | 5 of 12 configurations | 1 | durability, index consistency, list-append, real-time order |
 | `MUT-FRESH-SNAPSHOT` a fresh snapshot per statement | 8 of 8 configurations | 1 | bank, foreign key, index consistency, list-append, workload invariants |
 | `MUT-RETRY-UNKNOWN` retrying an autocommit statement after an unknown commit outcome | 2 of 8 configurations | 1 | durability, list-append |
 | `MUT-INDEX-STALE-DELETE` stale index entries after an UPDATE or DELETE | 6 of 8 configurations | 1 | index consistency |
 | `MUT-UNIQUE-NO-CHECK` no unique check | 2 of 8 configurations | 1 | index consistency, unique |
-| `MUT-UNIQUE-OWN-WRITES` a unique check that misses the statement's own writes | 2 of 8 configurations | 5 | index consistency, unique |
+| `MUT-UNIQUE-OWN-WRITES` a unique check that misses the statement's own writes | 2 of 8 configurations | 2 | index consistency, unique |
 | `MUT-FK-NO-CHILD-CHECK` no check of a referencing row | 2 of 8 configurations | 1 | foreign key |
 | `MUT-FK-NO-PARENT-CHECK` no check or action on the referencing rows | 2 of 8 configurations | 1 | foreign key |
 | `MUT-FK-OWN-WRITES` foreign key lookups that miss the statement's own writes | 2 of 8 configurations | 1 | foreign key |
-| `MUT-CHECK-SKIP-UPDATE` CHECK on INSERT only | 2 of 8 configurations | 1 | check constraint |
-| `MUT-SUBQUERY-STALE-READS` subquery reads that a retry does not repeat | 2 of 2 configurations | 1 | durability |
+| `MUT-CHECK-SKIP-UPDATE` CHECK on INSERT only | 2 of 8 configurations | 5 | check constraint |
+| `MUT-SUBQUERY-STALE-READS` subquery reads that a retry does not repeat | 2 of 2 configurations | 2 | durability, list-append |
 | `MUT-UPDATE-SEES-OWN-WRITES` an UPDATE that revisits the rows it wrote | 0 of 8 configurations | none |  |
 
 ### `MUT-COMMIT-WITHOUT-CAS`
@@ -796,16 +817,16 @@ Every mutant runs in every simulator configuration below, with seeds 1 to 20, un
 |---|---|
 | list-append through the engine, no maintainers | detected with seed 1 by durability, list-append |
 | list-append through the engine, 2 maintainers | detected with seed 1 by durability, list-append |
-| bank through the engine, no maintainers | cannot detect: an unconditional manifest write drops whole concurrent commits, a dropped transfer conserves money, and the bank checker only checks totals |
-| bank through the engine, 2 maintainers | cannot detect: an unconditional manifest write drops whole concurrent commits, a dropped transfer conserves money, and the bank checker only checks totals |
-| list-append through SQL, no maintainers | detected with seed 1 by final read, list-append |
-| list-append through SQL, 2 maintainers | detected with seed 1 by durability, list-append |
-| bank through SQL, no maintainers | cannot detect: an unconditional manifest write drops whole concurrent commits, a dropped transfer conserves money, and the bank checker only checks totals |
-| bank through SQL, 2 maintainers | cannot detect: an unconditional manifest write drops whole concurrent commits, a dropped transfer conserves money, and the bank checker only checks totals |
-| unique through SQL, no maintainers | cannot detect: an unconditional manifest write drops whole concurrent commits, which leaves a consistent state in which no value repeats, and the unique workload does not check that acknowledged writes survive |
-| unique through SQL, 2 maintainers | cannot detect: an unconditional manifest write drops whole concurrent commits, which leaves a consistent state in which no value repeats, and the unique workload does not check that acknowledged writes survive |
+| bank through the engine, no maintainers | detected with seed 7 by storage |
+| bank through the engine, 2 maintainers | detected with seed 3 by storage |
+| list-append through SQL, no maintainers | detected with seed 1 by durability, list-append |
+| list-append through SQL, 2 maintainers | detected with seed 1 by durability, list-append, storage |
+| bank through SQL, no maintainers | detected with seed 2 by storage |
+| bank through SQL, 2 maintainers | detected with seed 1 by storage |
+| unique through SQL, no maintainers | cannot detect: an unconditional manifest write drops whole concurrent commits, which leaves a consistent state in which no value repeats, the unique workload does not check that acknowledged writes survive, and in 20 seeds no dropped commit leaves the store with objects that GC cannot collect |
+| unique through SQL, 2 maintainers | detected with seed 16 by storage |
 | foreign-key through SQL, no maintainers | detected with seed 1 by real-time order |
-| foreign-key through SQL, 2 maintainers | detected with seed 3 by real-time order |
+| foreign-key through SQL, 2 maintainers | detected with seed 2 by real-time order |
 
 Targeted tests:
 
@@ -819,21 +840,113 @@ Targeted tests:
 | Configuration | Result |
 |---|---|
 | list-append through the engine, no maintainers | cannot detect: without maintainers nothing is ever deleted, so no reader can lose an object |
-| list-append through the engine, 2 maintainers | detected with seed 1 by final read, list-append |
+| list-append through the engine, 2 maintainers | detected with seed 2 by grace period |
 | bank through the engine, no maintainers | cannot detect: without maintainers nothing is ever deleted, so no reader can lose an object |
-| bank through the engine, 2 maintainers | detected with seed 2 by grace period |
+| bank through the engine, 2 maintainers | detected with seed 1 by grace period |
 | list-append through SQL, no maintainers | cannot detect: without maintainers nothing is ever deleted, so no reader can lose an object |
-| list-append through SQL, 2 maintainers | detected with seed 1 by grace period |
+| list-append through SQL, 2 maintainers | detected with seed 1 by grace period, final read, list-append |
 | bank through SQL, no maintainers | cannot detect: without maintainers nothing is ever deleted, so no reader can lose an object |
 | bank through SQL, 2 maintainers | detected with seed 2 by grace period |
 | unique through SQL, no maintainers | cannot detect: without maintainers nothing is ever deleted, so no reader can lose an object |
-| unique through SQL, 2 maintainers | detected with seed 1 by grace period |
+| unique through SQL, 2 maintainers | detected with seed 2 by grace period |
 | foreign-key through SQL, no maintainers | cannot detect: without maintainers nothing is ever deleted, so no reader can lose an object |
-| foreign-key through SQL, 2 maintainers | detected with seed 1 by grace period, final read |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by grace period |
 
 Targeted tests:
 
 - `internal/workload` `TestRun/finds_snapshots_lost_before_the_grace_period_ends,_when_GC_ignores_it`: the real-store workload finds snapshots lost early with the mutant
+
+### `MUT-GC-BATCH-OBJECTS-FIRST`
+
+`engine.Mutations.GCBatchObjectsFirst` deletes the objects of an expired chain of garbage batches before the garbage they list and before the manifest write that drops the chain, so that a failed delete or a crash leaves the manifest referencing a missing batch.
+
+| Configuration | Result |
+|---|---|
+| list-append through the engine, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
+| list-append through the engine, 2 maintainers | detected with seed 1 by storage |
+| bank through the engine, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
+| bank through the engine, 2 maintainers | detected with seed 1 by storage |
+| list-append through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
+| list-append through SQL, 2 maintainers | detected with seed 1 by storage |
+| bank through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
+| bank through SQL, 2 maintainers | detected with seed 2 by storage |
+| unique through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
+| unique through SQL, 2 maintainers | detected with seed 2 by storage |
+| foreign-key through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by storage |
+
+Targeted tests:
+
+- `internal/engine` `TestMutations/GCBatchObjectsFirst_leaves_a_chain_of_garbage_batches_without_its_batch_after_a_failed_delete,_so_GC_fails_for_good`: with the mutant, a failed delete of expired garbage leaves the manifest referencing a garbage batch that is gone, and every later pass in another process fails on it and deletes nothing
+
+### `MUT-GC-SWEEP-SEGMENTS-ONLY`
+
+`engine.Mutations.GCSweepSegmentsOnly` lists only segments when GC sweeps for orphans, so that a garbage batch whose GC pass lost or crashed, or whose delete failed after its chain was dropped, is never deleted.
+
+| Configuration | Result |
+|---|---|
+| list-append through the engine, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
+| list-append through the engine, 2 maintainers | detected with seed 1 by storage |
+| bank through the engine, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
+| bank through the engine, 2 maintainers | detected with seed 1 by storage |
+| list-append through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
+| list-append through SQL, 2 maintainers | detected with seed 1 by storage |
+| bank through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
+| bank through SQL, 2 maintainers | detected with seed 1 by storage |
+| unique through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
+| unique through SQL, 2 maintainers | detected with seed 1 by storage |
+| foreign-key through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by storage |
+
+Targeted tests:
+
+- `internal/engine` `TestMutations/GCSweepSegmentsOnly_never_deletes_the_garbage_batch_of_a_pass_that_crashed`: with the mutant, the garbage batch of a GC pass that crashed before its manifest write stays in the store after every later pass
+
+### `MUT-GC-CHAIN-FIRST-STAMP`
+
+`engine.Mutations.GCChainKeepsFirstStamp` adds every GC pass's garbage batch to the newest chain, however old, and keeps the stamp of the chain's first batch, so that garbage is deleted before it is a grace period old.
+
+| Configuration | Result |
+|---|---|
+| list-append through the engine, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
+| list-append through the engine, 2 maintainers | detected with seed 1 by grace period |
+| bank through the engine, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
+| bank through the engine, 2 maintainers | detected with seed 3 by grace period |
+| list-append through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
+| list-append through SQL, 2 maintainers | detected with seed 8 by grace period |
+| bank through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
+| bank through SQL, 2 maintainers | detected with seed 16 by grace period |
+| unique through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
+| unique through SQL, 2 maintainers | detected with seed 6 by grace period |
+| foreign-key through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
+| foreign-key through SQL, 2 maintainers | detected with seed 7 by grace period |
+
+Targeted tests:
+
+- `internal/engine` `TestMutations/GCChainKeepsFirstStamp_deletes_garbage_before_it_is_a_grace_period_old`: with the mutant, garbage that joins a chain of garbage batches nine minutes old is deleted a minute later with the chain, and a reader a minute old loses its snapshot
+
+### `MUT-GC-DELETE-REFERENCED`
+
+`engine.Mutations.GCDeleteReferenced` deletes the garbage of an expired chain of garbage batches also when the manifest references it otherwise, such as the output of a compaction that GC stamped as an orphan before the compaction's rebase landed.
+
+| Configuration | Result |
+|---|---|
+| list-append through the engine, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
+| list-append through the engine, 2 maintainers | detected with seed 8 by storage |
+| bank through the engine, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
+| bank through the engine, 2 maintainers | detected with seed 7 by storage |
+| list-append through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
+| list-append through SQL, 2 maintainers | cannot detect: in 20 seeds, no GC pass stamps the output of a compaction as an orphan between the compaction's segment write and its rebased manifest write, which the mutant needs; `TestMutations` of the engine makes that happen and detects the mutant |
+| bank through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
+| bank through SQL, 2 maintainers | cannot detect: in 20 seeds, no GC pass stamps the output of a compaction as an orphan between the compaction's segment write and its rebased manifest write, which the mutant needs; `TestMutations` of the engine makes that happen and detects the mutant |
+| unique through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
+| unique through SQL, 2 maintainers | detected with seed 15 by storage |
+| foreign-key through SQL, no maintainers | not applicable: without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete |
+| foreign-key through SQL, 2 maintainers | cannot detect: in 20 seeds, no GC pass stamps the output of a compaction as an orphan between the compaction's segment write and its rebased manifest write, which the mutant needs; `TestMutations` of the engine makes that happen and detects the mutant |
+
+Targeted tests:
+
+- `internal/engine` `TestMutations/GCDeleteReferenced_deletes_the_output_of_a_compaction_that_GC_stamped_as_an_orphan_before_its_rebase_landed`: with the mutant, GC deletes the live output of a rebased compaction when the stamp it got as an orphan expires, and stops at its own check that a deleted object is not live
 
 ### `MUT-SKIP-FRESHNESS`
 
@@ -844,15 +957,15 @@ Targeted tests:
 | list-append through the engine, no maintainers | detected with seed 1 by list-append |
 | list-append through the engine, 2 maintainers | detected with seed 1 by list-append |
 | bank through the engine, no maintainers | cannot detect: a stale snapshot makes a transfer conflict or read an older consistent state, which conserves money |
-| bank through the engine, 2 maintainers | cannot detect: a stale snapshot makes a transfer conflict or read an older consistent state, which conserves money |
+| bank through the engine, 2 maintainers | detected with seed 18 by grace period |
 | list-append through SQL, no maintainers | detected with seed 1 by list-append |
 | list-append through SQL, 2 maintainers | detected with seed 1 by list-append |
 | bank through SQL, no maintainers | cannot detect: a stale snapshot makes a transfer conflict or read an older consistent state, which conserves money |
-| bank through SQL, 2 maintainers | detected with seed 5 by grace period |
+| bank through SQL, 2 maintainers | detected with seed 2 by grace period |
 | unique through SQL, no maintainers | cannot detect: a stale snapshot is an older consistent state in which no value repeats, and a write from it conflicts at commit; without maintainers no reader loses an object either |
-| unique through SQL, 2 maintainers | detected with seed 5 by grace period |
+| unique through SQL, 2 maintainers | detected with seed 6 by grace period |
 | foreign-key through SQL, no maintainers | detected with seed 2 by real-time order |
-| foreign-key through SQL, 2 maintainers | detected with seed 1 by real-time order |
+| foreign-key through SQL, 2 maintainers | detected with seed 2 by real-time order |
 
 ### `MUT-ACK-BEFORE-CONFIRM`
 
@@ -862,16 +975,16 @@ Targeted tests:
 |---|---|
 | list-append through the engine, no maintainers | detected with seed 1 by durability |
 | list-append through the engine, 2 maintainers | detected with seed 1 by durability |
-| bank through the engine, no maintainers | cannot detect: an acknowledged transfer that never landed is missing as a whole, which conserves money |
-| bank through the engine, 2 maintainers | cannot detect: an acknowledged transfer that never landed is missing as a whole, which conserves money |
+| bank through the engine, no maintainers | cannot detect: an acknowledged transfer that never landed is missing as a whole, which conserves money, and without maintainers its segment is an orphan that GC collects like that of any failed commit |
+| bank through the engine, 2 maintainers | detected with seed 3 by storage |
 | list-append through SQL, no maintainers | detected with seed 1 by durability |
 | list-append through SQL, 2 maintainers | detected with seed 1 by durability |
-| bank through SQL, no maintainers | cannot detect: an acknowledged transfer that never landed is missing as a whole, which conserves money |
-| bank through SQL, 2 maintainers | cannot detect: an acknowledged transfer that never landed is missing as a whole, which conserves money |
-| unique through SQL, no maintainers | cannot detect: an acknowledged write that never landed is missing as a whole, which leaves a consistent state, and the unique workload does not check that acknowledged writes survive |
-| unique through SQL, 2 maintainers | cannot detect: an acknowledged write that never landed is missing as a whole, which leaves a consistent state, and the unique workload does not check that acknowledged writes survive |
+| bank through SQL, no maintainers | cannot detect: an acknowledged transfer that never landed is missing as a whole, which conserves money, and without maintainers its segment is an orphan that GC collects like that of any failed commit |
+| bank through SQL, 2 maintainers | detected with seed 4 by storage |
+| unique through SQL, no maintainers | cannot detect: an acknowledged write that never landed is missing as a whole, which leaves a consistent state, the unique workload does not check that acknowledged writes survive, and without maintainers the segment of such a write is an orphan that GC collects like any other |
+| unique through SQL, 2 maintainers | detected with seed 8 by storage |
 | foreign-key through SQL, no maintainers | detected with seed 2 by real-time order |
-| foreign-key through SQL, 2 maintainers | detected with seed 2 by real-time order |
+| foreign-key through SQL, 2 maintainers | detected with seed 2 by real-time order, storage |
 
 Targeted tests:
 
@@ -884,13 +997,13 @@ Targeted tests:
 | Configuration | Result |
 |---|---|
 | list-append through the engine, no maintainers | cannot detect: without maintainers nothing compacts, so there is never a rebase |
-| list-append through the engine, 2 maintainers | detected with seed 1 by durability, list-append |
+| list-append through the engine, 2 maintainers | detected with seed 2 by durability, list-append |
 | bank through the engine, no maintainers | cannot detect: without maintainers nothing compacts, so there is never a rebase |
 | bank through the engine, 2 maintainers | cannot detect: resurrected balances are a consistent older state, which conserves money, and the engine workload has no index |
 | list-append through SQL, no maintainers | cannot detect: without maintainers nothing compacts, so there is never a rebase |
 | list-append through SQL, 2 maintainers | detected with seed 1 by durability, list-append |
 | bank through SQL, no maintainers | cannot detect: without maintainers nothing compacts, so there is never a rebase |
-| bank through SQL, 2 maintainers | detected with seed 2 by index consistency |
+| bank through SQL, 2 maintainers | detected with seed 1 by index consistency |
 | unique through SQL, no maintainers | cannot detect: without maintainers nothing compacts, so there is never a rebase |
 | unique through SQL, 2 maintainers | detected with seed 2 by index consistency |
 | foreign-key through SQL, no maintainers | cannot detect: without maintainers nothing compacts, so there is never a rebase |
@@ -914,11 +1027,11 @@ Targeted tests:
 | list-append through SQL, no maintainers | detected with seed 1 by list-append |
 | list-append through SQL, 2 maintainers | detected with seed 1 by list-append |
 | bank through SQL, no maintainers | detected with seed 1 by workload invariants, bank |
-| bank through SQL, 2 maintainers | detected with seed 1 by workload invariants, bank |
+| bank through SQL, 2 maintainers | detected with seed 2 by workload invariants |
 | unique through SQL, no maintainers | detected with seed 1 by index consistency |
 | unique through SQL, 2 maintainers | detected with seed 1 by index consistency |
-| foreign-key through SQL, no maintainers | detected with seed 8 by foreign key |
-| foreign-key through SQL, 2 maintainers | detected with seed 14 by foreign key |
+| foreign-key through SQL, no maintainers | detected with seed 14 by foreign key |
+| foreign-key through SQL, 2 maintainers | detected with seed 2 by foreign key |
 
 Targeted tests:
 
@@ -962,9 +1075,9 @@ Targeted tests:
 | bank through SQL, no maintainers | detected with seed 1 by index consistency |
 | bank through SQL, 2 maintainers | detected with seed 1 by index consistency |
 | unique through SQL, no maintainers | detected with seed 1 by index consistency |
-| unique through SQL, 2 maintainers | detected with seed 1 by index consistency |
+| unique through SQL, 2 maintainers | detected with seed 2 by index consistency |
 | foreign-key through SQL, no maintainers | detected with seed 1 by index consistency |
-| foreign-key through SQL, 2 maintainers | detected with seed 2 by index consistency |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by index consistency |
 
 Targeted tests:
 
@@ -1008,7 +1121,7 @@ Targeted tests:
 | bank through SQL, no maintainers | cannot detect: the workload has no unique index besides the primary key |
 | bank through SQL, 2 maintainers | cannot detect: the workload has no unique index besides the primary key |
 | unique through SQL, no maintainers | detected with seed 5 by unique, index consistency |
-| unique through SQL, 2 maintainers | detected with seed 9 by unique, index consistency |
+| unique through SQL, 2 maintainers | detected with seed 2 by unique, index consistency |
 | foreign-key through SQL, no maintainers | cannot detect: the workload has no unique index besides the primary key |
 | foreign-key through SQL, 2 maintainers | cannot detect: the workload has no unique index besides the primary key |
 
@@ -1052,7 +1165,7 @@ Targeted tests:
 | unique through SQL, no maintainers | cannot detect: the workload has no foreign keys |
 | unique through SQL, 2 maintainers | cannot detect: the workload has no foreign keys |
 | foreign-key through SQL, no maintainers | detected with seed 1 by foreign key |
-| foreign-key through SQL, 2 maintainers | detected with seed 2 by foreign key |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by foreign key |
 
 ### `MUT-FK-OWN-WRITES`
 
@@ -1090,7 +1203,7 @@ Targeted tests:
 | unique through SQL, no maintainers | cannot detect: the workload has no CHECK constraints |
 | unique through SQL, 2 maintainers | cannot detect: the workload has no CHECK constraints |
 | foreign-key through SQL, no maintainers | detected with seed 5 by check constraint |
-| foreign-key through SQL, 2 maintainers | detected with seed 1 by check constraint |
+| foreign-key through SQL, 2 maintainers | detected with seed 6 by check constraint |
 
 ### `MUT-SUBQUERY-STALE-READS`
 
@@ -1102,8 +1215,8 @@ Targeted tests:
 | list-append through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
 | bank through the engine, no maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
 | bank through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
-| list-append through SQL, no maintainers | detected with seed 3 by durability |
-| list-append through SQL, 2 maintainers | detected with seed 1 by durability |
+| list-append through SQL, no maintainers | detected with seed 2 by durability, list-append |
+| list-append through SQL, 2 maintainers | detected with seed 2 by durability, list-append |
 | bank through SQL, no maintainers | not applicable: only the list-append workload writes with a subquery, an append to a packed list that reads the list in a subquery |
 | bank through SQL, 2 maintainers | not applicable: only the list-append workload writes with a subquery, an append to a packed list that reads the list in a subquery |
 | unique through SQL, no maintainers | not applicable: only the list-append workload writes with a subquery, an append to a packed list that reads the list in a subquery |
@@ -1150,6 +1263,9 @@ The fixed simulator corpus must reach every state at least once, or its test fai
 | `STATE-AUTOCOMMIT-RETRY` | an autocommit statement retries after a conflict | "an autocommit statement retries after a conflict" |
 | `STATE-COMPACTION-REBASE` | a compaction reapplies its swap on top of commits that landed meanwhile | "a compaction rebases on commits that only added segments" |
 | `STATE-GC-REBASE` | a GC pass reapplies its manifest change on top of commits that landed meanwhile | "a GC pass rebases on commits that landed meanwhile" |
+| `STATE-GC-KEEPS-LIVE-GARBAGE` | an expired garbage batch lists a live segment, the output of a compaction that a GC pass stamped as an orphan before the compaction's rebase landed, and GC keeps it | "GC keeps a live segment that an expired garbage batch lists" |
+| `STATE-GC-BATCH-REWRITTEN` | a GC pass that rebases writes its garbage batch again, because the chain it was to join changed meanwhile, and the first one becomes an orphan | "a GC pass writes its garbage batch again for another chain" |
+| `STATE-GC-CHAIN-DROPPED` | a GC pass deletes the garbage of an expired chain of garbage batches, drops the chain from the manifest, and then deletes its batch objects | "a GC pass drops an expired chain and deletes its batches" |
 | `STATE-LEASE-TAKEOVER` | a maintainer takes over a lease that another holder let expire | "a maintainer takes over an expired lease" |
 | `STATE-LEASE-OVERLAP` | two maintainers believe they hold the lease at the same time | "two maintainers believe they hold the lease at once" |
 | `STATE-SNAPSHOT-EXPIRED-REFUSED` | a reader older than the grace period is refused with ErrSnapshotExpired | "a reader older than the grace period is told so" |

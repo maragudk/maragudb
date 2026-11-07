@@ -38,6 +38,9 @@ var (
 	ErrTxDone = errors.New("engine: transaction already committed or rolled back")
 	// ErrReadOnly is returned when writing in a read-only transaction.
 	ErrReadOnly = errors.New("engine: read-only transaction")
+	// ErrUnsupportedManifest is returned for a manifest in an encoding that this version does not
+	// read, such as one written by an earlier version.
+	ErrUnsupportedManifest = errors.New("engine: unsupported manifest version")
 )
 
 // Options for [Open].
@@ -85,6 +88,18 @@ type Mutations struct {
 	// CompactedSegmentAhead puts the compacted segment ahead of the segments that were committed
 	// during the compaction when it rebases, so that the merged values shadow the newer ones.
 	CompactedSegmentAhead bool
+	// GCBatchObjectsFirst deletes the batch objects of an expired chain of garbage batches before
+	// its garbage, and before the manifest write that drops the chain.
+	GCBatchObjectsFirst bool
+	// GCSweepSegmentsOnly sweeps only segments for orphans, and not garbage batch objects.
+	GCSweepSegmentsOnly bool
+	// GCChainKeepsFirstStamp adds every GC pass's batch to the newest chain of garbage batches,
+	// however old the chain is, and keeps the stamp of its oldest batch as the stamp of the chain.
+	GCChainKeepsFirstStamp bool
+	// GCDeleteReferenced deletes the garbage of an expired chain of garbage batches even when the
+	// manifest still references it otherwise: as a live segment, as unstamped garbage, or in a
+	// chain that has not expired.
+	GCDeleteReferenced bool
 }
 
 // Stats about store requests and cache effectiveness.
@@ -130,6 +145,11 @@ type DB struct {
 	manifestMu sync.Mutex
 	manifest   *manifest
 	etag       string
+
+	// batches caches the garbage batch objects of the chains that the last GC pass read, which
+	// are immutable, so that a pass reads only the batches that are new to it.
+	batchMu sync.Mutex
+	batches map[string]*garbageBatch
 
 	memHits, memMisses, diskHits, diskMisses                    atomic.Int64
 	compactionsStarted, compactions, compactionRebases, deleted atomic.Int64
@@ -235,6 +255,9 @@ func (db *DB) Stats() Stats {
 		s.Seq = m.Seq
 		s.Segments = len(m.Segments)
 		s.Garbage = len(m.Garbage)
+		for _, b := range m.Batches {
+			s.Garbage += b.Objects
+		}
 	}
 	return s
 }

@@ -38,7 +38,7 @@ func TestMaintainer_Step(t *testing.T) {
 		is.Equal(t, 0, res.Deleted, "the garbage is only stamped")
 		s := db.Stats()
 		is.Equal(t, 1, s.Segments)
-		is.Equal(t, 4, s.Garbage)
+		is.Equal(t, 5, s.Garbage, "the four segments and their garbage batch")
 		is.Equal(t, int64(1), s.MaintenanceRuns)
 		is.Equal(t, int64(1), s.LeaseAcquisitions)
 		is.Equal(t, int64(0), s.LeaseLosses)
@@ -58,11 +58,12 @@ func TestMaintainer_Step(t *testing.T) {
 		res, err = m.Step(t.Context())
 		is.NotError(t, err)
 		is.True(t, res.Attempted && !res.Compacted && res.Ran, fmt.Sprint(res))
-		is.Equal(t, 4, res.Deleted)
+		is.Equal(t, 5, res.Deleted)
 		d := db.Stats().S3.Sub(before)
-		// Lease read and write, the freshness check of GC, the listing, the deletes, the manifest
-		// write, and the lease release.
-		is.Equal(t, s3.Counts{Get: 1, GetConditional: 1, PutConditional: 3, Delete: 4, List: 1}, d)
+		// Lease read and write, the freshness check of GC, the listings of segments and garbage
+		// batches, the deletes of the segments, the manifest write, the delete of the garbage
+		// batch, which this process wrote and so need not read, and the lease release.
+		is.Equal(t, s3.Counts{Get: 1, GetConditional: 1, PutConditional: 3, Delete: 5, List: 2}, d)
 		is.Equal(t, 0, db.Stats().Garbage)
 		is.Equal(t, int64(2), db.Stats().MaintenanceRuns)
 

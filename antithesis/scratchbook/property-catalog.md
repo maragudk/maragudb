@@ -17,6 +17,8 @@ updated: 2026-11-03
 | An unknown outcome happens in a process that keeps running | `Sometimes(...)` | `/internal/sim` | implemented |
 | A reader younger than the grace period never loses its objects | `Always(...)` | `/internal/engine/blocks.go` | implemented |
 | Lost manifest writes are resolved, conflicts happen, GC finds orphans and expired objects | `Sometimes` / `Reachable` | `/internal/engine` | implemented |
+| The manifest never references a garbage batch that is gone | `Unreachable("the manifest references a missing garbage batch")` | `/internal/engine/compact.go` | implemented |
+| GC keeps a live segment that an expired garbage batch lists, writes a garbage batch again for another chain, and drops expired chains | `Sometimes(...)` | `/internal/engine/compact.go` | implemented |
 | Autocommit retries after a conflict, and reports an unknown outcome instead of retrying | `Sometimes(...)` | `/internal/sql/exec/session.go` | implemented |
 
 Each `parallel_driver_s3_*` run checks its own history at the end, in a database prefix of its own, so no `finally_` command is needed. A run whose store stays unreachable for its whole five-minute budget exits cleanly without a verdict; any other failure to set up or read back the database fails the command. The final read-back has a deadline of its own, so the history is checked even when the clients ran out of time.

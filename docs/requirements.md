@@ -107,7 +107,7 @@ These apply to every section, for the SQL surface that exists at that point.
    - A join from one row of a table to the rows that reference it, through an index on the referencing columns, with a cold cache uses O(log n) GETs for each row it reads. `AC-5.8`
 
    Latency against Tigris is measured and reported, but it does not gate. `AC-5.4`
-6. **Bounded storage.** After compaction, the object count grows with data size, not with commit count. `AC-6.1` GC never deletes an object that a snapshot within the configured grace period still references. `AC-6.2` A reader older than the grace period gets a clear error, never wrong data. `AC-6.3`
+6. **Bounded storage.** After compaction, the object count grows with data size, not with commit count. `AC-6.1` GC never deletes an object that a snapshot within the configured grace period still references. `AC-6.2` A reader older than the grace period gets a clear error, never wrong data. `AC-6.3` The manifest that a commit writes has a size independent of the number of commits within the grace period: it is bounded by the live segments, the window of commit records, and the number of maintenance passes within the grace period. `AC-6.4`
 7. **Real S3-compatible storage.** An integration suite passes against Tigris. `AC-7.1` If the Tigris credentials are not in the environment or in a gitignored `.env` file, the suite fails and does not skip. The failure message names the missing variables. `AC-7.2`
 8. **Antithesis-ready.** Antithesis Go SDK assertions (Always, Sometimes, and Reachable) mark the key invariants. `AC-8.1` A docker-compose harness runs the simulator workloads as an Antithesis workload. `AC-8.2` Go cross-compiles to amd64. `AC-8.3`
 

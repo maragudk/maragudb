@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -169,6 +170,20 @@ func TestRegisterDriver(t *testing.T) {
 }
 
 func TestDB(t *testing.T) {
+	t.Run("fails with an error that names the versions on a database whose manifest an earlier version wrote", func(t *testing.T) {
+		verify.Covers(t, "a statement on a database whose manifest has the encoding of version 1 fails with an error that names the versions, and returns no rows", "AC-6.4")
+		w := newWorld(t)
+		v1 := `{"version":1,"seq":1,"commitID":"c1","segments":[],"garbage":[{"key":"app/seg/0000000000000000-a","unreferencedAt":"2026-01-01T00:00:00Z"}],"commits":[{"seq":1,"id":"c1"}],"updatedAt":"2026-01-01T00:00:00Z"}`
+		_, err := w.fake.Put(t.Context(), "app/manifest", []byte(v1), s3.PutOptions{})
+		is.NotError(t, err)
+		db := w.open(maragudb.Options{})
+		rows, err := db.QueryContext(t.Context(), "SELECT 1")
+		if err == nil {
+			_ = rows.Close()
+		}
+		is.True(t, err != nil && strings.Contains(err.Error(), "the manifest has version 1, and this version of maragudb reads only version 2"), fmt.Sprint(err))
+	})
+
 	t.Run("round trips every type through parameters and Scan", func(t *testing.T) {
 		verify.Covers(t, "every type and NULL round-trips through $1-style parameters and Scan", "INV-TYPES", "INV-PLACEHOLDERS")
 		db := newDB(t)
@@ -476,7 +491,7 @@ func TestStats(t *testing.T) {
 	})
 
 	t.Run("compaction and GC bound the objects", func(t *testing.T) {
-		verify.Covers(t, "after 11 commits, compaction leaves one segment, and GC deletes the 11 old ones only after the grace period", "AC-6.1", "AC-6.2")
+		verify.Covers(t, "after 11 commits, compaction leaves one segment, and GC deletes the 11 old ones and their garbage batch only after the grace period", "AC-6.1", "AC-6.2")
 		synctest.Test(t, func(t *testing.T) {
 			w := newWorld(t)
 			grace := time.Minute
@@ -503,7 +518,7 @@ func TestStats(t *testing.T) {
 			time.Sleep(grace)
 			n, err = maragudb.GC(t.Context(), db)
 			is.NotError(t, err)
-			is.Equal(t, 11, n)
+			is.Equal(t, 12, n, "the 11 segments and their garbage batch")
 			is.Equal(t, "0\n1\n2\n3\n4\n5\n6\n7\n8\n9", queryRows(t, db, "SELECT * FROM t"))
 		})
 	})
@@ -515,6 +530,52 @@ func TestStats(t *testing.T) {
 }
 
 func TestMaintenance(t *testing.T) {
+	t.Run("writes manifests no larger after 10,000 commits than after 1,000, with the default grace period and maintenance interval", func(t *testing.T) {
+		verify.Covers(t, "with the default grace period and maintenance, a commit every 300 ms for 50 minutes, so that no garbage expires, writes manifests whose bytes beside the live segments grow by at most 2 KiB from the first 1,000 commits to the last, with at most 60 live segments", "AC-6.4")
+		synctest.Test(t, func(t *testing.T) {
+			w := newWorld(t)
+			db := w.open(maragudb.Options{Maintenance: new(true)})
+			mustExec(t, db, "CREATE TABLE t (id bigint PRIMARY KEY, n bigint)")
+			// The manifest that a commit wrote is read from the store right after the commit. The
+			// bytes of its live segments depend on when maintenance last compacted, which the
+			// jitter of the interval makes random, so they are counted apart and only bounded.
+			// Everything else is compared, as the largest among commits 100 to 1,099 and among
+			// the last 1,000. Between those, every tenth commit counts toward the bound on segments.
+			var early, late, segments, most int
+			for i := range 10_000 {
+				mustExec(t, db, "INSERT INTO t VALUES ($1, $1)", i)
+				if i%10 != 0 && (i < 100 || (i >= 1_100 && i < 9_000)) {
+					time.Sleep(300 * time.Millisecond)
+					continue
+				}
+				body, ok := w.fake.Body("app/manifest")
+				is.True(t, ok)
+				var m struct {
+					Segments json.RawMessage `json:"segments"`
+				}
+				is.NotError(t, json.Unmarshal(body, &m))
+				var segs []json.RawMessage
+				is.NotError(t, json.Unmarshal(m.Segments, &segs))
+				most = max(most, len(body))
+				segments = max(segments, len(segs))
+				rest := len(body) - len(m.Segments)
+				switch {
+				case i >= 100 && i < 1_100:
+					early = max(early, rest)
+				case i >= 9_000:
+					late = max(late, rest)
+				}
+				time.Sleep(300 * time.Millisecond)
+			}
+			t.Logf("largest manifest of a commit: %d bytes, beside the segments %d bytes after 1,000 commits and %d after 10,000, at most %d segments", most, early, late, segments)
+			is.True(t, late <= early+2048, fmt.Sprintf("%d bytes after 1,000 commits, %d after 10,000", early, late))
+			is.True(t, segments <= 60, fmt.Sprint(segments, " segments"))
+			s, err := maragudb.Stats(t.Context(), db)
+			is.NotError(t, err)
+			is.True(t, s.Garbage > 9_000, fmt.Sprintf("the garbage of the last 50 minutes is kept: %d objects", s.Garbage))
+		})
+	})
+
 	t.Run("compacts and collects garbage in the background and reports it in the statistics", func(t *testing.T) {
 		verify.Covers(t, "background maintenance compacts and collects garbage and reports it in Stats", "AC-6.1")
 		synctest.Test(t, func(t *testing.T) {
@@ -533,7 +594,7 @@ func TestMaintenance(t *testing.T) {
 			s, err = maragudb.Stats(t.Context(), db)
 			is.NotError(t, err)
 			is.Equal(t, 1, s.Segments, "compacted at the threshold")
-			is.Equal(t, 4, s.Garbage, "the old segments are stamped")
+			is.Equal(t, 5, s.Garbage, "the old segments are stamped, in a garbage batch")
 			is.Equal(t, int64(1), s.MaintenanceRuns)
 			is.Equal(t, int64(1), s.LeaseAcquisitions)
 			is.Equal(t, int64(0), s.LeaseLosses)

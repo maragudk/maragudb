@@ -3,6 +3,7 @@ package engine_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -107,6 +108,52 @@ func equalMap(t *testing.T, want, got map[string]string) {
 	is.Equal(t, fmt.Sprint(want), fmt.Sprint(got))
 }
 
+// garbageChain as the manifest in the store references it.
+type garbageChain struct {
+	Key       string    `json:"key"`
+	Since     time.Time `json:"since"`
+	StampedAt time.Time `json:"stampedAt"`
+}
+
+// garbageChains that the manifest in the store references.
+func garbageChains(t *testing.T, w *world) []garbageChain {
+	t.Helper()
+	body, ok := w.fake.Body("db/manifest")
+	is.True(t, ok)
+	var m struct {
+		Batches []garbageChain `json:"batches"`
+	}
+	is.NotError(t, json.Unmarshal(body, &m))
+	return m.Batches
+}
+
+// keysWith the prefix in the store.
+func keysWith(w *world, prefix string) []string {
+	var keys []string
+	for _, key := range w.fake.Keys() {
+		if strings.HasPrefix(key, prefix) {
+			keys = append(keys, key)
+		}
+	}
+	return keys
+}
+
+// collectAll runs GC with db four times, a grace period apart, which stamps, expires, and deletes
+// every piece of garbage, also the orphans that the first pass cannot stamp yet, and then checks
+// that only the manifest and the live segments remain.
+func collectAll(t *testing.T, w *world, db *engine.DB, grace time.Duration) {
+	t.Helper()
+	put(t, db, "collect", "all")
+	for range 4 {
+		_, err := db.GC(t.Context())
+		is.NotError(t, err)
+		w.clock.Sleep(t.Context(), grace)
+	}
+	is.Equal(t, 0, db.Stats().Garbage)
+	is.Equal(t, db.Stats().Segments, len(keysWith(w, "db/seg/")), "only live segments")
+	is.Equal(t, 0, len(keysWith(w, "db/gc/")), "no garbage batches")
+}
+
 func TestOpen(t *testing.T) {
 	t.Run("creates the manifest once and reuses it", func(t *testing.T) {
 		w := newWorld(t)
@@ -122,6 +169,20 @@ func TestOpen(t *testing.T) {
 		is.Equal(t, 2, len(keys))
 		is.Equal(t, "db/manifest", keys[0])
 		is.True(t, strings.HasPrefix(keys[1], "db/seg/"), keys[1])
+	})
+
+	t.Run("fails with ErrUnsupportedManifest on a manifest of version 1, which listed stamped garbage itself", func(t *testing.T) {
+		verify.Covers(t, "a database whose manifest has the encoding of version 1 fails to open with an error that names the versions, and is left as it is", "AC-6.4")
+		w := newWorld(t)
+		v1 := `{"version":1,"seq":3,"commitID":"c3","segments":[],"garbage":[{"key":"db/seg/0000000000000001-a","unreferencedAt":"2026-01-01T00:00:00Z"}],"commits":[{"seq":3,"id":"c3"}],"updatedAt":"2026-01-01T00:00:00Z"}`
+		_, err := w.fake.Put(t.Context(), "db/manifest", []byte(v1), s3.PutOptions{})
+		is.NotError(t, err)
+		_, err = engine.Open(t.Context(), engine.Options{Client: w.fake, Prefix: "db", Now: w.clock.Now})
+		is.Error(t, engine.ErrUnsupportedManifest, err)
+		is.True(t, strings.Contains(err.Error(), "the manifest has version 1, and this version of maragudb reads only version 2"), err.Error())
+		body, ok := w.fake.Body("db/manifest")
+		is.True(t, ok)
+		is.Equal(t, v1, string(body))
 	})
 
 	t.Run("requires a client", func(t *testing.T) {
@@ -622,7 +683,7 @@ func TestDB_Compact(t *testing.T) {
 		w.clock.Sleep(t.Context(), grace)
 		n, err := db1.GC(t.Context())
 		is.NotError(t, err)
-		is.Equal(t, 1, n, "the orphan is collected after the grace period")
+		is.Equal(t, 2, n, "the orphan and the garbage batch that stamped it are collected after the grace period")
 		is.Equal(t, 4, len(w.fake.Keys()))
 	})
 }
@@ -657,7 +718,7 @@ func TestDB_GC(t *testing.T) {
 		w.clock.Sleep(t.Context(), grace/2)
 		n, err = db.GC(t.Context())
 		is.NotError(t, err)
-		is.Equal(t, 2, n)
+		is.Equal(t, 3, n, "the two segments and the garbage batch")
 		is.Equal(t, 2, len(w.fake.Keys()), "manifest and one segment")
 		is.Equal(t, 0, db.Stats().Garbage)
 
@@ -699,12 +760,12 @@ func TestDB_GC(t *testing.T) {
 		n, err = db.GC(t.Context())
 		is.NotError(t, err)
 		is.Equal(t, 0, n, "the orphan may belong to a compaction that is about to rebase, so it is only stamped")
-		is.Equal(t, 1, db.Stats().Garbage)
-		is.Equal(t, 3, len(w.fake.Keys()), "manifest, the live segment, and the orphan")
+		is.Equal(t, 2, db.Stats().Garbage, "the orphan and its garbage batch")
+		is.Equal(t, 4, len(w.fake.Keys()), "manifest, the live segment, the orphan, and the garbage batch")
 		w.clock.Sleep(t.Context(), grace)
 		n, err = db.GC(t.Context())
 		is.NotError(t, err)
-		is.Equal(t, 1, n)
+		is.Equal(t, 2, n)
 		is.Equal(t, 0, db.Stats().Garbage)
 		is.Equal(t, 2, len(w.fake.Keys()), "manifest and the live segment")
 		_, ok := get(t, db, "a")
@@ -738,7 +799,8 @@ func TestDB_GC(t *testing.T) {
 		tx, err := db2.BeginReadOnly(t.Context())
 		is.NotError(t, err)
 		equalMap(t, map[string]string{"a": "1", "b": "2", "c": "3"}, scan(t, tx, "", ""))
-		// A GC pass after the rebase sees the output as live and the stamp from before is dropped.
+		// The stamp from before stays in its garbage batch, and when the batch expires, GC keeps
+		// the output, because the manifest it read has it as a live segment.
 		_, err = db1.GC(t.Context())
 		is.NotError(t, err)
 		w.clock.Sleep(t.Context(), grace)
@@ -776,17 +838,17 @@ func TestDB_GC(t *testing.T) {
 		is.Equal(t, 0, n)
 		is.Equal(t, 2, interfered)
 		w.decide = nil
-		is.Equal(t, 6, db1.Stats().Garbage, "the two merged first plus two per later compaction")
+		is.Equal(t, 7, db1.Stats().Garbage, "the two merged first and their garbage batch, plus two per later compaction")
 
 		w.clock.Sleep(t.Context(), grace)
 		n, err = db1.GC(t.Context())
 		is.NotError(t, err)
-		is.Equal(t, 2, n, "only the garbage stamped by the rebased pass has expired")
-		is.Equal(t, 4, db1.Stats().Garbage)
+		is.Equal(t, 3, n, "only the garbage stamped by the rebased pass has expired, with its batch")
+		is.Equal(t, 5, db1.Stats().Garbage)
 		w.clock.Sleep(t.Context(), grace)
 		n, err = db1.GC(t.Context())
 		is.NotError(t, err)
-		is.Equal(t, 4, n)
+		is.Equal(t, 5, n)
 		v, ok := get(t, db2, "c")
 		is.True(t, ok)
 		is.Equal(t, "2", v)
@@ -806,6 +868,214 @@ func TestDB_GC(t *testing.T) {
 		it := tx.Scan(t.Context(), nil, nil)
 		is.True(t, !it.Next())
 		is.Error(t, engine.ErrSnapshotExpired, it.Err())
+	})
+
+	t.Run("stamps the garbage of passes less than an eighth of the grace period apart into one chain of garbage batches, so the manifest references at most ten chains", func(t *testing.T) {
+		verify.Covers(t, "with a compaction and a GC pass every 30 seconds for two hours and a one hour grace period, the manifest never references more than ten chains of garbage batches, each spanning less than an eighth of the grace period, and every chain is deleted with its garbage once its latest stamp is a grace period old", "AC-6.4", "AC-6.1")
+		hour := time.Hour
+		w := newWorld(t)
+		db := w.open(1, engine.Options{GCGracePeriod: &hour})
+		most := 0
+		for i := range 240 {
+			put(t, db, "a", fmt.Sprint(i))
+			put(t, db, "b", fmt.Sprint(i))
+			is.NotError(t, db.Compact(t.Context()))
+			_, err := db.GC(t.Context())
+			is.NotError(t, err)
+			chains := garbageChains(t, w)
+			most = max(most, len(chains))
+			for _, c := range chains {
+				is.True(t, c.StampedAt.Sub(c.Since) < hour/8, fmt.Sprintf("chain from %v to %v", c.Since, c.StampedAt))
+				is.True(t, w.clock.Now().Sub(c.StampedAt) < hour+30*time.Second, "a chain is deleted at the first pass after it expires")
+			}
+			w.clock.Sleep(t.Context(), 30*time.Second)
+		}
+		is.True(t, most >= 8 && most <= 10, fmt.Sprint("at most ", most, " chains"))
+		is.True(t, db.Stats().Garbage > 400, fmt.Sprint(db.Stats().Garbage, " garbage objects of the last hour"))
+		w.clock.Sleep(t.Context(), hour)
+		_, err := db.GC(t.Context())
+		is.NotError(t, err)
+		is.Equal(t, 0, len(garbageChains(t, w)))
+		is.Equal(t, 2, len(w.fake.Keys()), "manifest and one segment")
+		v, ok := get(t, db, "a")
+		is.True(t, ok)
+		is.Equal(t, "239", v)
+	})
+
+	t.Run("deletes the garbage batches of an expired chain only after the manifest dropped it, so the next pass completes a pass whose delete failed", func(t *testing.T) {
+		verify.Covers(t, "when a delete of expired garbage fails, its chain of garbage batches stays in the manifest with its batch objects, and the next pass, in another process, deletes the rest", "AC-6.1")
+		w := newWorld(t)
+		db := w.open(1, engine.Options{GCGracePeriod: &grace})
+		put(t, db, "a", "1")
+		put(t, db, "b", "2")
+		is.NotError(t, db.Compact(t.Context()))
+		_, err := db.GC(t.Context())
+		is.NotError(t, err)
+		w.clock.Sleep(t.Context(), grace)
+		failed := false
+		w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
+			if kind == s3.KindDelete && strings.HasPrefix(key, "db/seg/") && !failed {
+				failed = true
+				return s3fake.OutcomeError
+			}
+			return s3fake.OutcomeNormal
+		}
+		n, err := db.GC(t.Context())
+		is.NotError(t, err)
+		is.Equal(t, 1, n, "one of the two expired segments")
+		is.Equal(t, 1, len(garbageChains(t, w)), "the chain stays")
+		is.Equal(t, 1, len(keysWith(w, "db/gc/")), "with its batch")
+		other := w.open(2, engine.Options{GCGracePeriod: &grace})
+		n, err = other.GC(t.Context())
+		is.NotError(t, err)
+		is.Equal(t, 2, n, "the other segment and the batch")
+		is.Equal(t, 2, len(w.fake.Keys()), "manifest and one segment")
+	})
+
+	t.Run("sweeps the garbage batch of a pass that crashed before its manifest write as an orphan", func(t *testing.T) {
+		verify.Covers(t, "a garbage batch whose GC pass crashed before its manifest write is stamped as an orphan and deleted after the grace period", "AC-6.1")
+		w := newWorld(t)
+		db := w.open(1, engine.Options{GCGracePeriod: &grace})
+		put(t, db, "a", "1")
+		put(t, db, "b", "2")
+		is.NotError(t, db.Compact(t.Context()))
+		proc := &s3fake.Process{Name: "crasher"}
+		ctx := s3fake.WithProcess(t.Context(), proc)
+		crasher, err := engine.Open(ctx, engine.Options{Client: w.fake, Prefix: "db", Now: w.clock.Now, GCGracePeriod: &grace, Rand: rand.New(rand.NewPCG(3, 3))})
+		is.NotError(t, err)
+		w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
+			if kind == s3.KindPutConditional && key == "db/manifest" {
+				w.decide = nil
+				return s3fake.OutcomeCrashBefore
+			}
+			return s3fake.OutcomeNormal
+		}
+		_, err = crasher.GC(ctx)
+		is.Error(t, s3fake.ErrCrashed, err)
+		is.Equal(t, 1, len(keysWith(w, "db/gc/")), "the batch of the crashed pass")
+		is.Equal(t, 0, len(garbageChains(t, w)))
+		collectAll(t, w, db, grace)
+	})
+
+	t.Run("writes its garbage batch again when it rebases on a pass that started a chain meanwhile, and the first batch is swept", func(t *testing.T) {
+		verify.Covers(t, "a GC pass whose manifest write loses to another pass that started a chain of garbage batches joins that chain with a new batch, and every batch and piece of garbage is collected after the grace period", "AC-6.1", "AC-6.2")
+		w := newWorld(t)
+		db1 := w.open(1, engine.Options{GCGracePeriod: &grace})
+		db2 := w.open(2, engine.Options{GCGracePeriod: &grace})
+		put(t, db1, "a", "1")
+		put(t, db1, "b", "2")
+		is.NotError(t, db1.Compact(t.Context()))
+		w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
+			if kind == s3.KindPutConditional && key == "db/manifest" {
+				w.decide = nil
+				put(t, db2, "c", "3")
+				is.NotError(t, db2.Compact(t.Context()))
+				_, err := db2.GC(t.Context())
+				is.NotError(t, err)
+			}
+			return s3fake.OutcomeNormal
+		}
+		_, err := db1.GC(t.Context())
+		is.NotError(t, err)
+		chains := garbageChains(t, w)
+		is.Equal(t, 1, len(chains), "db1's batch joined db2's chain")
+		is.Equal(t, 3, len(keysWith(w, "db/gc/")), "db2's batch, db1's first batch, and the one that joined the chain")
+		collectAll(t, w, db1, grace)
+		equalMap(t, map[string]string{"a": "1", "b": "2", "c": "3", "collect": "all"}, func() map[string]string {
+			tx, err := db2.BeginReadOnly(t.Context())
+			is.NotError(t, err)
+			return scan(t, tx, "", "")
+		}())
+	})
+
+	t.Run("gives up instead of rebasing once it is older than half the grace period, and its garbage batch is collected", func(t *testing.T) {
+		verify.Covers(t, "a GC pass older than half the grace period writes no manifest that references its garbage batch, which is then swept as an orphan", "AC-6.2", "AC-6.1")
+		w := newWorld(t)
+		db1 := w.open(1, engine.Options{GCGracePeriod: &grace})
+		db2 := w.open(2, engine.Options{GCGracePeriod: &grace})
+		put(t, db1, "a", "1")
+		put(t, db1, "b", "2")
+		is.NotError(t, db1.Compact(t.Context()))
+		w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
+			if kind == s3.KindPutConditional && key == "db/manifest" {
+				w.decide = nil
+				put(t, db2, "c", "3")
+				w.clock.Sleep(t.Context(), grace/2)
+			}
+			return s3fake.OutcomeNormal
+		}
+		_, err := db1.GC(t.Context())
+		is.Error(t, engine.ErrSnapshotExpired, err)
+		is.Equal(t, 0, len(garbageChains(t, w)))
+		is.Equal(t, 1, len(keysWith(w, "db/gc/")))
+		collectAll(t, w, db2, grace)
+	})
+
+	t.Run("runs passes of one process at the same time, which share the cache of garbage batches", func(t *testing.T) {
+		w := newWorld(t)
+		db := w.open(1, engine.Options{GCGracePeriod: &grace})
+		var wg sync.WaitGroup
+		for i := range 4 {
+			wg.Go(func() {
+				for j := range 20 {
+					// Commits of the goroutines conflict with each other, which only matters here
+					// for the segments and orphans they leave.
+					tx, err := db.Begin(t.Context())
+					is.NotError(t, err)
+					is.NotError(t, tx.Put([]byte(fmt.Sprint("k", i)), []byte(fmt.Sprint(j))))
+					_ = tx.Commit(t.Context())
+					_ = db.Compact(t.Context())
+					_, _ = db.GC(t.Context())
+				}
+			})
+		}
+		wg.Wait()
+		collectAll(t, w, db, grace)
+	})
+
+	t.Run("fails with ErrConflict when another pass deleted a garbage batch after the manifest was read, and a retry succeeds", func(t *testing.T) {
+		w := newWorld(t)
+		db1 := w.open(1, engine.Options{GCGracePeriod: &grace})
+		put(t, db1, "a", "1")
+		put(t, db1, "b", "2")
+		is.NotError(t, db1.Compact(t.Context()))
+		_, err := db1.GC(t.Context())
+		is.NotError(t, err)
+		w.clock.Sleep(t.Context(), grace)
+		// db2 has no garbage batch cached, so it reads the one the manifest references, which
+		// db1 deletes just before.
+		db2 := w.open(2, engine.Options{GCGracePeriod: &grace})
+		w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
+			if kind == s3.KindGet && strings.HasPrefix(key, "db/gc/") {
+				w.decide = nil
+				n, err := db1.GC(t.Context())
+				is.NotError(t, err)
+				is.Equal(t, 3, n)
+			}
+			return s3fake.OutcomeNormal
+		}
+		_, err = db2.GC(t.Context())
+		is.Error(t, engine.ErrConflict, err)
+		_, err = db2.GC(t.Context())
+		is.NotError(t, err)
+		is.Equal(t, 2, len(w.fake.Keys()), "manifest and one segment")
+	})
+
+	t.Run("fails with an error that names the garbage batch when the manifest references a missing one", func(t *testing.T) {
+		w := newWorld(t)
+		db1 := w.open(1, engine.Options{GCGracePeriod: &grace})
+		put(t, db1, "a", "1")
+		put(t, db1, "b", "2")
+		is.NotError(t, db1.Compact(t.Context()))
+		_, err := db1.GC(t.Context())
+		is.NotError(t, err)
+		batches := keysWith(w, "db/gc/")
+		is.Equal(t, 1, len(batches))
+		is.NotError(t, w.fake.Delete(t.Context(), batches[0]))
+		db2 := w.open(2, engine.Options{GCGracePeriod: &grace})
+		_, err = db2.GC(t.Context())
+		is.True(t, err != nil && !errors.Is(err, engine.ErrConflict), fmt.Sprint(err))
+		is.True(t, strings.Contains(err.Error(), "references the missing garbage batch \""+batches[0]+"\""), err.Error())
 	})
 }
 
@@ -1081,6 +1351,131 @@ func TestMutations(t *testing.T) {
 		equalMap(t, map[string]string{"a": "1", "b": "2"}, scan(t, tx, "", "")) // the mutant resurrected the old values
 	})
 
+	t.Run("GCBatchObjectsFirst leaves a chain of garbage batches without its batch after a failed delete, so GC fails for good", func(t *testing.T) {
+		verify.Covers(t, "with the mutant, a failed delete of expired garbage leaves the manifest referencing a garbage batch that is gone, and every later pass in another process fails on it and deletes nothing", "MUT-GC-BATCH-OBJECTS-FIRST")
+		grace := 10 * time.Minute
+		w := newWorld(t)
+		db := w.open(1, engine.Options{GCGracePeriod: &grace, Mutations: engine.Mutations{GCBatchObjectsFirst: true}})
+		put(t, db, "a", "1")
+		put(t, db, "b", "2")
+		is.NotError(t, db.Compact(t.Context()))
+		_, err := db.GC(t.Context())
+		is.NotError(t, err)
+		w.clock.Sleep(t.Context(), grace)
+		failed := false
+		w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
+			if kind == s3.KindDelete && strings.HasPrefix(key, "db/seg/") && !failed {
+				failed = true
+				return s3fake.OutcomeError
+			}
+			return s3fake.OutcomeNormal
+		}
+		_, err = db.GC(t.Context())
+		is.NotError(t, err)
+		is.Equal(t, 1, len(garbageChains(t, w)))
+		is.Equal(t, 0, len(keysWith(w, "db/gc/")), "the mutant deleted the batch")
+		other := w.open(2, engine.Options{GCGracePeriod: &grace})
+		for range 3 {
+			n, err := other.GC(t.Context())
+			is.True(t, err != nil && !errors.Is(err, engine.ErrConflict), fmt.Sprint(err))
+			is.Equal(t, 0, n)
+		}
+		is.Equal(t, 2, len(keysWith(w, "db/seg/")), "the segment whose delete failed is never deleted")
+	})
+
+	t.Run("GCSweepSegmentsOnly never deletes the garbage batch of a pass that crashed", func(t *testing.T) {
+		verify.Covers(t, "with the mutant, the garbage batch of a GC pass that crashed before its manifest write stays in the store after every later pass", "MUT-GC-SWEEP-SEGMENTS-ONLY")
+		grace := 10 * time.Minute
+		w := newWorld(t)
+		db := w.open(1, engine.Options{GCGracePeriod: &grace, Mutations: engine.Mutations{GCSweepSegmentsOnly: true}})
+		put(t, db, "a", "1")
+		put(t, db, "b", "2")
+		is.NotError(t, db.Compact(t.Context()))
+		proc := &s3fake.Process{Name: "crasher"}
+		ctx := s3fake.WithProcess(t.Context(), proc)
+		crasher, err := engine.Open(ctx, engine.Options{Client: w.fake, Prefix: "db", Now: w.clock.Now, GCGracePeriod: &grace, Rand: rand.New(rand.NewPCG(3, 3))})
+		is.NotError(t, err)
+		w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
+			if kind == s3.KindPutConditional && key == "db/manifest" {
+				w.decide = nil
+				return s3fake.OutcomeCrashBefore
+			}
+			return s3fake.OutcomeNormal
+		}
+		_, err = crasher.GC(ctx)
+		is.Error(t, s3fake.ErrCrashed, err)
+		orphan := keysWith(w, "db/gc/")
+		is.Equal(t, 1, len(orphan))
+		put(t, db, "c", "3")
+		for range 4 {
+			_, err := db.GC(t.Context())
+			is.NotError(t, err)
+			w.clock.Sleep(t.Context(), grace)
+		}
+		is.Equal(t, 0, db.Stats().Garbage)
+		is.Equal(t, fmt.Sprint(orphan), fmt.Sprint(keysWith(w, "db/gc/")), "the orphaned batch is never collected")
+	})
+
+	t.Run("GCChainKeepsFirstStamp deletes garbage before it is a grace period old", func(t *testing.T) {
+		verify.Covers(t, "with the mutant, garbage that joins a chain of garbage batches nine minutes old is deleted a minute later with the chain, and a reader a minute old loses its snapshot", "MUT-GC-CHAIN-FIRST-STAMP")
+		grace := 10 * time.Minute
+		read := func(t *testing.T, mutations engine.Mutations) error {
+			w := newWorld(t)
+			db := w.open(1, engine.Options{GCGracePeriod: &grace, Mutations: mutations})
+			reader := w.open(2, engine.Options{GCGracePeriod: &grace, MemoryCacheBytes: new(int64)})
+			put(t, db, "a", "1")
+			put(t, db, "b", "2")
+			is.NotError(t, db.Compact(t.Context()))
+			_, err := db.GC(t.Context())
+			is.NotError(t, err)
+			w.clock.Sleep(t.Context(), grace-time.Minute)
+			put(t, db, "c", "3")
+			tx, err := reader.BeginReadOnly(t.Context())
+			is.NotError(t, err)
+			is.NotError(t, db.Compact(t.Context()))
+			_, err = db.GC(t.Context())
+			is.NotError(t, err)
+			w.clock.Sleep(t.Context(), time.Minute)
+			_, err = db.GC(t.Context())
+			is.NotError(t, err)
+			_, _, err = tx.Get(t.Context(), []byte("a"))
+			return err
+		}
+		is.NotError(t, read(t, engine.Mutations{}))
+		is.Error(t, engine.ErrSnapshotExpired, read(t, engine.Mutations{GCChainKeepsFirstStamp: true}))
+	})
+
+	t.Run("GCDeleteReferenced deletes the output of a compaction that GC stamped as an orphan before its rebase landed", func(t *testing.T) {
+		verify.Covers(t, "with the mutant, GC deletes the live output of a rebased compaction when the stamp it got as an orphan expires, and stops at its own check that a deleted object is not live", "MUT-GC-DELETE-REFERENCED")
+		grace := 10 * time.Minute
+		w := newWorld(t)
+		db1 := w.open(1, engine.Options{GCGracePeriod: &grace, MemoryCacheBytes: new(int64), Mutations: engine.Mutations{GCDeleteReferenced: true}})
+		db2 := w.open(2, engine.Options{GCGracePeriod: &grace, MemoryCacheBytes: new(int64)})
+		put(t, db1, "a", "1")
+		put(t, db1, "b", "2")
+		w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
+			// The merged segment is written, and db2 is about to write the manifest. A commit lands
+			// first, and a GC pass stamps the merged segment as an orphan.
+			if kind == s3.KindPutConditional && key == "db/manifest" {
+				w.decide = nil
+				put(t, db1, "c", "3")
+				_, err := db1.GC(t.Context())
+				is.NotError(t, err)
+				is.Equal(t, 1, len(garbageChains(t, w)))
+			}
+			return s3fake.OutcomeNormal
+		}
+		is.NotError(t, db2.Compact(t.Context()))
+		is.Equal(t, int64(1), db2.Stats().CompactionRebases)
+		w.clock.Sleep(t.Context(), grace)
+		_, err := db1.GC(t.Context())
+		is.True(t, err != nil && strings.Contains(err.Error(), "is referenced by the manifest"), fmt.Sprint(err))
+		tx, err := db2.BeginReadOnly(t.Context())
+		is.NotError(t, err)
+		_, _, err = tx.Get(t.Context(), []byte("a"))
+		is.Error(t, engine.ErrSnapshotExpired, err, "the compacted segment is gone")
+	})
+
 	t.Run("AckBeforeConfirm reports success for a write that never happened", func(t *testing.T) {
 		verify.Covers(t, "with the mutant, a commit whose manifest write failed is reported as successful and is invisible", "MUT-ACK-BEFORE-CONFIRM")
 		w := newWorld(t)
@@ -1284,7 +1679,7 @@ func TestDB_Tigris(t *testing.T) {
 		time.Sleep(grace)
 		n, err = db.GC(t.Context())
 		is.NotError(t, err)
-		is.Equal(t, 3, n, "expired segments were deleted")
+		is.Equal(t, 4, n, "expired segments and their garbage batch were deleted")
 		infos, err := client.List(t.Context(), cfg.Prefix+"/"+strings.ReplaceAll(t.Name(), "/", "-"))
 		is.NotError(t, err)
 		is.Equal(t, 2, len(infos), "manifest and one segment")

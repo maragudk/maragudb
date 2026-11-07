@@ -122,9 +122,12 @@ func (m *Maintainer) due(man *manifest) bool {
 
 // garbageDue reports whether the manifest has garbage to stamp or to delete.
 func (m *Maintainer) garbageDue(man *manifest) bool {
+	if len(man.Garbage) > 0 {
+		return true
+	}
 	now := m.db.now()
-	for _, g := range man.Garbage {
-		if g.UnreferencedAt.IsZero() || now.Sub(g.UnreferencedAt) >= m.db.grace {
+	for _, b := range man.Batches {
+		if now.Sub(b.StampedAt) >= m.db.grace {
 			return true
 		}
 	}

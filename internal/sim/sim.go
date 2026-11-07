@@ -261,6 +261,11 @@ const (
 	// CheckerCheck finds a row that violates a CHECK constraint, in a snapshot that a reader saw,
 	// or in the final state of the store, with [exec.CheckConstraints].
 	CheckerCheck = "check constraint"
+	// CheckerStorage finds objects that garbage collection never deletes, or that it fails on,
+	// after the run: a fresh process runs GC a grace period apart until all garbage has expired,
+	// and then the store must hold only the manifest, the lease, the live segments, and the
+	// objects of writes that the manifest has not moved past.
+	CheckerStorage = "storage"
 	// CheckerRealTime finds a reader that misses a commit acknowledged before it began, through
 	// a counter that only grows.
 	CheckerRealTime = "real-time order"
@@ -436,6 +441,7 @@ func Run(cfg Config) Result {
 			r.anoms = append(r.anoms, &Anomaly{Checker: CheckerBank, Err: err})
 		}
 	}
+	r.checkStorage()
 	res.Anomalies = r.anoms
 	if cfg.Mutations == (engine.Mutations{}) && cfg.SQLMutations == (exec.Mutations{}) {
 		assert.Always(len(r.anoms) == 0, "the simulated history has no anomalies", map[string]any{"seed": cfg.Seed})
@@ -570,6 +576,58 @@ func (r *run) readFinal() (map[string][]int64, map[string]int64, error) {
 	})
 	r.sched.Run()
 	return lists, balances, err
+}
+
+// checkStorage runs GC in a fresh process without faults, with the run's mutations, five times a
+// grace period apart, which is enough for every piece of garbage to be stamped, to expire, and to
+// be deleted with its garbage batch, also the orphans that the first pass cannot stamp yet. Then
+// every segment object must be live, and no garbage and no garbage batch may remain, apart from
+// the objects of writes against the final manifest, which a later commit makes orphans.
+func (r *run) checkStorage() {
+	r.goTask("storage", func(ctx context.Context) {
+		grace := r.cfg.GracePeriod
+		db, err := engine.Open(ctx, engine.Options{Client: r.fake.WithoutFaults(), Prefix: "db", Now: r.sched.Now, Sleep: r.sched.Sleep, MemoryCacheBytes: new(int64), GCGracePeriod: &grace, Mutations: r.cfg.Mutations, Rand: rand.New(rand.NewPCG(r.cfg.Seed, 0x6c))})
+		if err != nil {
+			r.anomaly(CheckerStorage, "opening: %v", err)
+			return
+		}
+		for i := range 5 {
+			if _, err := db.GC(ctx); err != nil {
+				r.anomaly(CheckerStorage, "GC pass %d after the run: %v", i+1, err)
+				return
+			}
+			r.sched.Sleep(ctx, grace)
+		}
+		stats := db.Stats()
+		if stats.Garbage > 0 {
+			r.anomaly(CheckerStorage, "%d garbage objects remain after their grace period", stats.Garbage)
+		}
+		var segments int
+		var leaked []string
+		for _, key := range r.fake.Keys() {
+			name, ok := strings.CutPrefix(key, "db/")
+			if !ok || name == "manifest" || name == "maintenance-lease" {
+				continue
+			}
+			kind, rest, _ := strings.Cut(name, "/")
+			hexSeq, _, _ := strings.Cut(rest, "-")
+			if seq, err := strconv.ParseUint(hexSeq, 16, 64); err == nil && seq >= stats.Seq {
+				continue
+			}
+			if kind == "seg" {
+				segments++
+				continue
+			}
+			leaked = append(leaked, key)
+		}
+		if segments > stats.Segments {
+			r.anomaly(CheckerStorage, "%d segment objects for %d live segments", segments, stats.Segments)
+		}
+		if len(leaked) > 0 {
+			r.anomaly(CheckerStorage, "objects that GC never deletes: %v", leaked)
+		}
+	})
+	r.sched.Run()
 }
 
 func keyName(i int) string {
@@ -726,9 +784,13 @@ func (c *client) closeSQL() {
 }
 
 // pause the client in the middle of a transaction now and then, like a stalled process,
-// so that snapshots outlive compactions.
+// so that snapshots outlive compactions, and rarely for up to the grace period, so that a reader
+// whose snapshot is almost a grace period old reads garbage that GC must still keep.
 func (c *client) pause(ctx context.Context) {
-	if c.rng.IntN(5) == 0 {
+	switch c.rng.IntN(25) {
+	case 0:
+		c.run.sched.Sleep(ctx, time.Duration(c.rng.Int64N(int64(c.run.cfg.GracePeriod))))
+	case 1, 2, 3, 4:
 		c.run.sched.Sleep(ctx, time.Duration(c.rng.Int64N(int64(200*time.Millisecond))))
 	}
 }

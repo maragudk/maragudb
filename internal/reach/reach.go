@@ -23,6 +23,9 @@ const (
 	AutocommitRetry         State = "STATE-AUTOCOMMIT-RETRY"
 	CompactionRebase        State = "STATE-COMPACTION-REBASE"
 	GCRebase                State = "STATE-GC-REBASE"
+	GCKeepsLiveGarbage      State = "STATE-GC-KEEPS-LIVE-GARBAGE"
+	GCBatchRewritten        State = "STATE-GC-BATCH-REWRITTEN"
+	GCChainDropped          State = "STATE-GC-CHAIN-DROPPED"
 	LeaseTakeover           State = "STATE-LEASE-TAKEOVER"
 	LeaseOverlap            State = "STATE-LEASE-OVERLAP"
 	SnapshotExpiredRefused  State = "STATE-SNAPSHOT-EXPIRED-REFUSED"
@@ -52,6 +55,9 @@ func Declarations() []Declared {
 		{AutocommitRetry, "an autocommit statement retries after a conflict", "an autocommit statement retries after a conflict"},
 		{CompactionRebase, "a compaction reapplies its swap on top of commits that landed meanwhile", "a compaction rebases on commits that only added segments"},
 		{GCRebase, "a GC pass reapplies its manifest change on top of commits that landed meanwhile", "a GC pass rebases on commits that landed meanwhile"},
+		{GCKeepsLiveGarbage, "an expired garbage batch lists a live segment, the output of a compaction that a GC pass stamped as an orphan before the compaction's rebase landed, and GC keeps it", "GC keeps a live segment that an expired garbage batch lists"},
+		{GCBatchRewritten, "a GC pass that rebases writes its garbage batch again, because the chain it was to join changed meanwhile, and the first one becomes an orphan", "a GC pass writes its garbage batch again for another chain"},
+		{GCChainDropped, "a GC pass deletes the garbage of an expired chain of garbage batches, drops the chain from the manifest, and then deletes its batch objects", "a GC pass drops an expired chain and deletes its batches"},
 		{LeaseTakeover, "a maintainer takes over a lease that another holder let expire", "a maintainer takes over an expired lease"},
 		{LeaseOverlap, "two maintainers believe they hold the lease at the same time", "two maintainers believe they hold the lease at once"},
 		{SnapshotExpiredRefused, "a reader older than the grace period is refused with ErrSnapshotExpired", "a reader older than the grace period is told so"},

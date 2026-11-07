@@ -251,11 +251,12 @@ func TestSimulator(t *testing.T) {
 
 	t.Run("corpus finds no anomalies", func(t *testing.T) {
 		verify.Covers(t, "the fixed corpus, with injected errors, latency, lost acknowledgements, outages, and crashes, finds no anomalies with any checker and exercises every fault", "AC-1.1", "AC-1.2", "AC-1.3", "AC-1.4", "AC-1.5", "AC-1.7", "AC-1.8", "AC-3.1", "AC-3.2", "AC-6.2", "INV-MULTI-WRITER", "INV-STRICT-SERIALIZABLE", "INV-CACHE-LOSS", "INV-S3-ONLY")
+		verify.Covers(t, "after every run of the fixed corpus, GC passes a grace period apart leave only the live segments and the objects of writes against the final manifest, and fail on no missing garbage batch", "AC-6.1")
 		verify.Covers(t, "the fixed corpus, with the unique workload under the same faults, finds no two rows with the same unique value in any snapshot a reader saw or in the final state, and after every run through SQL every index of the store matches its table, and lookups through the indexes find the rows of the table", "INV-UNIQUE", "INV-INDEX-CONSISTENT")
 		verify.Covers(t, "the fixed corpus, with the foreign key workload under the same faults, finds no reference to a missing row and no row that violates a CHECK in any snapshot a reader saw, and after every run through SQL every foreign key and CHECK of the store holds", "INV-FK", "INV-CHECK")
 		verify.Covers(t, "the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, and unique and foreign key violations that only a concurrent commit causes",
 			"AC-1.3", "AC-1.4", "STATE-LOST-ACK-LANDED", "STATE-LOST-ACK-CONFLICT", "STATE-LIVE-UNKNOWN", "STATE-AUTOCOMMIT-RETRY",
-			"STATE-COMPACTION-REBASE", "STATE-GC-REBASE", "STATE-LEASE-TAKEOVER", "STATE-LEASE-OVERLAP",
+			"STATE-COMPACTION-REBASE", "STATE-GC-REBASE", "STATE-GC-KEEPS-LIVE-GARBAGE", "STATE-GC-BATCH-REWRITTEN", "STATE-GC-CHAIN-DROPPED", "STATE-LEASE-TAKEOVER", "STATE-LEASE-OVERLAP",
 			"STATE-SNAPSHOT-EXPIRED-REFUSED", "STATE-BLOCK-READ-RETRY-SUCCEEDED", "STATE-CRASH-MID-COMMIT-RECOVERED",
 			"STATE-CRASH-MID-COMPACTION", "STATE-CRASH-MID-GC", "STATE-UNIQUE-AFTER-CONFLICT", "STATE-UNIQUE-VALUE-REUSED",
 			"STATE-FK-AFTER-CONFLICT", "STATE-FK-CASCADE-TABLES")
@@ -614,6 +615,9 @@ type mutant struct {
 	// cells of the others do not apply, for the reason only.
 	workloads []sim.Workload
 	only      string
+	// maintained is true for a mutant of code that only runs with maintainers, so that the cells
+	// without them do not apply.
+	maintained bool
 }
 
 // cell of the kill matrix: a workload, through an API, with a number of maintainers.
@@ -662,6 +666,8 @@ const (
 	noUniqueIndex     = "the workload has no unique index besides the primary key"
 	noForeignKey      = "the workload has no foreign keys"
 	noCheck           = "the workload has no CHECK constraints"
+	ackConserves      = "an acknowledged transfer that never landed is missing as a whole, which conserves money, and without maintainers its segment is an orphan that GC collects like that of any failed commit"
+	noMaintainedGC    = "without maintainers, garbage collection runs only in the storage check after the run, without faults, concurrent passes, or compactions, so the steps the mutant breaks always complete"
 )
 
 // mutants in the kill matrix.
@@ -707,8 +713,8 @@ func mutants() []mutant {
 			id: "MUT-COMMIT-WITHOUT-CAS", replay: "cas", name: "commit without CAS",
 			description: "`engine.Mutations.CommitWithoutCAS` writes the manifest unconditionally, so a commit can overwrite a concurrent one.",
 			mutations:   engine.Mutations{CommitWithoutCAS: true},
-			cannot:      merge(bankCells(bankConserves), workloadCells(sim.Unique, "an unconditional manifest write drops whole concurrent commits, which leaves a consistent state in which no value repeats, and the unique workload does not check that acknowledged writes survive")),
-			checkers:    []string{sim.CheckerListAppend},
+			cannot:      map[cell]string{{workload: sim.Unique, sql: true}: "an unconditional manifest write drops whole concurrent commits, which leaves a consistent state in which no value repeats, the unique workload does not check that acknowledged writes survive, and in 20 seeds no dropped commit leaves the store with objects that GC cannot collect"},
+			checkers:    []string{sim.CheckerListAppend, sim.CheckerStorage},
 		},
 		{
 			id: "MUT-GC-IGNORE-GRACE", replay: "gc", name: "GC ignoring the grace period",
@@ -718,15 +724,52 @@ func mutants() []mutant {
 			checkers:    []string{sim.CheckerGracePeriod},
 		},
 		{
+			id: "MUT-GC-BATCH-OBJECTS-FIRST", replay: "gc-batch-objects-first", name: "garbage batches deleted before their garbage",
+			description: "`engine.Mutations.GCBatchObjectsFirst` deletes the objects of an expired chain of garbage batches before the garbage they list and before the manifest write that drops the chain, so that a failed delete or a crash leaves the manifest referencing a missing batch.",
+			mutations:   engine.Mutations{GCBatchObjectsFirst: true},
+			maintained:  true,
+			checkers:    []string{sim.CheckerStorage},
+		},
+		{
+			id: "MUT-GC-SWEEP-SEGMENTS-ONLY", replay: "gc-sweep-segments-only", name: "an orphan sweep that misses garbage batches",
+			description: "`engine.Mutations.GCSweepSegmentsOnly` lists only segments when GC sweeps for orphans, so that a garbage batch whose GC pass lost or crashed, or whose delete failed after its chain was dropped, is never deleted.",
+			mutations:   engine.Mutations{GCSweepSegmentsOnly: true},
+			maintained:  true,
+			checkers:    []string{sim.CheckerStorage},
+		},
+		{
+			id: "MUT-GC-CHAIN-FIRST-STAMP", replay: "gc-chain-first-stamp", name: "a chain of garbage batches with the stamp of its first batch",
+			description: "`engine.Mutations.GCChainKeepsFirstStamp` adds every GC pass's garbage batch to the newest chain, however old, and keeps the stamp of the chain's first batch, so that garbage is deleted before it is a grace period old.",
+			mutations:   engine.Mutations{GCChainKeepsFirstStamp: true},
+			maintained:  true,
+			checkers:    []string{sim.CheckerGracePeriod},
+		},
+		{
+			id: "MUT-GC-DELETE-REFERENCED", replay: "gc-delete-referenced", name: "GC deleting expired garbage that is referenced again",
+			description: "`engine.Mutations.GCDeleteReferenced` deletes the garbage of an expired chain of garbage batches also when the manifest references it otherwise, such as the output of a compaction that GC stamped as an orphan before the compaction's rebase landed.",
+			mutations:   engine.Mutations{GCDeleteReferenced: true},
+			maintained:  true,
+			cannot: func() map[cell]string {
+				m := map[cell]string{}
+				for _, w := range []sim.Workload{sim.ListAppend, sim.Bank, sim.ForeignKey} {
+					m[cell{workload: w, sql: true, maintainers: 2}] = "in 20 seeds, no GC pass stamps the output of a compaction as an orphan between the compaction's segment write and its rebased manifest write, which the mutant needs; `TestMutations` of the engine makes that happen and detects the mutant"
+				}
+				return m
+			}(),
+			checkers: []string{sim.CheckerStorage},
+		},
+		{
 			id: "MUT-SKIP-FRESHNESS", replay: "freshness", name: "serving the cache without a freshness check",
 			description: "`engine.Mutations.SkipFreshnessCheck` starts transactions from the cached manifest without asking the store, so a transaction can miss commits acknowledged before it began.",
 			mutations:   engine.Mutations{SkipFreshnessCheck: true},
 			cannot: func() map[cell]string {
 				m := merge(bankCells("a stale snapshot makes a transfer conflict or read an older consistent state, which conserves money"),
 					map[cell]string{{workload: sim.Unique, sql: true}: "a stale snapshot is an older consistent state in which no value repeats, and a write from it conflicts at commit; without maintainers no reader loses an object either"})
-				// The audits through SQL read the accounts twice, by rows and with SUM, and a stale
-				// snapshot can lose an object that maintenance collected meanwhile.
+				// A stale snapshot can lose an object that maintenance collected meanwhile, which the
+				// audits through SQL, which read the accounts twice, by rows and with SUM, and the
+				// readers that pause for almost a grace period run into.
 				delete(m, cell{workload: sim.Bank, sql: true, maintainers: 2})
+				delete(m, cell{workload: sim.Bank, maintainers: 2})
 				return m
 			}(),
 			checkers: []string{sim.CheckerListAppend},
@@ -735,8 +778,12 @@ func mutants() []mutant {
 			id: "MUT-ACK-BEFORE-CONFIRM", replay: "ack", name: "acking before the write is confirmed",
 			description: "`engine.Mutations.AckBeforeConfirm` reports a commit as successful without waiting for the store's answer.",
 			mutations:   engine.Mutations{AckBeforeConfirm: true},
-			cannot:      merge(bankCells("an acknowledged transfer that never landed is missing as a whole, which conserves money"), workloadCells(sim.Unique, "an acknowledged write that never landed is missing as a whole, which leaves a consistent state, and the unique workload does not check that acknowledged writes survive")),
-			checkers:    []string{sim.CheckerDurability},
+			cannot: map[cell]string{
+				{workload: sim.Bank}:              ackConserves,
+				{workload: sim.Bank, sql: true}:   ackConserves,
+				{workload: sim.Unique, sql: true}: "an acknowledged write that never landed is missing as a whole, which leaves a consistent state, the unique workload does not check that acknowledged writes survive, and without maintainers the segment of such a write is an orphan that GC collects like any other",
+			},
+			checkers: []string{sim.CheckerDurability, sim.CheckerStorage},
 		},
 		{
 			id: "MUT-COMPACTED-AHEAD", replay: "compacted-ahead", name: "the compacted segment ahead of newer ones after a rebase",
@@ -842,6 +889,9 @@ func (m mutant) applicable(c cell) (bool, string) {
 	}
 	if len(m.workloads) > 0 && !slices.Contains(m.workloads, c.workload) {
 		return false, m.only
+	}
+	if m.maintained && c.maintainers == 0 {
+		return false, noMaintainedGC
 	}
 	return true, ""
 }
@@ -984,7 +1034,7 @@ func TestMutants(t *testing.T) {
 					caught[name] = true
 				}
 				if r.Status == verify.Detected && c.maintainers == 0 && !slices.ContainsFunc(r.Checkers, func(name string) bool {
-					return name == sim.CheckerListAppend || name == sim.CheckerDurability || name == sim.CheckerBank || name == sim.CheckerUnique || name == sim.CheckerIndex || name == sim.CheckerForeignKey || name == sim.CheckerCheck || name == sim.CheckerRealTime
+					return name == sim.CheckerListAppend || name == sim.CheckerDurability || name == sim.CheckerBank || name == sim.CheckerUnique || name == sim.CheckerIndex || name == sim.CheckerForeignKey || name == sim.CheckerCheck || name == sim.CheckerRealTime || name == sim.CheckerStorage
 				}) {
 					t.Errorf("%v: without maintainers, a history or invariant checker must find the mutant, but only %v did", c, r.Checkers)
 				}

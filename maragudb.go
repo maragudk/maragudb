@@ -67,7 +67,7 @@ var (
 	// the store stopped answering. The commit may or may not have been applied.
 	ErrCommitUnknown = engine.ErrCommitUnknown
 	// ErrSnapshotExpired is returned by a transaction older than the GC grace period, and by
-	// [Compact] when it took longer than that.
+	// [Compact] and [GC] when they took longer than half of it.
 	ErrSnapshotExpired = engine.ErrSnapshotExpired
 	// ErrUnsupported is a statement that Postgres accepts and maragudb does not, such as one
 	// that uses a feature maragudb does not have, or one whose result in Postgres would depend
@@ -360,8 +360,9 @@ func Compact(ctx context.Context, db *sql.DB) error {
 
 // GC deletes objects that no transaction within the grace period can reference, and returns how
 // many it deleted. Commits that happen meanwhile do not fail it; it returns [ErrConflict] only
-// when it kept losing to them, and can then be retried. Background maintenance runs it on its
-// own unless [Options.Maintenance] is off.
+// when it kept losing to them, or to another GC pass, and [ErrSnapshotExpired] when it took longer
+// than half the grace period, and it can be retried after either. Background maintenance runs it
+// on its own unless [Options.Maintenance] is off.
 func GC(ctx context.Context, db *sql.DB) (int, error) {
 	var n int
 	err := withConn(ctx, db, func(c *sqldriver.Conn) error {
