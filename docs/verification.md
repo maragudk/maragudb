@@ -10,10 +10,10 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 ## At a glance
 
-- 34 acceptance criteria (`AC-`), 24 key invariants (`INV-`), 29 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
-- 15 mutants (`MUT-`), deliberate bugs, of which 14 are detected by the simulator's checkers within 20 seeds.
+- 34 acceptance criteria (`AC-`), 24 key invariants (`INV-`), 31 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
+- 16 mutants (`MUT-`), deliberate bugs, of which 15 are detected by the simulator's checkers within 20 seeds.
 - 17 interesting states (`STATE-`) that the simulator's fixed corpus must reach.
-- 197 declarations of coverage in the tests.
+- 207 declarations of coverage in the tests.
 
 ## Acceptance criteria
 
@@ -136,6 +136,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 > Differential testing against Postgres: Both systems must agree on whether a statement succeeds or fails, and on the error class when both fail. Postgres runs with enable_seqscan = off, so that the differences with a DEV- ID do not show.
 
+- `internal/pgdiff` `TestCTEs/evaluates_subqueries_in_FROM_and_CTEs_as_Postgres_does,_with_their_names_and_errors`: subqueries in FROM with an alias and names for their columns, and non-recursive CTEs, several of them, a later one reading an earlier one, with names for their columns, read several times or never, and in subqueries, give Postgres's rows, names, and errors, such as 42712 for a CTE named twice and 42P10 for too many column names
 - `internal/pgdiff` `TestChecks/names_CHECK_constraints_as_Postgres_does,_and_fails_a_CHECK_as_Postgres_does_when_the_table_is_created`: CHECK constraints get Postgres's names, after the one column they read or after the table, numbered past the names of every constraint of every table, they share the names of a table's constraints with its PRIMARY KEY and UNIQUE constraints and its NOT NULL constraints, and a CHECK that is not boolean, reads a missing column, or repeats a name fails with the class of Postgres's error
 - `internal/pgdiff` `TestDefaults/fills_in_defaults_as_Postgres_does,_with_the_same_errors`: a column's DEFAULT is used for a column that an INSERT leaves out, for DEFAULT in VALUES and in SET, and for DEFAULT VALUES, converted to the column's type by assignment, and a DEFAULT that reads a column, has a parameter, has the wrong type, or fails to fold fails as in Postgres
 - `internal/pgdiff` `TestDifferential/generated_statements_give_the_same_results_on_Postgres_and_maragudb`: hegel-generated schemas, rows, transactions, and statements, written once as Postgres SQL, give the same results, column names, affected-row counts, and transaction states on both sides, ordered exactly when ORDER BY decides the order and as multisets otherwise, and fail on both sides with the same error class, except for statements that maragudb rejects as unsupported, which Postgres skips
@@ -149,6 +150,8 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/pgdiff` `TestJoins/resolves_aliases_and_qualified_names_as_Postgres_does,_with_the_same_errors`: table aliases with and without AS, names for the columns of a table, qualified names, t.*, and a name alone resolve as in Postgres, and an ambiguous name (42702), a missing or hidden FROM entry (42P01), a table named twice (42712), a missing column (42703), and too many column names (42P10) fail with the class of Postgres's error
 - `internal/pgdiff` `TestRunner_Run/accepts_different_errors_that_agree_once_Postgres_visits_the_rows_in_key_order_instead_of_the_order_of_an_index`: when Postgres reads the rows through an index in the order of its entries and reports another row's error than maragudb, which reads them in key order, the rerun in key order marks the other indexes invalid, so that Postgres agrees
 - `internal/pgdiff` `TestRunner_Run/reports_errors_of_different_classes_as_a_mismatch`: a statement that fails on both sides for different reasons is a mismatch
+- `internal/pgdiff` `TestSubqueries/fails_a_scalar_subquery_with_more_than_one_row_with_21000,_and_a_subquery_with_the_wrong_number_of_columns_as_Postgres_does`: a scalar subquery with more than one row fails with 21000 where every plan evaluates it, and a subquery with several columns fails with 42601
+- `internal/pgdiff` `TestSubqueryNames/resolves_names_in_the_query_of_a_subquery_first_and_then_in_the_queries_around_it,_as_Postgres_does,_with_the_same_errors`: a name in a subquery resolves in its own FROM first and then in the queries around it, from the nearest out, a qualified name by the nearest table of that name, with 42702 for an ambiguous name at the nearest level that has it, 42703 and 42P01 when no level has it, and 42803 for an ungrouped column of a grouped query around
 
 ### `AC-4.4`
 
@@ -370,6 +373,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/engine` `TestTx_Commit/a_commit_from_another_process_is_visible_to_a_transaction_begun_after_it`: a transaction in another process sees a commit acknowledged before it began, read from the store
 - `internal/history` `TestCheckListAppend`: the list-append checker accepts serializable histories and rejects stale reads, write skew, lost updates, reads of failed writes, duplicate values, and cycles through real-time edges
 - `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus, with injected errors, latency, lost acknowledgements, outages, and crashes, finds no anomalies with any checker and exercises every fault
+- `internal/sql/exec` `TestMutations/SubqueryStaleAcrossRetries_makes_a_retried_autocommit_statement_write_what_its_subquery_read_before_the_conflict`: an autocommit statement that retries after a conflict evaluates its subqueries again in the new snapshot, and with the mutant it reuses the results of the conflicted attempt, which loses the concurrent write
 
 ### `INV-DB-CONFLICTS`
 
@@ -420,6 +424,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/pgdiff` `TestAggregates/computes_COUNT,_SUM,_AVG,_MIN,_and_MAX_as_Postgres_does,_with_numeric_results_for_SUM_and_AVG_of_integers`: COUNT(*), COUNT(x), SUM, AVG, MIN, and MAX, also with DISTINCT, over bigint, integer, double precision, text, bytea, timestamptz, and NULLs give Postgres's values and types: SUM of integer is bigint, SUM of bigint and AVG of integers are numeric with Postgres's scale, and MIN and MAX of text compare by byte order
 - `internal/pgdiff` `TestAggregates/computes_arithmetic_on_numeric_results_with_Postgres's_values,_scales,_and_errors`: unary minus and plus and +, -, *, /, and % on the numeric results of SUM and AVG of integers, with each other and with integer and bigint operands, give Postgres's values and scales, division by zero (22012), and out of range errors (22003), and their results compare, sort, group, and cast as other numerics; with a double precision operand the numeric converts to double precision
 - `internal/pgdiff` `TestAggregates/divides_numerics_to_Postgres's_scale_of_at_most_1000_digits,_multiplies_to_at_most_16383,_and_converts_tiny_and_huge_numerics_to_double_precision_with_Postgres's_out_of_range_errors`: repeated division and multiplication of numeric aggregate results give Postgres's text at the limits of scale, a quotient of scale 1000 and a product rounded half away from zero to scale 16383, and a numeric that rounds to zero or infinity as double precision fails with 22003
+- `internal/pgdiff` `TestCTEs/evaluates_subqueries_in_FROM_and_CTEs_as_Postgres_does,_with_their_names_and_errors`: subqueries in FROM with an alias and names for their columns, and non-recursive CTEs, several of them, a later one reading an earlier one, with names for their columns, read several times or never, and in subqueries, give Postgres's rows, names, and errors, such as 42712 for a CTE named twice and 42P10 for too many column names
 - `internal/pgdiff` `TestCasts/every_value_casts_to_every_type_the_same_as_Postgres,_or_is_rejected_as_unsupported`: hegel-drawn values of every supported type, and integer and numeric literals, cast to every supported type and back to text with the same result or error class as Postgres, unless maragudb rejects the cast as unsupported
 - `internal/pgdiff` `TestCasts/text_casts_to_every_type,_and_back_to_text,_the_same_as_Postgres,_or_are_rejected_as_unsupported`: hegel-drawn text near valid input for bigint, double precision, boolean, bytea, and timestamptz casts to the type and back to text with the same result or the same error class as Postgres, unless maragudb rejects it as unsupported
 - `internal/pgdiff` `TestChecks/checks_CHECK_constraints_in_the_order_of_their_names,_after_NOT_NULL_and_before_the_keys,_as_Postgres_does`: an INSERT or UPDATE evaluates the NOT NULL constraints, then the CHECK constraints in the order of their names, failing at the first that is false or fails itself, and then the primary key and the unique indexes, row by row, so it fails with the same class as Postgres, and NULL passes a CHECK
@@ -448,6 +453,12 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/pgdiff` `TestJoins/resolves_aliases_and_qualified_names_as_Postgres_does,_with_the_same_errors`: table aliases with and without AS, names for the columns of a table, qualified names, t.*, and a name alone resolve as in Postgres, and an ambiguous name (42702), a missing or hidden FROM entry (42P01), a table named twice (42712), a missing column (42703), and too many column names (42P10) fail with the class of Postgres's error
 - `internal/pgdiff` `TestNumericArithmetic/adds,_subtracts,_multiplies,_divides,_takes_remainders_of,_and_negates_numerics_as_Postgres_does`: hegel-drawn numerics, with trailing zeros, zeros of every scale, and values at the limits of scale and of digits before the point, give the same text or error class as Postgres for -a, a + b, a - b, a * b, a / b, and a % b, including the scale that select_div_scale picks, rounding half away from zero, the 16383 digits of a product, and the 131072 digits before the point
 - `internal/pgdiff` `TestParameters/a_parameter_of_every_Go_type_in_every_context_gives_the_same_result_as_Postgres_with_pgx,_or_is_rejected_as_unsupported`: hegel-drawn Go values bound as parameters in contexts that infer different types give the same result or error class as Postgres with pgx, or fail on both when pgx refuses to encode them, unless maragudb rejects them as unsupported
+- `internal/pgdiff` `TestSubqueries/evaluates_IN,_NOT_IN,_EXISTS,_NOT_EXISTS,_and_scalar_subqueries_as_Postgres_does,_correlated_or_not,_with_their_NULL_rules`: IN, NOT IN with NULLs on either side, EXISTS, NOT EXISTS, and scalar subqueries, which are NULL without a row, give Postgres's rows in WHERE, the output, ORDER BY, HAVING, and the conditions of joins, correlated with the query around or not, at any depth
+- `internal/pgdiff` `TestSubqueries/fails_a_scalar_subquery_with_more_than_one_row_with_21000,_and_a_subquery_with_the_wrong_number_of_columns_as_Postgres_does`: a scalar subquery with more than one row fails with 21000 where every plan evaluates it, and a subquery with several columns fails with 42601
+- `internal/pgdiff` `TestSubqueryNames/resolves_names_in_the_query_of_a_subquery_first_and_then_in_the_queries_around_it,_as_Postgres_does,_with_the_same_errors`: a name in a subquery resolves in its own FROM first and then in the queries around it, from the nearest out, a qualified name by the nearest table of that name, with 42702 for an ambiguous name at the nearest level that has it, 42703 and 42P01 when no level has it, and 42803 for an ungrouped column of a grouped query around
+- `internal/pgdiff` `TestSubqueryPlans/Postgres_evaluates_a_subquery_lazily,_before_a_scan,_as_a_semi-join,_or_not_at_all,_and_stops_at_the_row_that_decides_it`: EXPLAIN and the outcomes on Postgres 18 with sequential scans off show that an uncorrelated subquery in an index condition is evaluated before the scan, also of an empty table, and in a filter only when a row reaches it, that IN, also correlated, and EXISTS become semi-joins and NOT EXISTS an anti-join, which evaluate a condition of the query around on rows that the subquery rejects, that NOT IN is a hashed SubPlan, that EXISTS drops the output of its query, that a subquery in FROM and a CTE read once are merged into the query around and their unread outputs never evaluated, that a CTE read twice is evaluated as a whole, that an unread CTE is never evaluated, and that a scalar subquery stops at its second row
+- `internal/pgdiff` `TestSubqueryPlans/rejects_a_subquery_whose_evaluation_fails_where_some_plan_evaluates_it_and_another_does_not,_and_accepts_it_otherwise`: a subquery that can fail is evaluated on every row and in every place that a plan of Postgres could evaluate it, an uncorrelated one in a condition before any row, the conditions of a correlated EXISTS also without a row of the query around, and a subquery in FROM or a CTE before the statement reads any row, and the statement is rejected when the evaluation fails, while a scalar subquery with more than one row fails with 21000 where every plan evaluates it
+- `internal/pgdiff` `TestSubqueryWrites/evaluates_subqueries_in_UPDATE,_DELETE,_and_INSERT_on_the_snapshot_of_the_statement,_also_on_the_table_they_write`: subqueries in the WHERE of UPDATE and DELETE, in SET, and in INSERT ... VALUES read the rows as the statement began, also of the table it writes, as in Postgres
 - `internal/sql/exec` `TestSession_Defaults/now()_is_the_start_of_the_transaction,_the_same_for_every_use_in_it,_from_the_engine's_clock_at_microsecond_precision`: now(), CURRENT_TIMESTAMP, and transaction_timestamp() are the start of the transaction on the engine's clock, truncated to microseconds, the same in every statement of a transaction and in a DEFAULT, and later in a later transaction
 - `internal/sql/exec` `TestSession_Insert/applies_Postgres's_assignment_casts`: an INSERT applies the assignment casts Postgres has: a quoted literal as the column's type, numeric and float literals rounded into bigint, integers widened to double precision, and any value written into text
 - `internal/sql/exec` `TestSession_Select/accepts_a_WHERE_clause_only_when_its_outcome_is_the_same_in_every_order_Postgres_could_pick_on_the_rows_its_primary_key_index_selects`: a WHERE clause whose outcome on a row depends on the order Postgres evaluates its conditions in, including the equalities its equivalence classes imply, is ErrUnsupported, and so is a LIKE on a key column that can fail; the other conditions are evaluated only on the rows that the primary key conditions select, and every other WHERE clause fails exactly when Postgres fails in every order
@@ -611,13 +622,19 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 > Other clauses.
 
-- `internal/pgdiff` `TestUnsupported/UNS-CLAUSES_other_clauses_of_queries_and_writes`: DISTINCT ON, subqueries, set operations, FOR UPDATE, RETURNING, ON CONFLICT, INSERT ... SELECT, an alias in INSERT, UPDATE ... FROM, and DELETE ... USING are rejected, and Postgres accepts them
+- `internal/pgdiff` `TestUnsupported/UNS-CLAUSES_other_clauses_of_queries_and_writes`: DISTINCT ON, set operations, also in a subquery, FOR UPDATE, RETURNING, ON CONFLICT, INSERT ... SELECT, an alias in INSERT, UPDATE ... FROM, and DELETE ... USING are rejected, and Postgres accepts them
 
 ### `UNS-JOINS`
 
 > Other forms of FROM and of names.
 
-- `internal/pgdiff` `TestUnsupported/UNS-JOINS_other_forms_of_FROM_and_of_names`: RIGHT and FULL joins, LATERAL, an alias for a join or for the columns of USING, subqueries and functions in FROM, names with a schema, a reference to a whole row, and a repeated name in the names of a table's columns are rejected, and Postgres accepts them
+- `internal/pgdiff` `TestUnsupported/UNS-JOINS_other_forms_of_FROM_and_of_names`: RIGHT and FULL joins, LATERAL, an alias for a join or for the columns of USING, VALUES and functions in FROM, names with a schema, a reference to a whole row, and a repeated name in the names of a table's columns are rejected, and Postgres accepts them
+
+### `UNS-SUBQUERIES`
+
+> Other forms of subqueries and of WITH.
+
+- `internal/pgdiff` `TestUnsupported/UNS-SUBQUERIES_other_forms_of_subqueries_and_of_WITH`: ANY, SOME, and ALL, a row on the left of IN, WITH RECURSIVE, MATERIALIZED and NOT MATERIALIZED, a query that writes in WITH, WITH in front of INSERT, UPDATE, or DELETE, a subquery in FROM without an alias, an aggregate of the columns of a query around a subquery, t.* of a table of a query around, and a subquery in the list of an IN, in GROUP BY, or in LIMIT or OFFSET are rejected, and Postgres accepts them
 
 ### `UNS-AGGREGATES`
 
@@ -703,6 +720,13 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/pgdiff` `TestJoinPlans/rejects_a_join_whose_conditions_fail_on_a_row_or_pair_that_some_plan_evaluates_them_on,_and_accepts_it_otherwise`: a condition of a join that can fail, in WHERE or ON, on one table or several, is evaluated on every row and combination of rows that a plan of Postgres could evaluate it on, also on its sides alone and with NULLs for the right side of a LEFT JOIN, and the statement is rejected when it fails on any, while an output expression that fails is reported when every failing row fails with the same class
 - `internal/pgdiff` `TestUnsupported/UNS-PLAN-DEPENDENT-JOIN_a_condition_of_a_join_that_fails_on_a_row_that_some_plan_evaluates_it_on`: a SELECT on several tables with a condition that fails on a row or a combination of rows that a plan of Postgres could evaluate it on is rejected, because whether Postgres fails depends on its join plan, and Postgres accepts it when its plan does not evaluate the condition there
 
+### `UNS-PLAN-DEPENDENT-SUBQUERY`
+
+> A subquery whose evaluation fails where one plan evaluates it and another does not.
+
+- `internal/pgdiff` `TestSubqueryPlans/rejects_a_subquery_whose_evaluation_fails_where_some_plan_evaluates_it_and_another_does_not,_and_accepts_it_otherwise`: a subquery that can fail is evaluated on every row and in every place that a plan of Postgres could evaluate it, an uncorrelated one in a condition before any row, the conditions of a correlated EXISTS also without a row of the query around, and a subquery in FROM or a CTE before the statement reads any row, and the statement is rejected when the evaluation fails, while a scalar subquery with more than one row fails with 21000 where every plan evaluates it
+- `internal/pgdiff` `TestUnsupported/UNS-PLAN-DEPENDENT-SUBQUERY_a_subquery_that_fails_where_some_plan_evaluates_it_and_another_does_not`: a statement whose subquery fails on rows or in places that one plan of Postgres evaluates it on and another does not is rejected: an uncorrelated subquery in a condition, a correlated EXISTS whose conditions fail on rows that no row of the query around reaches, a correlated IN that can fail, a subquery in FROM or a CTE that fails, and a condition that can fail on their columns, and Postgres accepts the statement when its plan does not evaluate the subquery there
+
 ### `UNS-DISTINCT-ZERO`
 
 > DISTINCT, GROUP BY, MIN, and MAX of values that are equal but print differently.
@@ -761,6 +785,7 @@ Every mutant runs in every simulator configuration below, with seeds 1 to 20, un
 | `MUT-FK-NO-PARENT-CHECK` no check or action on the referencing rows | 2 of 8 configurations | 1 | foreign key |
 | `MUT-FK-OWN-WRITES` foreign key lookups that miss the statement's own writes | 2 of 8 configurations | 1 | foreign key |
 | `MUT-CHECK-SKIP-UPDATE` CHECK on INSERT only | 2 of 8 configurations | 1 | check constraint |
+| `MUT-SUBQUERY-STALE-READS` subquery reads that a retry does not repeat | 2 of 2 configurations | 1 | durability |
 | `MUT-UPDATE-SEES-OWN-WRITES` an UPDATE that revisits the rows it wrote | 0 of 8 configurations | none |  |
 
 ### `MUT-COMMIT-WITHOUT-CAS`
@@ -798,7 +823,7 @@ Targeted tests:
 | bank through the engine, no maintainers | cannot detect: without maintainers nothing is ever deleted, so no reader can lose an object |
 | bank through the engine, 2 maintainers | detected with seed 2 by grace period |
 | list-append through SQL, no maintainers | cannot detect: without maintainers nothing is ever deleted, so no reader can lose an object |
-| list-append through SQL, 2 maintainers | detected with seed 2 by grace period, final read, list-append |
+| list-append through SQL, 2 maintainers | detected with seed 1 by grace period |
 | bank through SQL, no maintainers | cannot detect: without maintainers nothing is ever deleted, so no reader can lose an object |
 | bank through SQL, 2 maintainers | detected with seed 2 by grace period |
 | unique through SQL, no maintainers | cannot detect: without maintainers nothing is ever deleted, so no reader can lose an object |
@@ -1066,6 +1091,29 @@ Targeted tests:
 | unique through SQL, 2 maintainers | cannot detect: the workload has no CHECK constraints |
 | foreign-key through SQL, no maintainers | detected with seed 5 by check constraint |
 | foreign-key through SQL, 2 maintainers | detected with seed 1 by check constraint |
+
+### `MUT-SUBQUERY-STALE-READS`
+
+`exec.Mutations.SubqueryStaleAcrossRetries` keeps the results of the uncorrelated subqueries of an autocommit statement when it retries after a conflict, so that the retry writes what a subquery read in the snapshot whose commit lost, outside of the conflict check of the commit that succeeds.
+
+| Configuration | Result |
+|---|---|
+| list-append through the engine, no maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
+| list-append through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
+| bank through the engine, no maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
+| bank through the engine, 2 maintainers | not applicable: the mutant is in the SQL layer, which the engine workloads do not use |
+| list-append through SQL, no maintainers | detected with seed 3 by durability |
+| list-append through SQL, 2 maintainers | detected with seed 1 by durability |
+| bank through SQL, no maintainers | not applicable: only the list-append workload writes with a subquery, an append to a packed list that reads the list in a subquery |
+| bank through SQL, 2 maintainers | not applicable: only the list-append workload writes with a subquery, an append to a packed list that reads the list in a subquery |
+| unique through SQL, no maintainers | not applicable: only the list-append workload writes with a subquery, an append to a packed list that reads the list in a subquery |
+| unique through SQL, 2 maintainers | not applicable: only the list-append workload writes with a subquery, an append to a packed list that reads the list in a subquery |
+| foreign-key through SQL, no maintainers | not applicable: only the list-append workload writes with a subquery, an append to a packed list that reads the list in a subquery |
+| foreign-key through SQL, 2 maintainers | not applicable: only the list-append workload writes with a subquery, an append to a packed list that reads the list in a subquery |
+
+Targeted tests:
+
+- `internal/sql/exec` `TestMutations/SubqueryStaleAcrossRetries_makes_a_retried_autocommit_statement_write_what_its_subquery_read_before_the_conflict`: an autocommit statement that retries after a conflict evaluates its subqueries again in the new snapshot, and with the mutant it reuses the results of the conflicted attempt, which loses the concurrent write
 
 ### `MUT-UPDATE-SEES-OWN-WRITES`
 

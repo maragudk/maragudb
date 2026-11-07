@@ -1068,6 +1068,34 @@ func TestMutations(t *testing.T) {
 		is.Equal(t, "101\n102\n103", query(t, s, "SELECT id FROM h"), "the mutant moves every row until it leaves the range")
 	})
 
+	t.Run("SubqueryStaleAcrossRetries makes a retried autocommit statement write what its subquery read before the conflict", func(t *testing.T) {
+		verify.Covers(t, "an autocommit statement that retries after a conflict evaluates its subqueries again in the new snapshot, and with the mutant it reuses the results of the conflicted attempt, which loses the concurrent write", "MUT-SUBQUERY-STALE-READS", "INV-STRICT-SERIALIZABLE")
+		for _, mutated := range []bool{false, true} {
+			w := newWorld(t)
+			a, _ := w.session(exec.Options{Mutations: exec.Mutations{SubqueryStaleAcrossRetries: mutated}})
+			b, _ := w.session(exec.Options{})
+			mustExec(t, a, "CREATE TABLE t (id bigint PRIMARY KEY, n bigint)")
+			mustExec(t, a, "INSERT INTO t VALUES (1, 0)")
+			// b commits between a's read and a's manifest write, so a retries its statement.
+			interfered := false
+			w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
+				if kind == s3.KindPutConditional && strings.HasSuffix(key, "manifest") && !interfered {
+					interfered = true
+					w.decide = nil
+					mustExec(t, b, "UPDATE t SET n = n + 100")
+				}
+				return s3fake.OutcomeNormal
+			}
+			mustExec(t, a, "UPDATE t SET n = (SELECT x.n FROM t AS x WHERE x.id = 1) + 1")
+			is.True(t, interfered)
+			want := "101"
+			if mutated {
+				want = "1"
+			}
+			is.Equal(t, want, query(t, b, "SELECT n FROM t"))
+		}
+	})
+
 	t.Run("FreshSnapshotPerStatement lets a transaction see a commit made after it began", func(t *testing.T) {
 		verify.Covers(t, "with the mutant, a transaction sees a commit made after it began", "MUT-FRESH-SNAPSHOT")
 		for _, mutated := range []bool{false, true} {

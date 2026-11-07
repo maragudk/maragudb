@@ -146,11 +146,9 @@
         {
           "cell": "list-append through SQL, 2 maintainers",
           "status": "detected",
-          "seed": 2,
+          "seed": 1,
           "checkers": [
-            "grace period",
-            "final read",
-            "list-append"
+            "grace period"
           ]
         },
         {
@@ -1159,6 +1157,80 @@
           "checkers": [
             "check constraint"
           ]
+        }
+      ]
+    },
+    {
+      "id": "MUT-SUBQUERY-STALE-READS",
+      "name": "subquery reads that a retry does not repeat",
+      "replay": "subquery-stale-reads",
+      "description": "`exec.Mutations.SubqueryStaleAcrossRetries` keeps the results of the uncorrelated subqueries of an autocommit statement when it retries after a conflict, so that the retry writes what a subquery read in the snapshot whose commit lost, outside of the conflict check of the commit that succeeds.",
+      "results": [
+        {
+          "cell": "list-append through the engine, no maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "list-append through the engine, 2 maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "bank through the engine, no maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "bank through the engine, 2 maintainers",
+          "status": "not applicable",
+          "reason": "the mutant is in the SQL layer, which the engine workloads do not use"
+        },
+        {
+          "cell": "list-append through SQL, no maintainers",
+          "status": "detected",
+          "seed": 3,
+          "checkers": [
+            "durability"
+          ]
+        },
+        {
+          "cell": "list-append through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "durability"
+          ]
+        },
+        {
+          "cell": "bank through SQL, no maintainers",
+          "status": "not applicable",
+          "reason": "only the list-append workload writes with a subquery, an append to a packed list that reads the list in a subquery"
+        },
+        {
+          "cell": "bank through SQL, 2 maintainers",
+          "status": "not applicable",
+          "reason": "only the list-append workload writes with a subquery, an append to a packed list that reads the list in a subquery"
+        },
+        {
+          "cell": "unique through SQL, no maintainers",
+          "status": "not applicable",
+          "reason": "only the list-append workload writes with a subquery, an append to a packed list that reads the list in a subquery"
+        },
+        {
+          "cell": "unique through SQL, 2 maintainers",
+          "status": "not applicable",
+          "reason": "only the list-append workload writes with a subquery, an append to a packed list that reads the list in a subquery"
+        },
+        {
+          "cell": "foreign-key through SQL, no maintainers",
+          "status": "not applicable",
+          "reason": "only the list-append workload writes with a subquery, an append to a packed list that reads the list in a subquery"
+        },
+        {
+          "cell": "foreign-key through SQL, 2 maintainers",
+          "status": "not applicable",
+          "reason": "only the list-append workload writes with a subquery, an append to a packed list that reads the list in a subquery"
         }
       ]
     },

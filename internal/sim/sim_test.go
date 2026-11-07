@@ -610,6 +610,10 @@ type mutant struct {
 	// checkers that must each detect the mutant in at least one cell, so that the checker meant
 	// to catch it keeps doing so.
 	checkers []string
+	// workloads, when set, are the only workloads that run the code the mutant breaks, and the
+	// cells of the others do not apply, for the reason only.
+	workloads []sim.Workload
+	only      string
 }
 
 // cell of the kill matrix: a workload, through an API, with a number of maintainers.
@@ -805,6 +809,14 @@ func mutants() []mutant {
 			checkers:     []string{sim.CheckerCheck},
 		},
 		{
+			id: "MUT-SUBQUERY-STALE-READS", replay: "subquery-stale-reads", name: "subquery reads that a retry does not repeat",
+			description:  "`exec.Mutations.SubqueryStaleAcrossRetries` keeps the results of the uncorrelated subqueries of an autocommit statement when it retries after a conflict, so that the retry writes what a subquery read in the snapshot whose commit lost, outside of the conflict check of the commit that succeeds.",
+			sqlMutations: exec.Mutations{SubqueryStaleAcrossRetries: true},
+			workloads:    []sim.Workload{sim.ListAppend},
+			only:         "only the list-append workload writes with a subquery, an append to a packed list that reads the list in a subquery",
+			checkers:     []string{sim.CheckerDurability},
+		},
+		{
 			id: "MUT-UPDATE-SEES-OWN-WRITES", replay: "update-sees-own-writes", name: "an UPDATE that revisits the rows it wrote",
 			description:  "`exec.Mutations.UpdateSeesOwnWrites` restarts an UPDATE's scan after every row it writes, the Halloween problem. It only shows when an UPDATE moves rows to keys it has not visited yet.",
 			sqlMutations: exec.Mutations{UpdateSeesOwnWrites: true},
@@ -822,9 +834,16 @@ func mutants() []mutant {
 	}
 }
 
-// applicable reports whether the mutant can run in the cell: a mutant in the SQL layer needs SQL.
-func (m mutant) applicable(c cell) bool {
-	return c.sql || m.sqlMutations == (exec.Mutations{})
+// applicable reports whether the mutant can run in the cell, and why not: a mutant in the SQL
+// layer needs SQL, and one of code that only some workloads run needs one of them.
+func (m mutant) applicable(c cell) (bool, string) {
+	if !c.sql && m.sqlMutations != (exec.Mutations{}) {
+		return false, sqlOnly
+	}
+	if len(m.workloads) > 0 && !slices.Contains(m.workloads, c.workload) {
+		return false, m.only
+	}
+	return true, ""
 }
 
 var update = flag.Bool("update", false, "write the kill matrix to "+verify.KillMatrixPath)
@@ -931,9 +950,9 @@ func TestMutants(t *testing.T) {
 			var wg sync.WaitGroup
 			for j, c := range cs {
 				results[j] = verify.KillMatrixResult{Cell: c.String(), Status: verify.Undetected}
-				if !m.applicable(c) {
+				if ok, reason := m.applicable(c); !ok {
 					results[j].Status = verify.NotApplicable
-					results[j].Reason = sqlOnly
+					results[j].Reason = reason
 					continue
 				}
 				wg.Go(func() {

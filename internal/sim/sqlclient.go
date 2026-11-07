@@ -332,9 +332,14 @@ func (c *client) listAppendSQL(ctx context.Context) {
 		h = history.Tx{Client: c.id, Invoke: c.run.stamp()}
 		value := c.value()
 		var res sql.Result
-		if PackedList(k) {
+		switch {
+		case PackedList(k) && value%2 == 0:
+			// The same append, with the list read by a subquery, whose read the commit must
+			// check like any other: a retry after a conflict must read the list again.
+			res, err = c.sql.ExecContext(ctx, "UPDATE packed SET vals = (SELECT p.vals FROM packed AS p WHERE p.k = $2) || $1 WHERE k = $2", EncodePacked([]int64{value}), k)
+		case PackedList(k):
 			res, err = c.sql.ExecContext(ctx, "UPDATE packed SET vals = vals || $1 WHERE k = $2", EncodePacked([]int64{value}), k)
-		} else {
+		default:
 			res, err = c.sql.ExecContext(ctx, "INSERT INTO lists VALUES ($1, $2, $3)", k, len(list), value)
 		}
 		if err == nil {
