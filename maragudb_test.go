@@ -1,6 +1,7 @@
 package maragudb_test
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"database/sql/driver"
@@ -8,11 +9,14 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"math/rand/v2"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -670,6 +674,42 @@ func TestDiskCacheHelperProcess(t *testing.T) {
 	}
 }
 
+// lockedBuffer is a log that a goroutine writes while a test reads it.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// panics are the records of a JSON log at the error level of the panics that maintenance
+// recovered.
+func (b *lockedBuffer) panics(t *testing.T) []map[string]any {
+	t.Helper()
+	var records []map[string]any
+	for line := range strings.SplitSeq(strings.TrimSpace(b.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var r map[string]any
+		is.NotError(t, json.Unmarshal([]byte(line), &r))
+		if r["level"] == "ERROR" && strings.Contains(fmt.Sprint(r["msg"]), "recovered a panic in a maintenance step") {
+			records = append(records, r)
+		}
+	}
+	return records
+}
+
 func TestMaintenance(t *testing.T) {
 	t.Parallel()
 
@@ -813,6 +853,77 @@ func TestMaintenance(t *testing.T) {
 			s, err = maragudb.Stats(t.Context(), db)
 			is.NotError(t, err)
 			is.Equal(t, int64(0), s.Requests.Sub(before).Total(), "nothing to do within the grace period")
+		})
+	})
+
+	t.Run("survives a panic of the store in the middle of a compaction: the database keeps answering, the log has the panic with its stack, maintenance backs off and then compacts once the panic stops, and closing the database while it backs off stops it at once", func(t *testing.T) {
+		verify.Covers(t, "through the public driver, a panic of the store in the middle of a background compaction leaves the process running and the database answering reads and writes, Options.Logger gets the panic with its stack at the error level once, maintenance does nothing for the backoff and compacts after it once the panic stopped, and closing the database while maintenance backs off returns without waiting and stops the goroutine", "INV-MAINTENANCE-PANIC")
+		synctest.Test(t, func(t *testing.T) {
+			w := newWorld(t)
+			var armed atomic.Bool
+			w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
+				if armed.Load() && kind == s3.KindPut && strings.HasPrefix(key, "app/seg/") {
+					panic("the store panics")
+				}
+				return s3fake.OutcomeNormal
+			}
+			var log lockedBuffer
+			interval := time.Second
+			db := w.open(maragudb.Options{Maintenance: new(true), MaintenanceInterval: &interval, CompactionFanIn: new(4), Logger: slog.New(slog.NewJSONHandler(&log, nil))})
+			stats := func() maragudb.Statistics {
+				s, err := maragudb.Stats(t.Context(), db)
+				is.NotError(t, err)
+				return s
+			}
+			// waitForPanics until the log has n of them, and returns their records.
+			waitForPanics := func(n int) []map[string]any {
+				for range 30 {
+					if records := log.panics(t); len(records) >= n {
+						return records
+					}
+					time.Sleep(interval)
+				}
+				t.Fatalf("maintenance did not panic %d times", n)
+				return nil
+			}
+			mustExec(t, db, "CREATE TABLE t (id bigint PRIMARY KEY)")
+			for i := range 3 {
+				mustExec(t, db, "INSERT INTO t VALUES ($1)", i)
+			}
+
+			// The store panics on the write of the merged segment, after the merge read its blocks.
+			armed.Store(true)
+			records := waitForPanics(1)
+			is.Equal(t, 1, len(records))
+			is.Equal(t, "the store panics", records[0]["panic"])
+			is.True(t, strings.Contains(fmt.Sprint(records[0]["stack"]), "engine.(*DB).mergeSegments"), fmt.Sprint(records[0]["stack"]))
+			is.Equal(t, "0\n1\n2", queryRows(t, db, "SELECT id FROM t ORDER BY id"))
+			armed.Store(false)
+			mustExec(t, db, "INSERT INTO t VALUES (3)")
+
+			// For the backoff of 10 seconds, maintenance does nothing, though it is due.
+			time.Sleep(8 * interval)
+			s := stats()
+			is.Equal(t, 5, s.Segments)
+			is.Equal(t, int64(0), s.MaintenanceRuns)
+			time.Sleep(4 * interval)
+			s = stats()
+			is.True(t, s.Segments < 5, fmt.Sprint(s.Segments, " segments"))
+			is.Equal(t, int64(1), s.MaintenanceRuns)
+			is.Equal(t, "0\n1\n2\n3", queryRows(t, db, "SELECT id FROM t ORDER BY id"))
+			is.Equal(t, 1, len(log.panics(t)), "a panic is logged once")
+			is.True(t, !strings.Contains(log.String(), "background maintenance failed"), log.String())
+
+			// Closing the database while maintenance backs off returns without waiting.
+			for i := range 4 {
+				mustExec(t, db, "INSERT INTO t VALUES ($1)", 4+i)
+			}
+			armed.Store(true)
+			waitForPanics(2)
+			armed.Store(false)
+			start := time.Now()
+			is.NotError(t, db.Close())
+			is.Equal(t, time.Duration(0), time.Since(start))
 		})
 	})
 

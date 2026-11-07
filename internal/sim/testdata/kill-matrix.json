@@ -2390,6 +2390,110 @@
           ]
         }
       ]
+    },
+    {
+      "id": "MUT-MAINTENANCE-UNRECOVERED",
+      "name": "a maintenance step that does not recover a panic",
+      "replay": "maintenance-unrecovered",
+      "description": "`engine.Mutations.MaintenanceUnrecovered` lets a panic unwind out of a maintenance step instead of recovering it, which in the driver's background goroutine ends the process. It runs with `engine.Mutations.MaintenancePanics`, which makes one in three maintenance steps that get to work panic in the middle of a compaction or a GC pass, and with the clients' maintenance coordinated by the lease, so that the panic reaches the client's task, which fails the run.",
+      "results": [
+        {
+          "cell": "list-append through the engine, no maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "panic"
+          ]
+        },
+        {
+          "cell": "list-append through the engine, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "panic"
+          ]
+        },
+        {
+          "cell": "bank through the engine, no maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "panic"
+          ]
+        },
+        {
+          "cell": "bank through the engine, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "panic"
+          ]
+        },
+        {
+          "cell": "list-append through SQL, no maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "panic"
+          ]
+        },
+        {
+          "cell": "list-append through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "panic"
+          ]
+        },
+        {
+          "cell": "bank through SQL, no maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "panic"
+          ]
+        },
+        {
+          "cell": "bank through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "panic"
+          ]
+        },
+        {
+          "cell": "unique through SQL, no maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "panic"
+          ]
+        },
+        {
+          "cell": "unique through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 1,
+          "checkers": [
+            "panic"
+          ]
+        },
+        {
+          "cell": "foreign-key through SQL, no maintainers",
+          "status": "detected",
+          "seed": 3,
+          "checkers": [
+            "panic"
+          ]
+        },
+        {
+          "cell": "foreign-key through SQL, 2 maintainers",
+          "status": "detected",
+          "seed": 2,
+          "checkers": [
+            "panic"
+          ]
+        }
+      ]
     }
   ]
 }

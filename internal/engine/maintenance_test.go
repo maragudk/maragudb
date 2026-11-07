@@ -1,8 +1,11 @@
 package engine_test
 
 import (
+	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"math"
 	"math/rand/v2"
 	"slices"
@@ -267,6 +270,346 @@ func TestMaintainer_Step(t *testing.T) {
 			}
 			is.Equal(t, 1, db.Stats().Segments)
 		}
+	})
+}
+
+// logRecords of a JSON log, one map per record.
+func logRecords(t *testing.T, buf *bytes.Buffer) []map[string]any {
+	t.Helper()
+	var records []map[string]any
+	for line := range strings.SplitSeq(strings.TrimSpace(buf.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var r map[string]any
+		is.NotError(t, json.Unmarshal([]byte(line), &r))
+		records = append(records, r)
+	}
+	return records
+}
+
+// number of a JSON log record's value, or zero for one that is no number.
+func number(v any) float64 {
+	f, _ := v.(float64)
+	return f
+}
+
+// panicRecords of a JSON log: the records at the error level of the panics that maintenance
+// recovered.
+func panicRecords(t *testing.T, buf *bytes.Buffer) []map[string]any {
+	t.Helper()
+	var records []map[string]any
+	for _, r := range logRecords(t, buf) {
+		if r["level"] == "ERROR" && strings.Contains(fmt.Sprint(r["msg"]), "recovered a panic in a maintenance step") {
+			records = append(records, r)
+		}
+	}
+	return records
+}
+
+func TestMaintainer_Panics(t *testing.T) {
+	t.Parallel()
+
+	grace := 10 * time.Minute
+
+	t.Run("recovers a panic in the middle of a compaction, logs it with its stack, backs off with a doubling wait up to the cap while reads and writes go on, and compacts once the panic stops", func(t *testing.T) {
+		verify.Covers(t, "a maintenance step recovers a panic of the store in the middle of a compaction, logs its value and stack at the error level, does nothing until a backoff that doubles up to its cap has passed, keeps reads and writes working, and compacts once the panic stops, with every value kept", "INV-MAINTENANCE-PANIC")
+		w := newWorld(t)
+		var buf bytes.Buffer
+		db := w.open(1, engine.Options{GCGracePeriod: &grace, Logger: slog.New(slog.NewJSONHandler(&buf, nil))})
+		var panics []string
+		m := db.NewMaintainer(engine.MaintenanceOptions{Tiers: engine.Tiers{FanIn: 4, FullRatio: 100}, PanicBackoff: 10 * time.Second, MaxPanicBackoff: 40 * time.Second, OnPanic: func(value any, stack []byte) {
+			panics = append(panics, fmt.Sprint(value))
+			is.True(t, strings.Contains(string(stack), "mergeSegments"), string(stack))
+		}})
+		for i := range 4 {
+			put(t, db, fmt.Sprint("k", i), "v")
+		}
+		// The store panics on the write of the merged segment, after the merge read every block.
+		armed := true
+		w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
+			if armed && kind == s3.KindPut && strings.HasPrefix(key, "db/seg/") {
+				panic("the store panics")
+			}
+			return s3fake.OutcomeNormal
+		}
+		res, err := m.Step(t.Context())
+		is.Error(t, engine.ErrPanicked, err)
+		is.True(t, strings.Contains(err.Error(), "panic: the store panics"), err.Error())
+		is.True(t, res.Attempted && !res.Ran, fmt.Sprint(res))
+		is.True(t, !m.Holds(), "the maintainer forgets the lease")
+		is.EqualSlice(t, []string{"the store panics"}, panics)
+		records := panicRecords(t, &buf)
+		is.Equal(t, 1, len(records))
+		is.Equal(t, "the store panics", records[0]["panic"])
+		is.True(t, strings.Contains(fmt.Sprint(records[0]["stack"]), "engine.(*DB).mergeSegments"), fmt.Sprint(records[0]["stack"]))
+		is.Equal(t, float64(1), number(records[0]["panics"]))
+		is.Equal(t, float64(10*time.Second), number(records[0]["backoff"]))
+
+		// While maintenance backs off, reads and writes work, and a step does nothing.
+		armed = false
+		for i := range 4 {
+			v, ok := get(t, db, fmt.Sprint("k", i))
+			is.True(t, ok)
+			is.Equal(t, "v", v)
+		}
+		put(t, db, "k4", "v")
+		before := db.Stats().S3
+		res, err = m.Step(t.Context())
+		is.NotError(t, err)
+		is.Equal(t, engine.StepResult{BackingOff: true}, res)
+		is.Equal(t, int64(0), db.Stats().S3.Sub(before).Total(), "a step that backs off makes no requests")
+		is.Equal(t, 5, db.Stats().Segments)
+
+		// A panic that repeats doubles the backoff up to the cap.
+		armed = true
+		for _, backoff := range []time.Duration{10 * time.Second, 20 * time.Second, 40 * time.Second} {
+			w.clock.Sleep(t.Context(), backoff-time.Millisecond)
+			res, err := m.Step(t.Context())
+			is.NotError(t, err)
+			is.True(t, res.BackingOff, fmt.Sprint(res))
+			w.clock.Sleep(t.Context(), time.Millisecond)
+			_, err = m.Step(t.Context())
+			is.Error(t, engine.ErrPanicked, err)
+		}
+		records = panicRecords(t, &buf)
+		is.Equal(t, 4, len(panics))
+		is.Equal(t, 4, len(records))
+		for i, backoff := range []time.Duration{10 * time.Second, 20 * time.Second, 40 * time.Second, 40 * time.Second} {
+			is.Equal(t, float64(i+1), number(records[i]["panics"]))
+			is.Equal(t, float64(backoff), number(records[i]["backoff"]))
+		}
+
+		// Once the panic stops, the step after the backoff compacts, and nothing is lost.
+		armed = false
+		w.clock.Sleep(t.Context(), 40*time.Second-time.Millisecond)
+		res, err = m.Step(t.Context())
+		is.NotError(t, err)
+		is.True(t, res.BackingOff, "the backoff lasts to its end")
+		w.clock.Sleep(t.Context(), time.Millisecond)
+		res, err = m.Step(t.Context())
+		is.NotError(t, err)
+		is.True(t, res.Compacted, fmt.Sprint(res))
+		is.Equal(t, 1, db.Stats().Segments)
+		for i := range 5 {
+			v, ok := get(t, db, fmt.Sprint("k", i))
+			is.True(t, ok)
+			is.Equal(t, "v", v)
+		}
+
+		// A step that got to work without a panic starts the backoff over.
+		for i := range 4 {
+			put(t, db, fmt.Sprint("k", i), "w")
+		}
+		armed = true
+		_, err = m.Step(t.Context())
+		is.Error(t, engine.ErrPanicked, err)
+		records = panicRecords(t, &buf)
+		is.Equal(t, float64(1), number(records[len(records)-1]["panics"]))
+		is.Equal(t, float64(10*time.Second), number(records[len(records)-1]["backoff"]))
+	})
+
+	t.Run("a step that fails without a panic between two panics keeps doubling the backoff, and a panic after the step's work counts its run once", func(t *testing.T) {
+		w := newWorld(t)
+		var buf bytes.Buffer
+		db := w.open(1, engine.Options{GCGracePeriod: &grace, Logger: slog.New(slog.NewJSONHandler(&buf, nil))})
+		m := db.NewMaintainer(engine.MaintenanceOptions{Tiers: engine.Tiers{FanIn: 2, FullRatio: 100}})
+		put(t, db, "k0", "v")
+		put(t, db, "k1", "v")
+		fail := ""
+		w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
+			switch {
+			case fail == "panic" && kind == s3.KindPut && strings.HasPrefix(key, "db/seg/"):
+				panic("the store panics")
+			case fail == "error" && kind == s3.KindGetConditional && key == "db/manifest":
+				return s3fake.OutcomeError
+			}
+			return s3fake.OutcomeNormal
+		}
+		fail = "panic"
+		_, err := m.Step(t.Context())
+		is.Error(t, engine.ErrPanicked, err)
+		w.clock.Sleep(t.Context(), 10*time.Second)
+		fail = "error"
+		res, err := m.Step(t.Context())
+		is.True(t, err != nil && !errors.Is(err, engine.ErrPanicked), fmt.Sprint(err))
+		is.True(t, res.Attempted)
+		fail = "panic"
+		_, err = m.Step(t.Context())
+		is.Error(t, engine.ErrPanicked, err)
+		records := panicRecords(t, &buf)
+		is.Equal(t, 2, len(records))
+		is.Equal(t, float64(20*time.Second), number(records[1]["backoff"]), "the failed step did not end the row")
+
+		// The lease's release, after the compaction landed, panics.
+		fail = ""
+		w.clock.Sleep(t.Context(), 20*time.Second)
+		leaseWrites := 0
+		w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
+			if kind == s3.KindPutConditional && key == "db/maintenance-lease" {
+				if leaseWrites++; leaseWrites == 2 {
+					panic("the store panics on the release")
+				}
+			}
+			return s3fake.OutcomeNormal
+		}
+		res, err = m.Step(t.Context())
+		is.Error(t, engine.ErrPanicked, err)
+		is.True(t, res.Compacted && res.Ran, fmt.Sprint(res))
+		is.Equal(t, int64(1), db.Stats().MaintenanceRuns)
+	})
+
+	t.Run("keeps the backoff at its cap of 10 minutes by default, however many panics there are in a row", func(t *testing.T) {
+		w := newWorld(t)
+		var buf bytes.Buffer
+		db := w.open(1, engine.Options{GCGracePeriod: &grace, Logger: slog.New(slog.NewJSONHandler(&buf, nil))})
+		m := db.NewMaintainer(engine.MaintenanceOptions{Tiers: engine.Tiers{FanIn: 2}})
+		put(t, db, "k0", "v")
+		put(t, db, "k1", "v")
+		w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
+			if kind == s3.KindPut && strings.HasPrefix(key, "db/seg/") {
+				panic("the store panics")
+			}
+			return s3fake.OutcomeNormal
+		}
+		for range 70 {
+			_, err := m.Step(t.Context())
+			is.Error(t, engine.ErrPanicked, err)
+			w.clock.Sleep(t.Context(), 10*time.Minute)
+		}
+		records := panicRecords(t, &buf)
+		is.Equal(t, 70, len(records))
+		for i, r := range records {
+			want := min(10*time.Second<<min(i, 10), 10*time.Minute)
+			is.Equal(t, float64(want), number(r["backoff"]), fmt.Sprint("panic ", i+1))
+		}
+	})
+
+	t.Run("a panic between the segment write and the manifest write of a compaction, and one in the middle of garbage collection, lose nothing, and garbage collection then deletes everything they left behind", func(t *testing.T) {
+		verify.Covers(t, "a maintenance step that panics after the write of its merged segment, or after garbage collection deleted some garbage, leaves every value readable, and later steps collect everything the panicked steps left behind", "INV-MAINTENANCE-PANIC")
+		w := newWorld(t)
+		db := w.open(1, engine.Options{GCGracePeriod: &grace})
+		backoff := time.Second
+		m := db.NewMaintainer(engine.MaintenanceOptions{Tiers: engine.Tiers{FanIn: 4, FullRatio: 100}, PanicBackoff: backoff, MaxPanicBackoff: backoff})
+		for i := range 4 {
+			put(t, db, fmt.Sprint("k", i), fmt.Sprint(i))
+		}
+		check := func() {
+			t.Helper()
+			for i := range 4 {
+				v, ok := get(t, db, fmt.Sprint("k", i))
+				is.True(t, ok)
+				is.Equal(t, fmt.Sprint(i), v)
+			}
+		}
+		w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
+			if kind == s3.KindPutConditional && key == "db/manifest" {
+				panic("the store panics on the manifest write")
+			}
+			return s3fake.OutcomeNormal
+		}
+		_, err := m.Step(t.Context())
+		is.Error(t, engine.ErrPanicked, err)
+		w.decide = nil
+		check()
+		is.Equal(t, 4, db.Stats().Segments, "the compaction did not land")
+		orphans := 0
+		for _, key := range w.fake.Keys() {
+			if strings.HasPrefix(key, "db/seg/") && !slices.Contains(segmentKeys(t, w), key) {
+				orphans++
+			}
+		}
+		is.Equal(t, 1, orphans, "the merged segment is in the store, and the manifest does not reference it")
+
+		w.clock.Sleep(t.Context(), backoff)
+		res, err := m.Step(t.Context())
+		is.NotError(t, err)
+		is.True(t, res.Compacted)
+		check()
+
+		// After the grace period, garbage collection panics after its first delete.
+		w.clock.Sleep(t.Context(), grace)
+		deletes := 0
+		w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
+			if kind == s3.KindDelete {
+				if deletes++; deletes == 2 {
+					panic("the store panics on the second delete")
+				}
+			}
+			return s3fake.OutcomeNormal
+		}
+		_, err = m.Step(t.Context())
+		is.Error(t, engine.ErrPanicked, err)
+		w.decide = nil
+		check()
+
+		// Later steps finish the work: the store keeps only the manifest, the lease, and the
+		// live segment.
+		for range 4 {
+			w.clock.Sleep(t.Context(), grace)
+			_, err := m.Step(t.Context())
+			is.NotError(t, err)
+		}
+		check()
+		live := segmentKeys(t, w)
+		is.Equal(t, 1, len(live))
+		is.EqualSlice(t, []string{"db/maintenance-lease", "db/manifest", live[0]}, slices.Sorted(slices.Values(w.fake.Keys())))
+	})
+
+	t.Run("with MaintenancePanics, some steps panic with ErrInjectedPanic at points the random source picks, and the others make progress", func(t *testing.T) {
+		w := newWorld(t)
+		db := w.open(1, engine.Options{GCGracePeriod: &grace, Mutations: engine.Mutations{MaintenancePanics: true}})
+		var injected, inCompaction, inGC int
+		m := db.NewMaintainer(engine.MaintenanceOptions{Tiers: engine.Tiers{FanIn: 2}, PanicBackoff: time.Second, MaxPanicBackoff: time.Second, OnPanic: func(value any, stack []byte) {
+			is.Equal(t, engine.ErrInjectedPanic, value.(error))
+			injected++
+			switch {
+			case strings.Contains(string(stack), "engine.(*DB).compact("):
+				inCompaction++
+			case strings.Contains(string(stack), "engine.(*DB).gc("):
+				inGC++
+			}
+		}})
+		compactions := 0
+		for i := range 40 {
+			put(t, db, fmt.Sprint("k", i%5), fmt.Sprint(i))
+			w.clock.Sleep(t.Context(), time.Second)
+			res, err := m.Step(t.Context())
+			if err != nil {
+				is.Error(t, engine.ErrPanicked, err)
+			}
+			if res.Compacted && err == nil {
+				compactions++
+			}
+		}
+		is.True(t, injected >= 5, fmt.Sprint(injected, " panics"))
+		is.True(t, inCompaction > 0 && inGC > 0, fmt.Sprint(inCompaction, " panics in compactions and ", inGC, " in GC passes"))
+		is.True(t, compactions >= 5, fmt.Sprint(compactions, " compactions"))
+		for k := range 5 {
+			v, ok := get(t, db, fmt.Sprint("k", k))
+			is.True(t, ok)
+			is.Equal(t, fmt.Sprint(35+k), v)
+		}
+	})
+
+	t.Run("with MaintenanceUnrecovered, a panic unwinds out of the step", func(t *testing.T) {
+		w := newWorld(t)
+		db := w.open(1, engine.Options{GCGracePeriod: &grace, Mutations: engine.Mutations{MaintenanceUnrecovered: true}})
+		m := db.NewMaintainer(engine.MaintenanceOptions{Tiers: engine.Tiers{FanIn: 2}})
+		put(t, db, "k0", "v")
+		put(t, db, "k1", "v")
+		w.decide = func(kind s3.Kind, key string) s3fake.Outcome {
+			if kind == s3.KindPut && strings.HasPrefix(key, "db/seg/") {
+				panic("the store panics")
+			}
+			return s3fake.OutcomeNormal
+		}
+		var p any
+		func() {
+			defer func() { p = recover() }()
+			_, _ = m.Step(t.Context())
+		}()
+		is.Equal(t, "the store panics", p)
 	})
 }
 

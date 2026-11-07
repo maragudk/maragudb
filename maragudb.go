@@ -44,7 +44,10 @@
 //
 // A panic inside the driver is a bug in maragudb, or in [Options.Store]. The driver recovers it, so that it never
 // unwinds through database/sql, and the call fails with [ErrInternal]; the connection is
-// discarded, and a transaction in which a call panicked never commits.
+// discarded, and a transaction in which a call panicked never commits. A panic in background
+// maintenance does not end the process either: the maintenance step recovers it and logs it, and
+// maintenance tries again after a wait that doubles with each panic in a row, as
+// [Options.Maintenance] describes.
 package maragudb
 
 import (
@@ -208,6 +211,15 @@ type Options struct {
 	// has, so an idle process makes no requests. Closing the sql.DB stops the loop, waits for
 	// a running step to stop, and releases the lease, which is one write to the store. With it
 	// off, call [Compact] and [GC] now and then instead.
+	//
+	// A panic in a maintenance step is a bug in maragudb or in [Options.Store]. The step recovers
+	// it, and Logger gets the panic's value and stack at the error level. Maintenance then does
+	// no work for 10 seconds, a wait that doubles with each further panic in a row up to 10
+	// minutes, and starts over after a step that gets to work and finishes without an error.
+	// Reads and writes keep working, and the store stays correct wherever the step stopped,
+	// because compaction lands only with a conditional manifest write, and garbage collection
+	// deletes what a stopped step left behind. Closing the sql.DB stops the loop at once, also
+	// during the wait.
 	Maintenance *bool
 	// MaintenanceInterval is the time between two checks for maintenance work, with a jitter of
 	// half the interval either way. Defaults to 10 seconds.

@@ -223,7 +223,12 @@ type Stats struct {
 	// and LeaseLosses count the lease handovers.
 	MaintenanceSteps, MaintenanceAttempts, MaintenanceRuns, MergesStarted int
 	LeaseAcquisitions, LeaseLosses                                        int
-	Elapsed                                                               time.Duration
+	// MaintenancePanics counts the panics that [engine.Mutations.MaintenancePanics] injected
+	// into the clients' maintenance steps and that the steps recovered, MaintenanceBackoffs the
+	// steps that did nothing because they backed off after one, and MaintenanceResumed the
+	// maintainers that changed the database again after one.
+	MaintenancePanics, MaintenanceBackoffs, MaintenanceResumed int
+	Elapsed                                                    time.Duration
 }
 
 // Add the counts of o, for totals over several runs.
@@ -251,6 +256,9 @@ func (s *Stats) Add(o Stats) {
 	s.MergesStarted += o.MergesStarted
 	s.LeaseAcquisitions += o.LeaseAcquisitions
 	s.LeaseLosses += o.LeaseLosses
+	s.MaintenancePanics += o.MaintenancePanics
+	s.MaintenanceBackoffs += o.MaintenanceBackoffs
+	s.MaintenanceResumed += o.MaintenanceResumed
 	s.Elapsed += o.Elapsed
 }
 
@@ -342,6 +350,9 @@ func (r Result) Report() string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "seed %d (%v): %d tx, %d commits, %d conflicts, %d unknown (%d without a crash), %d crashes, %d outages (%d operations failed), %d compactions, %d GCs (%d deleted), %d maintenance runs (%d lease acquisitions, %d losses), %v virtual time",
 		r.Config.Seed, r.Config.Name(), len(r.History), r.Stats.Commits, r.Stats.Conflicts, r.Stats.Unknown, r.Stats.LiveUnknown, r.Stats.Crashes, r.Stats.Outages, r.Stats.Unavailable, r.Stats.Compactions, r.Stats.GCs, r.Stats.Deleted, r.Stats.MaintenanceRuns, r.Stats.LeaseAcquisitions, r.Stats.LeaseLosses, r.Stats.Elapsed)
+	if r.Stats.MaintenancePanics > 0 {
+		fmt.Fprintf(&b, ", %d injected maintenance panics recovered (%d steps backed off, %d maintainers resumed)", r.Stats.MaintenancePanics, r.Stats.MaintenanceBackoffs, r.Stats.MaintenanceResumed)
+	}
 	for _, a := range r.Anomalies {
 		fmt.Fprintf(&b, "\nANOMALY: %v", a)
 	}
@@ -372,20 +383,22 @@ type run struct {
 	// ticked is the highest value of the counter of the foreign key workload that an
 	// acknowledged commit wrote.
 	ticked int64
-	// panicked is the first panic that the SQL driver recovered, with the stack where it
-	// happened, which the task that made the call panics with again once the call returned.
+	// panicked is the first panic that the SQL driver or a maintenance step recovered, other
+	// than an injected one, with the stack where it happened, which the task that made the call
+	// panics with again once the call returned.
 	panicked *sched.TaskPanic
 }
 
-// recovered records a panic that the SQL driver recovered. The driver call returns an error
-// instead, so that database/sql unwinds without leaving its locks held.
+// recovered records a panic that the SQL driver or a maintenance step recovered. The driver call
+// returns an error instead, so that database/sql unwinds without leaving its locks held.
 func (r *run) recovered(value any, stack []byte) {
 	if r.panicked == nil {
 		r.panicked = &sched.TaskPanic{Value: value, Stack: stack}
 	}
 }
 
-// repanic with the panic that the SQL driver recovered, if any, so that the run fails with it.
+// repanic with the panic that the SQL driver or a maintenance step recovered, if any, so that
+// the run fails with it.
 func (r *run) repanic() {
 	if r.panicked != nil {
 		panic(r.panicked)
@@ -433,7 +446,8 @@ func Run(cfg Config) (res Result) {
 			panic(p)
 		}
 		if inner, ok := tp.Value.(*sched.TaskPanic); ok {
-			// A panic that the SQL driver recovered, which the task panicked with again.
+			// A panic that the SQL driver or a maintenance step recovered, which the task
+			// panicked with again.
 			inner.Task = tp.Task
 			tp = inner
 		}
@@ -591,7 +605,7 @@ func (r *run) open(ctx context.Context, id int, rng *rand.Rand, disk cache.Cache
 
 // maintenanceOptions for a client in the configured mode, or false in [MaintenanceOff].
 func (r *run) maintenanceOptions(id int) (engine.MaintenanceOptions, bool) {
-	opts := engine.MaintenanceOptions{Holder: fmt.Sprint("client", id), Tiers: r.cfg.Tiers, LeaseDuration: 400 * time.Millisecond}
+	opts := engine.MaintenanceOptions{Holder: fmt.Sprint("client", id), Tiers: r.cfg.Tiers, LeaseDuration: 400 * time.Millisecond, PanicBackoff: 400 * time.Millisecond, MaxPanicBackoff: 1600 * time.Millisecond}
 	switch r.cfg.Maintenance {
 	case MaintenanceOff:
 		return opts, false
@@ -780,9 +794,11 @@ type client struct {
 	// damagedAt is the number of the client's reads that the store had damaged when its current
 	// operation began.
 	damagedAt int
-	// maint is the client's maintainer in the maintenance modes.
-	maint *engine.Maintainer
-	next  int64
+	// maint is the client's maintainer in the maintenance modes, and panicked is true from a
+	// panic that it recovered until it changes the database again.
+	maint    *engine.Maintainer
+	panicked bool
+	next     int64
 	// crashedInCommit is true from a crash during a commit's writes until the restarted client
 	// commits again.
 	crashedInCommit bool
@@ -819,6 +835,7 @@ func (c *client) loop(ctx context.Context) {
 			c.engine, c.refused = db, 0
 			c.checkCache()
 			if opts, ok := c.run.maintenanceOptions(c.id); ok {
+				opts.OnPanic = c.maintenancePanicked
 				c.maint = db.NewMaintainer(opts)
 			}
 		}
@@ -879,9 +896,30 @@ func (c *client) step(ctx context.Context) {
 	s.CompactionRebases += int(after.CompactionRebases - before.CompactionRebases)
 	s.LeaseAcquisitions += int(after.LeaseAcquisitions - before.LeaseAcquisitions)
 	s.LeaseLosses += int(after.LeaseLosses - before.LeaseLosses)
+	if res.BackingOff {
+		s.MaintenanceBackoffs++
+	}
+	// The step that panicked may have changed the database before the panic; only a later one
+	// resumes.
+	if res.Ran && c.panicked && !errors.Is(err, engine.ErrPanicked) {
+		s.MaintenanceResumed++
+		c.panicked = false
+	}
 	if res.Attempted || err != nil {
 		c.run.trace("client %d: maintenance: %+v, %v", c.id, res, err)
 	}
+}
+
+// maintenancePanicked is called with every panic that the client's maintainer recovered. The
+// panic that [engine.Mutations.MaintenancePanics] injects is a fault that the run expects; any
+// other panic is a bug, which fails the run once the step returned.
+func (c *client) maintenancePanicked(value any, stack []byte) {
+	if err, ok := value.(error); ok && errors.Is(err, engine.ErrInjectedPanic) {
+		c.run.stats.MaintenancePanics++
+		c.panicked = true
+		return
+	}
+	c.run.recovered(value, stack)
 }
 
 func (c *client) afterCrash() {
@@ -894,6 +932,7 @@ func (c *client) afterCrash() {
 		c.db = nil
 		c.engine = nil
 		c.maint = nil
+		c.panicked = false
 		c.closeSQL()
 		c.proc = nil
 		c.disk = nil

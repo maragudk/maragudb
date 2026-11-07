@@ -10,10 +10,10 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 ## At a glance
 
-- 36 acceptance criteria (`AC-`), 27 key invariants (`INV-`), 31 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
-- 28 mutants (`MUT-`), deliberate bugs, of which 26 are detected by the simulator's checkers within 20 seeds.
+- 36 acceptance criteria (`AC-`), 28 key invariants (`INV-`), 31 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
+- 29 mutants (`MUT-`), deliberate bugs, of which 27 are detected by the simulator's checkers within 20 seeds.
 - 27 interesting states (`STATE-`) that the simulator's fixed corpus must reach.
-- 286 declarations of coverage in the tests.
+- 291 declarations of coverage in the tests.
 
 ## Acceptance criteria
 
@@ -451,6 +451,16 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/sqldriver` `TestDriver_panics/a_panic_while_a_connection_opens_fails_it_with_ErrInternal_and_leaves_the_connector_usable`: a panic in opening the engine for a connection fails the ping with an error that wraps ErrInternal, and a second ping fails the same way instead of hanging
 - `internal/sqldriver` `TestDriver_panics/a_statement_outside_a_transaction_that_panics_after_its_commit_runs_once,_and_database/sql_does_not_run_it_again`: an UPDATE outside a transaction, plain and prepared, that panics after its commit fails with an error that wraps ErrInternal and not driver.ErrBadConn, and its increment lands exactly once
 - `internal/sqldriver` `TestDriver_panics/a_transaction_in_which_a_statement_panicked_rolls_back_on_commit,_and_the_commit_fails_with_ErrInternal`: a transaction whose statement panicked after it wrote a row fails its commit with an error that wraps ErrInternal, and the row is not there
+
+### `INV-MAINTENANCE-PANIC`
+
+> API: A panic in background maintenance, which is a bug in maragudb or in the object store, never ends the process either: the maintenance step recovers it, logs its value and stack at the error level, and maintenance tries again from a clean state after a wait that doubles with every panic in a row, up to a cap. Meanwhile reads and writes keep working, the store stays correct wherever the step stopped, maintenance makes progress again once the panic stops, and closing the database stops maintenance promptly, also while it waits.
+
+- `.` `TestMaintenance/survives_a_panic_of_the_store_in_the_middle_of_a_compaction:_the_database_keeps_answering,_the_log_has_the_panic_with_its_stack,_maintenance_backs_off_and_then_compacts_once_the_panic_stops,_and_closing_the_database_while_it_backs_off_stops_it_at_once`: through the public driver, a panic of the store in the middle of a background compaction leaves the process running and the database answering reads and writes, Options.Logger gets the panic with its stack at the error level once, maintenance does nothing for the backoff and compacts after it once the panic stopped, and closing the database while maintenance backs off returns without waiting and stops the goroutine
+- `internal/engine` `TestMaintainer_Panics/a_panic_between_the_segment_write_and_the_manifest_write_of_a_compaction,_and_one_in_the_middle_of_garbage_collection,_lose_nothing,_and_garbage_collection_then_deletes_everything_they_left_behind`: a maintenance step that panics after the write of its merged segment, or after garbage collection deleted some garbage, leaves every value readable, and later steps collect everything the panicked steps left behind
+- `internal/engine` `TestMaintainer_Panics/recovers_a_panic_in_the_middle_of_a_compaction,_logs_it_with_its_stack,_backs_off_with_a_doubling_wait_up_to_the_cap_while_reads_and_writes_go_on,_and_compacts_once_the_panic_stops`: a maintenance step recovers a panic of the store in the middle of a compaction, logs its value and stack at the error level, does nothing until a backoff that doubles up to its cap has passed, keeps reads and writes working, and compacts once the panic stops, with every value kept
+- `internal/sim` `TestClient_maintenancePanicked/counts_the_panic_that_MaintenancePanics_injects,_and_records_any_other_panic,_so_that_the_run_fails_with_it`: the simulator expects only the panic that the fault injection of maintenance panics with, and fails a run with the value and the stack of any other panic that a maintenance step recovered
+- `internal/sim` `TestRun_maintenancePanics/panics_that_MaintenancePanics_injects_in_the_middle_of_the_clients'_compactions_and_GC_passes_are_recovered,_every_checker_passes,_and_maintenance_resumes_after_each_backoff`: with panics injected at points the seed picks in the middle of the clients' compactions and GC passes, in every workload, through the engine and SQL, in every maintenance mode, with crashes and with maintainers, every checker passes, steps back off after a panic, and maintenance changes the database again after it
 
 ### `INV-CAS-COMMIT`
 
@@ -905,6 +915,7 @@ Every mutant runs in every simulator configuration below, with seeds 1 to 20, un
 | `MUT-DISK-CACHE-SERVE-CUT-READ` a disk cache that serves a read that an eviction cut short | 0 of 0 configurations | none |  |
 | `MUT-SEGMENT-UNCHECKED` blocks of segments read without their checksum | 12 of 12 configurations | 1 | bank, cache integrity, index consistency, list-append, unique, workload invariants |
 | `MUT-DISK-CACHE-UNCOUNTED` a disk cache that does not count the files of an earlier process | 12 of 12 configurations | 1 | disk cache bound |
+| `MUT-MAINTENANCE-UNRECOVERED` a maintenance step that does not recover a panic | 12 of 12 configurations | 1 | panic |
 
 ### `MUT-COMMIT-WITHOUT-CAS`
 
@@ -1531,6 +1542,25 @@ Targeted tests:
 Targeted tests:
 
 - `internal/cache` `TestDisk/with_the_mutant_that_does_not_count_the_files_of_an_earlier_process,_the_random_operations_find_files_that_are_not_counted`: with the mutant, the random operations on a disk cache find files that it does not count after a restart
+
+### `MUT-MAINTENANCE-UNRECOVERED`
+
+`engine.Mutations.MaintenanceUnrecovered` lets a panic unwind out of a maintenance step instead of recovering it, which in the driver's background goroutine ends the process. It runs with `engine.Mutations.MaintenancePanics`, which makes one in three maintenance steps that get to work panic in the middle of a compaction or a GC pass, and with the clients' maintenance coordinated by the lease, so that the panic reaches the client's task, which fails the run.
+
+| Configuration | Result |
+|---|---|
+| list-append through the engine, no maintainers | detected with seed 1 by panic |
+| list-append through the engine, 2 maintainers | detected with seed 1 by panic |
+| bank through the engine, no maintainers | detected with seed 1 by panic |
+| bank through the engine, 2 maintainers | detected with seed 1 by panic |
+| list-append through SQL, no maintainers | detected with seed 1 by panic |
+| list-append through SQL, 2 maintainers | detected with seed 1 by panic |
+| bank through SQL, no maintainers | detected with seed 1 by panic |
+| bank through SQL, 2 maintainers | detected with seed 1 by panic |
+| unique through SQL, no maintainers | detected with seed 1 by panic |
+| unique through SQL, 2 maintainers | detected with seed 1 by panic |
+| foreign-key through SQL, no maintainers | detected with seed 3 by panic |
+| foreign-key through SQL, 2 maintainers | detected with seed 2 by panic |
 
 ## Reached states
 

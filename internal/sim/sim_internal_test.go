@@ -11,6 +11,7 @@ import (
 	"maragu.dev/maragudb/internal/engine"
 	"maragu.dev/maragudb/internal/s3"
 	"maragu.dev/maragudb/internal/s3fake"
+	"maragu.dev/maragudb/internal/verify"
 )
 
 func TestClient_checkError(t *testing.T) {
@@ -65,5 +66,29 @@ func TestClient_checkError(t *testing.T) {
 		c, _ = newClient(t, true)
 		c.checkError(errors.New("exec: duplicate key"))
 		is.Equal(t, 0, len(c.run.anoms))
+	})
+}
+
+func TestClient_maintenancePanicked(t *testing.T) {
+	t.Run("counts the panic that MaintenancePanics injects, and records any other panic, so that the run fails with it", func(t *testing.T) {
+		verify.Covers(t, "the simulator expects only the panic that the fault injection of maintenance panics with, and fails a run with the value and the stack of any other panic that a maintenance step recovered", "INV-MAINTENANCE-PANIC")
+		c := &client{run: &run{}}
+		c.maintenancePanicked(engine.ErrInjectedPanic, []byte("stack"))
+		is.Equal(t, 1, c.run.stats.MaintenancePanics)
+		is.True(t, c.panicked)
+		is.True(t, c.run.panicked == nil)
+
+		c.maintenancePanicked(errors.New("a bug"), []byte("the stack"))
+		is.Equal(t, 1, c.run.stats.MaintenancePanics)
+		is.True(t, c.run.panicked != nil)
+		is.Equal(t, "a bug", fmt.Sprint(c.run.panicked.Value))
+		is.Equal(t, "the stack", string(c.run.panicked.Stack))
+		func() {
+			defer func() {
+				p := recover()
+				is.True(t, p == c.run.panicked, fmt.Sprint(p))
+			}()
+			c.run.repanic()
+		}()
 	})
 }

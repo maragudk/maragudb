@@ -198,7 +198,10 @@ func (c *Connector) DB(ctx context.Context) (*engine.DB, error) {
 	return db, nil
 }
 
-// maintain runs maintenance steps at jittered intervals until ctx ends.
+// maintain runs maintenance steps at jittered intervals until ctx ends. It is the only goroutine
+// that the driver starts. A step recovers its own panics and backs off after them, as
+// [engine.Maintainer.Step] describes, so the loop keeps going, and a step that is backing off
+// returns at once, so the loop stops as soon as ctx ends.
 func (c *Connector) maintain(ctx context.Context) {
 	defer close(c.stopped)
 	interval := c.d.opts.Maintenance.Interval
@@ -215,6 +218,8 @@ func (c *Connector) maintain(ctx context.Context) {
 		res, err := c.maintainer.Step(ctx)
 		switch {
 		case err != nil && ctx.Err() != nil:
+		case errors.Is(err, engine.ErrPanicked):
+			// The maintainer logged the panic with its stack at the error level, and backs off.
 		case errors.Is(err, engine.ErrConflict), errors.Is(err, engine.ErrSnapshotExpired), errors.Is(err, engine.ErrLeaseLost):
 			// Another process did the work, or is doing it; the next step sees the result.
 			c.d.opts.Logger.Debug("background maintenance yielded", "dsn", c.dsn, "error", err)

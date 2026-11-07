@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"runtime/debug"
 	"time"
 
 	"github.com/antithesishq/antithesis-sdk-go/assert"
@@ -16,6 +17,14 @@ import (
 // ErrLeaseLost is returned by maintenance that stopped because it no longer holds the lease:
 // another maintainer took it over after it expired without renewal.
 var ErrLeaseLost = errors.New("engine: maintenance lease lost")
+
+// ErrPanicked is returned by a maintenance step that panicked and whose panic the maintainer
+// recovered. The panic is a bug in maragudb or in the object store. The message holds the
+// panic's value, and the logger got it with the stack.
+var ErrPanicked = errors.New("engine: a maintenance step panicked")
+
+// ErrInjectedPanic is the value that [Mutations.MaintenancePanics] panics with.
+var ErrInjectedPanic = errors.New("engine: a panic that Mutations.MaintenancePanics injected")
 
 // MaintenanceOptions for [DB.NewMaintainer].
 type MaintenanceOptions struct {
@@ -32,6 +41,13 @@ type MaintenanceOptions struct {
 	// as a stalled process would, so that other maintainers take the lease over while this one
 	// still believes it holds it, and the leases overlap.
 	IgnoreLeaseExpiry bool
+	// PanicBackoff is how long the maintainer does no work after a step panicked, and
+	// MaxPanicBackoff caps it. The backoff doubles with each panic until a step that gets to work
+	// finishes without an error. They default to 10 seconds and 10 minutes.
+	PanicBackoff, MaxPanicBackoff time.Duration
+	// OnPanic, when set, is called with the value and the stack of every panic that a step
+	// recovers, after the panic is logged.
+	OnPanic func(value any, stack []byte)
 }
 
 // Maintainer compacts and garbage collects a database when there is work, coordinated with the
@@ -46,6 +62,11 @@ type Maintainer struct {
 	held       bool
 	etag       string
 	acquiredAt time.Time
+
+	// panics counts the steps in a row that panicked, and retryAt is when the backoff after the
+	// last of them ends.
+	panics  int
+	retryAt time.Time
 }
 
 // lease is the body of the lease object.
@@ -63,6 +84,12 @@ func (db *DB) NewMaintainer(opts MaintenanceOptions) *Maintainer {
 	if opts.LeaseDuration <= 0 {
 		opts.LeaseDuration = time.Minute
 	}
+	if opts.PanicBackoff <= 0 {
+		opts.PanicBackoff = 10 * time.Second
+	}
+	if opts.MaxPanicBackoff <= 0 {
+		opts.MaxPanicBackoff = 10 * time.Minute
+	}
 	return &Maintainer{db: db, opts: opts, key: db.key("maintenance-lease")}
 }
 
@@ -78,6 +105,9 @@ type StepResult struct {
 	// Ran is true when the step changed the database: it compacted, or garbage collection
 	// stamped or deleted something.
 	Ran bool
+	// BackingOff is true when the step did nothing because an earlier step panicked and the
+	// backoff after it has not ended.
+	BackingOff bool
 }
 
 // Step runs maintenance once if there is work: compaction while the tiers make a merge of
@@ -85,8 +115,24 @@ type StepResult struct {
 // than the grace period. It decides from the manifest the database already has, so a
 // step without work makes no requests. With the lease, the step first acquires it, and gives
 // it up again at the end, so that an idle process holds nothing.
-func (m *Maintainer) Step(ctx context.Context) (StepResult, error) {
-	var res StepResult
+//
+// A panic in the step is a bug in maragudb or in the object store. The step recovers it and
+// returns an error that wraps [ErrPanicked], as [Maintainer.recovered] describes, and the
+// steps until the backoff after it ends do nothing.
+func (m *Maintainer) Step(ctx context.Context) (res StepResult, err error) {
+	// counted is true once the step counted its run in the statistics.
+	counted := false
+	if !m.db.mutations.MaintenanceUnrecovered {
+		defer func() {
+			if p := recover(); p != nil {
+				m.recovered(p, &res, &err, counted)
+			}
+		}()
+	}
+	if m.panics > 0 && m.db.now().Before(m.retryAt) {
+		res.BackingOff = true
+		return res, nil
+	}
 	man, _ := m.db.cachedManifest()
 	if man == nil || !m.due(man) {
 		return res, nil
@@ -98,9 +144,10 @@ func (m *Maintainer) Step(ctx context.Context) (StepResult, error) {
 		}
 	}
 	res.Attempted = true
-	err := m.maintain(ctx, &res)
+	err = m.maintain(ctx, &res)
 	if res.Ran {
 		m.db.maintenanceRuns.Add(1)
+		counted = true
 	}
 	assert.Sometimes(res.Ran, "a maintenance step does work", nil)
 	if !m.opts.DisableLease {
@@ -108,7 +155,47 @@ func (m *Maintainer) Step(ctx context.Context) (StepResult, error) {
 			err = rerr
 		}
 	}
+	if err == nil {
+		m.panics = 0
+	}
 	return res, err
+}
+
+// recovered handles the panic p that [Maintainer.Step] recovered, before the stack unwinds. It
+// counts the step's run unless the step counted it already, logs the panic's value and the stack
+// where it happened at the error level, tells
+// [MaintenanceOptions.OnPanic], and sets err to an error that wraps [ErrPanicked]. The next steps
+// start from a clean state: the merges and garbage of a step live in the step's own calls, and
+// the maintainer forgets the lease, which expires on its own, and which this maintainer can
+// acquire again at once because the lease has its name. The steps do nothing until
+// [MaintenanceOptions.PanicBackoff] has passed, doubled for every earlier panic in a row, up to
+// [MaintenanceOptions.MaxPanicBackoff], so that a panic that repeats cannot spin; only a step
+// that gets to work and finishes without an error ends the row. Every write of
+// a step is a conditional manifest write or an object that the manifest does not reference yet,
+// which garbage collection collects, so a step that stops anywhere leaves the store correct.
+func (m *Maintainer) recovered(p any, res *StepResult, err *error, counted bool) {
+	stack := debug.Stack()
+	m.held, m.etag = false, ""
+	if res.Ran && !counted {
+		m.db.maintenanceRuns.Add(1)
+	}
+	m.panics++
+	// Doubling stops at the cap, so it cannot overflow however many panics there were.
+	backoff := m.opts.PanicBackoff
+	for i := 1; i < m.panics && backoff < m.opts.MaxPanicBackoff; i++ {
+		backoff *= 2
+	}
+	backoff = min(backoff, m.opts.MaxPanicBackoff)
+	m.retryAt = m.db.now().Add(backoff)
+	m.db.log.Error("engine: recovered a panic in a maintenance step, which is a bug in maragudb or in its object store; maintenance backs off and tries again",
+		"panic", fmt.Sprint(p), "stack", string(stack), "holder", m.opts.Holder, "panics", m.panics, "backoff", backoff)
+	if injected, ok := p.(error); !ok || !errors.Is(injected, ErrInjectedPanic) {
+		assert.Unreachable("a maintenance step panics", map[string]any{"panic": fmt.Sprint(p), "stack": string(stack)})
+	}
+	if m.opts.OnPanic != nil {
+		m.opts.OnPanic(p, stack)
+	}
+	*err = fmt.Errorf("%w: panic: %v", ErrPanicked, p)
 }
 
 // due reports whether the manifest has work.
@@ -138,6 +225,16 @@ func (m *Maintainer) garbageDue(man *manifest) bool {
 func (m *Maintainer) maintain(ctx context.Context, res *StepResult) error {
 	man, _ := m.db.cachedManifest()
 	progress := func() error { return m.progress(ctx) }
+	if m.db.mutations.MaintenancePanics && m.db.intN(3) == 0 {
+		at, calls := m.db.intN(8), 0
+		progress = func() error {
+			if calls == at {
+				panic(ErrInjectedPanic)
+			}
+			calls++
+			return m.progress(ctx)
+		}
+	}
 	// A merge can make the next tier due, so compaction runs again while a merge is due, a
 	// bounded number of times, so that the tiers settle within one step.
 	for range 16 {

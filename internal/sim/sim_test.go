@@ -539,6 +539,9 @@ func TestSimulator(t *testing.T) {
 					cfg.DiskMutations = m.diskMutations
 					cfg.DiskFaults = cfg.DiskFaults || m.diskMutations != (cache.DiskMutations{})
 					cfg.StoreDamage = cfg.StoreDamage || m.storeDamage
+					if cfg.Maintenance == sim.MaintenanceOff {
+						cfg.Maintenance = m.maintenance
+					}
 					if m.sqlMutations != (exec.Mutations{}) {
 						cfg.SQL = true
 					}
@@ -650,6 +653,9 @@ type mutant struct {
 	diskMutations cache.DiskMutations
 	// storeDamage runs the mutant with [sim.Config.StoreDamage].
 	storeDamage bool
+	// maintenance runs the mutant with the clients' maintenance in this mode, when it is not
+	// [sim.MaintenanceOff].
+	maintenance sim.MaintenanceMode
 	// unsimulated, for a mutant that no cell can run, is why not, and a targeted test detects it.
 	unsimulated string
 	// engineOnly, for a mutant that only the cells through the engine can run, is why the cells
@@ -658,7 +664,8 @@ type mutant struct {
 	// cannot says, for every cell that cannot detect the mutant, why not.
 	cannot map[cell]string
 	// checkers that must each detect the mutant in at least one cell, so that the checker meant
-	// to catch it keeps doing so.
+	// to catch it keeps doing so. A mutant that names the panic checker is one whose bug is a
+	// panic that escapes, so that checker counts in the cells without maintainers too.
 	checkers []string
 	// workloads, when set, are the only workloads that run the code the mutant breaks, and the
 	// cells of the others do not apply, for the reason only.
@@ -997,6 +1004,13 @@ func mutants() []mutant {
 			diskMutations: cache.DiskMutations{UncountedAtOpen: true},
 			checkers:      []string{sim.CheckerDiskCache},
 		},
+		{
+			id: "MUT-MAINTENANCE-UNRECOVERED", replay: "maintenance-unrecovered", name: "a maintenance step that does not recover a panic",
+			description: "`engine.Mutations.MaintenanceUnrecovered` lets a panic unwind out of a maintenance step instead of recovering it, which in the driver's background goroutine ends the process. It runs with `engine.Mutations.MaintenancePanics`, which makes one in three maintenance steps that get to work panic in the middle of a compaction or a GC pass, and with the clients' maintenance coordinated by the lease, so that the panic reaches the client's task, which fails the run.",
+			mutations:   engine.Mutations{MaintenancePanics: true, MaintenanceUnrecovered: true},
+			maintenance: sim.MaintenanceLease,
+			checkers:    []string{sim.CheckerPanic},
+		},
 	}
 }
 
@@ -1117,6 +1131,57 @@ func TestRun_panic(t *testing.T) {
 	})
 }
 
+func TestRun_maintenancePanics(t *testing.T) {
+	t.Run("panics that MaintenancePanics injects in the middle of the clients' compactions and GC passes are recovered, every checker passes, and maintenance resumes after each backoff", func(t *testing.T) {
+		verify.Covers(t, "with panics injected at points the seed picks in the middle of the clients' compactions and GC passes, in every workload, through the engine and SQL, in every maintenance mode, with crashes and with maintainers, every checker passes, steps back off after a panic, and maintenance changes the database again after it", "INV-MAINTENANCE-PANIC")
+		t.Parallel()
+		var cfgs []sim.Config
+		for _, w := range []sim.Workload{sim.ListAppend, sim.Bank, sim.Unique, sim.ForeignKey} {
+			for _, useSQL := range []bool{false, true} {
+				if (w == sim.Unique || w == sim.ForeignKey) && !useSQL {
+					continue
+				}
+				for _, mode := range []sim.MaintenanceMode{sim.MaintenanceLease, sim.MaintenanceNoLease, sim.MaintenanceOverlap} {
+					cfg := sim.DefaultConfig(uint64(600 + len(cfgs)))
+					cfg.Workload = w
+					cfg.SQL = useSQL
+					cfg.Maintenance = mode
+					cfg.Maintainers = len(cfgs) % 2 * 2
+					cfg.TxPerClient = 40
+					cfg.Mutations = engine.Mutations{MaintenancePanics: true}
+					cfgs = append(cfgs, cfg)
+				}
+			}
+		}
+		results := make([]sim.Result, len(cfgs))
+		var wg sync.WaitGroup
+		for i, cfg := range cfgs {
+			wg.Go(func() { results[i] = runSim(cfg) })
+		}
+		wg.Wait()
+		// A maintainer resumes when it changes the database again after a panic, before the run
+		// ends or its process crashes, which a run with few steps of work need not reach.
+		backedOff, resumed := 0, 0
+		for _, res := range results {
+			t.Log(res.Report())
+			if res.Stats.MaintenanceBackoffs > 0 {
+				backedOff++
+			}
+			if res.Stats.MaintenanceResumed > 0 {
+				resumed++
+			}
+		}
+		for _, res := range results {
+			is.True(t, !res.Failed(), res.Report())
+			is.True(t, res.Stats.MaintenancePanics > 0, res.Report())
+		}
+		msg := fmt.Sprintf("of %d runs, %d backed off after a panic, and in %d a maintainer resumed after one", len(results), backedOff, resumed)
+		t.Log(msg)
+		is.True(t, backedOff >= len(results)*3/4, msg)
+		is.True(t, resumed >= len(results)/2, msg)
+	})
+}
+
 func TestMutants(t *testing.T) {
 	verify.Covers(t, "every mutant is detected by a checker in at least one simulator configuration, every configuration that cannot detect a mutant says why, and the kill matrix matches its golden file", "AC-2")
 	t.Parallel()
@@ -1193,6 +1258,7 @@ func TestMutants(t *testing.T) {
 						cfg.DiskMutations = m.diskMutations
 						cfg.DiskFaults = m.diskMutations != (cache.DiskMutations{})
 						cfg.StoreDamage = m.storeDamage
+						cfg.Maintenance = m.maintenance
 						res := runSim(cfg)
 						if res.Failed() {
 							r.Status, r.Seed, r.Checkers = verify.Detected, seed, res.Checkers()
@@ -1213,7 +1279,8 @@ func TestMutants(t *testing.T) {
 					caught[name] = true
 				}
 				if r.Status == verify.Detected && c.maintainers == 0 && !slices.ContainsFunc(r.Checkers, func(name string) bool {
-					return name == sim.CheckerListAppend || name == sim.CheckerDurability || name == sim.CheckerBank || name == sim.CheckerUnique || name == sim.CheckerIndex || name == sim.CheckerForeignKey || name == sim.CheckerCheck || name == sim.CheckerRealTime || name == sim.CheckerStorage || name == sim.CheckerDiskCache || name == sim.CheckerCache || name == sim.CheckerDamage
+					return name == sim.CheckerListAppend || name == sim.CheckerDurability || name == sim.CheckerBank || name == sim.CheckerUnique || name == sim.CheckerIndex || name == sim.CheckerForeignKey || name == sim.CheckerCheck || name == sim.CheckerRealTime || name == sim.CheckerStorage || name == sim.CheckerDiskCache || name == sim.CheckerCache || name == sim.CheckerDamage ||
+						(name == sim.CheckerPanic && slices.Contains(m.checkers, sim.CheckerPanic))
 				}) {
 					t.Errorf("%v: without maintainers, a history or invariant checker must find the mutant, but only %v did", c, r.Checkers)
 				}

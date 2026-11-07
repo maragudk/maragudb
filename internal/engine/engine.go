@@ -124,6 +124,15 @@ type Mutations struct {
 	// SegmentUnchecked decodes the blocks of segments without checking their checksums, and
 	// caches the blocks it reads from the store before decoding them.
 	SegmentUnchecked bool
+	// MaintenancePanics makes one in three [Maintainer] steps that get to work panic with
+	// [ErrInjectedPanic], at one of the first eight calls of the step's progress hook, which the
+	// random source picks: before a block read or the segment write of a merge, before the
+	// manifest write of a compaction, or between the reads, the writes, and the deletes of
+	// garbage collection. It is a fault rather than a bug: the step recovers the panic.
+	MaintenancePanics bool
+	// MaintenanceUnrecovered lets a panic in a [Maintainer] step unwind out of the step instead of
+	// recovering it.
+	MaintenanceUnrecovered bool
 }
 
 // Stats about store requests and cache effectiveness.
@@ -315,6 +324,13 @@ func (db *DB) newID() string {
 	var b [8]byte
 	binary.LittleEndian.PutUint64(b[:], db.rand.Uint64())
 	return hex.EncodeToString(b[:])
+}
+
+// intN drawn uniformly from [0, n), for n > 0.
+func (db *DB) intN(n int) int {
+	db.randMu.Lock()
+	defer db.randMu.Unlock()
+	return db.rand.IntN(n)
 }
 
 // jitter drawn uniformly from [0, d), for d > 0.

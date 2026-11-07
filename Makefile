@@ -46,7 +46,7 @@ verification:
 # fresh-snapshot, retry-unknown, index-stale-delete, unique-no-check, unique-own-writes,
 # fk-no-child-check, fk-no-parent-check, fk-own-writes, check-skip-update, subquery-stale-reads,
 # update-sees-own-writes, disk-cache-unverified, disk-cache-serve-cut-read, disk-cache-uncounted,
-# and segment-unchecked.
+# segment-unchecked, and maintenance-unrecovered.
 .PHONY: replay
 replay:
 	MARAGUDB_SEED=$(SEED) MARAGUDB_WORKLOAD=$(WORKLOAD) MARAGUDB_API=$(API) MARAGUDB_CORPUS=$(CORPUS) MARAGUDB_MAINTAINERS=$(MAINTAINERS) MARAGUDB_MAINTENANCE=$(MAINTENANCE) MARAGUDB_DISK_FAULTS=$(DISK_FAULTS) MARAGUDB_STORE_DAMAGE=$(STORE_DAMAGE) MARAGUDB_MUTATION=$(MUTATION) go test ./internal/sim -run 'TestSimulator/replay' -count 1 -v
