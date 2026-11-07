@@ -2,6 +2,8 @@ package value_test
 
 import (
 	"bytes"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
 	"strconv"
@@ -262,6 +264,62 @@ func TestEncodeRow(t *testing.T) {
 		b := value.EncodeRow(nil, []value.Value{value.NewInt(1)})
 		_, err := value.DecodeRow(b, []value.Type{value.String})
 		is.Error(t, value.ErrCorruptRow, err)
+	})
+
+	t.Run("rejects values that no write stores: text that is not UTF-8, and times finer than a microsecond", func(t *testing.T) {
+		verify.Covers(t, "a row of text that is not UTF-8, or of a time finer than a microsecond, fails to decode with ErrCorruptRow", "INV-DAMAGE-DETECTED")
+		row := func(tag value.Type, rest ...byte) []byte {
+			return append([]byte{byte(tag)}, rest...)
+		}
+		times := func(sec int64, nsec uint32) []byte {
+			b := binary.BigEndian.AppendUint64(nil, uint64(sec))
+			return binary.BigEndian.AppendUint32(b, nsec)
+		}
+		for _, test := range []struct {
+			b   []byte
+			typ value.Type
+		}{
+			{row(value.String, 2, 0xff, 0xfe), value.String},
+			{row(value.Time, times(0, 1)...), value.Time},
+		} {
+			_, err := value.DecodeRow(test.b, []value.Type{test.typ})
+			is.Error(t, value.ErrCorruptRow, err, fmt.Sprintf("%x", test.b))
+		}
+		_, err := value.DecodeRow(row(value.Time, times(0, 1000)...), []value.Type{value.Time})
+		is.NotError(t, err)
+	})
+}
+
+// FuzzDecodeRow decodes arbitrary bytes as a row of arbitrary column types, which never panics,
+// fails with [value.ErrCorruptRow] when it fails, and yields values that encode to bytes that
+// decode to the same values.
+func FuzzDecodeRow(f *testing.F) {
+	columns := []value.Type{value.Int, value.Float, value.Bool, value.String, value.Bytes, value.Time}
+	b := value.EncodeRow(nil, []value.Value{value.NewInt(-3), value.NewFloat(math.NaN()), value.NewBool(true), value.NewString("é"), value.NewBytes([]byte{0}), value.NewTime(time.Date(2026, 1, 1, 0, 0, 0, 1000, time.UTC))})
+	f.Add(b, []byte{0, 1, 2, 3, 4, 5})
+	f.Add(value.EncodeRow(nil, []value.Value{value.NewNull(value.Int), value.NewString("")}), []byte{0, 3})
+	f.Add([]byte{4, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x01}, []byte{3})
+	f.Fuzz(func(t *testing.T, b, schema []byte) {
+		types := make([]value.Type, len(schema))
+		for i, c := range schema {
+			types[i] = columns[int(c)%len(columns)]
+		}
+		row, err := value.DecodeRow(b, types)
+		if err != nil {
+			if !errors.Is(err, value.ErrCorruptRow) {
+				t.Fatalf("error %v does not wrap ErrCorruptRow", err)
+			}
+			return
+		}
+		again, err := value.DecodeRow(value.EncodeRow(nil, row), types)
+		if err != nil {
+			t.Fatalf("a decoded row does not decode again: %v", err)
+		}
+		for i := range row {
+			if !equalValue(row[i], again[i]) {
+				t.Fatalf("column %d decoded as %v, and then as %v", i, row[i], again[i])
+			}
+		}
 	})
 }
 

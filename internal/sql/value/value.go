@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // Type of a SQL value.
@@ -464,6 +465,9 @@ func decodeValue(b []byte, t Type) (Value, []byte, error) {
 		}
 		payload := b[:n]
 		if t == String {
+			if !utf8.Valid(payload) {
+				return Value{}, nil, errors.New("text that is not valid UTF-8")
+			}
 			return NewString(string(payload)), b[n:], nil
 		}
 		return NewBytes(bytes.Clone(payload)), b[n:], nil
@@ -473,7 +477,7 @@ func decodeValue(b []byte, t Type) (Value, []byte, error) {
 		}
 		sec := int64(binary.BigEndian.Uint64(b))
 		nsec := binary.BigEndian.Uint32(b[8:])
-		if nsec >= 1e9 {
+		if nsec >= 1e9 || nsec%1000 != 0 {
 			return Value{}, nil, fmt.Errorf("bad nanoseconds %d", nsec)
 		}
 		return NewTime(time.Unix(sec, int64(nsec))), b[12:], nil

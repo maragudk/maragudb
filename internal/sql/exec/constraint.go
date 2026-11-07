@@ -6,6 +6,7 @@ import (
 	"slices"
 	"strings"
 
+	"maragu.dev/maragudb/internal/engine"
 	"maragu.dev/maragudb/internal/sql/ast"
 	"maragu.dev/maragudb/internal/sql/parser"
 	"maragu.dev/maragudb/internal/sql/value"
@@ -26,7 +27,7 @@ func (s *Session) defaultExpr(b *binder, t *table, i int) (*cexpr, error) {
 	}
 	e, err := parser.ParseExpr(c.Default)
 	if err != nil {
-		return nil, fmt.Errorf("exec: corrupt default of column %q of %q: %w", c.Name, t.Name, err)
+		return nil, fmt.Errorf("%w: default of column %q of %q: %w", engine.ErrCorrupt, c.Name, t.Name, err)
 	}
 	bound, err := b.bind(e)
 	if err != nil {
@@ -218,7 +219,7 @@ func (s *Session) checksOf(t *table) ([]boundCheck, error) {
 	for _, c := range t.Checks {
 		e, err := parser.ParseExpr(c.Expr)
 		if err != nil {
-			return nil, fmt.Errorf("exec: corrupt check constraint %q of %q: %w", c.Name, t.Name, err)
+			return nil, fmt.Errorf("%w: check constraint %q of %q: %w", engine.ErrCorrupt, c.Name, t.Name, err)
 		}
 		bound, err := s.bindCheck(t, e)
 		if err != nil {

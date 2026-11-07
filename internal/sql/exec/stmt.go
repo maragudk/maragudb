@@ -12,6 +12,7 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"maragu.dev/maragudb/internal/engine"
 	"maragu.dev/maragudb/internal/sql/ast"
 	"maragu.dev/maragudb/internal/sql/value"
 )
@@ -355,9 +356,12 @@ func (s *Session) scanRows(ctx context.Context, t *table, a access, f filter, fn
 		return orderDependent
 	}
 	visit := func(key, val []byte) (bool, error) {
+		if s.opts.Mutations.PanicInScan {
+			panic(fmt.Sprintf("exec: a scan of %q panics", t.Name))
+		}
 		row, err := value.DecodeRow(val, types)
 		if err != nil {
-			return false, fmt.Errorf("exec: table %q: %w", t.Name, err)
+			return false, fmt.Errorf("%w: table %q: %w", engine.ErrCorrupt, t.Name, err)
 		}
 		return match(key, row)
 	}

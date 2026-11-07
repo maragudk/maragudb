@@ -3,11 +3,13 @@ package exec
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
 	"unicode/utf8"
 
+	"maragu.dev/maragudb/internal/engine"
 	"maragu.dev/maragudb/internal/sql/ast"
 	"maragu.dev/maragudb/internal/sql/value"
 )
@@ -261,12 +263,108 @@ func (s *Session) relation(ctx context.Context, name string) (*table, bool, erro
 		s.tables[name] = nil
 		return nil, false, nil
 	}
+	t, err := decodeTable(name, b)
+	if err != nil {
+		return nil, false, err
+	}
+	s.tables[name] = t
+	return t, true, nil
+}
+
+// decodeTable decodes the catalog entry of the relation name, whose bytes are b, and validates
+// it. An entry that does not decode or does not hold up gives an error that wraps
+// [engine.ErrCorrupt].
+func decodeTable(name string, b []byte) (*table, error) {
 	var t table
 	if err := json.Unmarshal(b, &t); err != nil {
-		return nil, false, fmt.Errorf("exec: corrupt definition of relation %q: %w", name, err)
+		return nil, fmt.Errorf("%w: definition of relation %q: %w", engine.ErrCorrupt, name, err)
 	}
-	s.tables[name] = &t
-	return &t, true, nil
+	if err := t.validate(name); err != nil {
+		return nil, fmt.Errorf("%w: definition of relation %q: %w", engine.ErrCorrupt, name, err)
+	}
+	return &t, nil
+}
+
+// validate a decoded definition of the relation name: what the SQL layer relies on without
+// checking it again, such as column references in range, an index with columns, and names
+// without a NUL byte. References to other tables are checked when they are followed, by
+// [foreignKey.link].
+func (t *table) validate(name string) error {
+	if t.Name != name || name == "" || strings.IndexByte(name, 0) >= 0 {
+		return fmt.Errorf("the entry has the name %q", t.Name)
+	}
+	if t.IndexOf != "" {
+		if strings.IndexByte(t.IndexOf, 0) >= 0 || len(t.Columns) > 0 || len(t.PrimaryKey) > 0 || t.PrimaryKeyIndex != "" || len(t.Indexes) > 0 || len(t.Checks) > 0 || len(t.ForeignKeys) > 0 || len(t.ReferencedBy) > 0 || len(t.Constraints) > 0 {
+			return errors.New("the entry of an index has more than the name of its table")
+		}
+		return nil
+	}
+	seen := map[string]bool{}
+	for _, c := range t.Columns {
+		if seen[c.Name] {
+			return fmt.Errorf("column %q is there twice", c.Name)
+		}
+		seen[c.Name] = true
+		if !c.Type.IsColumnType() {
+			return fmt.Errorf("column %q has type %d", c.Name, c.Type)
+		}
+	}
+	inRange := func(what string, cols []int) error {
+		if len(cols) == 0 {
+			return fmt.Errorf("%s has no columns", what)
+		}
+		for _, c := range cols {
+			if c < 0 || c >= len(t.Columns) {
+				return fmt.Errorf("%s has column %d of %d", what, c, len(t.Columns))
+			}
+		}
+		return nil
+	}
+	if err := inRange("the primary key", t.PrimaryKey); err != nil {
+		return err
+	}
+	for i, c := range t.PrimaryKey {
+		if slices.Contains(t.PrimaryKey[:i], c) {
+			return fmt.Errorf("the primary key has column %d twice", c)
+		}
+	}
+	names := map[string]bool{t.PrimaryKeyIndex: true}
+	for _, x := range t.Indexes {
+		if x.Name == "" || strings.IndexByte(x.Name, 0) >= 0 || names[x.Name] {
+			return fmt.Errorf("an index has the name %q", x.Name)
+		}
+		names[x.Name] = true
+		cols := make([]int, len(x.Columns))
+		for i, c := range x.Columns {
+			cols[i] = c.Column
+		}
+		if err := inRange(fmt.Sprintf("index %q", x.Name), cols); err != nil {
+			return err
+		}
+	}
+	for _, fk := range t.ForeignKeys {
+		what := fmt.Sprintf("foreign key %q", fk.Name)
+		if err := inRange(what, fk.Columns); err != nil {
+			return err
+		}
+		if len(fk.RefColumns) != len(fk.Columns) || fk.Parent == "" || fk.Index == "" {
+			return fmt.Errorf("%s references %d columns of %q through %q", what, len(fk.RefColumns), fk.Parent, fk.Index)
+		}
+		for _, c := range fk.SetColumns {
+			if !slices.Contains(fk.Columns, c) {
+				return fmt.Errorf("%s sets column %d, which is not in the key", what, c)
+			}
+		}
+		if fk.OnDelete < ast.NoAction || fk.OnDelete > ast.SetDefault || fk.OnUpdate < ast.NoAction || fk.OnUpdate > ast.SetDefault {
+			return fmt.Errorf("%s has actions %d and %d", what, fk.OnDelete, fk.OnUpdate)
+		}
+	}
+	for _, r := range t.ReferencedBy {
+		if r.Table == "" || r.Name == "" {
+			return fmt.Errorf("a reference to the table names %q of %q", r.Name, r.Table)
+		}
+	}
+	return nil
 }
 
 // getTable from the catalog, through the transaction's cache.

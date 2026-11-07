@@ -61,6 +61,9 @@ type Mutations struct {
 	// autocommit statement when the statement retries after a conflict, so that the retry reads
 	// them from the snapshot whose commit lost.
 	SubqueryStaleAcrossRetries bool
+	// PanicInScan panics in every scan of the rows of a table, as a bug in the SQL layer would,
+	// so that a test can show that a panic fails a simulation instead of hanging it.
+	PanicInScan bool
 }
 
 // Session runs statements for one client, serially. It is not safe for concurrent use.

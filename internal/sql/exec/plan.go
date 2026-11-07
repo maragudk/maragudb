@@ -1006,6 +1006,10 @@ func (t *table) candidates(f filter, order []int, reads []int) []candidate {
 // couldScan reports whether Postgres could pick a scan of the index x without index conditions.
 // See [table.candidates].
 func (t *table) couldScan(x *index, f filter, order []int, reads []int) bool {
+	if len(x.Columns) == 0 {
+		// No index of a valid definition is without columns; Postgres could read every row.
+		return true
+	}
 	for _, c := range x.Columns {
 		if f.touched[c.Column] {
 			return true

@@ -3,7 +3,6 @@ package exec
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -80,7 +79,7 @@ func (s *Session) fillIndex(ctx context.Context, t *table, x *index) error {
 	for it.Next() {
 		row, err := value.DecodeRow(it.Value(), types)
 		if err != nil {
-			return fmt.Errorf("exec: table %q: %w", t.Name, err)
+			return fmt.Errorf("%w: table %q: %w", engine.ErrCorrupt, t.Name, err)
 		}
 		key, unique := x.entry(t, row)
 		if unique && !s.opts.Mutations.UniqueNoCheck {
@@ -342,15 +341,15 @@ func CheckIndexes(ctx context.Context, tx *engine.Tx) error {
 	names := map[string]string{}
 	it := tx.Scan(ctx, []byte("c/"), []byte("c0"))
 	for it.Next() {
-		var t table
-		if err := json.Unmarshal(it.Value(), &t); err != nil {
-			return fmt.Errorf("exec: corrupt catalog entry %q: %w", it.Key(), err)
+		t, err := decodeTable(strings.TrimPrefix(string(it.Key()), "c/"), it.Value())
+		if err != nil {
+			return err
 		}
 		if t.IndexOf != "" {
 			names[t.Name] = t.IndexOf
 			continue
 		}
-		tables[t.Name] = &t
+		tables[t.Name] = t
 	}
 	if err := it.Err(); err != nil {
 		return err
@@ -377,7 +376,7 @@ func CheckIndexes(ctx context.Context, tx *engine.Tx) error {
 		for rows.Next() {
 			row, err := value.DecodeRow(rows.Value(), types)
 			if err != nil {
-				return fmt.Errorf("exec: table %q: %w", t.Name, err)
+				return fmt.Errorf("%w: table %q: %w", engine.ErrCorrupt, t.Name, err)
 			}
 			for i := range t.Indexes {
 				x := &t.Indexes[i]

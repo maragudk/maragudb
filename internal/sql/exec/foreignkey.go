@@ -40,6 +40,43 @@ type reference struct {
 	Name  string `json:"name"`
 }
 
+// link checks that the foreign key of child fits parent, the table it references: that it
+// references as many columns of parent as it has, of the same types, and exactly the columns of
+// the unique index of parent that it names. A definition that does not hold up gives an error
+// that wraps [engine.ErrCorrupt].
+func (fk *foreignKey) link(child, parent *table) error {
+	fail := func(format string, args ...any) error {
+		return fmt.Errorf("%w: foreign key %q of %q: %s", engine.ErrCorrupt, fk.Name, child.Name, fmt.Sprintf(format, args...))
+	}
+	if fk.Parent != parent.Name {
+		return fail("it references %q, not %q", fk.Parent, parent.Name)
+	}
+	for i, c := range fk.RefColumns {
+		if c < 0 || c >= len(parent.Columns) {
+			return fail("it references column %d of the %d of %q", c, len(parent.Columns), parent.Name)
+		}
+		if child.Columns[fk.Columns[i]].Type != parent.Columns[c].Type {
+			return fail("its column %d and the referenced column %d have different types", fk.Columns[i], c)
+		}
+	}
+	var cols []int
+	if fk.Index == parent.PrimaryKeyIndex {
+		cols = parent.PrimaryKey
+	} else {
+		i := slices.IndexFunc(parent.Indexes, func(x index) bool { return x.Name == fk.Index })
+		if i < 0 || !parent.Indexes[i].Unique {
+			return fail("%q has no unique index %q", parent.Name, fk.Index)
+		}
+		for _, c := range parent.Indexes[i].Columns {
+			cols = append(cols, c.Column)
+		}
+	}
+	if slices.ContainsFunc(cols, func(c int) bool { return !slices.Contains(fk.RefColumns, c) }) || slices.ContainsFunc(fk.RefColumns, func(c int) bool { return !slices.Contains(cols, c) }) {
+		return fail("the index %q of %q has other columns than it references", fk.Index, parent.Name)
+	}
+	return nil
+}
+
 // setColumns of the key's ON DELETE SET NULL or SET DEFAULT.
 func (fk *foreignKey) setColumns() []int {
 	if len(fk.SetColumns) > 0 {
@@ -332,7 +369,10 @@ func (s *Session) act(ctx context.Context, ev rowEvent, r reference) error {
 	}
 	fk, ok := child.foreignKey(r.Name)
 	if !ok {
-		return fmt.Errorf("exec: table %q does not have its foreign key %q", child.Name, r.Name)
+		return fmt.Errorf("%w: table %q does not have its foreign key %q", engine.ErrCorrupt, child.Name, r.Name)
+	}
+	if err := fk.link(child, ev.t); err != nil {
+		return err
 	}
 	key, complete := values(ev.old, fk.RefColumns)
 	if !complete || s.opts.Mutations.ForeignKeyNoParentCheck {
@@ -441,6 +481,9 @@ func (s *Session) checkReference(ctx context.Context, ev rowEvent, fk *foreignKe
 			return err
 		}
 	}
+	if err := fk.link(ev.t, parent); err != nil {
+		return err
+	}
 	exists, err := s.parentExists(ctx, parent, fk, key)
 	if err != nil || exists {
 		return err
@@ -525,7 +568,7 @@ func (s *Session) referencing(ctx context.Context, child *table, fk *foreignKey,
 	visit := func(k, v []byte) bool {
 		row, derr := value.DecodeRow(v, types)
 		if derr != nil {
-			err = fmt.Errorf("exec: table %q: %w", child.Name, derr)
+			err = fmt.Errorf("%w: table %q: %w", engine.ErrCorrupt, child.Name, derr)
 			return false
 		}
 		if matches(row) {
@@ -657,7 +700,10 @@ func (s *Session) checkActionOrder(ctx context.Context, t *table) error {
 		}
 		fk, ok := child.foreignKey(r.Name)
 		if !ok {
-			return nil, nil, fmt.Errorf("exec: table %q does not have its foreign key %q", child.Name, r.Name)
+			return nil, nil, fmt.Errorf("%w: table %q does not have its foreign key %q", engine.ErrCorrupt, child.Name, r.Name)
+		}
+		if err := fk.link(child, x); err != nil {
+			return nil, nil, err
 		}
 		return child, fk, nil
 	}
@@ -801,7 +847,7 @@ func CheckConstraints(ctx context.Context, tx *engine.Tx) error {
 		for it.Next() {
 			row, err := value.DecodeRow(it.Value(), types)
 			if err != nil {
-				return fmt.Errorf("exec: table %q: %w", t.Name, err)
+				return fmt.Errorf("%w: table %q: %w", engine.ErrCorrupt, t.Name, err)
 			}
 			rows[name] = append(rows[name], row)
 		}
@@ -822,6 +868,9 @@ func CheckConstraints(ctx context.Context, tx *engine.Tx) error {
 			parent, ok := tables[fk.Parent]
 			if !ok {
 				return fmt.Errorf("%w: the foreign key %q of %q references the missing table %q", ErrDanglingReference, fk.Name, t.Name, fk.Parent)
+			}
+			if err := fk.link(t, parent); err != nil {
+				return err
 			}
 			keys := map[string]bool{}
 			for _, row := range rows[parent.Name] {

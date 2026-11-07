@@ -710,3 +710,48 @@ func runWorkloadIn(t *testing.T, ops int, bound int64, disk func() *cache.Disk, 
 	}
 	return res
 }
+
+// FuzzDisk reads a file of arbitrary bytes as the entry of a key, which never panics, and is a
+// hit only when the file is exactly what a Put of the key and the value it returns writes.
+func FuzzDisk(f *testing.F) {
+	var files fsfake.FS
+	d, err := cache.NewDisk(&files, cache.DiskOptions{MaxBytes: 1 << 20})
+	if err != nil {
+		f.Fatal(err)
+	}
+	d.Put("db/seg/a@0+10", []byte("0123456789"))
+	for _, name := range files.Names() {
+		b, _ := files.File(name)
+		f.Add("db/seg/a@0+10", b)
+		f.Add("db/seg/b@0+10", b)
+		f.Add("db/seg/a@0+10", b[:len(b)-1])
+	}
+	f.Add("k", []byte{})
+	f.Fuzz(func(t *testing.T, key string, file []byte) {
+		var files fsfake.FS
+		d, err := cache.NewDisk(&files, cache.DiskOptions{MaxBytes: 1 << 20})
+		if err != nil {
+			t.Fatal(err)
+		}
+		d.Put(key, nil)
+		names := files.Names()
+		if len(names) != 1 {
+			t.Fatalf("a Put left %d files", len(names))
+		}
+		files.SetFile(names[0], file)
+		v, ok := d.Get(key)
+		if !ok {
+			return
+		}
+		var again fsfake.FS
+		d2, err := cache.NewDisk(&again, cache.DiskOptions{MaxBytes: 1 << 20})
+		if err != nil {
+			t.Fatal(err)
+		}
+		d2.Put(key, v)
+		want, _ := again.File(names[0])
+		if !bytes.Equal(file, want) {
+			t.Fatalf("a hit of %q returned %q from a file that a Put of it does not write", key, v)
+		}
+	})
+}
