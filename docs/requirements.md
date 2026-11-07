@@ -2,7 +2,7 @@
 
 ## What it is
 
-maragudb is an embedded Go SQL database. Its only durable state is in S3-compatible object storage. `INV-S3-ONLY` Many processes can read and write the same database at the same time, with strict serializable ACID transactions. `INV-MULTI-WRITER` Caches in memory and on local disk are allowed (in the style of turbopuffer), but correctness never depends on them: losing every cache never loses or corrupts data. `INV-CACHE-LOSS`
+maragudb is an embedded Go SQL database. Its only durable state is in S3-compatible object storage. `INV-S3-ONLY` Many processes can read and write the same database at the same time, with strict serializable ACID transactions. `INV-MULTI-WRITER` Caches in memory and on local disk are allowed (in the style of turbopuffer), but correctness never depends on them: losing every cache never loses or corrupts data. `INV-CACHE-LOSS` The disk cache holds at most a configured number of bytes: the files it holds never exceed that bound by more than one entry, whatever the access pattern and across restarts. `INV-DISK-CACHE-BOUND`
 
 Target workload: small OLTP app databases (web app backends, point lookups, small transactions, MBs to a few GBs). Commit latency of tens of milliseconds is acceptable.
 

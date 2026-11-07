@@ -7,7 +7,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"math/rand/v2"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"testing/synctest"
@@ -16,6 +20,7 @@ import (
 	"maragu.dev/is"
 
 	"maragu.dev/maragudb"
+	"maragu.dev/maragudb/internal/cache"
 	"maragu.dev/maragudb/internal/engine"
 	"maragu.dev/maragudb/internal/s3"
 	"maragu.dev/maragudb/internal/s3fake"
@@ -530,6 +535,125 @@ func TestStats(t *testing.T) {
 		_, err := maragudb.Stats(t.Context(), sql.OpenDB(otherConnector{}))
 		is.True(t, err != nil)
 	})
+}
+
+func TestDiskCache(t *testing.T) {
+	t.Run("keeps the files of the disk cache within DiskCacheBytes, and serves reads from them after a restart", func(t *testing.T) {
+		verify.Covers(t, "a database with a disk cache of 64 KiB, which commits and reads many times that, keeps the files of its disk cache within the bound after every statement, and a database opened again on the directory reads from it", "INV-DISK-CACHE-BOUND")
+		w := newWorld(t)
+		dir := t.TempDir()
+		const bound = 64 << 10
+		opts := maragudb.Options{DiskCacheDir: &dir, DiskCacheBytes: new(int64(bound)), MemoryCacheBytes: new(int64)}
+		db := w.open(opts)
+		var peak int64
+		check := func() {
+			t.Helper()
+			var total int64
+			is.NotError(t, filepath.WalkDir(dir, func(path string, e fs.DirEntry, err error) error {
+				if err != nil || e.IsDir() {
+					return err
+				}
+				info, err := e.Info()
+				if err != nil {
+					return err
+				}
+				total += cache.FileBytes(info.Size())
+				return nil
+			}))
+			// No statement runs during the check, so not even the file of a write in progress may
+			// exceed the bound.
+			is.True(t, total <= bound, fmt.Sprintf("the disk cache takes %d bytes, more than %d", total, bound))
+			peak = max(peak, total)
+		}
+		mustExec(t, db, "CREATE TABLE t (id bigint PRIMARY KEY, name text)")
+		for i := range 60 {
+			mustExec(t, db, "INSERT INTO t VALUES ($1, $2)", i, strings.Repeat("x", 2000))
+			check()
+			is.Equal(t, "1", queryRows(t, db, "SELECT count(*) FROM t WHERE id = $1", i/2))
+			check()
+		}
+		is.True(t, peak > bound-4*4096, fmt.Sprintf("the disk cache filled up, to %d bytes", peak))
+		is.NotError(t, db.Close())
+
+		db2 := w.open(opts)
+		before, err := maragudb.Stats(t.Context(), db2)
+		is.NotError(t, err)
+		is.Equal(t, "1", queryRows(t, db2, "SELECT count(*) FROM t WHERE id = 59"))
+		after, err := maragudb.Stats(t.Context(), db2)
+		is.NotError(t, err)
+		is.True(t, after.DiskCacheHits > before.DiskCacheHits, "the blocks of the last commit are on disk")
+		check()
+	})
+
+	t.Run("shares the disk cache of a DSN between databases in one process, and fails with ErrDiskCacheInUse in another process", func(t *testing.T) {
+		verify.Covers(t, "two databases of one DSN with one DiskCacheDir in one process both work, and another process that opens the DSN with that directory fails with ErrDiskCacheInUse", "INV-DISK-CACHE-BOUND")
+		w := newWorld(t)
+		dir := t.TempDir()
+		opts := maragudb.Options{DiskCacheDir: &dir}
+		db1 := w.open(opts)
+		db2 := w.open(opts)
+		is.NotError(t, db1.PingContext(t.Context()))
+		is.NotError(t, db2.PingContext(t.Context()))
+
+		cmd := exec.Command(os.Args[0], "-test.run=^TestDiskCacheHelperProcess$")
+		cmd.Env = helperEnv(diskCacheHelperEnv + "=" + dir)
+		out, err := cmd.Output()
+		is.NotError(t, err)
+		is.Equal(t, "in use", firstLine(out))
+
+		is.NotError(t, db1.Close())
+		is.NotError(t, db2.Close())
+		cmd = exec.Command(os.Args[0], "-test.run=^TestDiskCacheHelperProcess$")
+		cmd.Env = helperEnv(diskCacheHelperEnv + "=" + dir)
+		out, err = cmd.Output()
+		is.NotError(t, err)
+		is.Equal(t, "open", firstLine(out), "closing both databases released the directory")
+	})
+}
+
+// helperEnv is the environment of this process with the variable set, but without the directory
+// of the verification facts, so that a helper process records none.
+func helperEnv(variable string) []string {
+	var env []string
+	for _, v := range os.Environ() {
+		if !strings.HasPrefix(v, "MARAGUDB_VERIFY_DIR=") {
+			env = append(env, v)
+		}
+	}
+	return append(env, variable)
+}
+
+func firstLine(b []byte) string {
+	line, _, _ := strings.Cut(string(b), "\n")
+	return line
+}
+
+// diskCacheHelperEnv names the disk cache directory of [TestDiskCacheHelperProcess].
+const diskCacheHelperEnv = "MARAGUDB_DISK_CACHE_HELPER_DIR"
+
+// TestDiskCacheHelperProcess opens a database with the disk cache directory of
+// [diskCacheHelperEnv], in a process of its own, and prints whether it could.
+func TestDiskCacheHelperProcess(t *testing.T) {
+	dir := os.Getenv(diskCacheHelperEnv)
+	if dir == "" {
+		t.Skip("only runs as a helper process")
+	}
+	c, err := maragudb.NewConnector(maragudb.Options{DiskCacheDir: &dir, Maintenance: new(false), Store: s3test.NewStore(s3fake.New())}, "s3://bucket/app")
+	if err != nil {
+		fmt.Println(err)
+		return
+	}
+	db := sql.OpenDB(c)
+	defer func() { _ = db.Close() }()
+	err = db.PingContext(t.Context())
+	switch {
+	case errors.Is(err, maragudb.ErrDiskCacheInUse):
+		fmt.Println("in use")
+	case err != nil:
+		fmt.Println(err)
+	default:
+		fmt.Println("open")
+	}
 }
 
 func TestMaintenance(t *testing.T) {

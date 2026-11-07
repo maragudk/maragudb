@@ -40,8 +40,11 @@ type Options struct {
 	Exec exec.Options
 	// NewClient opens an object store client for a bucket. Required when Engine.Client is nil.
 	NewClient func(ctx context.Context, bucket string) (s3.Client, error)
-	// DiskCacheDir holds a disk cache per DSN when set.
+	// DiskCacheDir holds a disk cache per DSN when set, in a subdirectory of its own.
 	DiskCacheDir string
+	// DiskCacheBytes bounds each disk cache, as [cache.OpenDir] counts them. A disk cache needs a
+	// positive bound, and zero turns the disk cache off.
+	DiskCacheBytes int64
 	// Maintenance in the background for every database.
 	Maintenance MaintenanceOptions
 	Logger      *slog.Logger
@@ -115,6 +118,8 @@ type Connector struct {
 	maintainer *engine.Maintainer
 	stop       context.CancelFunc
 	stopped    chan struct{}
+	// closeDisk closes the disk cache that the connector opened, if any.
+	closeDisk func()
 }
 
 // NewConnector for a DSN.
@@ -148,16 +153,18 @@ func (c *Connector) DB(ctx context.Context) (*engine.DB, error) {
 		}
 		opts.Client = client
 	}
-	if opts.DiskCache == nil && c.d.opts.DiskCacheDir != "" {
+	if opts.DiskCache == nil && c.d.opts.DiskCacheDir != "" && c.d.opts.DiskCacheBytes != 0 {
 		sum := sha256.Sum256([]byte(c.dsn))
-		disk, err := cache.NewDisk(filepath.Join(c.d.opts.DiskCacheDir, hex.EncodeToString(sum[:8])))
+		disk, closeDisk, err := cache.OpenDir(filepath.Join(c.d.opts.DiskCacheDir, hex.EncodeToString(sum[:8])), c.d.opts.DiskCacheBytes)
 		if err != nil {
 			return nil, fmt.Errorf("sqldriver: opening disk cache: %w", err)
 		}
 		opts.DiskCache = disk
+		c.closeDisk = closeDisk
 	}
 	db, err := engine.Open(ctx, opts)
 	if err != nil {
+		c.releaseDisk()
 		return nil, err
 	}
 	c.db = db
@@ -234,7 +241,16 @@ func (c *Connector) Close() error {
 		err = cerr
 	}
 	c.db = nil
+	c.releaseDisk()
 	return err
+}
+
+// releaseDisk closes the disk cache of the connector, if it has one. c.mu must be held.
+func (c *Connector) releaseDisk() {
+	if c.closeDisk != nil {
+		c.closeDisk()
+		c.closeDisk = nil
+	}
 }
 
 var _ io.Closer = (*Connector)(nil)

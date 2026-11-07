@@ -52,6 +52,7 @@ import (
 	"log/slog"
 	"time"
 
+	"maragu.dev/maragudb/internal/cache"
 	"maragu.dev/maragudb/internal/engine"
 	"maragu.dev/maragudb/internal/s3"
 	"maragu.dev/maragudb/internal/sql/exec"
@@ -138,6 +139,9 @@ var (
 	ErrTxAborted = exec.ErrTxAborted
 	// ErrDSN is an invalid data source name.
 	ErrDSN = sqldriver.ErrDSN
+	// ErrDiskCacheInUse is a disk cache directory that another process uses. See
+	// [Options.DiskCacheDir].
+	ErrDiskCacheInUse = cache.ErrInUse
 )
 
 // Options for [RegisterDriver] and [NewConnector]. Every field has a default.
@@ -149,9 +153,16 @@ type Options struct {
 	// MemoryCacheBytes bounds the in-memory block cache per database. Defaults to 64 MiB.
 	// Zero disables it.
 	MemoryCacheBytes *int64
-	// DiskCacheDir is a directory for a disk cache, which gets a subdirectory per DSN. Defaults
-	// to no disk cache. The disk cache never evicts.
+	// DiskCacheDir is a directory for a disk cache of the blocks that reads fetch, which gets a
+	// subdirectory per DSN. Defaults to no disk cache. Only one process can use the subdirectory
+	// of a DSN: opening a database whose subdirectory another process uses fails with
+	// [ErrDiskCacheInUse], so give each process a directory of its own. The databases of one DSN
+	// in one process share its disk cache.
 	DiskCacheDir *string
+	// DiskCacheBytes bounds the disk cache of each database, in the bytes its files take up, each
+	// rounded up to a block of 4 KiB. The least recently used blocks are evicted to stay within
+	// it. Defaults to 1 GiB. Zero turns the disk cache off.
+	DiskCacheBytes *int64
 	// GCGracePeriod is how long garbage collection keeps an object that a snapshot might still
 	// reference, and so the longest a transaction can live. Defaults to one hour. The period is
 	// measured on the clocks of the processes that run transactions and garbage collection, so
@@ -213,6 +224,9 @@ func (o Options) withDefaults() Options {
 	if o.DiskCacheDir == nil {
 		o.DiskCacheDir = new("")
 	}
+	if o.DiskCacheBytes == nil {
+		o.DiskCacheBytes = new(int64(1 << 30))
+	}
 	if o.Maintenance == nil {
 		o.Maintenance = new(true)
 	}
@@ -238,8 +252,9 @@ func newDriver(opts Options) *sqldriver.Driver {
 			MemoryCacheBytes: opts.MemoryCacheBytes,
 			GCGracePeriod:    opts.GCGracePeriod,
 		},
-		Exec:         exec.Options{Logger: opts.Logger},
-		DiskCacheDir: *opts.DiskCacheDir,
+		Exec:           exec.Options{Logger: opts.Logger},
+		DiskCacheDir:   *opts.DiskCacheDir,
+		DiskCacheBytes: *opts.DiskCacheBytes,
 		Maintenance: sqldriver.MaintenanceOptions{
 			Disabled: !*opts.Maintenance,
 			Interval: *opts.MaintenanceInterval,

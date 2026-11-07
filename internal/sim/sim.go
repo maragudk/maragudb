@@ -4,6 +4,7 @@
 package sim
 
 import (
+	"cmp"
 	"context"
 	"database/sql"
 	"errors"
@@ -17,6 +18,7 @@ import (
 
 	"maragu.dev/maragudb/internal/cache"
 	"maragu.dev/maragudb/internal/engine"
+	"maragu.dev/maragudb/internal/fsfake"
 	"maragu.dev/maragudb/internal/history"
 	"maragu.dev/maragudb/internal/reach"
 	"maragu.dev/maragudb/internal/s3"
@@ -132,6 +134,13 @@ type Config struct {
 	SQL bool
 	// SQLMutations to break the SQL layer with. Only used with SQL.
 	SQLMutations exec.Mutations
+	// DiskFaults bounds the disk cache of every client that has one to between 2 and 16 blocks of
+	// 4 KiB, so that it evicts, and damages its files at every crash and now and then between
+	// transactions. Without it, the disk caches are far larger than a run fills, and their files
+	// stay whole.
+	DiskFaults bool
+	// DiskMutations to break the clients' disk caches with.
+	DiskMutations cache.DiskMutations
 	// Trace receives one line per event when non-nil.
 	Trace func(string)
 }
@@ -274,6 +283,9 @@ const (
 	// CheckerRealTime finds a reader that misses a commit acknowledged before it began, through
 	// a counter that only grows.
 	CheckerRealTime = "real-time order"
+	// CheckerDiskCache finds a client whose disk cache holds files that take more bytes than its
+	// bound, or more than it counts, after any of its operations.
+	CheckerDiskCache = "disk cache bound"
 )
 
 // Anomaly found in a run, with the checker that found it.
@@ -398,7 +410,12 @@ func Run(cfg Config) Result {
 	}
 	r.activeClients = cfg.Clients
 	for i := range cfg.Clients {
-		c := &client{run: r, id: i, rng: rand.New(rand.NewPCG(cfg.Seed, uint64(i)+1)), disk: cache.NewMemory(0), freed: map[string]bool{}}
+		c := &client{run: r, id: i, rng: rand.New(rand.NewPCG(cfg.Seed, uint64(i)+1)), freed: map[string]bool{}}
+		c.diskRng = rand.New(rand.NewPCG(cfg.Seed, 0xd15c+uint64(i)))
+		c.diskBytes = 1 << 40
+		if cfg.DiskFaults {
+			c.diskBytes = 4096 * (2 + c.diskRng.Int64N(15))
+		}
 		r.clients = append(r.clients, c)
 		r.goTask(fmt.Sprint("client", i), c.loop)
 	}
@@ -448,7 +465,7 @@ func Run(cfg Config) Result {
 	}
 	r.checkStorage()
 	res.Anomalies = r.anoms
-	if cfg.Mutations == (engine.Mutations{}) && cfg.SQLMutations == (exec.Mutations{}) {
+	if cfg.Mutations == (engine.Mutations{}) && cfg.SQLMutations == (exec.Mutations{}) && cfg.DiskMutations == (cache.DiskMutations{}) {
 		assert.Always(len(r.anoms) == 0, "the simulated history has no anomalies", map[string]any{"seed": cfg.Seed})
 	}
 	res.Digest = r.digest(res)
@@ -571,7 +588,11 @@ func (r *run) readFinal() (map[string][]int64, map[string]int64, error) {
 			case ListAppend:
 				// The overflow of a list follows its packed part in key order.
 				list, overflow := strings.CutSuffix(key, overflowSuffix)
-				lists[list] = append(lists[list], decodeList(it.Value())...)
+				var values []int64
+				if values, err = decodeList(it.Value()); err != nil {
+					return
+				}
+				lists[list] = append(lists[list], values...)
 				if !overflow && lists[list] == nil {
 					lists[list] = []int64{}
 				}
@@ -648,19 +669,20 @@ func keyName(i int) string {
 	return fmt.Sprintf("k%02d", i)
 }
 
-func decodeList(b []byte) []int64 {
+// decodeList, or fail on bytes that no write of the workload wrote.
+func decodeList(b []byte) ([]int64, error) {
 	if len(b) == 0 {
-		return []int64{}
+		return []int64{}, nil
 	}
 	var list []int64
 	for _, s := range strings.Split(string(b), ",") {
 		v, err := strconv.ParseInt(s, 10, 64)
 		if err != nil {
-			panic(fmt.Sprintf("sim: corrupt list %q", b))
+			return nil, fmt.Errorf("corrupt list %q", b)
 		}
 		list = append(list, v)
 	}
-	return list
+	return list, nil
 }
 
 func encodeList(list []int64) []byte {
@@ -671,15 +693,22 @@ func encodeList(list []int64) []byte {
 	return []byte(strings.Join(parts, ","))
 }
 
-// client is one simulated process running transactions. It restarts after a crash, keeping its
-// disk cache but losing its memory.
+// client is one simulated process running transactions. It restarts after a crash, keeping the
+// files of its disk cache but losing its memory, and a crash damages some of those files.
 type client struct {
-	run  *run
-	id   int
-	rng  *rand.Rand
-	disk cache.Cache
-	proc *s3fake.Process
-	db   *engine.DB
+	run *run
+	id  int
+	rng *rand.Rand
+	// files of the disk cache, its bound in bytes, and the disk cache of the current process,
+	// whose stats when last looked at are diskStats. diskRng draws the damage of a crash, and
+	// the bound.
+	files     fsfake.FS
+	diskBytes int64
+	disk      *cache.Disk
+	diskStats cache.DiskStats
+	diskRng   *rand.Rand
+	proc      *s3fake.Process
+	db        *engine.DB
 	// sql is the database/sql handle when the run goes through SQL.
 	sql *sql.DB
 	// maint is the client's maintainer in the maintenance modes.
@@ -701,6 +730,7 @@ func (c *client) loop(ctx context.Context) {
 		if c.db == nil && c.sql == nil {
 			c.proc = &s3fake.Process{Name: fmt.Sprint("client", c.id)}
 			pctx := s3fake.WithProcess(ctx, c.proc)
+			c.openDisk(ctx)
 			var err error
 			var db *engine.DB
 			if c.run.cfg.SQL {
@@ -735,9 +765,14 @@ func (c *client) loop(ctx context.Context) {
 		default:
 			c.bankTx(pctx)
 		}
+		c.checkDisk(ctx)
+		if names := c.files.Names(); c.run.cfg.DiskFaults && len(names) > 0 && c.diskRng.IntN(8) == 0 {
+			c.damageFile(names[c.diskRng.IntN(len(names))])
+		}
 		c.afterCrash()
 		if c.maint != nil && c.rng.IntN(3) == 0 {
 			c.step(pctx)
+			c.checkDisk(ctx)
 			c.afterCrash()
 		}
 		c.run.sched.Sleep(ctx, time.Duration(c.rng.Int64N(int64(5*time.Millisecond))))
@@ -783,6 +818,85 @@ func (c *client) afterCrash() {
 		c.maint = nil
 		c.closeSQL()
 		c.proc = nil
+		c.disk = nil
+		if c.run.cfg.DiskFaults {
+			c.damageDisk()
+		}
+	}
+}
+
+// openDisk opens the client's disk cache on its files, as a process does when it starts.
+func (c *client) openDisk(ctx context.Context) {
+	disk, err := cache.NewDisk(&c.files, cache.DiskOptions{MaxBytes: c.diskBytes, Mutations: c.run.cfg.DiskMutations})
+	if err != nil {
+		panic(fmt.Sprintf("sim: opening a disk cache: %v", err))
+	}
+	c.disk = disk
+	c.diskStats = cache.DiskStats{}
+	c.checkDisk(ctx)
+}
+
+// checkDisk checks that the files of the client's disk cache are within its bound and all
+// counted, and records the states its disk cache reached.
+func (c *client) checkDisk(ctx context.Context) {
+	if c.disk == nil {
+		return
+	}
+	// No Put runs between the operations of a client, so not even the one entry that a Put
+	// writes beyond the bound may be there.
+	total, _ := c.files.Bytes()
+	s := c.disk.Stats()
+	switch {
+	case total > c.diskBytes:
+		c.run.anomaly(CheckerDiskCache, "client %d: the files of the disk cache take %d bytes, more than the bound %d", c.id, total, c.diskBytes)
+	case total > s.Bytes:
+		c.run.anomaly(CheckerDiskCache, "client %d: the files of the disk cache take %d bytes, and it counts %d", c.id, total, s.Bytes)
+	}
+	if s.Evictions > c.diskStats.Evictions {
+		assert.Sometimes(true, "a disk cache evicts to stay within its bound", nil)
+		reach.Hit(ctx, reach.DiskCacheEviction)
+	}
+	if s.Refused > c.diskStats.Refused {
+		assert.Sometimes(true, "a disk cache refuses a damaged file", nil)
+		reach.Hit(ctx, reach.DiskCacheRefused)
+	}
+	c.diskStats = s
+}
+
+// damageDisk as a crash can: a third of the files of the disk cache are damaged, and the write in
+// progress may leave its temporary file.
+func (c *client) damageDisk() {
+	for _, name := range c.files.Names() {
+		if c.diskRng.IntN(3) == 0 {
+			c.damageFile(name)
+		}
+	}
+	if c.diskRng.IntN(2) == 0 {
+		c.files.SetFile(cache.TempPrefix+"crashed", make([]byte, c.diskRng.IntN(5000)))
+	}
+}
+
+// damageFile of the disk cache, as a disk or another program can at any time: the file may have
+// a bit flipped, hold the content of another entry's file, lose its end, or be gone. No file
+// grows, so the disk cache still counts every byte of its files.
+func (c *client) damageFile(name string) {
+	b, _ := c.files.File(name)
+	switch n := c.diskRng.IntN(10); {
+	case n < 5:
+		if len(b) > 0 {
+			b[c.diskRng.IntN(len(b))] ^= 1 << c.diskRng.IntN(8)
+			c.files.SetFile(name, b)
+		}
+	case n < 8:
+		names := c.files.Names()
+		other, _ := c.files.File(names[c.diskRng.IntN(len(names))])
+		if cache.FileBytes(int64(len(other))) <= cache.FileBytes(int64(len(b))) {
+			c.files.SetFile(name, other)
+		}
+	case n < 9:
+		c.files.SetFile(name, b[:c.diskRng.IntN(len(b)+1)])
+	default:
+		_ = c.files.Remove(name)
 	}
 }
 
@@ -919,8 +1033,13 @@ func (c *client) listAppendTx(ctx context.Context) {
 			}
 			return
 		}
-		overflow := decodeList(w)
-		list := append(decodeList(v), overflow...)
+		overflow, oerr := decodeList(w)
+		list, lerr := decodeList(v)
+		if err := cmp.Or(lerr, oerr); err != nil {
+			c.run.anomaly(CheckerWorkload, "client %d: %v", c.id, err)
+			return
+		}
+		list = append(list, overflow...)
 		h.Ops = append(h.Ops, history.Op{Kind: history.Read, Key: p.key, List: list})
 		if p.append {
 			value := c.value()

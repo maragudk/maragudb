@@ -98,23 +98,3 @@ func TestMemory(t *testing.T) {
 		}, hegel.WithTestCases(500))
 	})
 }
-
-func TestDisk(t *testing.T) {
-	t.Run("returns what was put and survives a new instance on the same directory", func(t *testing.T) {
-		dir := t.TempDir()
-		d, err := cache.NewDisk(dir)
-		is.NotError(t, err)
-		d.Put("a/b", []byte("1"))
-		v, ok := d.Get("a/b")
-		is.True(t, ok)
-		is.Equal(t, "1", string(v))
-		_, ok = d.Get("missing")
-		is.True(t, !ok)
-
-		d2, err := cache.NewDisk(dir)
-		is.NotError(t, err)
-		v, ok = d2.Get("a/b")
-		is.True(t, ok)
-		is.Equal(t, "1", string(v))
-	})
-}

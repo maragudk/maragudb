@@ -224,13 +224,17 @@ func TestOpen(t *testing.T) {
 	t.Run("serves blocks and the manifest from a disk cache directory across restarts", func(t *testing.T) {
 		w := newWorld(t)
 		dir := t.TempDir()
-		disk, err := cache.NewDisk(dir)
+		disk, closeDisk, err := cache.OpenDir(dir, 1<<20)
 		is.NotError(t, err)
 		db := w.open(1, engine.Options{DiskCache: disk})
 		put(t, db, "a", "1")
+		is.NotError(t, db.Close())
+		closeDisk()
 
-		disk2, err := cache.NewDisk(dir)
+		disk2, closeDisk2, err := cache.OpenDir(dir, 1<<20)
 		is.NotError(t, err)
+		t.Cleanup(closeDisk2)
+		is.True(t, disk2 != disk, "a new cache on the directory, as in a new process")
 		db2 := w.open(2, engine.Options{DiskCache: disk2, MemoryCacheBytes: new(int64)})
 		before := db2.Stats().S3
 		v, ok := get(t, db2, "a")

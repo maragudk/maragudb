@@ -19,6 +19,7 @@ import (
 
 	"maragu.dev/is"
 
+	"maragu.dev/maragudb/internal/cache"
 	"maragu.dev/maragudb/internal/engine"
 	"maragu.dev/maragudb/internal/reach"
 	"maragu.dev/maragudb/internal/sim"
@@ -185,6 +186,20 @@ func corpus() []sim.Config {
 		}
 		cfgs = append(cfgs, cfg)
 	}
+	// Disk caches small enough to evict, whose files crashes and the disk damage, in every
+	// workload, through the engine and through SQL, some with heavier faults.
+	for seed := uint64(700); seed < 724; seed++ {
+		cfg := sim.DefaultConfig(seed)
+		cfg.Workload = sim.Workload(seed % 4)
+		cfg.SQL = cfg.Workload >= sim.Unique || seed%8 >= 4
+		cfg.DiskFaults = true
+		if seed%3 == 0 {
+			cfg.Clients = 10
+			cfg.CrashRate = 0.03
+			cfg.Maintainers = 2
+		}
+		cfgs = append(cfgs, cfg)
+	}
 	// The same through the SQL layer and the database/sql driver.
 	for seed := uint64(300); seed < 330; seed++ {
 		for _, w := range []sim.Workload{sim.ListAppend, sim.Bank} {
@@ -218,6 +233,9 @@ func failReport(t *testing.T, res sim.Result) {
 		replay += " CORPUS=1"
 	} else {
 		replay += fmt.Sprintf(" MAINTAINERS=%d MAINTENANCE=%s", cfg.Maintainers, maintenanceName(cfg.Maintenance))
+		if cfg.DiskFaults {
+			replay += " DISK_FAULTS=1"
+		}
 	}
 	t.Errorf("%s\n\nconfiguration: %+v\n\nreplay with:\n  %s", res.Report(), cfg, replay)
 }
@@ -254,12 +272,13 @@ func TestSimulator(t *testing.T) {
 		verify.Covers(t, "after every run of the fixed corpus, GC passes a grace period apart leave only the live segments and the objects of writes against the final manifest, and fail on no missing garbage batch", "AC-6.1")
 		verify.Covers(t, "the fixed corpus, with the unique workload under the same faults, finds no two rows with the same unique value in any snapshot a reader saw or in the final state, and after every run through SQL every index of the store matches its table, and lookups through the indexes find the rows of the table", "INV-UNIQUE", "INV-INDEX-CONSISTENT")
 		verify.Covers(t, "the fixed corpus, with the foreign key workload under the same faults, finds no reference to a missing row and no row that violates a CHECK in any snapshot a reader saw, and after every run through SQL every foreign key and CHECK of the store holds", "INV-FK", "INV-CHECK")
-		verify.Covers(t, "the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, and unique and foreign key violations that only a concurrent commit causes",
+		verify.Covers(t, "the fixed corpus, with disk caches small enough to evict and files that crashes and the disk damage, finds no anomalies, and after every operation of every client the files of its disk cache are within the bound and all counted", "INV-DISK-CACHE-BOUND", "INV-CACHE-LOSS")
+		verify.Covers(t, "the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, unique and foreign key violations that only a concurrent commit causes, and disk caches that evict and refuse damaged files",
 			"AC-1.3", "AC-1.4", "STATE-LOST-ACK-LANDED", "STATE-LOST-ACK-CONFLICT", "STATE-LIVE-UNKNOWN", "STATE-AUTOCOMMIT-RETRY",
 			"STATE-COMPACTION-REBASE", "STATE-COMPACTION-PARTIAL-REBASE", "STATE-COMPACTION-KEEPS-TOMBSTONE", "STATE-COMPACTION-UPPER-TIER", "STATE-COMPACTION-WINDOWS", "STATE-GC-REBASE", "STATE-GC-KEEPS-LIVE-GARBAGE", "STATE-GC-BATCH-REWRITTEN", "STATE-GC-CHAIN-DROPPED", "STATE-LEASE-TAKEOVER", "STATE-LEASE-OVERLAP",
 			"STATE-SNAPSHOT-EXPIRED-REFUSED", "STATE-BLOCK-READ-RETRY-SUCCEEDED", "STATE-CRASH-MID-COMMIT-RECOVERED",
 			"STATE-CRASH-MID-COMPACTION", "STATE-CRASH-MID-GC", "STATE-UNIQUE-AFTER-CONFLICT", "STATE-UNIQUE-VALUE-REUSED",
-			"STATE-FK-AFTER-CONFLICT", "STATE-FK-CASCADE-TABLES")
+			"STATE-FK-AFTER-CONFLICT", "STATE-FK-CASCADE-TABLES", "STATE-DISK-CACHE-EVICTION", "STATE-DISK-CACHE-REFUSED")
 		t.Parallel()
 		c := corpusResults()
 		for _, res := range c.failed {
@@ -486,6 +505,9 @@ func TestSimulator(t *testing.T) {
 			cfg.Maintainers, err = strconv.Atoi(n)
 			is.NotError(t, err)
 		}
+		if os.Getenv("MARAGUDB_DISK_FAULTS") != "" {
+			cfg.DiskFaults = true
+		}
 		switch os.Getenv("MARAGUDB_MAINTENANCE") {
 		case "lease":
 			cfg.Maintenance = sim.MaintenanceLease
@@ -501,6 +523,8 @@ func TestSimulator(t *testing.T) {
 					found = true
 					cfg.Mutations = m.mutations
 					cfg.SQLMutations = m.sqlMutations
+					cfg.DiskMutations = m.diskMutations
+					cfg.DiskFaults = cfg.DiskFaults || m.diskMutations != (cache.DiskMutations{})
 					if m.sqlMutations != (exec.Mutations{}) {
 						cfg.SQL = true
 					}
@@ -554,6 +578,7 @@ func TestSimulator(t *testing.T) {
 			cfg.MaxOutage = time.Duration(1+rng.IntN(3000)) * time.Millisecond
 			cfg.OutageTimeout = time.Duration(rng.IntN(200)) * time.Millisecond
 			cfg.GracePeriod = time.Duration(50+rng.IntN(3000)) * time.Millisecond
+			cfg.DiskFaults = rng.IntN(2) == 0
 			res := runSim(cfg)
 			runs++
 			batch.add(res)
@@ -606,6 +631,13 @@ type mutant struct {
 	id, replay, name, description string
 	mutations                     engine.Mutations
 	sqlMutations                  exec.Mutations
+	// diskMutations break the disk cache, and run with [sim.Config.DiskFaults].
+	diskMutations cache.DiskMutations
+	// unsimulated, for a mutant that no cell can run, is why not, and a targeted test detects it.
+	unsimulated string
+	// engineOnly, for a mutant that only the cells through the engine can run, is why the cells
+	// through SQL do not apply.
+	engineOnly string
 	// cannot says, for every cell that cannot detect the mutant, why not.
 	cannot map[cell]string
 	// checkers that must each detect the mutant in at least one cell, so that the checker meant
@@ -923,12 +955,37 @@ func mutants() []mutant {
 				return m
 			}(),
 		},
+		{
+			id: "MUT-DISK-CACHE-UNVERIFIED", replay: "disk-cache-unverified", name: "a disk cache that serves damaged files",
+			description:   "`cache.DiskMutations.Unverified` serves the bytes of a disk cache file without checking its header, key, length, and checksum, so that a file that a crash truncated, corrupted, or filled with another entry's content is served.",
+			diskMutations: cache.DiskMutations{Unverified: true},
+			engineOnly:    "a damaged table definition that the mutant serves can make the SQL layer fail an index lookup with a panic, which ends the simulation instead of a checker; the cells through the engine, which have no table definitions, and `TestDisk` of the cache detect the mutant",
+			checkers:      []string{sim.CheckerListAppend, sim.CheckerBank},
+		},
+		{
+			id: "MUT-DISK-CACHE-SERVE-CUT-READ", replay: "disk-cache-serve-cut-read", name: "a disk cache that serves a read that an eviction cut short",
+			description:   "`cache.DiskMutations.ServeCutReads` serves a disk cache file that is shorter than its header says as it is, as a read that an eviction or a replacement cut short leaves on a file system that does not keep a removed file readable.",
+			diskMutations: cache.DiskMutations{ServeCutReads: true},
+			unsimulated:   "a disk cache read in the simulator never overlaps an eviction, because the scheduler runs one task at a time and a read of the disk cache does not yield, and a block or manifest cut short fails to decode in the engine anyway; `TestDisk` of the cache overlaps reads with evictions and detects the mutant",
+		},
+		{
+			id: "MUT-DISK-CACHE-UNCOUNTED", replay: "disk-cache-uncounted", name: "a disk cache that does not count the files of an earlier process",
+			description:   "`cache.DiskMutations.UncountedAtOpen` leaves the files that are in a disk cache directory at open out of the cache, so that a restarted process never counts or evicts them and its directory grows past the bound.",
+			diskMutations: cache.DiskMutations{UncountedAtOpen: true},
+			checkers:      []string{sim.CheckerDiskCache},
+		},
 	}
 }
 
 // applicable reports whether the mutant can run in the cell, and why not: a mutant in the SQL
 // layer needs SQL, and one of code that only some workloads run needs one of them.
 func (m mutant) applicable(c cell) (bool, string) {
+	if m.unsimulated != "" {
+		return false, m.unsimulated
+	}
+	if c.sql && m.engineOnly != "" {
+		return false, m.engineOnly
+	}
 	if !c.sql && m.sqlMutations != (exec.Mutations{}) {
 		return false, sqlOnly
 	}
@@ -1062,6 +1119,8 @@ func TestMutants(t *testing.T) {
 						cfg.Maintainers = c.maintainers
 						cfg.Mutations = m.mutations
 						cfg.SQLMutations = m.sqlMutations
+						cfg.DiskMutations = m.diskMutations
+						cfg.DiskFaults = m.diskMutations != (cache.DiskMutations{})
 						res := runSim(cfg)
 						if res.Failed() {
 							r.Status, r.Seed, r.Checkers = verify.Detected, seed, res.Checkers()
@@ -1082,7 +1141,7 @@ func TestMutants(t *testing.T) {
 					caught[name] = true
 				}
 				if r.Status == verify.Detected && c.maintainers == 0 && !slices.ContainsFunc(r.Checkers, func(name string) bool {
-					return name == sim.CheckerListAppend || name == sim.CheckerDurability || name == sim.CheckerBank || name == sim.CheckerUnique || name == sim.CheckerIndex || name == sim.CheckerForeignKey || name == sim.CheckerCheck || name == sim.CheckerRealTime || name == sim.CheckerStorage
+					return name == sim.CheckerListAppend || name == sim.CheckerDurability || name == sim.CheckerBank || name == sim.CheckerUnique || name == sim.CheckerIndex || name == sim.CheckerForeignKey || name == sim.CheckerCheck || name == sim.CheckerRealTime || name == sim.CheckerStorage || name == sim.CheckerDiskCache
 				}) {
 					t.Errorf("%v: without maintainers, a history or invariant checker must find the mutant, but only %v did", c, r.Checkers)
 				}

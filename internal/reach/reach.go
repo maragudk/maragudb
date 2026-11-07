@@ -41,6 +41,8 @@ const (
 	UniqueValueReused        State = "STATE-UNIQUE-VALUE-REUSED"
 	ForeignKeyAfterConflict  State = "STATE-FK-AFTER-CONFLICT"
 	ForeignKeyCascadeTables  State = "STATE-FK-CASCADE-TABLES"
+	DiskCacheEviction        State = "STATE-DISK-CACHE-EVICTION"
+	DiskCacheRefused         State = "STATE-DISK-CACHE-REFUSED"
 )
 
 // Declared state, with what it means and the message of the Antithesis assertion that marks it.
@@ -77,6 +79,8 @@ func Declarations() []Declared {
 		{UniqueValueReused, "a client inserts a row with a unique value that its own committed UPDATE or DELETE freed", "a unique value that a committed write freed is taken again"},
 		{ForeignKeyAfterConflict, "an autocommit statement that passed its foreign key checks loses its commit to a concurrent one, and its retry fails with a foreign key violation that the concurrent commit causes", "a foreign key violation occurs only because of a concurrent commit"},
 		{ForeignKeyCascadeTables, "one statement's ON DELETE CASCADE actions delete rows in more than one table", "a cascade deletes rows in more than one table"},
+		{DiskCacheEviction, "a client's disk cache evicts its least recently used entries to stay within its bound", "a disk cache evicts to stay within its bound"},
+		{DiskCacheRefused, "a client's disk cache refuses a file that a crash damaged or removed, and the read goes to the store", "a disk cache refuses a damaged file"},
 	}
 }
 

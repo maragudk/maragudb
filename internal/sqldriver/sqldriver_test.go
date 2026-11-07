@@ -145,7 +145,7 @@ func TestConnector(t *testing.T) {
 
 	t.Run("uses a disk cache directory per DSN", func(t *testing.T) {
 		fake := s3fake.New()
-		d := sqldriver.New(sqldriver.Options{Engine: engine.Options{Client: fake, MemoryCacheBytes: new(int64)}, DiskCacheDir: t.TempDir(), Maintenance: sqldriver.MaintenanceOptions{Disabled: true}})
+		d := sqldriver.New(sqldriver.Options{Engine: engine.Options{Client: fake, MemoryCacheBytes: new(int64)}, DiskCacheDir: t.TempDir(), DiskCacheBytes: 1 << 20, Maintenance: sqldriver.MaintenanceOptions{Disabled: true}})
 		c, err := sqldriver.NewConnector(d, "s3://bucket/db")
 		is.NotError(t, err)
 		db := sql.OpenDB(c)

@@ -1,13 +1,9 @@
-// Package cache has byte caches for immutable objects: an in-memory LRU and a directory on disk.
+// Package cache has byte caches for immutable objects: an LRU in memory and an LRU in a directory
+// on disk, both bounded in bytes.
 package cache
 
 import (
 	"container/list"
-	"crypto/sha256"
-	"encoding/hex"
-	"fmt"
-	"os"
-	"path/filepath"
 	"sync"
 	"unsafe"
 )
@@ -116,49 +112,4 @@ func (m *Memory) Bytes() int64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.bytes
-}
-
-// Disk is a cache of files in a directory, named by a hash of the key. It never evicts.
-type Disk struct {
-	dir string
-}
-
-// NewDisk cache in dir, which is created if missing.
-func NewDisk(dir string) (*Disk, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, fmt.Errorf("cache: creating directory %q: %w", dir, err)
-	}
-	return &Disk{dir: dir}, nil
-}
-
-func (d *Disk) path(key string) string {
-	sum := sha256.Sum256([]byte(key))
-	return filepath.Join(d.dir, hex.EncodeToString(sum[:]))
-}
-
-func (d *Disk) Get(key string) ([]byte, bool) {
-	b, err := os.ReadFile(d.path(key))
-	if err != nil {
-		return nil, false
-	}
-	return b, true
-}
-
-func (d *Disk) Put(key string, value []byte) {
-	path := d.path(key)
-	tmp, err := os.CreateTemp(d.dir, "tmp-*")
-	if err != nil {
-		return
-	}
-	defer func() {
-		_ = os.Remove(tmp.Name())
-	}()
-	if _, err := tmp.Write(value); err != nil {
-		_ = tmp.Close()
-		return
-	}
-	if err := tmp.Close(); err != nil {
-		return
-	}
-	_ = os.Rename(tmp.Name(), path)
 }

@@ -10,10 +10,10 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 ## At a glance
 
-- 36 acceptance criteria (`AC-`), 24 key invariants (`INV-`), 31 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
-- 24 mutants (`MUT-`), deliberate bugs, of which 23 are detected by the simulator's checkers within 20 seeds.
-- 24 interesting states (`STATE-`) that the simulator's fixed corpus must reach.
-- 235 declarations of coverage in the tests.
+- 36 acceptance criteria (`AC-`), 25 key invariants (`INV-`), 31 classes of unsupported statements (`UNS-`), and 1 remaining differences from Postgres (`DEV-`), each verified by at least one test.
+- 27 mutants (`MUT-`), deliberate bugs, of which 25 are detected by the simulator's checkers within 20 seeds.
+- 26 interesting states (`STATE-`) that the simulator's fixed corpus must reach.
+- 251 declarations of coverage in the tests.
 
 ## Acceptance criteria
 
@@ -43,7 +43,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/s3fake` `TestClient_Faults/a_lost_ack_hides_a_precondition_failure_too`: a lost acknowledgement also hides a precondition failure, so the client cannot tell what happened
 - `internal/s3fake` `TestClient_Faults/lost_acks_are_applied_but_reported_as_errors`: a lost acknowledgement applies the write and still reports an error
 - `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus, with injected errors, latency, lost acknowledgements, outages, and crashes, finds no anomalies with any checker and exercises every fault
-- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, and unique and foreign key violations that only a concurrent commit causes
+- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, unique and foreign key violations that only a concurrent commit causes, and disk caches that evict and refuse damaged files
 
 ### `AC-1.4`
 
@@ -52,7 +52,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 - `internal/s3fake` `TestClient_Faults/a_crashed_process_cannot_make_further_requests`: a crashed process fails every later request, and other processes are unaffected
 - `internal/s3fake` `TestClient_Faults/crashes_happen_both_before_and_after_apply`: over 50 seeds, crashes happen both before and after the write is applied
 - `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus, with injected errors, latency, lost acknowledgements, outages, and crashes, finds no anomalies with any checker and exercises every fault
-- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, and unique and foreign key violations that only a concurrent commit causes
+- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, unique and foreign key violations that only a concurrent commit causes, and disk caches that evict and refuse damaged files
 
 ### `AC-1.5`
 
@@ -352,8 +352,27 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 > Caches in memory and on local disk are allowed (in the style of turbopuffer), but correctness never depends on them: losing every cache never loses or corrupts data.
 
+- `internal/cache` `TestDisk/never_serves_bytes_that_the_latest_Put_of_a_key_did_not_put,_never_holds_more_than_the_bound,_and_counts_every_file,_through_damage,_restarts,_and_evictions_and_replacements_in_the_middle_of_reads`: random operations, damaged and cut files, restarts with leftover temporary files, and evictions and replacements in the middle of reads never make a disk cache serve other bytes than the latest Put of the key, and its files never exceed the bound and are all counted
+- `internal/cache` `TestDisk/refuses_every_damaged_file_and_removes_it`: a disk cache file that is empty, truncated at any length, corrupt in any byte, of another key, or of the format without a header is a miss, and leaves the cache
+- `internal/cache` `TestDisk/serves_a_read_that_an_eviction_overlaps_whole_or_not_at_all`: an eviction of an entry in the middle of its read gives the whole value on a file system that keeps removed files readable, and a miss on one that cuts the read short, never the bytes it cut
 - `internal/engine` `TestDB_Stats/a_stale_disk-cached_manifest_is_refreshed_on_open`: a stale manifest in the disk cache is replaced by the store's newer one on open
 - `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus, with injected errors, latency, lost acknowledgements, outages, and crashes, finds no anomalies with any checker and exercises every fault
+- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus, with disk caches small enough to evict and files that crashes and the disk damage, finds no anomalies, and after every operation of every client the files of its disk cache are within the bound and all counted
+
+### `INV-DISK-CACHE-BOUND`
+
+> The disk cache holds at most a configured number of bytes: the files it holds never exceed that bound by more than one entry, whatever the access pattern and across restarts.
+
+- `.` `TestDiskCache/keeps_the_files_of_the_disk_cache_within_DiskCacheBytes,_and_serves_reads_from_them_after_a_restart`: a database with a disk cache of 64 KiB, which commits and reads many times that, keeps the files of its disk cache within the bound after every statement, and a database opened again on the directory reads from it
+- `.` `TestDiskCache/shares_the_disk_cache_of_a_DSN_between_databases_in_one_process,_and_fails_with_ErrDiskCacheInUse_in_another_process`: two databases of one DSN with one DiskCacheDir in one process both work, and another process that opens the DSN with that directory fails with ErrDiskCacheInUse
+- `internal/cache` `TestDisk/counts_the_files_of_an_earlier_process_at_open,_oldest_written_first,_removes_its_temporary_files,_and_keeps_other_files`: a disk cache counts the files that are in its directory at open, evicts the least recently written of them first, removes leftover temporary files, and evicts down to a lowered bound at open
+- `internal/cache` `TestDisk/keeps_counting_a_newer_file_of_a_key_when_a_read_of_the_older_one_fails_in_the_middle`: a read that fails because its entry was evicted and put again in the middle of it leaves the new entry in the cache and counted
+- `internal/cache` `TestDisk/keeps_its_files_within_the_bound_and_recently_used_entries_cached,_through_a_realistic_workload_with_restarts`: a read-through workload of segment blocks with a hot set, commits that rewrite the manifest, merges that make new segments, and restarts fills a disk cache to many times its bound, and after every operation its files are within the bound and all counted, every entry used within the last bound's worth of entries is a hit, and most hot reads hit
+- `internal/cache` `TestDisk/keeps_its_files_within_the_bound_by_one_entry_under_concurrent_reads_and_writes`: concurrent read-through workloads on one disk cache never make its files exceed the bound by more than one entry, checked after every operation
+- `internal/cache` `TestDisk/keeps_its_files_within_the_bound_in_a_directory_of_the_operating_system`: the realistic workload on a disk cache directory of the operating system, with restarts that close and open it again, keeps its files within the bound after every operation
+- `internal/cache` `TestDisk/never_serves_bytes_that_the_latest_Put_of_a_key_did_not_put,_never_holds_more_than_the_bound,_and_counts_every_file,_through_damage,_restarts,_and_evictions_and_replacements_in_the_middle_of_reads`: random operations, damaged and cut files, restarts with leftover temporary files, and evictions and replacements in the middle of reads never make a disk cache serve other bytes than the latest Put of the key, and its files never exceed the bound and are all counted
+- `internal/cache` `TestOpenDir/refuses_a_directory_that_another_process_has_open_until_that_process_ends,_also_by_a_crash,_and_shares_one_within_a_process`: a second process that opens a disk cache directory fails with ErrInUse while the first has it open, and opens it once the first closed it or crashed; within one process, the opens of a directory share one cache
+- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus, with disk caches small enough to evict and files that crashes and the disk damage, finds no anomalies, and after every operation of every client the files of its disk cache are within the bound and all counted
 
 ### `INV-REGISTER`
 
@@ -365,6 +384,7 @@ Each entry names the test's package, the test's name, and what the test asserts,
 
 > API: Options use pointer fields with opinionated defaults, as in <https://github.com/maragudk/sqlite/blob/main/sqlite.go>.
 
+- `.` `TestOptions_withDefaults/bounds_the_disk_cache_to_1_GiB_by_default,_and_keeps_a_bound_that_is_set`: DiskCacheBytes defaults to 1 GiB, and a bound that is set, also zero, stays
 - `internal/engine` `TestOpen/defaults_to_a_memory_cache_and_a_one_hour_grace_period`: options left unset get their defaults: a memory cache and a one hour grace period
 
 ### `INV-DSN`
@@ -830,6 +850,9 @@ Every mutant runs in every simulator configuration below, with seeds 1 to 20, un
 | `MUT-CHECK-SKIP-UPDATE` CHECK on INSERT only | 2 of 8 configurations | 5 | check constraint |
 | `MUT-SUBQUERY-STALE-READS` subquery reads that a retry does not repeat | 2 of 2 configurations | 2 | durability, list-append |
 | `MUT-UPDATE-SEES-OWN-WRITES` an UPDATE that revisits the rows it wrote | 0 of 8 configurations | none |  |
+| `MUT-DISK-CACHE-UNVERIFIED` a disk cache that serves damaged files | 4 of 4 configurations | 2 | bank, list-append, workload invariants |
+| `MUT-DISK-CACHE-SERVE-CUT-READ` a disk cache that serves a read that an eviction cut short | 0 of 0 configurations | none |  |
+| `MUT-DISK-CACHE-UNCOUNTED` a disk cache that does not count the files of an earlier process | 12 of 12 configurations | 1 | disk cache bound |
 
 ### `MUT-COMMIT-WITHOUT-CAS`
 
@@ -1365,6 +1388,75 @@ Targeted tests:
 
 - `internal/sql/exec` `TestMutations/UpdateSeesOwnWrites_revisits_moved_rows,_which_the_Halloween_test_catches`: with the mutant, an UPDATE that moves keys revisits rows it already moved
 
+### `MUT-DISK-CACHE-UNVERIFIED`
+
+`cache.DiskMutations.Unverified` serves the bytes of a disk cache file without checking its header, key, length, and checksum, so that a file that a crash truncated, corrupted, or filled with another entry's content is served.
+
+| Configuration | Result |
+|---|---|
+| list-append through the engine, no maintainers | detected with seed 2 by workload invariants, list-append |
+| list-append through the engine, 2 maintainers | detected with seed 3 by list-append |
+| bank through the engine, no maintainers | detected with seed 2 by bank |
+| bank through the engine, 2 maintainers | detected with seed 2 by workload invariants |
+| list-append through SQL, no maintainers | not applicable: a damaged table definition that the mutant serves can make the SQL layer fail an index lookup with a panic, which ends the simulation instead of a checker; the cells through the engine, which have no table definitions, and `TestDisk` of the cache detect the mutant |
+| list-append through SQL, 2 maintainers | not applicable: a damaged table definition that the mutant serves can make the SQL layer fail an index lookup with a panic, which ends the simulation instead of a checker; the cells through the engine, which have no table definitions, and `TestDisk` of the cache detect the mutant |
+| bank through SQL, no maintainers | not applicable: a damaged table definition that the mutant serves can make the SQL layer fail an index lookup with a panic, which ends the simulation instead of a checker; the cells through the engine, which have no table definitions, and `TestDisk` of the cache detect the mutant |
+| bank through SQL, 2 maintainers | not applicable: a damaged table definition that the mutant serves can make the SQL layer fail an index lookup with a panic, which ends the simulation instead of a checker; the cells through the engine, which have no table definitions, and `TestDisk` of the cache detect the mutant |
+| unique through SQL, no maintainers | not applicable: a damaged table definition that the mutant serves can make the SQL layer fail an index lookup with a panic, which ends the simulation instead of a checker; the cells through the engine, which have no table definitions, and `TestDisk` of the cache detect the mutant |
+| unique through SQL, 2 maintainers | not applicable: a damaged table definition that the mutant serves can make the SQL layer fail an index lookup with a panic, which ends the simulation instead of a checker; the cells through the engine, which have no table definitions, and `TestDisk` of the cache detect the mutant |
+| foreign-key through SQL, no maintainers | not applicable: a damaged table definition that the mutant serves can make the SQL layer fail an index lookup with a panic, which ends the simulation instead of a checker; the cells through the engine, which have no table definitions, and `TestDisk` of the cache detect the mutant |
+| foreign-key through SQL, 2 maintainers | not applicable: a damaged table definition that the mutant serves can make the SQL layer fail an index lookup with a panic, which ends the simulation instead of a checker; the cells through the engine, which have no table definitions, and `TestDisk` of the cache detect the mutant |
+
+Targeted tests:
+
+- `internal/cache` `TestDisk/with_the_mutant_that_serves_damaged_files,_the_random_operations_serve_bytes_that_were_not_put`: with the mutant, the random operations on a disk cache find a Get that serves a truncated, corrupt, or misplaced file
+
+### `MUT-DISK-CACHE-SERVE-CUT-READ`
+
+`cache.DiskMutations.ServeCutReads` serves a disk cache file that is shorter than its header says as it is, as a read that an eviction or a replacement cut short leaves on a file system that does not keep a removed file readable.
+
+| Configuration | Result |
+|---|---|
+| list-append through the engine, no maintainers | not applicable: a disk cache read in the simulator never overlaps an eviction, because the scheduler runs one task at a time and a read of the disk cache does not yield, and a block or manifest cut short fails to decode in the engine anyway; `TestDisk` of the cache overlaps reads with evictions and detects the mutant |
+| list-append through the engine, 2 maintainers | not applicable: a disk cache read in the simulator never overlaps an eviction, because the scheduler runs one task at a time and a read of the disk cache does not yield, and a block or manifest cut short fails to decode in the engine anyway; `TestDisk` of the cache overlaps reads with evictions and detects the mutant |
+| bank through the engine, no maintainers | not applicable: a disk cache read in the simulator never overlaps an eviction, because the scheduler runs one task at a time and a read of the disk cache does not yield, and a block or manifest cut short fails to decode in the engine anyway; `TestDisk` of the cache overlaps reads with evictions and detects the mutant |
+| bank through the engine, 2 maintainers | not applicable: a disk cache read in the simulator never overlaps an eviction, because the scheduler runs one task at a time and a read of the disk cache does not yield, and a block or manifest cut short fails to decode in the engine anyway; `TestDisk` of the cache overlaps reads with evictions and detects the mutant |
+| list-append through SQL, no maintainers | not applicable: a disk cache read in the simulator never overlaps an eviction, because the scheduler runs one task at a time and a read of the disk cache does not yield, and a block or manifest cut short fails to decode in the engine anyway; `TestDisk` of the cache overlaps reads with evictions and detects the mutant |
+| list-append through SQL, 2 maintainers | not applicable: a disk cache read in the simulator never overlaps an eviction, because the scheduler runs one task at a time and a read of the disk cache does not yield, and a block or manifest cut short fails to decode in the engine anyway; `TestDisk` of the cache overlaps reads with evictions and detects the mutant |
+| bank through SQL, no maintainers | not applicable: a disk cache read in the simulator never overlaps an eviction, because the scheduler runs one task at a time and a read of the disk cache does not yield, and a block or manifest cut short fails to decode in the engine anyway; `TestDisk` of the cache overlaps reads with evictions and detects the mutant |
+| bank through SQL, 2 maintainers | not applicable: a disk cache read in the simulator never overlaps an eviction, because the scheduler runs one task at a time and a read of the disk cache does not yield, and a block or manifest cut short fails to decode in the engine anyway; `TestDisk` of the cache overlaps reads with evictions and detects the mutant |
+| unique through SQL, no maintainers | not applicable: a disk cache read in the simulator never overlaps an eviction, because the scheduler runs one task at a time and a read of the disk cache does not yield, and a block or manifest cut short fails to decode in the engine anyway; `TestDisk` of the cache overlaps reads with evictions and detects the mutant |
+| unique through SQL, 2 maintainers | not applicable: a disk cache read in the simulator never overlaps an eviction, because the scheduler runs one task at a time and a read of the disk cache does not yield, and a block or manifest cut short fails to decode in the engine anyway; `TestDisk` of the cache overlaps reads with evictions and detects the mutant |
+| foreign-key through SQL, no maintainers | not applicable: a disk cache read in the simulator never overlaps an eviction, because the scheduler runs one task at a time and a read of the disk cache does not yield, and a block or manifest cut short fails to decode in the engine anyway; `TestDisk` of the cache overlaps reads with evictions and detects the mutant |
+| foreign-key through SQL, 2 maintainers | not applicable: a disk cache read in the simulator never overlaps an eviction, because the scheduler runs one task at a time and a read of the disk cache does not yield, and a block or manifest cut short fails to decode in the engine anyway; `TestDisk` of the cache overlaps reads with evictions and detects the mutant |
+
+Targeted tests:
+
+- `internal/cache` `TestDisk/with_the_mutant_that_serves_cut_reads,_the_random_operations_serve_bytes_that_were_not_put`: with the mutant, the random operations on a disk cache find a Get that serves a read that an eviction or a replacement cut short
+
+### `MUT-DISK-CACHE-UNCOUNTED`
+
+`cache.DiskMutations.UncountedAtOpen` leaves the files that are in a disk cache directory at open out of the cache, so that a restarted process never counts or evicts them and its directory grows past the bound.
+
+| Configuration | Result |
+|---|---|
+| list-append through the engine, no maintainers | detected with seed 1 by disk cache bound |
+| list-append through the engine, 2 maintainers | detected with seed 1 by disk cache bound |
+| bank through the engine, no maintainers | detected with seed 1 by disk cache bound |
+| bank through the engine, 2 maintainers | detected with seed 2 by disk cache bound |
+| list-append through SQL, no maintainers | detected with seed 2 by disk cache bound |
+| list-append through SQL, 2 maintainers | detected with seed 1 by disk cache bound |
+| bank through SQL, no maintainers | detected with seed 1 by disk cache bound |
+| bank through SQL, 2 maintainers | detected with seed 1 by disk cache bound |
+| unique through SQL, no maintainers | detected with seed 2 by disk cache bound |
+| unique through SQL, 2 maintainers | detected with seed 2 by disk cache bound |
+| foreign-key through SQL, no maintainers | detected with seed 1 by disk cache bound |
+| foreign-key through SQL, 2 maintainers | detected with seed 1 by disk cache bound |
+
+Targeted tests:
+
+- `internal/cache` `TestDisk/with_the_mutant_that_does_not_count_the_files_of_an_earlier_process,_the_random_operations_find_files_that_are_not_counted`: with the mutant, the random operations on a disk cache find files that it does not count after a restart
+
 ## Reached states
 
 The fixed simulator corpus must reach every state at least once, or its test fails. The counts of each run are in the CI report.
@@ -1395,7 +1487,9 @@ The fixed simulator corpus must reach every state at least once, or its test fai
 | `STATE-UNIQUE-VALUE-REUSED` | a client inserts a row with a unique value that its own committed UPDATE or DELETE freed | "a unique value that a committed write freed is taken again" |
 | `STATE-FK-AFTER-CONFLICT` | an autocommit statement that passed its foreign key checks loses its commit to a concurrent one, and its retry fails with a foreign key violation that the concurrent commit causes | "a foreign key violation occurs only because of a concurrent commit" |
 | `STATE-FK-CASCADE-TABLES` | one statement's ON DELETE CASCADE actions delete rows in more than one table | "a cascade deletes rows in more than one table" |
+| `STATE-DISK-CACHE-EVICTION` | a client's disk cache evicts its least recently used entries to stay within its bound | "a disk cache evicts to stay within its bound" |
+| `STATE-DISK-CACHE-REFUSED` | a client's disk cache refuses a file that a crash damaged or removed, and the read goes to the store | "a disk cache refuses a damaged file" |
 
 Verified by:
 
-- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, and unique and foreign key violations that only a concurrent commit causes
+- `internal/sim` `TestSimulator/corpus_finds_no_anomalies`: the fixed corpus reaches every declared state at least once, among them crashes during commits, compactions, and GC passes, lost acknowledgements resolved both ways, unique and foreign key violations that only a concurrent commit causes, and disk caches that evict and refuse damaged files
