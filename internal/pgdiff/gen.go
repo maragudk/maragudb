@@ -169,9 +169,9 @@ func Generate(src Source) Case {
 	for range g.draw(0, 2) {
 		c.Statements = append(c.Statements, g.createIndex())
 	}
-	// Two of the kinds of statements are joins and two are grouped, so that the others are as
-	// frequent as they were before there were either.
-	n := g.draw(1, 10)
+	// Two of the kinds of statements are joins, two are grouped, and two have subqueries, so that
+	// the others are as frequent as they were before there were any of these.
+	n := g.draw(1, 12)
 	// A third of the cases run some statements in an explicit transaction, which ends with a
 	// COMMIT, a ROLLBACK, or not at all.
 	begin, end := -1, -1
@@ -568,6 +568,9 @@ type scope struct {
 	safe bool
 	// null allows a bare NULL literal here.
 	null bool
+	// sub allows subqueries, nested sub levels deep at most. The columns of refs are those of
+	// the queries around, which a subquery reads by their qualified names.
+	sub int
 }
 
 func (s scope) withNull(null bool) scope {
@@ -581,6 +584,9 @@ func (g *gen) expr(t value.Type, s scope, depth int) ast.Expr {
 		return &ast.Literal{Value: value.NewNull(value.Unknown)}
 	}
 	s = s.withNull(false)
+	if s.sub > 0 && depth < 3 && g.rarely(4) {
+		return g.subquery(t, s, depth)
+	}
 	if s.columns && g.hasColumn(t, s) && g.draw(0, 2) == 0 {
 		return g.columnOfType(t, s)
 	}
@@ -687,8 +693,11 @@ func (g *gen) expr(t value.Type, s scope, depth int) ast.Expr {
 		case 4:
 			ot := g.anyTypeIn(s)
 			in := &ast.In{Expr: g.expr(ot, s, depth), Not: g.bool()}
+			// A subquery in the list of an IN is rejected.
+			ls := s
+			ls.sub = 0
 			for range g.draw(1, 3) {
-				in.List = append(in.List, g.expr(ot, s.withNull(true), depth))
+				in.List = append(in.List, g.expr(ot, ls.withNull(true), depth))
 			}
 			return in
 		case 5:
@@ -964,7 +973,11 @@ func (g *gen) statement() ast.Statement {
 		}
 		return g.createIndex()
 	}
-	switch g.draw(0, 9) {
+	switch g.draw(0, 11) {
+	case 10:
+		return g.subquerySelect()
+	case 11:
+		return g.subqueryWrite()
 	case 0:
 		return g.insert(g.draw(1, 3))
 	case 1:
@@ -1852,4 +1865,217 @@ func groupsOrdered(s *ast.Select) bool {
 		}
 	}
 	return true
+}
+
+// subquery of type t in the scope s: a scalar subquery, or for a boolean also EXISTS, NOT
+// EXISTS, IN, or NOT IN, on the table or the referenced table under a name of its own, whose
+// conditions now and then compare its columns with those of the queries around, which makes it
+// correlated, and whose expressions may have subqueries of their own. A scalar subquery is an
+// aggregate, which has one row, or a column, which can have several, and fails then.
+func (g *gen) subquery(t value.Type, s scope, depth int) ast.Expr {
+	src := g
+	if g.parent != nil && g.bool() {
+		src = g.parent
+	}
+	in := ref{name: fmt.Sprintf("s%d%d", s.sub, depth), g: src}
+	sel := &ast.Select{From: []ast.TableExpr{&ast.TableRef{Name: src.table.Name, Alias: in.name}}}
+	// The expressions of a subquery mostly cannot fail, because maragudb rejects one that fails
+	// where only some plans of Postgres evaluate it.
+	inner := scope{columns: true, refs: append([]ref{in}, s.refs...), safe: s.safe || !g.rarely(4), sub: s.sub - 1}
+	own := scope{columns: true, refs: []ref{in}, safe: inner.safe}
+	var conds []ast.Expr
+	if len(s.refs) > 0 && !g.rarely(4) {
+		// A correlation: a column of the subquery compared with a column of a query around.
+		for _, ct := range allTypes {
+			if len(src.cols[ct]) > 0 && g.hasColumn(ct, scope{refs: s.refs}) && g.bool() {
+				op := pick(g, []ast.BinaryOp{ast.Eq, ast.Eq, ast.Lt, ast.Ne})
+				conds = append(conds, &ast.Binary{Op: op, Left: g.columnOfType(ct, scope{refs: []ref{in}}), Right: g.columnOfType(ct, scope{refs: s.refs})})
+				break
+			}
+		}
+	}
+	if g.bool() {
+		conds = append(conds, g.expr(value.Bool, inner, depth+1))
+	}
+	if !s.safe && g.rarely(10) {
+		conds = append(conds, g.failing(scope{columns: true, refs: []ref{in}}))
+	}
+	if len(conds) > 0 {
+		sel.Where = join(conds)
+	}
+	column := func(ct value.Type) ast.Expr {
+		if len(src.cols[ct]) > 0 && !g.rarely(5) {
+			return g.columnOfType(ct, scope{refs: []ref{in}})
+		}
+		return g.expr(ct, inner, depth+1)
+	}
+	// An argument of an aggregate reads a column of the subquery, which makes it an aggregate of
+	// the subquery.
+	argument := func(ct value.Type) ast.Expr {
+		if len(src.cols[ct]) > 0 {
+			return g.columnOfType(ct, scope{refs: []ref{in}})
+		}
+		return g.expr(ct, own, depth+1)
+	}
+	if t == value.Bool && g.draw(0, 2) > 0 {
+		if g.bool() {
+			// EXISTS, whose output Postgres drops.
+			switch g.draw(0, 2) {
+			case 0:
+				sel.Items = []ast.SelectItem{{Star: true}}
+			case 1:
+				sel.Items = []ast.SelectItem{{Expr: &ast.Literal{Value: value.NewInt4(1)}}}
+			default:
+				sel.Items = []ast.SelectItem{{Expr: column(g.anyTypeIn(scope{refs: []ref{in}}))}}
+			}
+			var e ast.Expr = &ast.Subquery{Kind: ast.SubExists, Select: sel}
+			if g.bool() {
+				e = &ast.Unary{Op: ast.Not, Expr: e}
+			}
+			return e
+		}
+		ot := g.anyTypeIn(scope{refs: []ref{in}})
+		sel.Items = []ast.SelectItem{{Expr: column(ot)}}
+		if g.rarely(4) {
+			sel.Distinct = true
+		}
+		left := g.expr(ot, scope{columns: true, refs: s.refs, safe: s.safe, sub: s.sub - 1, null: true}, depth+1)
+		return &ast.Subquery{Kind: ast.SubIn, Select: sel, Expr: left, Not: g.bool()}
+	}
+	switch {
+	case t == value.Int && g.bool():
+		if g.bool() {
+			sel.Items = []ast.SelectItem{{Expr: &ast.Call{Name: "count", Star: true}}}
+		} else {
+			sel.Items = []ast.SelectItem{{Expr: &ast.Call{Name: "count", Args: []ast.Expr{argument(g.anyTypeIn(scope{refs: []ref{in}}))}}}}
+		}
+	case t != value.Bool && !g.rarely(3):
+		sel.Items = []ast.SelectItem{{Expr: &ast.Call{Name: pick(g, []string{"min", "max"}), Args: []ast.Expr{argument(t)}}}}
+	case s.safe || !g.rarely(3):
+		// One row at most, which cannot fail.
+		sel.Items = []ast.SelectItem{{Expr: column(t)}}
+		sel.Limit = &ast.Literal{Value: value.NewInt4(int32(g.draw(0, 1)))}
+		for _, k := range src.table.PrimaryKey {
+			sel.OrderBy = append(sel.OrderBy, ast.OrderItem{Expr: &ast.ColumnRef{Table: in.name, Name: k}, Desc: g.bool()})
+		}
+	default:
+		sel.Items = []ast.SelectItem{{Expr: column(t)}}
+	}
+	return &ast.Subquery{Kind: ast.SubScalar, Select: sel}
+}
+
+// subquerySelect is a SELECT whose expressions have subqueries, on the table under the name o,
+// or on a subquery in FROM or a CTE of that name that selects rows of the table, now and then
+// grouped, with every key column in ORDER BY, so that the order is mostly known.
+func (g *gen) subquerySelect() *ast.Select {
+	o := ref{name: "o", g: g}
+	s := &ast.Select{}
+	limited := g.rarely(6)
+	sc := scope{columns: true, refs: []ref{o}, safe: limited, sub: 2}
+	body := func() *ast.Select {
+		b := &ast.Select{Items: []ast.SelectItem{{Star: true}}, From: []ast.TableExpr{&ast.TableRef{Name: g.table.Name}}}
+		if g.bool() {
+			b.Where = g.expr(value.Bool, scope{columns: true, safe: !g.rarely(8), sub: 1}, 1)
+		}
+		return b
+	}
+	switch g.draw(0, 5) {
+	case 0:
+		if limited {
+			break
+		}
+		s.From = []ast.TableExpr{&ast.Derived{Select: body(), Alias: o.name}}
+	case 1:
+		if limited {
+			break
+		}
+		s.With = []ast.CTE{{Name: o.name, Select: body()}}
+		s.From = []ast.TableExpr{&ast.TableRef{Name: o.name}}
+		if g.rarely(4) {
+			// The CTE read twice.
+			s.From = append(s.From, &ast.TableRef{Name: o.name, Alias: "o2"})
+		}
+	}
+	if s.From == nil {
+		s.From = []ast.TableExpr{&ast.TableRef{Name: g.table.Name, Alias: o.name}}
+	}
+	if g.rarely(4) && !limited {
+		// Grouped by a column, with subqueries in the output and in HAVING that read the key.
+		t := g.anyTypeIn(sc)
+		key := g.columnOfTypeOr(t, sc)
+		s.GroupBy = []ast.Expr{key}
+		ks := scope{columns: false, sub: 1}
+		s.Items = []ast.SelectItem{{Expr: key}, {Expr: &ast.Call{Name: "count", Star: true}}}
+		if kref, ok := key.(*ast.ColumnRef); ok {
+			// The key is the only column of the query around that a subquery may read.
+			kg := &gen{src: g.src, cols: map[value.Type][]string{t: {kref.Name}}, table: g.table, parent: g.parent}
+			ks = scope{columns: true, refs: []ref{{name: o.name, g: kg}}, sub: 1}
+		}
+		s.Items = append(s.Items, ast.SelectItem{Expr: g.subquery(g.anyType(), ks, 1)})
+		if g.bool() {
+			s.Having = g.subquery(value.Bool, ks, 1)
+		}
+		s.OrderBy = []ast.OrderItem{{Expr: key}}
+		return s
+	}
+	for i := range g.draw(1, 3) {
+		item := ast.SelectItem{Expr: g.expr(g.anyType(), sc.withNull(true), 0)}
+		if g.bool() {
+			item.Alias = fmt.Sprint("a", i)
+		}
+		s.Items = append(s.Items, item)
+	}
+	if !g.rarely(4) {
+		where := g.subquery(value.Bool, sc, 0)
+		if g.bool() {
+			where = &ast.Binary{Op: ast.And, Left: qualify(g.keyCondition(), o.name), Right: where}
+		}
+		s.Where = where
+	}
+	if g.rarely(4) {
+		s.OrderBy = append(s.OrderBy, ast.OrderItem{Expr: g.subquery(g.anyType(), sc, 1)})
+	}
+	for _, k := range g.table.PrimaryKey {
+		s.OrderBy = append(s.OrderBy, ast.OrderItem{Expr: &ast.ColumnRef{Table: o.name, Name: k}, Desc: g.bool()})
+	}
+	if limited {
+		s.Limit = &ast.Literal{Value: value.NewInt4(int32(g.draw(0, 3)))}
+	}
+	return s
+}
+
+// subqueryWrite is an UPDATE or DELETE of the table under the name o, whose WHERE and SET have
+// subqueries, which may read the table itself, or an INSERT with a subquery in VALUES.
+func (g *gen) subqueryWrite() ast.Statement {
+	o := ref{name: "o", g: g}
+	sc := scope{columns: true, refs: []ref{o}, sub: 2}
+	switch g.draw(0, 2) {
+	case 0:
+		ins := g.insert(g.draw(1, 2))
+		for _, row := range ins.Rows {
+			i := g.draw(0, len(row)-1)
+			if _, ok := row[i].(*ast.Default); !ok && !g.isKey(g.table.Columns[i].Name) {
+				row[i] = g.subquery(g.table.Columns[i].Type, scope{sub: 1}, 1)
+			}
+		}
+		return ins
+	case 1:
+		return &ast.Delete{Table: g.table.Name, Alias: o.name, Where: g.subquery(value.Bool, sc, 0)}
+	}
+	u := &ast.Update{Table: g.table.Name, Alias: o.name}
+	var nonKey []string
+	for _, name := range g.columnNames() {
+		if !g.isKey(name) && name != g.nowColumn {
+			nonKey = append(nonKey, name)
+		}
+	}
+	if len(nonKey) == 0 {
+		return &ast.Delete{Table: g.table.Name, Alias: o.name, Where: g.subquery(value.Bool, sc, 0)}
+	}
+	name := pick(g, nonKey)
+	u.Set = []ast.Assignment{{Column: name, Value: g.subquery(g.column(name).Type, sc, 0)}}
+	if g.bool() {
+		u.Where = g.subquery(value.Bool, sc, 0)
+	}
+	return u
 }
