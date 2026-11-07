@@ -173,7 +173,7 @@ func TestJoins(t *testing.T) {
 	})
 
 	t.Run("removes duplicate rows with DISTINCT as Postgres does", func(t *testing.T) {
-		verify.Covers(t, "SELECT DISTINCT keeps one row of every group of rows that are equal as Postgres compares them, NULLs equal to each other and NaN equal to NaN, sorts by ORDER BY items that must be output columns (42P10 otherwise), and rejects a group of -0 and 0, whose output depends on the plan", "INV-PG-SUBSET", "UNS-DISTINCT-ZERO")
+		verify.Covers(t, "SELECT DISTINCT keeps one row of every group of rows that are equal as Postgres compares them, NULLs equal to each other and NaN equal to NaN, sorts by ORDER BY items that must be output columns (42P10 otherwise), where constants that Postgres reads into equal values match, such as FALSE and 'no'::boolean, and constants of other types do not, and rejects a group of -0 and 0, whose output depends on the plan", "INV-PG-SUBSET", "UNS-DISTINCT-ZERO")
 		s := newJoinSession(t)
 		expect(t, s,
 			outcome{sql: "SELECT DISTINCT v FROM ja"},
@@ -187,6 +187,14 @@ func TestJoins(t *testing.T) {
 			outcome{sql: "SELECT DISTINCT v FROM ja ORDER BY id", code: "42P10"},
 			outcome{sql: "SELECT DISTINCT v FROM ja ORDER BY v + 0", code: "42P10"},
 			outcome{sql: "SELECT DISTINCT v FROM ja ORDER BY 1 + 0", code: "42P10"},
+			outcome{sql: "SELECT DISTINCT FALSE FROM ja ORDER BY CAST('no' AS boolean)"},
+			outcome{sql: "SELECT DISTINCT 'yes'::boolean FROM ja ORDER BY TRUE", code: "42601"},
+			outcome{sql: "SELECT DISTINCT 9223372036854775807 FROM ja ORDER BY '9223372036854775807'::bigint"},
+			outcome{sql: "SELECT DISTINCT '1.50'::float8 FROM ja ORDER BY '1.5'::float8"},
+			outcome{sql: "SELECT DISTINCT '2024-01-01'::timestamptz FROM ja ORDER BY '2024-01-01 00:00:00+00'::timestamptz"},
+			outcome{sql: "SELECT DISTINCT 5 FROM ja ORDER BY '5'::bigint", code: "42P10"},
+			outcome{sql: "SELECT DISTINCT 1.5::float8 FROM ja ORDER BY '1.5'::float8", code: "42P10"},
+			outcome{sql: "SELECT DISTINCT TRUE FROM ja ORDER BY 'no'::boolean", code: "42P10"},
 			outcome{sql: "SELECT DISTINCT v FROM ja ORDER BY nope", code: "42703"},
 			outcome{sql: "SELECT DISTINCT ja.v FROM ja JOIN jb ON ja.id = jb.aid"},
 			outcome{sql: "SELECT DISTINCT jb.aid, ja.s FROM jb LEFT JOIN ja ON ja.id = jb.aid"},

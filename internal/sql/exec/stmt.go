@@ -1136,12 +1136,26 @@ func outputNameStrength(e ast.Expr, names map[*ast.Select]string) (string, int) 
 
 // canonical text of an expression, for telling whether two expressions are the same one as
 // Postgres's analysis sees them: casts are written in one style, and a cast to the type the
-// expression already has is dropped, because Postgres drops it too.
+// expression already has is dropped, because Postgres drops it too. A constant of type boolean or
+// bigint, whether a keyword, digits, or a quoted literal cast to the type, is written as its
+// value, because Postgres reads each of them into the same constant: FALSE and 'no'::boolean are
+// one expression there.
 func (b *binder) canonical(e ast.Expr) string {
+	constant := func(v value.Value) ast.Expr {
+		return &ast.Cast{Expr: &ast.Literal{Value: value.NewUnknown(value.Format(v))}, Type: v.Type}
+	}
 	return ast.RenderExpr(ast.Map(b.normalize(e), func(x ast.Expr) ast.Expr {
+		if lit, ok := x.(*ast.Literal); ok && !lit.Value.Null && (lit.Value.Type == value.Bool || lit.Value.Type == value.Int) {
+			return constant(lit.Value)
+		}
 		c, ok := x.(*ast.Cast)
 		if !ok {
 			return x
+		}
+		if lit, ok := c.Expr.(*ast.Literal); ok && lit.Value.Type == value.Unknown && !lit.Value.Null {
+			if v, err := value.Parse(lit.Value.S, c.Type); err == nil {
+				return constant(v)
+			}
 		}
 		if inner, err := b.bindPruned(c.Expr); err == nil && inner.typ == c.Type {
 			return c.Expr
